@@ -26,7 +26,8 @@ pub const usb_serial_jtag = @import("hal/usb_serial_jtag.zig");
 comptime {
     if (!builtin.is_test) {
         // Keep otherwise unused register accessors in firmware compile coverage.
-        @export(&compile_check_accessors, .{ .name = "esp_compile_check_accessors" });
+        if (compatibility.chip == .esp32_c3)
+            @export(&compile_check_accessors, .{ .name = "esp_compile_check_accessors" });
 
         // export atomic intrinsics
         _ = @import("hal/atomic.zig");
@@ -73,11 +74,9 @@ pub fn init_sequence(clock_cfg: clocks.Config) void {
         rtos.init();
 }
 
-// NOTE: might be esp32c3 specific only + temporary until timers hal.
 fn disable_watchdogs() void {
     const peripherals = microzig.chip.peripherals;
     const TIMG0 = peripherals.TIMG0;
-    const RTC_CNTL = peripherals.RTC_CNTL;
 
     const dogfood = 0x50D83AA1;
     const super_dogfood = 0x8F1D312A;
@@ -87,15 +86,39 @@ fn disable_watchdogs() void {
     TIMG0.WDTCONFIG0.raw = 0;
     TIMG0.WDTWPROTECT.raw = 0;
 
-    // Feed and disable rtc watchdog
-    RTC_CNTL.WDTWPROTECT.raw = dogfood;
-    RTC_CNTL.WDTCONFIG0.raw = 0;
-    RTC_CNTL.WDTWPROTECT.raw = 0;
+    switch (compatibility.chip) {
+        .esp32_c3 => {
+            const RTC_CNTL = peripherals.RTC_CNTL;
 
-    // Feed and disable rtc super watchdog
-    RTC_CNTL.SWD_WPROTECT.raw = super_dogfood;
-    RTC_CNTL.SWD_CONF.modify(.{ .SWD_DISABLE = 1 });
-    RTC_CNTL.SWD_WPROTECT.raw = 0;
+            // Feed and disable rtc watchdog
+            RTC_CNTL.WDTWPROTECT.raw = dogfood;
+            RTC_CNTL.WDTCONFIG0.raw = 0;
+            RTC_CNTL.WDTWPROTECT.raw = 0;
+
+            // Feed and disable rtc super watchdog
+            RTC_CNTL.SWD_WPROTECT.raw = super_dogfood;
+            RTC_CNTL.SWD_CONF.modify(.{ .SWD_DISABLE = 1 });
+            RTC_CNTL.SWD_WPROTECT.raw = 0;
+        },
+        // The esp32c6 moved the rtc watchdogs into the low power domain and has a second timer
+        // group whose watchdog the rom bootloader may have armed as well.
+        .esp32_c6 => {
+            const TIMG1 = peripherals.TIMG1;
+            const LP_WDT = peripherals.LP_WDT;
+
+            TIMG1.WDTWPROTECT.raw = dogfood;
+            TIMG1.WDTCONFIG0.raw = 0;
+            TIMG1.WDTWPROTECT.raw = 0;
+
+            LP_WDT.WPROTECT.raw = dogfood;
+            LP_WDT.CONFIG0.raw = 0;
+            LP_WDT.WPROTECT.raw = 0;
+
+            LP_WDT.SWD_WPROTECT.raw = super_dogfood;
+            LP_WDT.SWD_CONFIG.modify(.{ .SWD_DISABLE = 1 });
+            LP_WDT.SWD_WPROTECT.raw = 0;
+        },
+    }
 }
 
 // Don't change the name of this export, it is checked by espflash tool. Only
