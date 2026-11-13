@@ -201,6 +201,8 @@ fn microzig_main() callconv(.c) noreturn {
 }
 
 test {
+    // Not through `core`: its tests include the heap's, which need the `umm` module.
+    _ = @import("core/usb.zig");
     _ = utilities;
     _ = Allocator;
 }

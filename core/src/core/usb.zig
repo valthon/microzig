@@ -10,6 +10,11 @@ pub const drivers = struct {
 };
 pub const types = @import("usb/types.zig");
 
+test "usb tests" {
+    _ = descriptor;
+    _ = drivers.CDC;
+}
+
 pub const ack: []const u8 = "";
 pub const nak: ?[]const u8 = null;
 
