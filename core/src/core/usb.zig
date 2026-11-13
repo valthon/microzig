@@ -440,6 +440,9 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
         cfg_num: u16,
         /// Ep0 data waiting to be sent
         tx_slice: ?[]const u8,
+        /// The control read in `tx_slice` ends on a full packet although the host asked for
+        /// more, so a zero-length packet has to follow its last one.
+        tx_zlp: bool,
         /// Driver state
         driver_data: ?config0.Drivers,
         ///
@@ -450,6 +453,7 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
             .new_address = 0,
             .cfg_num = 0,
             .tx_slice = null,
+            .tx_zlp = false,
             .driver_data = null,
             .driver_alloc = undefined,
         };
@@ -464,6 +468,15 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
         pub fn on_setup_req(self: *@This(), device_itf: *DeviceInterface, setup: *const types.SetupPacket) void {
             log.debug("on_setup_req", .{});
 
+            // A setup request starts a new control transfer and ends the one before it,
+            // finished or not (USB 2.0, 5.5.5). What that one still had to send is dropped:
+            // the host may have given up on a control read after its first packets. An address
+            // that waits for its status packet is dropped with it: the host did not take that
+            // packet and still talks to the address the device has.
+            self.tx_slice = null;
+            self.tx_zlp = false;
+            self.new_address = 0;
+
             const ret = switch (setup.request_type.recipient) {
                 .device => self.process_device_setup(device_itf, setup),
                 .interface => self.process_interface_setup(setup),
@@ -477,6 +490,12 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
                     const len = device_itf.ep_writev(.ep0, &.{limited});
                     assert(len <= device_descriptor.max_packet_size0);
                     self.tx_slice = limited[len..];
+                    // The host takes a packet shorter than the endpoint's maximum, or the
+                    // last byte it asked for, as the end of the data stage (USB 2.0, 5.5.3).
+                    // A reply shorter than wLength whose last packet is full gives it
+                    // neither, so it is followed by a zero-length packet.
+                    self.tx_zlp = limited.len < setup.length.native() and
+                        limited.len % device_descriptor.max_packet_size0 == 0;
                 }
             }
         }
@@ -501,6 +520,10 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
                     if (slice.len > 0) {
                         const len = device_itf.ep_writev(.ep0, &.{slice});
                         self.tx_slice = slice[len..];
+                    } else if (self.tx_zlp) {
+                        // The last packet was full and the host expects more.
+                        self.tx_zlp = false;
+                        device_itf.ep_ack(.ep0);
                     } else {
                         // Otherwise, we've just finished sending tx_slice.
                         // We expect an ensuing status phase where the host
@@ -809,6 +832,77 @@ test "completions and interface requests without a configuration reach no driver
     try std.testing.expect(ctl.drivers() == null);
 }
 
+fn test_get_descriptor(value: u16, length: u16) types.SetupPacket {
+    return .{
+        .request_type = .{ .recipient = .device, .type = .standard, .direction = .in },
+        .request = @backingInt(types.SetupRequest.get_descriptor),
+        .value = .from(value),
+        .index = .from(0),
+        .length = .from(length),
+    };
+}
+
+test "a new setup request drops the rest of an abandoned control read" {
+    const Controller = DeviceController(
+        test_config(struct { serial: drivers.CDC }),
+        .{.{ .serial = .{} }},
+    );
+    var dev: TestDevice = .{};
+    var ctl: Controller = .init;
+
+    // The first packet of the configuration descriptor, which is longer than one packet.
+    // The rest waits for the packet to complete.
+    try std.testing.expect(@sizeOf(@TypeOf(Controller.config_descriptor)) > 64);
+    ctl.on_setup_req(&dev.interface, &test_get_descriptor(0x0200, 255));
+    try std.testing.expectEqual(1, dev.written);
+
+    // The host gives up on the transfer and sends a request without a data stage.
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    try std.testing.expectEqual(2, dev.written);
+
+    // Its status packet completes. Nothing more may be written to EP0.
+    ctl.on_buffer(&dev.interface, comptime types.Endpoint.in(.ep0));
+    try std.testing.expectEqual(2, dev.written);
+}
+
+test "a new setup request drops an address whose status packet the host never took" {
+    const Controller = DeviceController(
+        test_config(struct { echo: drivers.EchoExample }),
+        .{.{ .echo = "echo" }},
+    );
+    const ep0_in = comptime types.Endpoint.in(.ep0);
+    const set_address: types.SetupPacket = .{
+        .request_type = .{ .recipient = .device, .type = .standard, .direction = .out },
+        .request = @backingInt(types.SetupRequest.set_address),
+        .value = .from(5),
+        .index = .from(0),
+        .length = .from(0),
+    };
+
+    // The address takes effect when the status packet completes, not before.
+    {
+        var dev: TestDevice = .{};
+        var ctl: Controller = .init;
+        ctl.on_setup_req(&dev.interface, &set_address);
+        try std.testing.expectEqual(1, dev.written);
+        try std.testing.expectEqual(null, dev.address);
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(5, dev.address);
+    }
+
+    // The host never takes the status packet and sends its next request to the address the
+    // device still has. When a packet of that request completes, the address must not change.
+    {
+        var dev: TestDevice = .{};
+        var ctl: Controller = .init;
+        ctl.on_setup_req(&dev.interface, &set_address);
+        ctl.on_setup_req(&dev.interface, &test_get_descriptor(0x0100, 18));
+        try std.testing.expectEqual(2, dev.written);
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(null, dev.address);
+    }
+}
+
 test "SET_CONFIGURATION with the current value opens the endpoints again" {
     const Controller = DeviceController(
         test_config(struct { serial: drivers.CDC }),
@@ -834,4 +928,71 @@ test "SET_CONFIGURATION with the current value opens the endpoints again" {
     ctl.on_setup_req(&dev.interface, &test_set_configuration(0));
     try std.testing.expect(ctl.drivers() == null);
     try std.testing.expectEqual(6, dev.opened);
+}
+
+test "a control read that ends on a packet boundary short of wLength ends with a zero-length packet" {
+    // EP0 packets of 8 bytes, and a product string of three characters: its descriptor is
+    // exactly 8 bytes (2 of header, 2 per UTF-16 code unit).
+    const cfg = comptime blk: {
+        var c = test_config(struct { echo: drivers.EchoExample });
+        c.max_supported_packet_size = 8;
+        c.product.str = "abc";
+        break :blk c;
+    };
+    const Controller = DeviceController(cfg, .{.{ .echo = "echo" }});
+    const product_string = 0x0300 | @as(u16, Controller.device_descriptor.product_s);
+    const ep0_in = comptime types.Endpoint.in(.ep0);
+    try std.testing.expectEqual(8, Controller.device_descriptor.max_packet_size0);
+    try std.testing.expectEqual(8, Controller.string_descriptors[Controller.device_descriptor.product_s].data.len);
+
+    // The host asks for up to 255 bytes. One full packet carries the whole descriptor, and
+    // only a packet shorter than that tells the host that there is no more (USB 2.0, 5.5.3).
+    {
+        var dev: TestDevice = .{ .packet_size = 8 };
+        var ctl: Controller = .init;
+        ctl.on_setup_req(&dev.interface, &test_get_descriptor(product_string, 255));
+        try std.testing.expectEqual(1, dev.written);
+        try std.testing.expectEqual(8, dev.last_written_len);
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(2, dev.written);
+        try std.testing.expectEqual(0, dev.last_written_len);
+        // The zero-length packet completes: the data stage is over.
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(2, dev.written);
+    }
+
+    // The host asks for exactly the 8 bytes: it knows the data stage ends there.
+    {
+        var dev: TestDevice = .{ .packet_size = 8 };
+        var ctl: Controller = .init;
+        ctl.on_setup_req(&dev.interface, &test_get_descriptor(product_string, 8));
+        try std.testing.expectEqual(1, dev.written);
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(1, dev.written);
+    }
+
+    // The 18-byte device descriptor, cut to 16 by wLength: the host got all it asked for.
+    {
+        var dev: TestDevice = .{ .packet_size = 8 };
+        var ctl: Controller = .init;
+        ctl.on_setup_req(&dev.interface, &test_get_descriptor(0x0100, 16));
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(2, dev.written);
+        try std.testing.expectEqual(8, dev.last_written_len);
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(2, dev.written);
+    }
+
+    // A reply that ends on a short packet needs nothing after it: 18 bytes are 8, 8 and 2.
+    {
+        var dev: TestDevice = .{ .packet_size = 8 };
+        var ctl: Controller = .init;
+        ctl.on_setup_req(&dev.interface, &test_get_descriptor(0x0100, 255));
+        ctl.on_buffer(&dev.interface, ep0_in);
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(3, dev.written);
+        try std.testing.expectEqual(2, dev.last_written_len);
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(3, dev.written);
+    }
 }
