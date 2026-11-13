@@ -442,9 +442,20 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                 set_rx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
                 set_tx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
             }
+            // The host can configure again without a bus reset (SET_CONFIGURATION), so an
+            // endpoint may be opened while a packet from its previous configuration is still
+            // armed. The NAK below withdraws that packet; the software state has to follow, or
+            // the next ep_listen panics and the next ep_writev refuses the data.
             switch (e.dir) {
-                .out => set_rx_ctrl(ep_i, RES_NAK, TOG_DATA0, false),
-                .in => set_tx_ctrl(ep_i, RES_NAK, TOG_DATA0, false),
+                .out => {
+                    set_rx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
+                    out_st.rx_armed = false;
+                    out_st.rx_last_len = 0;
+                },
+                .in => {
+                    set_tx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
+                    in_st.tx_busy = false;
+                },
             }
 
             const tx_len: *volatile Reg_U8 = &EP_Regs[ep_i].UEP_T_LEN;

@@ -658,10 +658,34 @@ pub fn Polled(comptime setup: Setup, comptime cfg: Config) type {
                     Epr.configure(ep_i, ep_type, .nak, .nak);
                 }
 
-                // Set the appropriate direction to desired state
+                // Set the appropriate direction to desired state.
+                // The host can configure again without a bus reset (SET_CONFIGURATION), so an
+                // endpoint may be opened while a packet from its previous configuration is still
+                // armed. The NAK withdraws that packet; the software state has to follow, or
+                // the next ep_listen panics and the next ep_writev refuses the data.
+                // The data toggle goes back to DATA0 as well: SET_CONFIGURATION resets it on
+                // the host's side (USB 2.0, 9.1.1.5), and `Epr.configure` above clears it only
+                // the first time the endpoint is opened.
+                // That packet may also have completed already without `poll` having seen it:
+                // `poll` takes one endpoint per call, lowest number first, so the request on
+                // EP0 that leads here is handled before a completion pending on this
+                // endpoint. Clear the completion flag: left set, it would be taken for the
+                // new configuration's first packet, which `handle_in` would then withdraw
+                // and report sent, and `handle_out` would report with the old length.
                 switch (e.dir) {
-                    .out => Epr.set_stat_rx(ep_i, .nak),
-                    .in => Epr.set_stat_tx(ep_i, .nak),
+                    .out => {
+                        Epr.set_stat_rx(ep_i, .nak);
+                        Epr.clear_dtog_rx(ep_i);
+                        Epr.clear_ctr_rx(ep_i);
+                        out_st.rx_armed = false;
+                        out_st.rx_last_len = 0;
+                    },
+                    .in => {
+                        Epr.set_stat_tx(ep_i, .nak);
+                        Epr.clear_dtog_tx(ep_i);
+                        Epr.clear_ctr_tx(ep_i);
+                        in_st.tx_busy = false;
+                    },
                 }
             }
         }

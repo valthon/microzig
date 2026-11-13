@@ -482,16 +482,23 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
                 const ptr_val: u32 = @as(u32, @intCast(@intFromPtr(st_ep.buf.ptr)));
 
+                // The host can configure again without a bus reset (SET_CONFIGURATION), so an
+                // endpoint may be opened while a packet from its previous configuration is still
+                // armed. The NAK below withdraws that packet; the software state has to follow,
+                // or the next ep_listen panics and the next ep_writev refuses the data.
                 if (e.dir == .out) {
                     const rx_dma: *volatile Reg_U32 = &UEP_RX_DMA[ep_i - 1];
                     rx_dma.raw = ptr_val;
                     const max_len: *volatile Reg_U16 = &UEP_MAX_LEN[ep_i];
                     max_len.raw = mps;
                     set_rx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
+                    st_ep.rx_armed = false;
+                    st_ep.rx_last_len = 0;
                 } else {
                     const tx_dma: *volatile Reg_U32 = &UEP_TX_DMA[ep_i - 1];
                     tx_dma.raw = ptr_val;
                     set_tx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
+                    st_ep.tx_busy = false;
                 }
             }
             log.debug("allocation and DMA setup done for ep{}", .{ep_i});
