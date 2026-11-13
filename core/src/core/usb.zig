@@ -141,6 +141,10 @@ pub const DeviceInterface = struct {
     /// selected is harmless (the controller drops it); one reported after the
     /// endpoint was opened again would reach the new configuration's driver as
     /// if its own packet had completed.
+    ///
+    /// Known exception: the nrf5x HAL cannot withdraw a packet that is already
+    /// loaded into an IN endpoint (see `ep_open` in port/nordic/nrf5x/src/hal/usbd.zig).
+    /// The host can still take that packet, and its completion is then reported.
     pub fn ep_open(self: *@This(), desc: *const descriptor.Endpoint) void {
         return self.vtable.ep_open(self, desc);
     }

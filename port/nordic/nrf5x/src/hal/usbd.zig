@@ -21,6 +21,19 @@ const MAX_PACKET_SIZE = 64;
 const NUM_EP = 8;
 const EP0_IN_STATUS_TIMEOUT_FRAMES: u11 = 5;
 
+/// How many times `wait_easydma` reads the end event before it gives up.
+///
+/// This bounds a wait on a peripheral that has stopped answering; it is not a timing figure.
+/// The product specification gives no duration for an EasyDMA transfer: it says only that
+/// ENDEPIN[n] / ENDEPOUT[n] "indicate that the entire buffer has been consumed" (nRF52840 PS,
+/// USBD, "EasyDMA"). A transfer here copies at most `MAX_PACKET_SIZE` bytes between RAM and
+/// the peripheral. One turn of the loop is a volatile load, a compare and a branch, so no
+/// fewer than three cycles of the 64 MHz core clock, and 2^20 turns are never less than
+/// 49 ms: orders of magnitude more than a 64 byte copy, and still a bounded stall. Counted
+/// in turns and not in time because the HAL's clock (`time.zig`) only runs once the
+/// application has started the RTC.
+const EASYDMA_WAIT_TURNS: u32 = 1 << 20;
+
 const PowerState = union(enum) {
     detached,
     enabling,
@@ -47,6 +60,8 @@ pub const USBD = struct {
     eps_in: [NUM_EP]EP_Config = @splat(.{}),
     eps_out: [NUM_EP]EP_Config = @splat(.{}),
     ep0_state: EP0_State = .{},
+    /// A packet was handed to data IN endpoint n and the host has not taken it yet.
+    in_busy: [NUM_EP]bool = @splat(false),
 
     interface: usb.DeviceInterface,
 
@@ -179,7 +194,10 @@ pub const USBD = struct {
                     var status_in = status >> 1;
                     inline for (1..8) |i| {
                         if (status_in == 0) break;
-                        if (status_in & 1 == 1) controller.on_buffer(&self.interface, .in(@fromBackingInt(i)));
+                        if (status_in & 1 == 1) {
+                            self.in_busy[i] = false;
+                            controller.on_buffer(&self.interface, .in(@fromBackingInt(i)));
+                        }
                         status_in >>= 1;
                     }
                     // OUT endpoints (bits 17-23)
@@ -257,6 +275,31 @@ pub const USBD = struct {
         self.eps_in = @splat(.{});
         self.eps_out = @splat(.{});
         self.ep0_state = .{};
+        self.in_busy = @splat(false);
+    }
+
+    /// Busy-waits for the EasyDMA transfer just started on an endpoint to end, and clears
+    /// its end event. Returns false if the event did not come within `EASYDMA_WAIT_TURNS`.
+    ///
+    /// The wait is here at all because "only a single EasyDMA transfer can take place in
+    /// USBD at any time" and the next one may not be started before this one's end event
+    /// (nRF52840 PS, USBD, "EasyDMA").
+    fn wait_easydma(dir: usb.types.Dir, i: u4) bool {
+        var turns: u32 = 0;
+        while (turns < EASYDMA_WAIT_TURNS) : (turns += 1) {
+            const ended = switch (dir) {
+                .in => peripherals.USBD.EVENTS_ENDEPIN[i].raw,
+                .out => peripherals.USBD.EVENTS_ENDEPOUT[i].raw,
+            };
+            if (ended != 0) {
+                switch (dir) {
+                    .in => peripherals.USBD.EVENTS_ENDEPIN[i].write_raw(0),
+                    .out => peripherals.USBD.EVENTS_ENDEPOUT[i].write_raw(0),
+                }
+                return true;
+            }
+        }
+        return false;
     }
 
     fn ep_writev(
@@ -273,6 +316,16 @@ pub const USBD = struct {
         }
 
         const i = @backingInt(ep_num);
+
+        // A data endpoint holds one packet until the host takes it (EPDATA, reported through
+        // EPDATASTATUS in `poll`). Starting another EasyDMA transfer before that would
+        // rewrite the packet the host may be reading, so the caller is told that nothing
+        // was taken. EP0 is exempt: a new SETUP makes whatever it still held obsolete.
+        if (ep_num != .ep0 and self.in_busy[i]) {
+            log.warn("ep_writev {t}: the previous packet has not been sent", .{ep_num});
+            return 0;
+        }
+
         const scratch = &self.bufs_in[i];
         const scratch_cap = @min(self.eps_in[i].max_packet_size, scratch.len);
         var scratch_slice: []align(1) u8 = scratch[0..scratch_cap];
@@ -312,9 +365,18 @@ pub const USBD = struct {
         // Start DMA
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled) cpu.interrupt.enable(.USBD);
-        peripherals.USBD.TASKS_STARTEPIN[i].write_raw(1);
-        while (peripherals.USBD.EVENTS_ENDEPIN[i].raw != 1) {}
+        // An end event left by a transfer that was given up on must not end this wait.
         peripherals.USBD.EVENTS_ENDEPIN[i].write_raw(0);
+        // Busy from before the transfer starts: the host can take the packet as soon as it
+        // is in the endpoint, and a `poll` that runs before this function returns (from an
+        // interrupt) then clears the flag. Set after the wait, it would stay set for good.
+        if (ep_num != .ep0) self.in_busy[i] = true;
+        peripherals.USBD.TASKS_STARTEPIN[i].write_raw(1);
+        if (!wait_easydma(.in, i)) {
+            log.err("ep_writev {t}: EasyDMA did not finish", .{ep_num});
+            if (ep_num == .ep0) self.ep0_state.in_pending = false else self.in_busy[i] = false;
+            return 0;
+        }
 
         return len;
     }
@@ -330,9 +392,10 @@ pub const USBD = struct {
 
         const self: *Self = @fieldParentPtr("interface", itf);
         const i = @backingInt(ep_num);
-        const size = peripherals.USBD.SIZE.EPOUT[i].raw;
-
         const scratch_buf = &self.bufs_out[i];
+        // SIZE.EPOUT[n] is a 7-bit field and can read up to 127; the buffer EasyDMA copies
+        // into holds one 64-byte packet.
+        const size: u32 = @min(peripherals.USBD.SIZE.EPOUT[i].raw, scratch_buf.len);
 
         // Prepare DMA transfer
         peripherals.USBD.EPOUT[i].PTR.write_raw(@intFromPtr(scratch_buf));
@@ -341,9 +404,13 @@ pub const USBD = struct {
         // Start DMA
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled) cpu.interrupt.enable(.USBD);
-        peripherals.USBD.TASKS_STARTEPOUT[i].write_raw(1);
-        while (peripherals.USBD.EVENTS_ENDEPOUT[i].raw != 1) {}
+        // An end event left by a transfer that was given up on must not end this wait.
         peripherals.USBD.EVENTS_ENDEPOUT[i].write_raw(0);
+        peripherals.USBD.TASKS_STARTEPOUT[i].write_raw(1);
+        if (!wait_easydma(.out, i)) {
+            log.err("ep_readv {t}: EasyDMA did not finish", .{ep_num});
+            return 0;
+        }
 
         var scratch_slice: []align(1) u8 = scratch_buf[0..size];
 
@@ -371,19 +438,48 @@ pub const USBD = struct {
         }
     }
 
+    /// Limitation: a packet that EasyDMA has already copied into a data IN endpoint when the
+    /// endpoint is opened again is not withdrawn. It stays in the peripheral, the host can
+    /// still take it, and `poll` then reports its completion to the new configuration's
+    /// driver. The product specification documents no register that discards it; nrfx does
+    /// it through undocumented ones (USBD + 0x800 / 0x804), which this HAL does not use.
+    /// The core's `ep_open` contract names this exception.
     fn ep_open(itf: *usb.DeviceInterface, desc: *const usb.descriptor.Endpoint) void {
         const self: *Self = @fieldParentPtr("interface", itf);
         const ep = desc.endpoint;
         const i = @backingInt(ep.num);
         const mask: u32 = @as(u32, 1) << i;
+
+        // The endpoint may have been open in an earlier configuration (see `ep_open` in
+        // core/usb.zig), and enabling an endpoint that is already enabled changes nothing,
+        // so what that configuration left behind is undone here.
+        if (ep.num != .ep0) {
+            // Both sides start a configuration at DATA0 (USB 2.0, 9.1.1.5). "Controlling the
+            // data toggle of data IN or OUT endpoint n (n=1..7) is done through register
+            // DTOGGLE" (nRF52840 PS, USBD, "Bulk and interrupt transactions"): EP in bits
+            // 0-2, IO in bit 7 (1 = IN), VALUE in bits 8-9 (0 = Nop, 1 = Data0). Like nrfx's
+            // `nrf_usbd_dtoggle_set`, select the endpoint with a Nop write first.
+            const select: u32 = @as(u32, i) | (@as(u32, @intFromBool(ep.dir == .in)) << 7);
+            peripherals.USBD.DTOGGLE.write_raw(select);
+            peripherals.USBD.DTOGGLE.write_raw(select | (1 << 8));
+        }
         switch (ep.dir) {
             .in => {
                 self.eps_in[i].max_packet_size = desc.max_packet_size.native();
+                self.in_busy[i] = false;
+                // A packet the earlier configuration sent must not be reported to this one.
+                peripherals.USBD.EPDATASTATUS.write_raw(mask); // W1C, EPINn is bit n
                 peripherals.USBD.EPINEN.write_raw(peripherals.USBD.EPINEN.raw | mask);
             },
             .out => {
                 self.eps_out[i].max_packet_size = desc.max_packet_size.native();
                 peripherals.USBD.EPOUTEN.write_raw(peripherals.USBD.EPOUTEN.raw | mask);
+                // Nor one it received and never read. Dropping the report alone would leave
+                // the endpoint answering NAK for good: "a NAK is returned until the software
+                // writes any value to register SIZE.EPOUT[n]" (nRF52840 PS, USBD, "Bulk and
+                // interrupt OUT transaction"). nrfx's `nrfx_usbd_ep_enable` does the same.
+                peripherals.USBD.EPDATASTATUS.write_raw(mask << 16); // W1C, EPOUTn is bit 16+n
+                if (ep.num != .ep0) peripherals.USBD.SIZE.EPOUT[i].write_raw(0);
             },
         }
 
