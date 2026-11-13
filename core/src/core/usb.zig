@@ -13,6 +13,7 @@ pub const types = @import("usb/types.zig");
 test "usb tests" {
     _ = descriptor;
     _ = drivers.CDC;
+    _ = types;
 }
 
 pub const ack: []const u8 = "";
@@ -631,4 +632,102 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
             }
         }
     };
+}
+
+/// A device for the tests below: it counts what the controller and the drivers ask of it and
+/// takes up to `packet_size` bytes of each write.
+const TestDevice = struct {
+    interface: DeviceInterface = .{ .vtable = &vtable },
+    opened: usize = 0,
+    listened: usize = 0,
+    written: usize = 0,
+    /// The most an endpoint takes in one write, and what the last write was given credit for.
+    packet_size: types.Len = 64,
+    last_written_len: types.Len = 0,
+    /// The address of the last `set_address`, if there was one.
+    address: ?u7 = null,
+
+    const vtable: DeviceInterface.VTable = .{
+        .ep_writev = ep_writev,
+        .ep_readv = ep_readv,
+        .ep_listen = ep_listen,
+        .ep_open = ep_open,
+        .set_address = set_address,
+    };
+
+    fn from(itf: *DeviceInterface) *TestDevice {
+        return @fieldParentPtr("interface", itf);
+    }
+
+    fn ep_writev(itf: *DeviceInterface, _: types.Endpoint.Num, data: []const []const u8) types.Len {
+        const dev = from(itf);
+        dev.written += 1;
+        var len: usize = 0;
+        for (data) |chunk| len += chunk.len;
+        dev.last_written_len = @intCast(@min(len, dev.packet_size));
+        return dev.last_written_len;
+    }
+
+    fn ep_readv(_: *DeviceInterface, _: types.Endpoint.Num, _: []const []u8) types.Len {
+        return 0;
+    }
+
+    fn ep_listen(itf: *DeviceInterface, _: types.Endpoint.Num, _: types.Len) void {
+        from(itf).listened += 1;
+    }
+
+    fn ep_open(itf: *DeviceInterface, _: *const descriptor.Endpoint) void {
+        from(itf).opened += 1;
+    }
+
+    fn set_address(itf: *DeviceInterface, address: u7) void {
+        from(itf).address = address;
+    }
+};
+
+fn test_config(Drivers: type) Config {
+    return .{
+        .bcd_usb = .v2_00,
+        .device_triple = .unspecified,
+        .vendor = .{ .id = 0x1209, .str = "MicroZig" },
+        .product = .{ .id = 0x0001, .str = "test" },
+        .bcd_device = .v1_00,
+        .serial = "0",
+        .max_supported_packet_size = 64,
+        .configurations = &.{.{
+            .attributes = .{ .self_powered = false },
+            .max_current_ma = 50,
+            .Drivers = Drivers,
+        }},
+    };
+}
+
+fn test_set_configuration(value: u16) types.SetupPacket {
+    return .{
+        .request_type = .{ .recipient = .device, .type = .standard, .direction = .out },
+        .request = @backingInt(types.SetupRequest.set_configuration),
+        .value = .from(value),
+        .index = .from(0),
+        .length = .from(0),
+    };
+}
+
+test "the controller configures the echo example driver" {
+    const Controller = DeviceController(
+        test_config(struct { echo: drivers.EchoExample }),
+        .{.{ .echo = "echo" }},
+    );
+    var dev: TestDevice = .{};
+    var ctl: Controller = .init;
+
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    try std.testing.expect(ctl.drivers() != null);
+    // One OUT and one IN endpoint; the driver listens on the OUT endpoint when it starts.
+    try std.testing.expectEqual(2, dev.opened);
+    try std.testing.expectEqual(1, dev.listened);
+
+    // A received packet is read and the driver listens again.
+    const echo = Controller.config_descriptor.drv.echo;
+    ctl.on_buffer(&dev.interface, comptime echo.ep_out.endpoint);
+    try std.testing.expectEqual(2, dev.listened);
 }
