@@ -11,6 +11,7 @@ const microzig = @import("microzig");
 const peripherals = microzig.chip.peripherals;
 const chip = microzig.hal.compatibility.chip;
 const usb = microzig.core.usb;
+const time = @import("time.zig");
 
 pub const RP2XXX_MAX_ENDPOINTS_COUNT = 16;
 
@@ -106,6 +107,11 @@ pub fn Polled(config: Config) type {
 
         /// Poll to see if the host has sent anything. Delegate to the appropriate handler in the
         /// controller based on the interrupt field set.
+        ///
+        /// For polled use only, not for the USB interrupt handler: a completion whose buffer
+        /// still reads AVAILABLE is left in BUFF_STATUS for a later call, INTS.BUFF_STATUS
+        /// stays set for as long as it is, and an interrupt handler that returned with it set
+        /// would be entered again at once.
         pub fn poll(self: *@This(), controller: anytype) void {
             comptime usb.validate_controller(@TypeOf(controller));
 
@@ -117,8 +123,18 @@ pub fn Polled(config: Config) type {
                 log.debug("-- setup request --", .{});
 
                 // Reset PID to 1 for EP0 IN. Every DATA packet we send in response
-                // to an IN on EP0 needs to use PID DATA1.
-                buffer_control[0].in.modify(.{ .PID_0 = 0 });
+                // to an IN on EP0 needs to use PID DATA1. (`ep_writev` flips the PID that is
+                // written here.)
+                if (buffer_control[0].in.read().AVAILABLE_0 != 0) {
+                    // The previous control transfer left a packet on EP0 IN that the host
+                    // has not taken: it gave up on the transfer, or timed out. The setup
+                    // request ends that transfer (USB 2.0, 5.5.5) and its handler will arm
+                    // EP0 IN for the new one, so take the buffer back first, the way
+                    // `ep_open` does, completion included.
+                    withdraw_buffer(.in(.ep0), 0);
+                } else {
+                    buffer_control[0].in.modify(.{ .PID_0 = 0 });
+                }
 
                 // Clear the status flag (write-one-to-clear)
                 peripherals.USB.SIE_STATUS.modify(.{ .SETUP_REC = 1 });
@@ -133,14 +149,15 @@ pub fn Polled(config: Config) type {
                 controller.on_setup_req(&self.interface, &setup);
             }
 
-            // Events on one or more buffers? (In practice, always one.)
+            // Events on one or more buffers?
             if (ints.BUFF_STATUS != 0) {
                 log.debug("-- buffer status --", .{});
 
                 const buff_status = peripherals.USB.BUFF_STATUS.raw;
 
                 inline for (0..2 * config.max_endpoints_count) |shift| {
-                    if (buff_status & (@as(u32, 1) << shift) != 0) {
+                    const bit = @as(u32, 1) << shift;
+                    if (buff_status & bit != 0) {
                         // Here we exploit knowledge of the ordering of buffer control
                         // registers in the peripheral. Each endpoint has a pair of
                         // registers, IN being first
@@ -150,19 +167,26 @@ pub fn Polled(config: Config) type {
                             .dir = if (shift % 2 == 0) .in else .out,
                         };
 
-                        // We should only get here if we've been notified that
-                        // the buffer is ours again. This is indicated by the hw
-                        // _clearing_ the AVAILABLE bit.
-                        //
-                        // It seems the hardware sets the AVAILABLE bit _after_ setting BUFF_STATUS
-                        // So we wait for it just to be sure.
-                        while (buffer_control[ep_num].get(ep.dir).read().AVAILABLE_0 != 0) {}
+                        // The buffer is ours again once the hardware has cleared AVAILABLE.
+                        // It sets the BUFF_STATUS bit first and updates the buffer control
+                        // register after that (RP2040 datasheet 4.1.2.8.2, STATUS phase; the
+                        // RP2350's 12.7.3.8.2 says the same), so AVAILABLE may still read 1
+                        // here. Then leave the bit set and take the buffer on a later poll
+                        // rather than wait for it: the bit can also belong to an earlier
+                        // buffer, when the handler of a setup request seen by this same poll
+                        // has just armed the endpoint again (EP0 IN, typically), and that
+                        // buffer stays AVAILABLE until the host takes it, if it ever does.
+                        if (buffer_control[ep_num].get(ep.dir).read().AVAILABLE_0 == 0) {
+                            // Acknowledge this one completion (write-one-to-clear) before
+                            // its handler runs. The handler may arm the endpoint again, and
+                            // the bit set when that buffer completes must survive this poll.
+                            peripherals.USB.BUFF_STATUS.write_raw(bit);
 
-                        log.debug("buffer ep{} {t}", .{ ep_num, ep.dir });
-                        controller.on_buffer(&self.interface, ep);
+                            log.debug("buffer ep{} {t}", .{ ep_num, ep.dir });
+                            controller.on_buffer(&self.interface, ep);
+                        }
                     }
                 }
-                peripherals.USB.BUFF_STATUS.raw = buff_status;
             }
 
             // Has the host signaled a bus reset?
@@ -407,19 +431,31 @@ pub fn Polled(config: Config) type {
 
             const self: *@This() = @fieldParentPtr("interface", itf);
 
-            assert(@backingInt(desc.endpoint.num) <= config.max_endpoints_count);
+            assert(@backingInt(desc.endpoint.num) < config.max_endpoints_count);
 
             const ep_hard = self.hardware_endpoint_get_by_address(ep);
 
             assert(desc.max_packet_size.native() <= max_supported_packet_size);
 
-            buffer_control[@backingInt(ep.num)].get(ep.dir).modify(.{ .PID_0 = 1 });
+            // The host can configure again without a bus reset (SET_CONFIGURATION), and `poll`
+            // does not write the buffer control register on a bus reset either, so the endpoint
+            // may be opened while a buffer from its previous configuration is still AVAILABLE,
+            // or has completed without `poll` having seen it. Take it back, and set the PID so
+            // that the first packet is DATA0.
+            withdraw_buffer(ep, 1);
 
             if (ep.num == .ep0) {
                 // ep0 has fixed data buffer
                 ep_hard.data_buffer = rp2xxx_buffers.ep0_buffer0;
             } else {
-                ep_hard.data_buffer = self.endpoint_alloc(desc) catch unreachable;
+                // An endpoint keeps its buffer for as long as the device runs. It is opened
+                // again every time the host selects the configuration, and nothing ever
+                // returns DPRAM, so allocating on every open would use it up.
+                const size = endpoint_buffer_size(desc);
+                if (ep_hard.data_buffer.len == 0)
+                    ep_hard.data_buffer = self.endpoint_alloc(size)
+                else if (ep_hard.data_buffer.len < size)
+                    @panic("USB endpoint reopened with a larger buffer");
                 endpoint_control[@backingInt(ep.num) - 1].get(ep.dir).write(.{
                     .ENABLE = 1,
                     .INTERRUPT_PER_BUFF = 1,
@@ -430,14 +466,79 @@ pub fn Polled(config: Config) type {
             @memset(ep_hard.data_buffer, 0);
         }
 
-        fn endpoint_alloc(self: *@This(), desc: *const usb.descriptor.Endpoint) ![]align(64) u8 {
-            // round up size to multiple of 64
-            var size = try std.math.divCeil(u16, desc.max_packet_size.native(), 64) * 64;
-            // double buffered Bulk endpoint
-            if (desc.attributes.transfer_type == .Bulk)
-                size *= 2;
+        /// Takes an endpoint's buffer back from the controller, armed or not: afterwards the
+        /// buffer control register holds `pid` and nothing else, as `ep_listen` and
+        /// `ep_writev` require, and `poll` reports no completion from before.
+        fn withdraw_buffer(ep: usb.types.Endpoint, pid: u1) void {
+            // The endpoint's bit in BUFF_STATUS, EP_ABORT and EP_ABORT_DONE.
+            const ep_bit = @as(u32, 1) << (2 * @as(u5, @backingInt(ep.num)) + switch (ep.dir) {
+                .in => @as(u5, 0),
+                .out => @as(u5, 1),
+            });
+            const bufctrl_ptr = buffer_control[@backingInt(ep.num)].get(ep.dir);
 
-            std.debug.assert(self.data_buffer.len >= size);
+            // The controller may be using an AVAILABLE buffer for a transaction at this very
+            // moment, so ask it to stop first: with the endpoint's EP_ABORT bit set it NAKs
+            // every access to the endpoint, and it sets the EP_ABORT_DONE bit "when it is safe
+            // to modify the buffer control register" (RP2040 datasheet 4.1.4, EP_ABORT and
+            // EP_ABORT_DONE).
+            const aborting = bufctrl_ptr.read().AVAILABLE_0 != 0 and ep_abort_usable();
+            if (aborting) {
+                peripherals.USB.EP_ABORT.write_raw(ep_bit);
+                const deadline = time.deadline_in_us(ep_abort_timeout_us);
+                while (peripherals.USB.EP_ABORT_DONE.raw & ep_bit == 0) {
+                    if (deadline.is_reached_by(time.get_time_since_boot())) {
+                        log.warn("ep{} {t}: abort not reported done, taking the buffer anyway", .{ @backingInt(ep.num), ep.dir });
+                        break;
+                    }
+                }
+            }
+
+            // Write the whole register: that withdraws the buffer.
+            bufctrl_ptr.write(.{ .PID_0 = pid });
+
+            // That buffer may have completed without `poll` having seen it yet. Acknowledge
+            // the completion here (BUFF_STATUS is write-one-to-clear): it belongs to what
+            // came before, and `poll` must not report it to what comes next.
+            peripherals.USB.BUFF_STATUS.write_raw(ep_bit);
+
+            if (aborting) {
+                // EP_ABORT_DONE is write-one-to-clear. This function is the only user of
+                // EP_ABORT and has no other endpoint's bit set, so zero ends the abort.
+                peripherals.USB.EP_ABORT_DONE.write_raw(ep_bit);
+                peripherals.USB.EP_ABORT.write_raw(0);
+            }
+        }
+
+        /// How long `withdraw_buffer` waits for EP_ABORT_DONE: one full-speed frame. The controller
+        /// reports the endpoint idle once a transaction in progress on it has ended, and
+        /// a transaction ends within the frame it started in.
+        const ep_abort_timeout_us = 1000;
+
+        /// Erratum RP2040-E2: on RP2040 B0 and B1 the controller NAKs every endpoint forever
+        /// once a transaction starts on an endpoint whose EP_ABORT bit is set, and the
+        /// workaround is not to use EP_ABORT. Fixed in B2, and in the RP2350 (its datasheet,
+        /// 12.7.2.1: "RP2350 fixes all RP2040 USB errata"). CHIP_ID.REVISION is 1 for B0
+        /// and B1 and 2 for B2 (pico-sdk, `rp2040_chip_version`).
+        fn ep_abort_usable() bool {
+            return switch (chip) {
+                .RP2040 => peripherals.SYSINFO.CHIP_ID.read().REVISION >= 2,
+                .RP2350 => true,
+            };
+        }
+
+        fn endpoint_buffer_size(desc: *const usb.descriptor.Endpoint) u16 {
+            // round up size to multiple of 64
+            const size = std.mem.alignForward(u16, desc.max_packet_size.native(), 64);
+            // double buffered Bulk endpoint
+            return if (desc.attributes.transfer_type == .Bulk) 2 * size else size;
+        }
+
+        fn endpoint_alloc(self: *@This(), size: u16) []align(64) u8 {
+            // Checked in every build mode: past this point the endpoint's buffer would lie
+            // outside the DPRAM.
+            if (self.data_buffer.len < size)
+                @panic("USB DPRAM exhausted");
 
             defer self.data_buffer = @alignCast(self.data_buffer[size..]);
             return self.data_buffer[0..size];
