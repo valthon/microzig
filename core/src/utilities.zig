@@ -65,13 +65,7 @@ pub fn SliceVector(comptime Slice: type) type {
         const Vector = @This();
 
         pub const Item = type_info.pointer.child;
-        pub const ItemPtr = @Pointer(.one, .{
-            .@"align" = type_info.pointer.attrs.@"align" orelse @alignOf(type_info.pointer.child),
-            .@"addrspace" = type_info.pointer.attrs.@"addrspace",
-            .@"const" = type_info.pointer.attrs.@"const",
-            .@"volatile" = type_info.pointer.attrs.@"volatile",
-            .@"allowzero" = type_info.pointer.attrs.@"allowzero",
-        }, type_info.pointer.child, null);
+        pub const ItemPtr = @Pointer(.one, type_info.pointer.attrs, type_info.pointer.child, null);
 
         /// The slice of slices. The first and the last slice of this slice must
         /// be non-empty or the slice-of-slices must be empty.
