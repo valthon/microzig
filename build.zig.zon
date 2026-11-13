@@ -40,11 +40,21 @@
             .hash = "zlinter-0.0.1-OjQ08QVrFgD1IXOCrUAG-hE-_yoEgq1JXDNZmXNBnmM8",
         },
     },
+    // Everything the dependencies above reach by `.path`, so that a project
+    // can depend on a commit of this repository by URL
+    // (`zig fetch --save=microzig git+https://...#<commit>`). With only the
+    // root files listed, such a package has no core/, port/ or build-internals/
+    // and the first port lookup fails with "does not have a build.zig".
     .paths = .{
         "README.md",
         "build.zig",
         "build.zig.zon",
         "LICENSE",
-        "tools/generate_linker_script.zig",
+        "build-internals",
+        "core",
+        "drivers",
+        "modules",
+        "port",
+        "tools",
     },
 }
