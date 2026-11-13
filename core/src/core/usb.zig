@@ -134,6 +134,13 @@ pub const DeviceInterface = struct {
     /// taken whole and the next `ep_listen` is accepted, and with its data toggle
     /// at DATA0, which is where the host puts its own toggle when it selects a
     /// configuration (USB 2.0, 9.1.1.5). Drivers rely on this.
+    ///
+    /// That includes a packet from before that has completed but has not been
+    /// reported yet: after `ep_open` returns, the controller's `on_buffer` must
+    /// not be called for it. A completion reported while no configuration is
+    /// selected is harmless (the controller drops it); one reported after the
+    /// endpoint was opened again would reach the new configuration's driver as
+    /// if its own packet had completed.
     pub fn ep_open(self: *@This(), desc: *const descriptor.Endpoint) void {
         return self.vtable.ep_open(self, desc);
     }
@@ -475,6 +482,7 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
         }
 
         /// Called by the device implementation when a packet has been sent or received.
+        /// A completion that arrives while no configuration is selected is dropped.
         pub fn on_buffer(self: *@This(), device_itf: *DeviceInterface, comptime ep: types.Endpoint) void {
             log.debug("on_buffer {t} {t}", .{ ep.num, ep.dir });
 
@@ -508,7 +516,13 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
                 log.warn("Unhandled packet on ep0 Out", .{});
 
             if (comptime driver_opt) |driver| {
-                handler(&@field(self.driver_data.?, driver_info.field_names[driver]), ep.num);
+                // No configuration is selected (the host deselected it, or the bus was reset)
+                // but a packet armed while one was has completed. The drivers that owned it
+                // are gone, so there is nobody to tell.
+                if (self.driver_data) |*data|
+                    handler(&@field(data, driver_info.field_names[driver]), ep.num)
+                else
+                    log.debug("{t} {t}: completion without a configuration, dropped", .{ ep.num, ep.dir });
             }
         }
 
@@ -566,7 +580,12 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
             switch (itf_num) {
                 inline else => |itf| if (comptime itf < handlers_itf.len) {
                     const drv = handlers_itf[itf];
-                    return @field(self.driver_data.?, @tagName(drv)).class_request(setup);
+                    if (self.driver_data) |*data|
+                        return @field(data, @tagName(drv)).class_request(setup);
+                    // A host may address an interface before it selects a configuration, or
+                    // after it deselected it. There is no interface then.
+                    log.debug("Request for interface {} without a configuration", .{itf_num});
+                    return nak;
                 } else {
                     log.warn("Interface index ({}) out of range ({})", .{ itf_num, handlers_itf.len });
                     return nak;
@@ -598,7 +617,11 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
         }
 
         fn process_set_config(self: *@This(), device_itf: *DeviceInterface, cfg_num: u16) void {
-            if (cfg_num == self.cfg_num) return;
+            // A request for the configuration that is already selected is carried out like any
+            // other. The host puts its data toggles back at DATA0 whenever it sends
+            // SET_CONFIGURATION (USB 2.0, 9.1.1.5 and 9.4.7), same value or not, and on the
+            // device's side that happens in `ep_open`. The drivers start over with their
+            // endpoints, as they do after any other SET_CONFIGURATION.
 
             if (self.driver_data) |data_old| {
                 _ = data_old;
@@ -738,4 +761,77 @@ test "the controller configures the echo example driver" {
     const echo = Controller.config_descriptor.drv.echo;
     ctl.on_buffer(&dev.interface, comptime echo.ep_out.endpoint);
     try std.testing.expectEqual(2, dev.listened);
+}
+
+test "completions and interface requests without a configuration reach no driver" {
+    const Controller = DeviceController(
+        test_config(struct { serial: drivers.CDC }),
+        .{.{ .serial = .{} }},
+    );
+    var dev: TestDevice = .{};
+    var ctl: Controller = .init;
+    const cdc = Controller.config_descriptor.drv.serial;
+    const get_line_coding: types.SetupPacket = .{
+        .request_type = .{ .recipient = .interface, .type = .class, .direction = .in },
+        .request = @backingInt(drivers.CDC.ManagementRequestType.GetLineCoding),
+        .value = .from(0),
+        .index = .from(cdc.itf_notifi.interface_number),
+        .length = .from(7),
+    };
+
+    // Before the host selects a configuration.
+    ctl.on_setup_req(&dev.interface, &get_line_coding);
+    try std.testing.expectEqual(0, dev.written);
+
+    // Configured: the request is answered. (Each SET_CONFIGURATION status is one write too.)
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    try std.testing.expectEqual(1, dev.written);
+    ctl.on_setup_req(&dev.interface, &get_line_coding);
+    try std.testing.expectEqual(2, dev.written);
+
+    // The host deselects the configuration while packets are still armed on the driver's
+    // endpoints. They complete afterwards.
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(0));
+    try std.testing.expect(ctl.drivers() == null);
+    try std.testing.expectEqual(3, dev.written);
+    const listened = dev.listened;
+    ctl.on_buffer(&dev.interface, comptime cdc.ep_out.endpoint);
+    ctl.on_buffer(&dev.interface, comptime cdc.ep_in.endpoint);
+    ctl.on_buffer(&dev.interface, comptime cdc.ep_notifi.endpoint);
+    ctl.on_setup_req(&dev.interface, &get_line_coding);
+    try std.testing.expectEqual(3, dev.written);
+    try std.testing.expectEqual(listened, dev.listened);
+
+    // And the same after a bus reset.
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    ctl.on_bus_reset(&dev.interface);
+    ctl.on_buffer(&dev.interface, comptime cdc.ep_in.endpoint);
+    try std.testing.expect(ctl.drivers() == null);
+}
+
+test "SET_CONFIGURATION with the current value opens the endpoints again" {
+    const Controller = DeviceController(
+        test_config(struct { serial: drivers.CDC }),
+        .{.{ .serial = .{} }},
+    );
+    var dev: TestDevice = .{};
+    var ctl: Controller = .init;
+
+    // Three endpoints: notification IN, data OUT, data IN. The driver listens once on start.
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    try std.testing.expectEqual(3, dev.opened);
+    try std.testing.expectEqual(1, dev.listened);
+
+    // The host selects the same configuration again, which puts its data toggles back at
+    // DATA0. Only `ep_open` does that on the device's side, and the driver starts over.
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    try std.testing.expect(ctl.drivers() != null);
+    try std.testing.expectEqual(6, dev.opened);
+    try std.testing.expectEqual(2, dev.listened);
+
+    // Deselecting twice opens nothing and leaves no driver.
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(0));
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(0));
+    try std.testing.expect(ctl.drivers() == null);
+    try std.testing.expectEqual(6, dev.opened);
 }
