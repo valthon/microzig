@@ -1,60 +1,96 @@
-name: Code Linting
+name: Lint
+
+# Lints the .zig files a PR changes.
+#
+# Runs on `pull_request` (not `pull_request_target`): the token is read-only
+# and no secrets are exposed, so building and running tools from the PR tree
+# is safe even for PRs from forks. Results are reported as annotations on the
+# PR's "Files changed" tab; no PR comments, so no write permission.
 
 on:
-  pull_request_target:
+  pull_request:
     branches: [main]
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  lint:
+  # Unused imports are bug-class (NO_SLOP.md §5): this job FAILS the PR.
+  unused-imports:
+    name: Unused imports
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-
     steps:
-      # SECURITY: Checkout base branch for linter binary
-      - name: Checkout base branch
+      - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.base_ref }}
-          path: base
-
-      - run: cp base/build.zig.zon .
+          fetch-depth: 0
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
 
-      # Build linter from trusted base branch code
-      - name: Build linter
-        working-directory: base/tools/linter
-        run: zig build --release=safe
+      - name: Build zigimports (pinned)
+        env:
+          ZIGIMPORTS_SHA: 2fcea024ff380a2b3a0d18ecc22f1068ef2056be
+        run: |
+          mkdir -p "$RUNNER_TEMP/zigimports"
+          cd "$RUNNER_TEMP/zigimports"
+          git init -q
+          git fetch -q --depth 1 https://github.com/mattnite/zigimports.git "$ZIGIMPORTS_SHA"
+          git checkout -q FETCH_HEAD
+          zig build --release=safe
+          ln -s "$PWD"/zig-out/bin/zigimports-* "$RUNNER_TEMP/zigimports-bin"
 
-      # Now checkout PR code to analyze (but not execute)
-      - name: Checkout PR code
+      - name: List changed Zig files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff -z --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" -- '*.zig' > "$RUNNER_TEMP/changed.z"
+          tr '\0' '\n' < "$RUNNER_TEMP/changed.z"
+
+      - name: Check for unused imports
+        run: |
+          if [ ! -s "$RUNNER_TEMP/changed.z" ]; then
+            echo "No changed .zig files."
+            exit 0
+          fi
+          set +e
+          xargs -0 "$RUNNER_TEMP/zigimports-bin" < "$RUNNER_TEMP/changed.z" > "$RUNNER_TEMP/unused.txt" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/unused.txt"
+          # "<file>:<line>:<col>: <name> is unused" -> error annotation
+          sed -nE 's/^(.+):([0-9]+):[0-9]+: (.+ is unused)$/::error file=\1,line=\2::\3 (fix: zigimports --fix <file>)/p' "$RUNNER_TEMP/unused.txt"
+          exit $rc
+
+  # MicroZig's own naming linter. Naming is style-class (NO_SLOP.md §5), and
+  # it has known false positives (C-ABI exports such as `vTaskDelay`), so this
+  # job only WARNS and never fails the PR.
+  naming:
+    name: Naming suggestions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: pr
           fetch-depth: 0
-          allow-unsafe-pr-checkout: true
 
-      - name: Run linter
-        working-directory: pr
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Build linter
+        working-directory: tools/linter
+        run: zig build --release=safe
+
+      - name: Run linter on changed Zig files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          echo "Base SHA: ${{ github.event.pull_request.base.sha }}"
-          echo "Head SHA: ${{ github.event.pull_request.head.sha }}"
-
-          # Get changed .zig files
-          FILES=$(git diff --name-only --diff-filter=d ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} | grep '\.zig$' || true)
-          echo "Changed files: $FILES"
-
-          if [ -n "$FILES" ]; then
-            echo "$FILES" | xargs ../base/tools/linter/zig-out/bin/linter > lint_results_raw.json
-          else
-            echo "[]" > lint_results_raw.json
+          git diff -z --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" -- '*.zig' > "$RUNNER_TEMP/changed.z"
+          if [ ! -s "$RUNNER_TEMP/changed.z" ]; then
+            echo "No changed .zig files."
+            exit 0
           fi
-
-          # Debug output
-          echo "Raw lint results:"
-          cat lint_results_raw.json
+          xargs -0 tools/linter/zig-out/bin/linter < "$RUNNER_TEMP/changed.z" > "$RUNNER_TEMP/lint.json"
+          jq -r '.[] | "::warning file=\(.file),line=\(.line)::\(.message)"' "$RUNNER_TEMP/lint.json"

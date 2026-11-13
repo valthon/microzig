@@ -3,36 +3,27 @@
 This is largely taken from [Zig's Code of Conduct](https://ziglang.org/code-of-conduct/).
 
 The rules here are strict. This space is for focused, on topic, technical work
-on the MicroZig and Zig Embedded Group projects only. It is everyone’s
-responsibility to maintain a positive environment, especially when disagreements
-occur.
+on this fork of MicroZig only. It is everyone’s responsibility to maintain a
+positive environment, especially when disagreements occur.
 
-This document applies to the Zig Embedded Group GitHub organization and Discord
-server.
+This document applies to this fork's GitHub repository: its issues, pull
+requests, and discussions.
 
-## Strict No LLM / No AI Policy
+## LLMs Are Tools
 
-This policy takes effect October 28th, 2026.
+Contributors may use any tools they choose, including LLMs and other AI-assisted tools, for code, documentation, translation, editing, research, or debugging.
 
-No LLM-generated content, whether it be code or prose.
+**You are responsible for what you submit.** Whatever tools you use, you are expected to:
 
-No paraphrasing LLM-generated content.
+- Understand your changes and be able to explain them in review.
+- Test your changes before submitting them.
+- Respond to review feedback yourself, in good faith.
 
-No LLMs for editing, including fixing spelling or grammatical errors.
+Contributions are judged on their correctness, quality, and fit for the project, not on how they were produced. Disclosing tool use is welcome but not required. Maintainers may decline low-effort, untested, or unexplained submissions, as they would any other.
 
-No LLMs for translation. English is encouraged, but not required. You are
-welcome to post in your native language and rely on others to have their own
-translation tools of choice to interpret your words.
+Discussion of tools, including LLMs, is welcome. Shaming, harassing, or excluding anyone over the tools they use is a violation of this Code of Conduct.
 
-No LLMs for brainstorming and then sharing the results of that brainstorming,
-even if you create the prose. If you use a chatbot to give you advice on a
-comment on the issue tracker, that comment is unwelcome.
-
-No LLMs for finding bugs.
-
-No talking about use of chatbot/LLM services.
-
-[Profession by Isaac Asimov](https://web.archive.org/web/20201109034130/https://www.abelard.org/asimov.php)
+Also, if you're using an LLM, make sure to point it at NO_SLOP.md to avoid embarrassing yourself.
 
 ## Safe, Constructive Behavior Only
 
@@ -55,7 +46,8 @@ Examples of unacceptable behavior by participants include:
 - Off-topic discussion of any kind - especially offensive or sensitive issues.
 - Publishing others’ private information, such as a physical or electronic
   address, without explicit permission.
-- Discussing this Code of Conduct or publicly accusing someone of violating it.
+- Publicly accusing someone of violating this Code of Conduct. Report it
+  instead (see Enforcement).
 - Making someone else feel like an outsider or implying a lack of technical
   abilities.
 - Destructive behavior. Anything that harms MicroZig or another open-source
@@ -63,21 +55,10 @@ Examples of unacceptable behavior by participants include:
 
 ## Enforcement
 
-If you need to report an issue you can contact Matthew Knight and Felix
-Queißner. We will swiftly remove anyone who is antagonizing others or being
-generally destructive.
+Upstream MicroZig's maintainers aren't responsible for this fork; please don't contact them about it.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported at the contact address listed on the maintainer's [GitHub profile](https://github.com/valthon).
+All complaints will be reviewed and investigated promptly and fairly.
 
-This includes Private Harassment. If person A is directly harassed or
-antagonized by person B, person B will be blocked from participating in this
-space even if the harassment didn’t take place on one of the mediums directly
-under rule of this Code of Conduct.
-
-As noted, discussing this Code of Conduct should not take place on GitHub, or
-Discord, because these spaces are for directly working on code, not for
-meta-discussion. If you have any issues with it, you can contact me directly, or
-you can join one of the community spaces that has different rules.
-
-Matthew Knight [mattnite@proton.me](mailto:mattnite@proton.me)
 
 ## Conclusion
 
