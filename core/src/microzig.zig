@@ -36,9 +36,16 @@ pub const Allocator = @import("allocator.zig");
 
 pub const AssertOptions = struct {};
 
+/// Panics if `expr` is false, in the builds that check: Debug and ReleaseSafe always, and
+/// ReleaseSmall and ReleaseFast when the firmware sets the `asserts` option of MicroBuild's
+/// `add_firmware`. In the other builds it does nothing.
+///
+/// Unlike `std.debug.assert`, a build that does not check does not assume `expr` either: a
+/// false `expr` there is ignored, it is not undefined behaviour. `expr` is an argument, so it
+/// is evaluated in every build.
 pub fn assert(expr: bool, opts: AssertOptions) void {
     _ = opts;
-    if (!config.asserts)
+    if (!(std.debug.runtime_safety or config.asserts))
         return;
 
     if (!expr) {

@@ -126,6 +126,14 @@ pub const DeviceInterface = struct {
     /// direction is IN this may call the controller's `on_buffer` function,
     /// so driver initialization must be done before this function is called
     /// on IN endpoint descriptors.
+    ///
+    /// The endpoint may have been open before: the host can select a configuration
+    /// again without a bus reset, and nothing tells the HAL that a configuration
+    /// ended. `ep_open` must leave the endpoint idle, with no packet armed or
+    /// pending from before, so that the next `ep_writev` of up to one packet is
+    /// taken whole and the next `ep_listen` is accepted, and with its data toggle
+    /// at DATA0, which is where the host puts its own toggle when it selects a
+    /// configuration (USB 2.0, 9.1.1.5). Drivers rely on this.
     pub fn ep_open(self: *@This(), desc: *const descriptor.Endpoint) void {
         return self.vtable.ep_open(self, desc);
     }

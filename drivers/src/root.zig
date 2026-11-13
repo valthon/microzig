@@ -6,8 +6,9 @@ const config = @import("config");
 
 /// Panics if `ok` is false, in any optimize mode, but only when asserts are
 /// enabled: by the `asserts` option of MicroBuild's `add_firmware` (the same
-/// flag as `microzig.assert`), or with `-Dasserts=true` when building the
-/// drivers alone. Otherwise it does nothing.
+/// flag as `microzig.assert`, which also checks in Debug and ReleaseSafe
+/// without it), or with `-Dasserts=true` when building the drivers alone.
+/// Otherwise it does nothing.
 pub fn assert(ok: bool) void {
     if (!config.asserts) return;
     if (!ok) @panic("Assertion failed");
