@@ -302,6 +302,19 @@ pub const USBD = struct {
         return false;
     }
 
+    /// Turns the USBD interrupt off in the NVIC for the length of an EasyDMA transfer; the
+    /// caller turns it on again if it was on. An application may run `poll` from the USBD
+    /// interrupt, and `poll` starts transfers of its own through the controller and the
+    /// drivers. One that came in between TASKS_STARTEPIN / TASKS_STARTEPOUT and the end event
+    /// would start a second transfer while the first is running, which the peripheral does
+    /// not allow (see `wait_easydma`).
+    fn usbd_interrupt_off() void {
+        cpu.interrupt.disable(.USBD);
+        // The barriers CMSIS's `__NVIC_DisableIRQ` puts after the same write.
+        cpu.dsb();
+        cpu.isb();
+    }
+
     fn ep_writev(
         itf: *usb.DeviceInterface,
         ep_num: usb.types.Endpoint.Num,
@@ -365,6 +378,7 @@ pub const USBD = struct {
         // Start DMA
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled) cpu.interrupt.enable(.USBD);
+        usbd_interrupt_off();
         // An end event left by a transfer that was given up on must not end this wait.
         peripherals.USBD.EVENTS_ENDEPIN[i].write_raw(0);
         // Busy from before the transfer starts: the host can take the packet as soon as it
@@ -404,6 +418,7 @@ pub const USBD = struct {
         // Start DMA
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled) cpu.interrupt.enable(.USBD);
+        usbd_interrupt_off();
         // An end event left by a transfer that was given up on must not end this wait.
         peripherals.USBD.EVENTS_ENDEPOUT[i].write_raw(0);
         peripherals.USBD.TASKS_STARTEPOUT[i].write_raw(1);
