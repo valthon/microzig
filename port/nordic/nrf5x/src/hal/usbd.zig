@@ -170,7 +170,17 @@ pub const USBD = struct {
                 }
 
                 // EP0 data-phase completions
-                if (peripherals.USBD.EVENTS_EP0DATADONE.raw != 0) {
+                //
+                // Not while a SETUP packet waits that arrived after the check above. The
+                // completion is then that of the transfer the packet ended, and acting on it
+                // would have the controller load that transfer's next packet: once in the
+                // endpoint, a packet "will trigger a valid, acknowledged (ACK) IN
+                // transaction" (nRF52840 PS v1.1, 6.35.9.1), and the host would take it for
+                // the answer to its new request. The event is left for the next `poll`,
+                // which drops it when it takes up the SETUP packet.
+                if (peripherals.USBD.EVENTS_EP0DATADONE.raw != 0 and
+                    peripherals.USBD.EVENTS_EP0SETUP.raw == 0)
+                {
                     peripherals.USBD.EVENTS_EP0DATADONE.write_raw(0);
                     switch (self.control.direction) {
                         .in => {
