@@ -12,6 +12,11 @@ const peripherals = microzig.chip.peripherals;
 const usb = microzig.core.usb;
 
 const errata = @import("./usbd/errata.zig");
+const ep0 = @import("./usbd/ep0.zig");
+
+test {
+    _ = ep0;
+}
 
 // +++++++++++++++++++++++++++++++++++++++++++++++++
 // Code
@@ -42,8 +47,6 @@ const PowerState = union(enum) {
 };
 
 const EP0_State = struct {
-    direction: usb.types.Dir = .out,
-    remaining_size: u16 = 0,
     in_pending: bool = false,
     in_start_frame: u11 = 0,
 };
@@ -60,6 +63,8 @@ pub const USBD = struct {
     eps_in: [NUM_EP]EP_Config = @splat(.{}),
     eps_out: [NUM_EP]EP_Config = @splat(.{}),
     ep0_state: EP0_State = .{},
+    /// Where the control transfer on endpoint 0 stands.
+    control: ep0.Control = .{},
     /// A packet was handed to data IN endpoint n and the host has not taken it yet.
     in_busy: [NUM_EP]bool = @splat(false),
 
@@ -162,25 +167,40 @@ pub const USBD = struct {
                         .index = .from(@as(u16, @intCast(peripherals.USBD.WINDEXH.raw)) << 8 | @as(u16, @intCast(peripherals.USBD.WINDEXL.raw))),
                         .length = .from(@as(u16, @intCast(peripherals.USBD.WLENGTHH.raw)) << 8 | @as(u16, @intCast(peripherals.USBD.WLENGTHL.raw))),
                     };
-                    self.ep0_state.direction = switch (peripherals.USBD.BMREQUESTTYPE.read().DIRECTION) {
-                        .HostToDevice => .out,
-                        .DeviceToHost => .in,
-                    };
-                    self.ep0_state.remaining_size = setup.length.native();
+                    self.control.setup(.{
+                        .request_type = @bitCast(setup.request_type),
+                        .request = setup.request,
+                        .length = setup.length.native(),
+                    });
                     controller.on_setup_req(&self.interface, &setup);
                 }
 
                 // EP0 data-phase completions
                 if (peripherals.USBD.EVENTS_EP0DATADONE.raw != 0) {
-                    // Here nrf-usbd doesn't clear OUT events
-                    // (https://github.com/nrf-rs/nrf-usbd/blob/main/src/usbd.rs#L683)
-                    // But this case is not handled in the controller yet
                     peripherals.USBD.EVENTS_EP0DATADONE.write_raw(0);
                     self.ep0_state.in_pending = false;
-                    switch (self.ep0_state.direction) {
-                        .in => controller.on_buffer(&self.interface, .in(.ep0)),
-                        // Control-OUT with data-phase is unhandled in the controller
-                        .out => peripherals.USBD.TASKS_EP0STATUS.write_raw(1),
+                    switch (self.control.direction) {
+                        .in => {
+                            // The host has taken a packet of a control read. After the last
+                            // one the status stage is started here, by the task and not by
+                            // the shortcut EP0DATADONE -> EP0STATUS (see `ep0.Control.in_done`).
+                            ep0_trigger(self.control.in_done());
+                            controller.on_buffer(&self.interface, .in(.ep0));
+                        },
+                        // A packet of a control write's data stage is in the endpoint. The
+                        // controller has no use for it (its `on_buffer` only logs a packet
+                        // on EP0 OUT), so it is not told; but the packet has to be taken out
+                        // before anything else may follow: the next packet or the status
+                        // stage comes after ENDEPOUT[0] (nRF52840 PS v1.1, 6.35.9.2).
+                        // Outside a data stage nothing let a packet in, so none is taken.
+                        .out => if (self.control.out_data_stage()) {
+                            if (self.easydma_out(0)) |size| {
+                                ep0_trigger(self.control.out_packet(@intCast(size), self.eps_out[0].max_packet_size));
+                            } else {
+                                log.err("EP0: EasyDMA did not finish, control write stalled", .{});
+                                ep0_trigger(self.control.out_failed());
+                            }
+                        },
                     }
                 }
 
@@ -279,6 +299,7 @@ pub const USBD = struct {
         self.eps_in = @splat(.{});
         self.eps_out = @splat(.{});
         self.ep0_state = .{};
+        self.control = .{};
         self.in_busy = @splat(false);
     }
 
@@ -319,6 +340,44 @@ pub const USBD = struct {
         cpu.isb();
     }
 
+    /// Triggers the task for the next stage of the control transfer `self.control` follows.
+    ///
+    /// Not if a SETUP packet has arrived since `poll` last looked: the task would be applied
+    /// to the transfer that packet started, which `self.control` knows nothing of yet. The
+    /// next `poll` takes that transfer up from its EP0SETUP. A SETUP packet that arrives
+    /// between this check and the write is not caught.
+    fn ep0_trigger(action: ep0.Action) void {
+        if (action == .none or peripherals.USBD.EVENTS_EP0SETUP.raw != 0) return;
+        switch (action) {
+            .none => unreachable,
+            .rcvout => peripherals.USBD.TASKS_EP0RCVOUT.write_raw(1),
+            .status => peripherals.USBD.TASKS_EP0STATUS.write_raw(1),
+            .stall => peripherals.USBD.TASKS_EP0STALL.write_raw(1),
+        }
+    }
+
+    /// Copies the packet that OUT endpoint `i` holds into `bufs_out[i]` and returns its
+    /// length, or null if EasyDMA did not finish.
+    fn easydma_out(self: *Self, i: u4) ?u32 {
+        const scratch_buf = &self.bufs_out[i];
+        // SIZE.EPOUT[n] is a 7-bit field and can read up to 127; the buffer EasyDMA copies
+        // into holds one 64-byte packet.
+        const size: u32 = @min(peripherals.USBD.SIZE.EPOUT[i].raw, scratch_buf.len);
+
+        // Prepare DMA transfer
+        peripherals.USBD.EPOUT[i].PTR.write_raw(@intFromPtr(scratch_buf));
+        peripherals.USBD.EPOUT[i].MAXCNT.write_raw(size);
+
+        // Start DMA
+        const was_enabled = cpu.interrupt.is_enabled(.USBD);
+        defer if (was_enabled) cpu.interrupt.enable(.USBD);
+        usbd_interrupt_off();
+        // An end event left by a transfer that was given up on must not end this wait.
+        peripherals.USBD.EVENTS_ENDEPOUT[i].write_raw(0);
+        peripherals.USBD.TASKS_STARTEPOUT[i].write_raw(1);
+        return if (wait_easydma(.out, i)) size else null;
+    }
+
     fn ep_writev(
         itf: *usb.DeviceInterface,
         ep_num: usb.types.Endpoint.Num,
@@ -327,16 +386,19 @@ pub const USBD = struct {
         const self: *Self = @fieldParentPtr("interface", itf);
         log.debug("ep_writev {t}: ({} bytes) {X} ({s})", .{ ep_num, data[0].len, data[0], data[0] });
 
-        // A zero-length write to EP0 asks for the status stage, with one exception: while a
-        // control read still owes the host bytes of wLength, it is a packet of the data stage.
+        // A zero-length write to EP0 accepts the request, with one exception: while a control
+        // read still owes the host bytes of wLength, it is a packet of the data stage.
         // The controller sends one after a reply that ends on a full packet, to tell the host
         // that there is no more. That one goes out below like any other EP0 IN packet, with
-        // MAXCNT 0, and being short it lets the status stage follow by itself. TASKS_EP0STATUS
-        // instead would leave the host's next IN token without the packet it is waiting for.
-        const ep0_data_stage = ep_num == .ep0 and
-            self.ep0_state.direction == .in and self.ep0_state.remaining_size != 0;
+        // MAXCNT 0, and being short it ends the data stage. TASKS_EP0STATUS instead would
+        // leave the host's next IN token without the packet it is waiting for.
+        //
+        // Accepting a request starts its status stage, unless it is a control write whose
+        // data the host has yet to send: then the data stage is let through, and `poll`
+        // starts the status stage when the data has been taken (see `ep0.Control.ack`).
+        const ep0_data_stage = ep_num == .ep0 and self.control.in_data_stage();
         if (data[0].len == 0 and !ep0_data_stage) {
-            if (ep_num == .ep0) peripherals.USBD.TASKS_EP0STATUS.write_raw(1);
+            if (ep_num == .ep0) ep0_trigger(self.control.ack());
             return 0;
         }
 
@@ -368,18 +430,12 @@ pub const USBD = struct {
         peripherals.USBD.EPIN[i].MAXCNT.write_raw(len);
 
         if (ep_num == .ep0) {
-            // EPIN0: a short packet (len < max_packet_size) indicates the end of the data
-            // stage and must be followed by us responding with an ACK token to an OUT token
-            // sent from the host (AKA the status stage)
-            // Also handle the case when it's the last packet with size 64
-            self.ep0_state.remaining_size -|= len;
-            const is_short_packet = len < self.eps_in[0].max_packet_size;
-            const is_last_packet = is_short_packet or self.ep0_state.remaining_size == 0;
-            if (is_last_packet) {
-                peripherals.USBD.SHORTS.write(.{ .EP0DATADONE_EP0STATUS = .Enabled });
-            } else {
-                peripherals.USBD.SHORTS.write(.{ .EP0DATADONE_EP0STATUS = .Disabled });
-            }
+            // A packet of a control read's data stage. Every data stage ends on a packet
+            // that `in_packet` takes for the last: a short one, the last byte of wLength, or
+            // the zero-length packet the controller adds after a reply that is shorter than
+            // wLength and ends on a full packet. When the host has acknowledged that one,
+            // `poll` starts the status stage.
+            self.control.in_packet(len, self.eps_in[0].max_packet_size);
 
             // Saving current frame counter to start the timeout that will trigger
             // status stage if the IN transfer is not acknowledged after a few frames
@@ -423,25 +479,10 @@ pub const USBD = struct {
         const self: *Self = @fieldParentPtr("interface", itf);
         const i = @backingInt(ep_num);
         const scratch_buf = &self.bufs_out[i];
-        // SIZE.EPOUT[n] is a 7-bit field and can read up to 127; the buffer EasyDMA copies
-        // into holds one 64-byte packet.
-        const size: u32 = @min(peripherals.USBD.SIZE.EPOUT[i].raw, scratch_buf.len);
-
-        // Prepare DMA transfer
-        peripherals.USBD.EPOUT[i].PTR.write_raw(@intFromPtr(scratch_buf));
-        peripherals.USBD.EPOUT[i].MAXCNT.write_raw(size);
-
-        // Start DMA
-        const was_enabled = cpu.interrupt.is_enabled(.USBD);
-        defer if (was_enabled) cpu.interrupt.enable(.USBD);
-        usbd_interrupt_off();
-        // An end event left by a transfer that was given up on must not end this wait.
-        peripherals.USBD.EVENTS_ENDEPOUT[i].write_raw(0);
-        peripherals.USBD.TASKS_STARTEPOUT[i].write_raw(1);
-        if (!wait_easydma(.out, i)) {
+        const size = self.easydma_out(i) orelse {
             log.err("ep_readv {t}: EasyDMA did not finish", .{ep_num});
             return 0;
-        }
+        };
 
         var scratch_slice: []align(1) u8 = scratch_buf[0..size];
 
