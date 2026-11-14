@@ -323,7 +323,15 @@ pub const USBD = struct {
         const self: *Self = @fieldParentPtr("interface", itf);
         log.debug("ep_writev {t}: ({} bytes) {X} ({s})", .{ ep_num, data[0].len, data[0], data[0] });
 
-        if (data[0].len == 0) {
+        // A zero-length write to EP0 asks for the status stage, with one exception: while a
+        // control read still owes the host bytes of wLength, it is a packet of the data stage.
+        // The controller sends one after a reply that ends on a full packet, to tell the host
+        // that there is no more. That one goes out below like any other EP0 IN packet, with
+        // MAXCNT 0, and being short it lets the status stage follow by itself. TASKS_EP0STATUS
+        // instead would leave the host's next IN token without the packet it is waiting for.
+        const ep0_data_stage = ep_num == .ep0 and
+            self.ep0_state.direction == .in and self.ep0_state.remaining_size != 0;
+        if (data[0].len == 0 and !ep0_data_stage) {
             if (ep_num == .ep0) peripherals.USBD.TASKS_EP0STATUS.write_raw(1);
             return 0;
         }
