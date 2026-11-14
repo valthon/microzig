@@ -759,7 +759,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
                         },
                     }) catch @panic("OOM"),
                 };
-            } else if (target.cpu.arch.isRISCV() and target.ptrBitWidth() == 32) {
+            } else if (target.cpu.arch.isRiscv() and target.ptrBitWidth() == 32) {
                 return .{
                     .name = "riscv32",
                     .root_source_file = mb.core_dep.namedLazyPath("cpu_riscv32"),
