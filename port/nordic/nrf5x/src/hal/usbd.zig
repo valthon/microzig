@@ -194,7 +194,11 @@ pub const USBD = struct {
                     var status_in = status >> 1;
                     inline for (1..8) |i| {
                         if (status_in == 0) break;
-                        if (status_in & 1 == 1) {
+                        // Only a packet this HAL is waiting on is reported. A bit for an
+                        // endpoint that is not busy belongs to a packet that was loaded
+                        // before the endpoint was opened again (see `ep_open`), and the
+                        // driver that owns the endpoint now never wrote it.
+                        if (status_in & 1 == 1 and self.in_busy[i]) {
                             self.in_busy[i] = false;
                             controller.on_buffer(&self.interface, .in(@fromBackingInt(i)));
                         }
@@ -389,6 +393,10 @@ pub const USBD = struct {
         usbd_interrupt_off();
         // An end event left by a transfer that was given up on must not end this wait.
         peripherals.USBD.EVENTS_ENDEPIN[i].write_raw(0);
+        // Nor may a completion from before be taken for this packet's. The endpoint is not
+        // busy here, so a bit set now is that of a packet loaded before the endpoint was
+        // opened again and taken by the host since (EPDATASTATUS is W1C, EPINn is bit n).
+        if (ep_num != .ep0) peripherals.USBD.EPDATASTATUS.write_raw(@as(u32, 1) << i);
         // Busy from before the transfer starts: the host can take the packet as soon as it
         // is in the endpoint, and a `poll` that runs before this function returns (from an
         // interrupt) then clears the flag. Set after the wait, it would stay set for good.
@@ -462,10 +470,13 @@ pub const USBD = struct {
     }
 
     /// Limitation: a packet that EasyDMA has already copied into a data IN endpoint when the
-    /// endpoint is opened again is not withdrawn. It stays in the peripheral, the host can
-    /// still take it, and `poll` then reports its completion to the new configuration's
-    /// driver. The product specification documents no register that discards it; nrfx does
-    /// it through undocumented ones (USBD + 0x800 / 0x804), which this HAL does not use.
+    /// endpoint is opened again is not withdrawn. It stays in the peripheral and the host can
+    /// still take it. The product specification documents no register that discards it; nrfx
+    /// does it through undocumented ones (USBD + 0x800 / 0x804), which this HAL does not use.
+    /// Its completion is not reported: `poll` passes on only the completion of a packet
+    /// written since the endpoint was opened, and `ep_writev` drops one that is still
+    /// latched when it loads the next packet. What is left is the packet itself, and a
+    /// completion that arrives between that drop and the load.
     /// The core's `ep_open` contract names this exception.
     fn ep_open(itf: *usb.DeviceInterface, desc: *const usb.descriptor.Endpoint) void {
         const self: *Self = @fieldParentPtr("interface", itf);
