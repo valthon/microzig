@@ -133,30 +133,30 @@ pub const default = struct {
     /// Allows an intelligent compile error when someone attempts to use RTT on a platform where "default" locking isn't supported yet
     const ErrorLock = struct {
         fn error_lock_unlock(_: *Context) void {
-            @compileError(std.fmt.comptimePrint("Unsupported architecture for built in lock support: {any}, please provide custom locking support via Config.exclusive_access field", .{builtin.cpu.arch}));
+            @compileError(std.fmt.comptimePrint("Unsupported architecture for built in lock support: {any}, please provide custom locking support via Config.exclusive_access field", .{builtin.target.cpu.arch}));
         }
     };
 
     fn resolve_lock_type() type {
-        const current_arch = builtin.cpu.arch;
+        const current_arch = builtin.target.cpu.arch;
         switch (current_arch) {
             .arm, .armeb, .thumb, .thumbeb => {},
             else => return GenericLock(*Context, ErrorLock.error_lock_unlock, ErrorLock.error_lock_unlock),
         }
 
-        if (builtin.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v6m)) or builtin.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v8m))) {
+        if (builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v6m)) or builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v8m))) {
             return GenericLock(
                 *Context,
                 ArmV6mV8m.lock,
                 ArmV6mV8m.unlock,
             );
-        } else if (builtin.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7m)) or builtin.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7em)) or builtin.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v8m_main))) {
+        } else if (builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7m)) or builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7em)) or builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v8m_main))) {
             return GenericLock(
                 *Context,
                 ArmV7mV7emV8mMain.lock,
                 ArmV7mV7emV8mMain.unlock,
             );
-        } else if (builtin.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7a)) or builtin.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7r))) {
+        } else if (builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7a)) or builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7r))) {
             return GenericLock(
                 *Context,
                 ArmV7aV7r.lock,

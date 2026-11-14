@@ -738,7 +738,7 @@ pub fn dump_trace_line(index: usize, address: usize) void {
 }
 
 pub const StackIterator = struct {
-    const native_arch = builtin.cpu.arch;
+    const native_arch = builtin.target.cpu.arch;
 
     // Last known value of the frame pointer register.
     fp: usize,
@@ -747,7 +747,7 @@ pub const StackIterator = struct {
     pub fn init(first_address: ?usize, fp: ?usize) StackIterator {
         if (native_arch.isSPARC()) {
             // Flush all the register windows on stack.
-            asm volatile (if (builtin.cpu.has(.sparc, .v9))
+            asm volatile (if (builtin.target.cpu.has(.sparc, .v9))
                     "flushw"
                 else
                     "ta 3" // ST_FLUSH_WINDOWS

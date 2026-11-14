@@ -48,7 +48,7 @@ pub const CPU_Options = struct {
     ///
     /// NOTE: This option is enabled by default if hard float is enabled.
     /// NOTE: Not supported on cortex_m0, cortex_m0plus and cortex_m3.
-    enable_fpu: bool = builtin.abi.float() == .hard,
+    enable_fpu: bool = builtin.target.abi.float() == .hard,
 };
 
 pub const interrupt = struct {
