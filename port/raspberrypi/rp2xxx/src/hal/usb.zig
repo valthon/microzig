@@ -190,6 +190,16 @@ pub fn Polled(config: Config) type {
             }
 
             // Has the host signaled a bus reset?
+            // Checked last on purpose. A reset holds the bus for at least 10 ms (TinyUSB's
+            // dcd_rp2040.c notes the same where it handles BUS_RESET), and nothing reaches
+            // the device meanwhile, so a setup request or a completion that the same poll
+            // finds came before the reset as long as `poll` runs more often than that.
+            // Handling those first and the reset last is their order on the bus, and it
+            // leaves the device unconfigured at address 0. With the reset first the
+            // controller would act on a request the reset had cancelled: a
+            // SET_CONFIGURATION seen together with the reset would leave the device
+            // configured. The datasheet's example (pico-examples, dev_lowlevel.c) and
+            // TinyUSB check the reset last as well.
             if (ints.BUS_RESET != 0) {
                 log.debug("-- bus reset --", .{});
 
