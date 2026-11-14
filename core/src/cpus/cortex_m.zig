@@ -800,7 +800,7 @@ const core = blk: {
 
 pub const utils = switch (cortex_m) {
     .cortex_m7 => @import("cortex_m/m7_utils.zig"),
-    else => void{},
+    else => {},
 };
 
 pub const peripherals = struct {
