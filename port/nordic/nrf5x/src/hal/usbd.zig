@@ -178,6 +178,8 @@ pub const USBD = struct {
                 // transaction" (nRF52840 PS v1.1, 6.35.9.1), and the host would take it for
                 // the answer to its new request. The event is left for the next `poll`,
                 // which drops it when it takes up the SETUP packet.
+                // For one that arrives after this check, `ep_writev` looks again before it loads
+                // the packet.
                 if (peripherals.USBD.EVENTS_EP0DATADONE.raw != 0 and
                     peripherals.USBD.EVENTS_EP0SETUP.raw == 0)
                 {
@@ -431,6 +433,18 @@ pub const USBD = struct {
         // is in the endpoint, and a `poll` that runs before this function returns (from an
         // interrupt) then clears the flag. Set after the wait, it would stay set for good.
         if (ep_num != .ep0) self.in_busy[i] = true;
+        // An EP0 packet is not loaded if a SETUP packet has arrived since `poll` last looked,
+        // while the controller was at work on the request before it or on that request's
+        // EP0DATADONE. The packet belongs to the transfer the SETUP packet ended, and once
+        // in the endpoint it would be the answer to the host's next IN token, which may be
+        // one of the new transfer (see the EP0DATADONE branch of `poll`). The caller is told
+        // that nothing was taken, the request stays as `self.control` has it, and the next
+        // `poll` takes up the new transfer from its EP0SETUP. Like `ep0_trigger`: a SETUP
+        // packet that arrives between this check and the write is not caught.
+        if (ep_num == .ep0 and peripherals.USBD.EVENTS_EP0SETUP.raw != 0) {
+            log.debug("ep_writev ep0: held back, a SETUP packet is waiting", .{});
+            return 0;
+        }
         peripherals.USBD.TASKS_STARTEPIN[i].write_raw(1);
         if (!wait_easydma(.in, i)) {
             log.err("ep_writev {t}: EasyDMA did not finish", .{ep_num});
