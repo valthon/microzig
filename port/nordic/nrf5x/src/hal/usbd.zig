@@ -407,21 +407,6 @@ pub const USBD = struct {
         peripherals.USBD.EPIN[i].PTR.write_raw(@intFromPtr(scratch));
         peripherals.USBD.EPIN[i].MAXCNT.write_raw(len);
 
-        if (ep_num == .ep0) {
-            // A packet of a control read's data stage. Every data stage ends on a packet
-            // that `in_packet` takes for the last: a short one, the last byte of wLength, or
-            // the zero-length packet the controller adds after a reply that is shorter than
-            // wLength and ends on a full packet. When the host has acknowledged that one,
-            // `poll` starts the status stage.
-            //
-            // Nothing starts the status stage while a packet waits for the host. Until the
-            // software has prepared the next stage the peripheral answers NAK (nRF52840 PS
-            // v1.1, 6.35.9), and the specification offers no way to withdraw a packet or to
-            // tell that the host has moved on; a host that gives up sends its next SETUP
-            // packet, which ends the transfer.
-            self.control.in_packet(len, self.eps_in[0].max_packet_size);
-        }
-
         // Start DMA
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled) cpu.interrupt.enable(.USBD);
@@ -439,8 +424,31 @@ pub const USBD = struct {
         peripherals.USBD.TASKS_STARTEPIN[i].write_raw(1);
         if (!wait_easydma(.in, i)) {
             log.err("ep_writev {t}: EasyDMA did not finish", .{ep_num});
-            if (ep_num != .ep0) self.in_busy[i] = false;
+            if (ep_num != .ep0) {
+                self.in_busy[i] = false;
+            } else {
+                // No packet is in the endpoint, so none will be acknowledged and nothing
+                // would move the control read on: it is stalled (see `ep0.Control.in_failed`).
+                ep0_trigger(self.control.in_failed());
+            }
             return 0;
+        }
+
+        if (ep_num == .ep0) {
+            // A packet of a control read's data stage is in the endpoint; only now is it
+            // counted, so that one that could not be loaded is not taken for an answer.
+            // Every data stage ends on a packet that `in_packet` takes for the last: a
+            // short one, the last byte of wLength, or the zero-length packet the controller
+            // adds after a reply that is shorter than wLength and ends on a full packet.
+            // When the host has acknowledged that one, `poll` starts the status stage. It
+            // cannot run between the copy and this call: the USBD interrupt is still off.
+            //
+            // Nothing starts the status stage while a packet waits for the host. Until the
+            // software has prepared the next stage the peripheral answers NAK (nRF52840 PS
+            // v1.1, 6.35.9), and the specification offers no way to withdraw a packet or to
+            // tell that the host has moved on; a host that gives up sends its next SETUP
+            // packet, which ends the transfer.
+            self.control.in_packet(len, self.eps_in[0].max_packet_size);
         }
 
         return len;

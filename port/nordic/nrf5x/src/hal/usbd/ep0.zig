@@ -38,8 +38,8 @@ pub const Control = struct {
     remaining: u16 = 0,
     /// The packet loaded into the endpoint ends the data stage of a control read.
     in_last: bool = false,
-    /// The controller answered the request: with a packet for the data stage, or by
-    /// accepting it.
+    /// The request has its answer: the controller's, a packet for the data stage or its
+    /// acceptance, or the stall for a packet of the controller's that could not be loaded.
     answered: bool = false,
     /// The request is SET_ADDRESS (see `is_set_address`), which is not the software's to
     /// answer: "The USBD peripheral handles the SetAddress transfer by itself. As a
@@ -68,13 +68,29 @@ pub const Control = struct {
         return self.direction == .out and self.remaining != 0;
     }
 
-    /// A packet of `len` bytes is about to be loaded for the data stage of a control read.
+    /// A packet of `len` bytes has been loaded for the data stage of a control read.
     /// It is the last one if it is shorter than the endpoint's maximum or carries the last
     /// byte the host asked for; `in_done` then starts the status stage.
     pub fn in_packet(self: *Control, len: u16, max_packet_size: u16) void {
         self.answered = true;
         self.remaining = if (len < max_packet_size) 0 else self.remaining -| len;
         self.in_last = self.remaining == 0;
+    }
+
+    /// A packet of a control read's data stage could not be loaded into the endpoint.
+    /// The host's IN tokens would be answered NAK until its next SETUP packet: only "the
+    /// data [transferred] from Data RAM memory into USBD will trigger a valid, acknowledged
+    /// (ACK) IN transaction" (6.35.9.1). So the transfer is given up, like a control write
+    /// in `out_failed`: "The software can choose to stall a command (in both data and status
+    /// stages) through the EP0STALL task" (6.35.9).
+    ///
+    /// The stall is the answer the request gets, also when the packet was the first:
+    /// `setup_handled` has nothing to add to it.
+    pub fn in_failed(self: *Control) Action {
+        self.answered = true;
+        self.remaining = 0;
+        self.in_last = false;
+        return .stall;
     }
 
     /// EP0DATADONE in a control read: the host has taken the packet and acknowledged it.
@@ -286,6 +302,39 @@ test "a SETUP packet ends a control read whose last packet the host never took" 
     ep0.in_packet(18, 64);
     ep0.setup(get_descriptor(255));
     try std.testing.expectEqual(Action.none, ep0.in_done());
+}
+
+test "a control read whose packet could not be loaded is stalled" {
+    var ep0: Control = .{};
+
+    // The first packet. The stall is the answer the request gets: the controller's return
+    // does not add a second one.
+    ep0.setup(get_descriptor(255));
+    try std.testing.expectEqual(Action.stall, ep0.in_failed());
+    try std.testing.expectEqual(Action.none, ep0.setup_handled());
+    try std.testing.expect(!ep0.in_data_stage());
+
+    // A later packet, after the host has taken the first.
+    ep0.setup(get_descriptor(255));
+    ep0.in_packet(64, 64);
+    try std.testing.expectEqual(Action.none, ep0.setup_handled());
+    try std.testing.expectEqual(Action.none, ep0.in_done());
+    try std.testing.expectEqual(Action.stall, ep0.in_failed());
+    try std.testing.expect(!ep0.in_data_stage());
+
+    // The last packet: no status stage follows the stall.
+    ep0.setup(get_descriptor(255));
+    ep0.in_packet(64, 64);
+    try std.testing.expectEqual(Action.none, ep0.in_done());
+    try std.testing.expectEqual(Action.stall, ep0.in_failed());
+    try std.testing.expectEqual(Action.none, ep0.in_done());
+
+    // The failure does not carry over to the next request.
+    ep0.setup(get_descriptor(255));
+    try std.testing.expectEqual(Action.stall, ep0.setup_handled());
+    ep0.setup(get_descriptor(255));
+    ep0.in_packet(18, 64);
+    try std.testing.expectEqual(Action.status, ep0.in_done());
 }
 
 test "a request the controller did not answer is stalled" {
