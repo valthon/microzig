@@ -100,12 +100,13 @@ pub const Control = struct {
     ///
     /// The same section notes "the possibility to enable a shortcut from the EP0DATADONE
     /// event to the EP0STATUS task", which starts the status stage without the software.
-    /// It is not used. Anomaly 199 of the nRF52840 ("USBD cannot receive tasks during DMA":
-    /// "if any EasyDMA transfer is in progress, USB tasks cannot be used") leaves open
+    /// It is not used. Anomaly 199 of the nRF52840, "USBD cannot receive tasks during DMA",
+    /// is in substance that USB tasks cannot be used while an EasyDMA transfer is in
+    /// progress (a paraphrase; `dma_begin` in errata.zig names the sources). It leaves open
     /// whether a task the shortcut triggers while a data endpoint's packet is being copied
     /// is performed, and nothing starts a status stage that was lost that way. `usbd.zig`
-    /// waits for each of its EasyDMA transfers to end before it goes on, so none is running
-    /// where it triggers the task this returns.
+    /// waits for each of its EasyDMA transfers to end and undoes the anomaly's workaround
+    /// before it goes on, so none is running where it triggers the task this returns.
     pub fn in_done(self: *Control) Action {
         if (!self.in_last) return .none;
         self.in_last = false;

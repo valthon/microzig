@@ -317,6 +317,26 @@ pub const USBD = struct {
         return false;
     }
 
+    /// Runs the EasyDMA transfer that PTR and MAXCNT of an endpoint describe: starts it and
+    /// waits for it to end. Returns false if it did not end (see `wait_easydma`). Every
+    /// transfer of this HAL is started here.
+    ///
+    /// Around the transfer goes the workaround for anomaly 199 of the nRF52840, "USBD cannot
+    /// receive tasks during DMA" (see `errata.dma_begin`). It is undone before this returns,
+    /// so that the task a caller triggers next (EP0RCVOUT, EP0STATUS, EP0STALL) comes after
+    /// it. That holds for a transfer that did not end, too: nothing else will end it, and
+    /// the stall its caller answers it with is a task like any other. Whether the peripheral
+    /// performs a task then is not known.
+    fn run_easydma(dir: usb.types.Dir, i: u4) bool {
+        errata.dma_begin();
+        defer errata.dma_end();
+        switch (dir) {
+            .in => peripherals.USBD.TASKS_STARTEPIN[i].write_raw(1),
+            .out => peripherals.USBD.TASKS_STARTEPOUT[i].write_raw(1),
+        }
+        return wait_easydma(dir, i);
+    }
+
     /// Turns the USBD interrupt off in the NVIC for the length of an EasyDMA transfer; the
     /// caller turns it on again if it was on. An application may run `poll` from the USBD
     /// interrupt, and `poll` starts transfers of its own through the controller and the
@@ -364,8 +384,7 @@ pub const USBD = struct {
         usbd_interrupt_off();
         // An end event left by a transfer that was given up on must not end this wait.
         peripherals.USBD.EVENTS_ENDEPOUT[i].write_raw(0);
-        peripherals.USBD.TASKS_STARTEPOUT[i].write_raw(1);
-        return if (wait_easydma(.out, i)) size else null;
+        return if (run_easydma(.out, i)) size else null;
     }
 
     fn ep_writev(
@@ -445,8 +464,7 @@ pub const USBD = struct {
             log.debug("ep_writev ep0: held back, a SETUP packet is waiting", .{});
             return 0;
         }
-        peripherals.USBD.TASKS_STARTEPIN[i].write_raw(1);
-        if (!wait_easydma(.in, i)) {
+        if (!run_easydma(.in, i)) {
             log.err("ep_writev {t}: EasyDMA did not finish", .{ep_num});
             if (ep_num != .ep0) {
                 self.in_busy[i] = false;
