@@ -236,9 +236,9 @@ pub fn MicroBuild(port_select: PortSelect) type {
             /// The MicroZig target that the firmware is built for. Either a board or a chip.
             target: *const Target,
 
-            /// The optimization level that should be used. Usually `ReleaseSmall` or `Debug` is a good choice.
+            /// The optimization level that should be used. Usually `.small` or `.debug` is a good choice.
             /// Also using `std.Build.standardOptimizeOption` is a good idea.
-            optimize: std.builtin.OptimizeMode,
+            optimize: std.lang.Optimize,
 
             /// The root source file for the application. This is your `src/main.zig` file.
             root_source_file: LazyPath,
@@ -369,7 +369,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
             cpu_mod.addImport("microzig", core_mod);
             core_mod.addImport("cpu", cpu_mod);
 
-            const regz_exe = b.dependency("tools/regz", .{ .optimize = .ReleaseSafe }).artifact("regz");
+            const regz_exe = b.dependency("tools/regz", .{ .optimize = .safe }).artifact("regz");
             const chip_source = switch (target.chip.register_definition) {
                 .atdf, .svd => |file| blk: {
                     const regz_run = b.addRunArtifact(regz_exe);
@@ -634,7 +634,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
                         .uf2 => |options| @import("tools/uf2").from_elf(
                             fw.mb.dep.builder.dependency("tools/uf2", .{
-                                .optimize = .ReleaseSafe,
+                                .optimize = .safe,
                             }),
                             elf_file,
                             options,
@@ -642,7 +642,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
                         .dfu => |options| @import("tools/dfu").from_elf(
                             fw.mb.dep.builder.dependency("tools/dfu", .{
-                                .optimize = .ReleaseSafe,
+                                .optimize = .safe,
                             }),
                             elf_file,
                             options,
@@ -650,7 +650,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
                         .esp => |options| @import("tools/esp-image").from_elf(
                             fw.mb.dep.builder.dependency("tools/esp-image", .{
-                                .optimize = .ReleaseSafe,
+                                .optimize = .safe,
                             }),
                             elf_file,
                             options,

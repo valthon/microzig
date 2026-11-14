@@ -352,7 +352,7 @@ fn get_bootrom(b: *std.Build, target: *const microzig.Target, rom: BootROM) std.
     const rom_exe = b.addExecutable(.{
         .name = b.fmt("stage2-{t}", .{rom}),
         .root_module = b.createModule(.{
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .target = b.resolveTargetQuery(zig_target),
         }),
     });

@@ -42,7 +42,7 @@ pub const CPU_Options = struct {
     /// of the interrupt handlers which print the interrupt name.
     ///
     /// NOTE: This option is enabled in debug builds by default.
-    verbose_unhandled_irq: bool = (builtin.mode == .debug),
+    verbose_unhandled_irq: bool = (builtin.optimize == .debug),
 
     /// If true, the FPU will be enabled in the startup code.
     ///
@@ -544,7 +544,7 @@ pub const startup_logic = struct {
     }
 
     fn default_exception_handler(comptime name: []const u8) microzig.interrupt.Handler {
-        return switch (builtin.mode) {
+        return switch (builtin.optimize) {
             .debug => .{ .c = DebugExceptionHandler(name).handle },
             else => .{ .c = ReleaseExceptionHandler.handle },
         };
