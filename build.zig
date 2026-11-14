@@ -161,7 +161,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
             var field_names: [count][]const u8 = undefined;
             var field_types: [count]type = undefined;
-            var field_attrs: [count]std.builtin.Type.Struct.FieldAttributes = undefined;
+            var field_attrs: [count]std.lang.Type.Struct.FieldAttributes = undefined;
 
             if (count > 0) {
                 var i: usize = 0;
@@ -286,7 +286,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
             strip_unused_symbols: bool = true,
 
             /// Unwind tables option for the firmware executable.
-            unwind_tables: ?std.builtin.UnwindTables = null,
+            unwind_tables: ?std.lang.UnwindTables = null,
 
             /// Error tracing option for the firmware executable.
             error_tracing: ?bool = null,
