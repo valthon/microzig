@@ -38,6 +38,9 @@ pub const Control = struct {
     remaining: u16 = 0,
     /// The packet loaded into the endpoint ends the data stage of a control read.
     in_last: bool = false,
+    /// The controller answered the request: with a packet for the data stage, or by
+    /// accepting it.
+    answered: bool = false,
 
     /// A SETUP packet arrived. It ends the transfer before it, finished or not.
     pub fn setup(self: *Control, packet: Setup) void {
@@ -63,6 +66,7 @@ pub const Control = struct {
     /// It is the last one if it is shorter than the endpoint's maximum or carries the last
     /// byte the host asked for; `in_done` then starts the status stage.
     pub fn in_packet(self: *Control, len: u16, max_packet_size: u16) void {
+        self.answered = true;
         self.remaining = if (len < max_packet_size) 0 else self.remaining -| len;
         self.in_last = self.remaining == 0;
     }
@@ -93,7 +97,19 @@ pub const Control = struct {
     /// [...] or initiate the status stage through the EP0STATUS task", once ENDEPOUT[0] has
     /// said that the data is in RAM (6.35.9.2). So the data stage is let through first.
     pub fn ack(self: *Control) Action {
+        self.answered = true;
         return if (self.out_data_stage()) .rcvout else .status;
+    }
+
+    /// The controller has returned from the SETUP packet. A request it did not answer, by
+    /// a packet for the data stage or by accepting it, is one it does not support, and
+    /// such a request is stalled: "The software can choose to stall a command (in both data
+    /// and status stages) through the EP0STALL task, for instance if the command is not
+    /// supported, or its wValue, wIndex or wLength parameters are wrong" (6.35.9). Left
+    /// alone, the peripheral answers NAK for as long as the host cares to ask.
+    pub fn setup_handled(self: *const Control) Action {
+        if (self.answered) return .none;
+        return .stall;
     }
 
     /// A packet of `len` bytes of a control write's data stage was taken out of the endpoint.
@@ -255,4 +271,31 @@ test "a SETUP packet ends a control read whose last packet the host never took" 
     ep0.in_packet(18, 64);
     ep0.setup(get_descriptor(255));
     try std.testing.expectEqual(Action.none, ep0.in_done());
+}
+
+test "a request the controller did not answer is stalled" {
+    var ep0: Control = .{};
+
+    // Unsupported: the controller returns without a word, for a read and for a write.
+    ep0.setup(get_descriptor(255));
+    try std.testing.expectEqual(Action.stall, ep0.setup_handled());
+    ep0.setup(set_line_coding(7));
+    try std.testing.expectEqual(Action.stall, ep0.setup_handled());
+
+    // Answered with the first packet of the data stage.
+    ep0.setup(get_descriptor(255));
+    ep0.in_packet(18, 64);
+    try std.testing.expectEqual(Action.none, ep0.setup_handled());
+
+    // Accepted, without and with a data stage to come.
+    ep0.setup(set_line_coding(0));
+    _ = ep0.ack();
+    try std.testing.expectEqual(Action.none, ep0.setup_handled());
+    ep0.setup(set_line_coding(7));
+    _ = ep0.ack();
+    try std.testing.expectEqual(Action.none, ep0.setup_handled());
+
+    // An answer does not carry over to the next request.
+    ep0.setup(get_descriptor(255));
+    try std.testing.expectEqual(Action.stall, ep0.setup_handled());
 }

@@ -173,6 +173,8 @@ pub const USBD = struct {
                         .length = setup.length.native(),
                     });
                     controller.on_setup_req(&self.interface, &setup);
+                    // The controller answers a request before it returns, or not at all.
+                    ep0_trigger(self.control.setup_handled());
                 }
 
                 // EP0 data-phase completions
