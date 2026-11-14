@@ -24,7 +24,6 @@ test {
 
 const MAX_PACKET_SIZE = 64;
 const NUM_EP = 8;
-const EP0_IN_STATUS_TIMEOUT_FRAMES: u11 = 5;
 
 /// How many times `wait_easydma` reads the end event before it gives up.
 ///
@@ -46,11 +45,6 @@ const PowerState = union(enum) {
     connected,
 };
 
-const EP0_State = struct {
-    in_pending: bool = false,
-    in_start_frame: u11 = 0,
-};
-
 const EP_Config = struct {
     max_packet_size: u16 = MAX_PACKET_SIZE,
 };
@@ -62,7 +56,6 @@ pub const USBD = struct {
     bufs_out: [NUM_EP][MAX_PACKET_SIZE]u8 align(4) = @splat(@splat(0)),
     eps_in: [NUM_EP]EP_Config = @splat(.{}),
     eps_out: [NUM_EP]EP_Config = @splat(.{}),
-    ep0_state: EP0_State = .{},
     /// Where the control transfer on endpoint 0 stands.
     control: ep0.Control = .{},
     /// A packet was handed to data IN endpoint n and the host has not taken it yet.
@@ -158,7 +151,6 @@ pub const USBD = struct {
                     // Aborted control transfer: drop stale DATADONE so it can't
                     // trigger on_buffer for the next transfer.
                     peripherals.USBD.EVENTS_EP0DATADONE.write_raw(0);
-                    self.ep0_state.in_pending = false;
 
                     const setup: usb.types.SetupPacket = .{
                         .request_type = @bitCast(@as(u8, @intCast(peripherals.USBD.BMREQUESTTYPE.raw))),
@@ -180,7 +172,6 @@ pub const USBD = struct {
                 // EP0 data-phase completions
                 if (peripherals.USBD.EVENTS_EP0DATADONE.raw != 0) {
                     peripherals.USBD.EVENTS_EP0DATADONE.write_raw(0);
-                    self.ep0_state.in_pending = false;
                     switch (self.control.direction) {
                         .in => {
                             // The host has taken a packet of a control read. After the last
@@ -248,20 +239,6 @@ pub const USBD = struct {
                 }
 
                 // TODO: ISO endpoints
-
-                // EP0 IN data stage:
-                // Host may jump to the status stage without acknowledging the data transfer
-                // so the EP0DATADONE_EP0STATUS short may never fire and device will keep
-                // NAKing the OUT tokens.
-                // HACK: trigger status stage if the IN transfer is not acknowledged after a few frames
-                if (self.ep0_state.in_pending) {
-                    const now = peripherals.USBD.FRAMECNTR.read().FRAMECNTR;
-                    if ((now -% self.ep0_state.in_start_frame) >= EP0_IN_STATUS_TIMEOUT_FRAMES) {
-                        peripherals.USBD.TASKS_EP0STATUS.write_raw(1);
-                        peripherals.USBD.EVENTS_EP0DATADONE.write_raw(0);
-                        self.ep0_state.in_pending = false;
-                    }
-                }
             },
         }
     }
@@ -300,7 +277,6 @@ pub const USBD = struct {
 
         self.eps_in = @splat(.{});
         self.eps_out = @splat(.{});
-        self.ep0_state = .{};
         self.control = .{};
         self.in_busy = @splat(false);
     }
@@ -437,12 +413,13 @@ pub const USBD = struct {
             // the zero-length packet the controller adds after a reply that is shorter than
             // wLength and ends on a full packet. When the host has acknowledged that one,
             // `poll` starts the status stage.
+            //
+            // Nothing starts the status stage while a packet waits for the host. Until the
+            // software has prepared the next stage the peripheral answers NAK (nRF52840 PS
+            // v1.1, 6.35.9), and the specification offers no way to withdraw a packet or to
+            // tell that the host has moved on; a host that gives up sends its next SETUP
+            // packet, which ends the transfer.
             self.control.in_packet(len, self.eps_in[0].max_packet_size);
-
-            // Saving current frame counter to start the timeout that will trigger
-            // status stage if the IN transfer is not acknowledged after a few frames
-            self.ep0_state.in_start_frame = peripherals.USBD.FRAMECNTR.read().FRAMECNTR;
-            self.ep0_state.in_pending = true;
         }
 
         // Start DMA
@@ -462,7 +439,7 @@ pub const USBD = struct {
         peripherals.USBD.TASKS_STARTEPIN[i].write_raw(1);
         if (!wait_easydma(.in, i)) {
             log.err("ep_writev {t}: EasyDMA did not finish", .{ep_num});
-            if (ep_num == .ep0) self.ep0_state.in_pending = false else self.in_busy[i] = false;
+            if (ep_num != .ep0) self.in_busy[i] = false;
             return 0;
         }
 
