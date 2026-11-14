@@ -578,6 +578,13 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
                         },
                         .set_address => self.new_address = @truncate(setup.value.native()),
                         .set_configuration => self.process_set_config(device_itf, setup.value.native()),
+                        // One byte: bConfigurationValue of the selected configuration, or 0
+                        // while there is none (USB 2.0, 9.4.2). There is only one configuration,
+                        // which any SET_CONFIGURATION value other than 0 selects.
+                        .get_configuration => return if (self.cfg_num == 0)
+                            &.{0}
+                        else
+                            std.mem.asBytes(&config_descriptor.first.configuration_value),
                         .get_descriptor => return get_descriptor(setup.value.native()),
                         .set_feature => {
                             const feature: types.FeatureSelector = @fromBackingInt(@intCast(setup.value.native() >> 8));
@@ -702,6 +709,8 @@ const TestDevice = struct {
     /// The most an endpoint takes in one write, and what the last write was given credit for.
     packet_size: types.Len = 64,
     last_written_len: types.Len = 0,
+    /// The bytes of the last write, as far as it was given credit for them.
+    last_written_data: [64]u8 = @splat(0),
     /// The address of the last `set_address`, if there was one.
     address: ?u7 = null,
 
@@ -721,7 +730,13 @@ const TestDevice = struct {
         const dev = from(itf);
         dev.written += 1;
         var len: usize = 0;
-        for (data) |chunk| len += chunk.len;
+        for (data) |chunk| {
+            for (chunk) |byte| {
+                if (len < dev.packet_size and len < dev.last_written_data.len)
+                    dev.last_written_data[len] = byte;
+                len += 1;
+            }
+        }
         dev.last_written_len = @intCast(@min(len, dev.packet_size));
         return dev.last_written_len;
     }
@@ -998,5 +1013,42 @@ test "a control read that ends on a packet boundary short of wLength ends with a
         try std.testing.expectEqual(2, dev.last_written_len);
         ctl.on_buffer(&dev.interface, ep0_in);
         try std.testing.expectEqual(3, dev.written);
+    }
+}
+
+test "GET_CONFIGURATION returns the selected configuration, or 0 without one" {
+    const Controller = DeviceController(
+        test_config(struct { echo: drivers.EchoExample }),
+        .{.{ .echo = "echo" }},
+    );
+    const ep0_in = comptime types.Endpoint.in(.ep0);
+    const get_configuration: types.SetupPacket = .{
+        .request_type = .{ .recipient = .device, .type = .standard, .direction = .in },
+        .request = @backingInt(types.SetupRequest.get_configuration),
+        .value = .from(0),
+        .index = .from(0),
+        .length = .from(1),
+    };
+    var dev: TestDevice = .{};
+    var ctl: Controller = .init;
+
+    // What the host does to the device, and the one byte it then reads back. A request the
+    // controller does not answer is stalled by the HAL, and nothing is written for it.
+    const steps = [_]struct { set: ?u16, expected: u8 }{
+        // Address state: no SET_CONFIGURATION yet.
+        .{ .set = null, .expected = 0 },
+        .{ .set = 1, .expected = 1 },
+        // Back in the Address state.
+        .{ .set = 0, .expected = 0 },
+    };
+    for (steps) |step| {
+        if (step.set) |value| ctl.on_setup_req(&dev.interface, &test_set_configuration(value));
+        const written = dev.written;
+        ctl.on_setup_req(&dev.interface, &get_configuration);
+        try std.testing.expectEqual(written + 1, dev.written);
+        try std.testing.expectEqualSlices(u8, &.{step.expected}, dev.last_written_data[0..dev.last_written_len]);
+        // The byte is all the host asked for: no zero-length packet follows it.
+        ctl.on_buffer(&dev.interface, ep0_in);
+        try std.testing.expectEqual(written + 1, dev.written);
     }
 }
