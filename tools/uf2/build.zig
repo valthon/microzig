@@ -19,11 +19,11 @@ pub fn from_elf(dep: *Dependency, elf_file: std.Build.LazyPath, opts: Options) s
 
     // elf file
     run.addArg("--elf-path");
-    run.addFileArg(elf_file);
+    run.addFileArg2(elf_file, .{});
 
     // output file
     run.addArg("--output-path");
-    return run.addOutputFileArg("output.uf2");
+    return run.addOutputFileArg2("output.uf2", .{});
 }
 
 pub fn build(b: *std.Build) void {
@@ -41,8 +41,8 @@ pub fn build(b: *std.Build) void {
                 }),
             });
             const update_family_id_run = b.addRunArtifact(update_family_id_exe);
-            update_family_id_run.addFileArg(microsoft_uf2_dep.path("utils/uf2families.json"));
-            update_family_id_run.addFileArg(b.path("src/family_id.zig"));
+            update_family_id_run.addFileArg2(microsoft_uf2_dep.path("utils/uf2families.json"), .{});
+            update_family_id_run.addFileArg2(b.path("src/family_id.zig"), .{});
             b.default_step.dependOn(&update_family_id_run.step);
         }
     }

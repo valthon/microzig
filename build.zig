@@ -378,14 +378,14 @@ pub fn MicroBuild(port_select: PortSelect) type {
                     regz_run.addArg(@tagName(target.chip.register_definition));
 
                     regz_run.addArg("--output_path"); // Write to a file
-                    const chips_dir = regz_run.addOutputDirectoryArg("chips");
+                    const chips_dir = regz_run.addOutputDirectoryArg2("chips", .{});
 
                     for (target.chip.patch_files) |patch_file| {
                         regz_run.addArg("--patch_path");
-                        regz_run.addFileArg(patch_file);
+                        regz_run.addFileArg2(patch_file, .{});
                     }
 
-                    regz_run.addFileArg(file);
+                    regz_run.addFileArg2(file, .{});
                     break :blk chips_dir.path(b, b.fmt("{s}.zig", .{target.chip.name}));
                 },
                 .embassy => |embassy| blk: {
@@ -395,11 +395,11 @@ pub fn MicroBuild(port_select: PortSelect) type {
                     regz_run.addArg(@tagName(target.chip.register_definition));
 
                     regz_run.addArg("--output_path"); // Write to a file
-                    const chips_dir = regz_run.addOutputDirectoryArg("chips");
+                    const chips_dir = regz_run.addOutputDirectoryArg2("chips", .{});
 
                     for (target.chip.patch_files) |patch_file| {
                         regz_run.addArg("--patch_path");
-                        regz_run.addFileArg(patch_file);
+                        regz_run.addFileArg2(patch_file, .{});
                     }
 
                     if (embassy.device) |device| {
@@ -407,7 +407,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
                         regz_run.addArg(device);
                     }
 
-                    regz_run.addDirectoryArg(embassy.path);
+                    regz_run.addDirectoryArg2(embassy.path, .{});
                     break :blk chips_dir.path(b, b.fmt("{s}.zig", .{target.chip.name}));
                 },
                 .targetdb => |targetdb| blk: {
@@ -417,17 +417,17 @@ pub fn MicroBuild(port_select: PortSelect) type {
                     regz_run.addArg(@tagName(target.chip.register_definition));
 
                     regz_run.addArg("--output_path"); // Write to a file
-                    const chips_dir = regz_run.addOutputDirectoryArg("chips");
+                    const chips_dir = regz_run.addOutputDirectoryArg2("chips", .{});
 
                     for (target.chip.patch_files) |patch_file| {
                         regz_run.addArg("--patch_path");
-                        regz_run.addFileArg(patch_file);
+                        regz_run.addFileArg2(patch_file, .{});
                     }
 
                     regz_run.addArg("--device");
                     regz_run.addArg(targetdb.device);
 
-                    regz_run.addDirectoryArg(targetdb.path);
+                    regz_run.addDirectoryArg2(targetdb.path, .{});
                     break :blk chips_dir.path(b, b.fmt("{s}.zig", .{target.chip.name}));
                 },
                 .zig => |src| src,
@@ -519,9 +519,9 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
                 const generate_linker_script_run = b.addRunArtifact(generate_linker_script_exe);
                 generate_linker_script_run.addArg(args_str);
-                const output = generate_linker_script_run.addOutputFileArg("linker.ld");
+                const output = generate_linker_script_run.addOutputFileArg2("linker.ld", .{});
                 if (linker_script_options.file) |file| {
-                    generate_linker_script_run.addFileArg(file);
+                    generate_linker_script_run.addFileArg2(file, .{});
                 }
                 break :blk output;
             };
