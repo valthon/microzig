@@ -715,7 +715,7 @@ fn write_default_enum_value(db: *Database, arena: Allocator, e: *const Enum, def
         }
     }
 
-    try writer.print("@enumFromInt(0x{X})", .{default});
+    try writer.print("@fromBackingInt(0x{X})", .{default});
 }
 
 fn write_enum_fields(db: *Database, arena: Allocator, e: *const Enum, out_writer: *std.Io.Writer) !void {
@@ -2470,7 +2470,7 @@ test "gen.field with named enum and unnamed default" {
             \\
             \\    /// offset: 0x00
             \\    TEST_REGISTER: mmio.Mmio(packed struct(u8) {
-            \\        TEST_FIELD: TEST_ENUM = @fromBackingInt(@intCast(0xA)),
+            \\        TEST_FIELD: TEST_ENUM = @fromBackingInt(0xA),
             \\        padding: u4 = 0,
             \\    }),
             \\};
