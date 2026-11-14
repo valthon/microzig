@@ -567,6 +567,7 @@ pub const USBD = struct {
         );
     }
 
-    /// No-op: the peripheral handles this
+    /// No-op: the peripheral handles this. It takes the address from the SET_ADDRESS
+    /// transfer, which it also completes without the software (see `ep0.Control.set_address`).
     fn set_address(_: *usb.DeviceInterface, _: u7) void {}
 };

@@ -41,12 +41,18 @@ pub const Control = struct {
     /// The controller answered the request: with a packet for the data stage, or by
     /// accepting it.
     answered: bool = false,
+    /// The request is SET_ADDRESS (see `is_set_address`), which is not the software's to
+    /// answer: "The USBD peripheral handles the SetAddress transfer by itself. As a
+    /// consequence, the software shall not process this command other than updating its
+    /// state machine [...], nor initiate a status stage" (6.35.9).
+    set_address: bool = false,
 
     /// A SETUP packet arrived. It ends the transfer before it, finished or not.
     pub fn setup(self: *Control, packet: Setup) void {
         self.* = .{
             .direction = if (packet.request_type & 0x80 != 0) .in else .out,
             .remaining = packet.length,
+            .set_address = is_set_address(packet),
         };
     }
 
@@ -98,6 +104,8 @@ pub const Control = struct {
     /// said that the data is in RAM (6.35.9.2). So the data stage is let through first.
     pub fn ack(self: *Control) Action {
         self.answered = true;
+        // The controller still sees SET_ADDRESS and accepts it: that is its state machine.
+        if (self.set_address) return .none;
         return if (self.out_data_stage()) .rcvout else .status;
     }
 
@@ -109,6 +117,7 @@ pub const Control = struct {
     /// alone, the peripheral answers NAK for as long as the host cares to ask.
     pub fn setup_handled(self: *const Control) Action {
         if (self.answered) return .none;
+        if (self.set_address) return .none;
         return .stall;
     }
 
@@ -129,6 +138,12 @@ pub const Control = struct {
         return .stall;
     }
 };
+
+/// Whether a SETUP packet is SET_ADDRESS: a standard request to the device, host to device
+/// (bmRequestType 0x00), with bRequest 5.
+fn is_set_address(packet: Setup) bool {
+    return packet.request_type == 0x00 and packet.request == 0x05;
+}
 
 // CDC SET_LINE_CODING: class request to an interface, host to device, 7 bytes of data.
 fn set_line_coding(length: u16) Setup {
@@ -297,5 +312,31 @@ test "a request the controller did not answer is stalled" {
 
     // An answer does not carry over to the next request.
     ep0.setup(get_descriptor(255));
+    try std.testing.expectEqual(Action.stall, ep0.setup_handled());
+}
+
+test "SET_ADDRESS gets neither a status stage nor a stall" {
+    const set_address: Setup = .{ .request_type = 0x00, .request = 5, .length = 0 };
+    var ep0: Control = .{};
+
+    // The controller accepts it like any other request without data.
+    ep0.setup(set_address);
+    try std.testing.expectEqual(Action.none, ep0.ack());
+    try std.testing.expectEqual(Action.none, ep0.setup_handled());
+
+    // And if it were not to answer, the transfer is still the peripheral's own.
+    ep0.setup(set_address);
+    try std.testing.expectEqual(Action.none, ep0.setup_handled());
+
+    // Only the standard request to the device is SET_ADDRESS: not request 5 of a class, not
+    // SET_CONFIGURATION (9), and not request 5 in the other direction. Each of those gets
+    // its status stage, also right after a SET_ADDRESS.
+    ep0.setup(.{ .request_type = 0x21, .request = 5, .length = 0 });
+    try std.testing.expectEqual(Action.status, ep0.ack());
+    ep0.setup(.{ .request_type = 0x00, .request = 9, .length = 0 });
+    try std.testing.expectEqual(Action.status, ep0.ack());
+    ep0.setup(.{ .request_type = 0x80, .request = 5, .length = 0 });
+    try std.testing.expectEqual(Action.status, ep0.ack());
+    ep0.setup(.{ .request_type = 0x21, .request = 5, .length = 0 });
     try std.testing.expectEqual(Action.stall, ep0.setup_handled());
 }
