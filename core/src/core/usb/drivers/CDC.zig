@@ -178,6 +178,10 @@ rx_ready: std.atomic.Value(bool),
 tx_data: []u8,
 tx_end: usb.types.Len,
 tx_ready: std.atomic.Value(bool),
+/// A full packet needs a short packet to terminate the host's bulk transfer
+/// (USB 2.0, 5.8.3). Foreground writes can cancel this when more data is queued;
+/// the completion handler claims it before submitting the terminating ZLP.
+tx_zlp_pending: std.atomic.Value(bool),
 
 pub fn available(self: *@This()) usb.types.Len {
     return self.rx_end - self.rx_seek;
@@ -205,6 +209,9 @@ pub fn read(self: *@This(), dst: []u8) usize {
 pub fn write(self: *@This(), data: []const u8) usize {
     const len = @min(self.tx_data.len - self.tx_end, data.len);
 
+    // Only an accepted byte can continue the preceding full packet. An empty write
+    // or one refused because the buffer is full must not suppress its termination.
+    if (len != 0) self.tx_zlp_pending.store(false, .seq_cst);
     @memcpy(self.tx_data[self.tx_end..][0..len], data[0..len]);
     self.tx_end += @intCast(len);
 
@@ -222,6 +229,8 @@ pub fn flush(self: *@This()) bool {
     if (!self.tx_ready.load(.seq_cst))
         return false;
     self.tx_ready.store(false, .seq_cst);
+    // Publish before ep_writev: a HAL may report completion before that call returns.
+    self.tx_zlp_pending.store(self.tx_end == self.tx_data.len, .seq_cst);
 
     // The IN endpoint is idle here and `tx_data` is one max-size packet (`init` checked that), so
     // the endpoint takes all of it. `tx_ready` is true only after `init`, when the controller
@@ -259,6 +268,7 @@ pub fn init(self: *@This(), desc: *const Descriptor, device: *usb.DeviceInterfac
         .tx_data = data[len_half..],
         .tx_end = 0,
         .tx_ready = .init(true),
+        .tx_zlp_pending = .init(false),
     };
     device.ep_listen(desc.ep_out.endpoint.num, @intCast(self.rx_data.len));
 }
@@ -308,6 +318,13 @@ pub fn on_rx(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
 pub fn on_tx_ready(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
     if (self.tx_ready.load(.seq_cst))
         log.warn("{s}({t}) called before buffer was consumed", .{ "on_tx_ready", ep_num });
+    if (self.tx_zlp_pending.swap(false, .seq_cst)) {
+        // USB 2.0, 5.8.3: terminate a max-packet-aligned bulk transfer whose length
+        // is not known to the host. Keep ownership until the ZLP's own completion;
+        // otherwise a foreground flush could overwrite it with the next payload.
+        assert(0 == self.device.ep_writev(ep_num, &.{""}), .{});
+        return;
+    }
     self.tx_ready.store(true, .seq_cst);
 }
 
@@ -336,4 +353,166 @@ test "GET_LINE_CODING replies with the 7-byte line coding structure" {
         &.{ 0x00, 0xC2, 0x01, 0x00, 0, 0, 8 },
         cdc.class_request(&setup).?,
     );
+}
+
+/// Models a HAL with one outstanding IN packet and a host bulk read whose length
+/// exceeds the CDC payload. The host exposes bytes only after a short packet/ZLP.
+const TestDevice = struct {
+    interface: usb.DeviceInterface = .{ .vtable = &vtable },
+    max_packet_size: usize,
+    packet: [512]u8 = undefined,
+    packet_len: ?usize = null,
+    packet_lengths: [64]usize = undefined,
+    packets: usize = 0,
+    received: [2048]u8 = undefined,
+    received_len: usize = 0,
+    delivered_len: usize = 0,
+
+    const vtable: usb.DeviceInterface.VTable = .{
+        .ep_writev = ep_writev,
+        .ep_readv = ep_readv,
+        .ep_listen = ep_listen,
+        .ep_open = ep_open,
+        .set_address = set_address,
+    };
+
+    fn ep_writev(itf: *usb.DeviceInterface, _: usb.types.Endpoint.Num, data: []const []const u8) usb.types.Len {
+        const self: *TestDevice = @fieldParentPtr("interface", itf);
+        std.debug.assert(self.packet_len == null);
+        var len: usize = 0;
+        for (data) |chunk| {
+            std.debug.assert(len + chunk.len <= self.max_packet_size);
+            @memcpy(self.packet[len..][0..chunk.len], chunk);
+            len += chunk.len;
+        }
+        self.packet_len = len;
+        self.packet_lengths[self.packets] = len;
+        self.packets += 1;
+        return @intCast(len);
+    }
+
+    fn ep_readv(_: *usb.DeviceInterface, _: usb.types.Endpoint.Num, _: []const []u8) usb.types.Len {
+        return 0;
+    }
+    fn ep_listen(_: *usb.DeviceInterface, _: usb.types.Endpoint.Num, _: usb.types.Len) void {}
+    fn ep_open(_: *usb.DeviceInterface, _: *const usb.descriptor.Endpoint) void {}
+    fn set_address(_: *usb.DeviceInterface, _: u7) void {}
+
+    fn complete(self: *TestDevice, cdc: *CDC) void {
+        const len = self.packet_len.?;
+        @memcpy(self.received[self.received_len..][0..len], self.packet[0..len]);
+        self.received_len += len;
+        if (len < self.max_packet_size) self.delivered_len = self.received_len;
+        // HALs release the packet before notifying the class driver, which may queue ZLP.
+        self.packet_len = null;
+        cdc.on_tx_ready(cdc.descriptor.ep_in.endpoint.num);
+    }
+};
+
+const CDC = @This();
+
+fn test_descriptor(comptime packet_size: usb.types.Len) Descriptor {
+    return comptime blk: {
+        var alloc: usb.DescriptorAllocator = .init(false);
+        break :blk Descriptor.create(&alloc, packet_size, .{}).descriptor;
+    };
+}
+
+test "full CDC packets terminate with a ZLP before making the endpoint writable" {
+    inline for (.{ 64, 512 }) |packet_size| {
+        const desc = test_descriptor(packet_size);
+        var storage: [2 * packet_size]u8 = undefined;
+        var dev: TestDevice = .{ .max_packet_size = packet_size };
+        var cdc: CDC = undefined;
+        cdc.init(&desc, &dev.interface, &storage);
+        const payload: [packet_size]u8 = @splat(0xa5);
+        try std.testing.expectEqual(payload.len, cdc.write(&payload));
+        try std.testing.expect(cdc.flush()); // auto-flush already submitted the full packet
+        dev.complete(&cdc);
+        try std.testing.expectEqual(0, dev.delivered_len);
+        try std.testing.expectEqual(@as(?usize, 0), dev.packet_len); // terminating ZLP
+
+        // Queue another payload while the ZLP is outstanding. It must not replace it.
+        try std.testing.expectEqual(1, cdc.write(&.{0x5a}));
+        try std.testing.expect(!cdc.flush());
+        try std.testing.expectEqual(@as(?usize, 0), dev.packet_len);
+        dev.complete(&cdc);
+        try std.testing.expectEqual(payload.len, dev.delivered_len);
+        try std.testing.expect(cdc.flush());
+        dev.complete(&cdc);
+        try std.testing.expectEqual(payload.len + 1, dev.delivered_len);
+        try std.testing.expectEqualSlices(u8, &payload, dev.received[0..payload.len]);
+        try std.testing.expectEqual(0x5a, dev.received[payload.len]);
+        try std.testing.expectEqualSlices(usize, &.{ packet_size, 0, 1 }, dev.packet_lengths[0..dev.packets]);
+        // Empty writes/flushes cannot invent another ZLP after the short final packet.
+        try std.testing.expectEqual(0, cdc.write(""));
+        try std.testing.expect(cdc.flush());
+        try std.testing.expectEqual(@as(?usize, null), dev.packet_len);
+    }
+}
+
+test "CDC queued data continues a transfer and terminates its final full packet" {
+    const desc = test_descriptor(64);
+    var storage: [128]u8 = undefined;
+    var dev: TestDevice = .{ .max_packet_size = 64 };
+    var cdc: CDC = undefined;
+    cdc.init(&desc, &dev.interface, &storage);
+    const payload: [128]u8 = @splat(0x42);
+    try std.testing.expectEqual(64, cdc.write(payload[0..64]));
+    try std.testing.expectEqual(64, cdc.write(payload[64..]));
+    dev.complete(&cdc);
+    try std.testing.expectEqual(@as(?usize, null), dev.packet_len); // more data queued: no ZLP yet
+    try std.testing.expect(cdc.flush());
+    dev.complete(&cdc);
+    try std.testing.expectEqual(@as(?usize, 0), dev.packet_len);
+    dev.complete(&cdc);
+    try std.testing.expectEqual(payload.len, dev.delivered_len);
+    try std.testing.expectEqualSlices(u8, &payload, dev.received[0..dev.delivered_len]);
+    try std.testing.expectEqualSlices(usize, &.{ 64, 64, 0 }, dev.packet_lengths[0..dev.packets]);
+}
+
+test "CDC 1 KiB stream written one packet at a time is delivered without another write" {
+    const desc = test_descriptor(64);
+    var storage: [128]u8 = undefined;
+    var dev: TestDevice = .{ .max_packet_size = 64 };
+    var cdc: CDC = undefined;
+    cdc.init(&desc, &dev.interface, &storage);
+    var payload: [1024]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @truncate(i);
+    for (0..16) |i| {
+        const end = (i + 1) * 64;
+        try std.testing.expectEqual(64, cdc.write(payload[i * 64 .. end]));
+        // Neither an empty write nor repeated flush can cancel the needed ZLP.
+        try std.testing.expectEqual(0, cdc.write(""));
+        try std.testing.expect(cdc.flush());
+        while (dev.packet_len != null) dev.complete(&cdc);
+        try std.testing.expectEqual(end, dev.delivered_len);
+    }
+    try std.testing.expectEqualSlices(u8, &payload, dev.received[0..dev.delivered_len]);
+    try std.testing.expectEqual(32, dev.packets); // sixteen data packets and sixteen ZLPs
+}
+
+test "CDC short final packets end transfers without an extra ZLP" {
+    const desc = test_descriptor(64);
+    for ([_]usize{ 1, 63, 65, 127 }) |len| {
+        var storage: [128]u8 = undefined;
+        var dev: TestDevice = .{ .max_packet_size = 64 };
+        var cdc: CDC = undefined;
+        cdc.init(&desc, &dev.interface, &storage);
+        var payload: [127]u8 = undefined;
+        for (&payload, 0..) |*byte, i| byte.* = @truncate(i);
+        var written: usize = 0;
+        while (written < len) {
+            const n = cdc.write(payload[written..len]);
+            written += n;
+            if (n == 0) dev.complete(&cdc);
+        }
+        while (!cdc.flush()) dev.complete(&cdc);
+        while (dev.packet_len != null) dev.complete(&cdc);
+        try std.testing.expectEqual(len, dev.delivered_len);
+        try std.testing.expectEqualSlices(u8, payload[0..len], dev.received[0..dev.delivered_len]);
+        for (dev.packet_lengths[0..dev.packets]) |packet_len|
+            try std.testing.expect(packet_len != 0);
+        try std.testing.expectEqual(len % 64, dev.packet_lengths[dev.packets - 1]);
+    }
 }
