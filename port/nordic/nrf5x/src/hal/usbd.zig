@@ -13,9 +13,11 @@ const usb = microzig.core.usb;
 
 const errata = @import("./usbd/errata.zig");
 const ep0 = @import("./usbd/ep0.zig");
+const out_flow = @import("./usbd/out_flow.zig");
 
 test {
     _ = ep0;
+    _ = out_flow;
 }
 
 // +++++++++++++++++++++++++++++++++++++++++++++++++
@@ -81,6 +83,8 @@ pub const USBD = struct {
     /// the host selected, and all others are disabled (see `poll`).
     opened_in: u8 = 0,
     opened_out: u8 = 0,
+    /// Which packets on the data OUT endpoints the controller may be told of.
+    out: out_flow.Flow = .{},
 
     interface: usb.DeviceInterface,
 
@@ -251,6 +255,7 @@ pub const USBD = struct {
                         // Nor does a closed endpoint report the packet it was holding.
                         for (1..NUM_EP) |i| {
                             if (self.opened_in >> @intCast(i) & 1 == 0) self.in_busy[i] = false;
+                            if (self.opened_out >> @intCast(i) & 1 == 0) self.out.forget(@intCast(i));
                         }
                     }
                 }
@@ -315,13 +320,19 @@ pub const USBD = struct {
                         }
                         status_in >>= 1;
                     }
-                    // OUT endpoints (bits 17-23)
+                    // OUT endpoints (bits 17-23): the packet is noted, and reported below.
                     var status_out = status >> 17;
-                    inline for (1..8) |i| {
+                    for (1..8) |i| {
                         if (status_out == 0) break;
-                        if (status_out & 1 == 1) controller.on_buffer(&self.interface, .out(@fromBackingInt(i)));
+                        if (status_out & 1 == 1) self.out.arrived(@intCast(i));
                         status_out >>= 1;
                     }
+                }
+
+                // A received packet is reported when the driver listens, which may be long
+                // after it arrived (see out_flow.zig), so this is looked at on every call.
+                inline for (1..8) |i| {
+                    if (self.out.report(i)) controller.on_buffer(&self.interface, .out(@fromBackingInt(i)));
                 }
 
                 // Suspend and resume
@@ -512,6 +523,7 @@ pub const USBD = struct {
         self.in_busy = @splat(false);
         self.opened_in = 0;
         self.opened_out = 0;
+        self.out = .{};
     }
 
     /// Busy-waits for the EasyDMA transfer just started on an endpoint to end, and clears
@@ -769,16 +781,26 @@ pub const USBD = struct {
         return @intCast(size - scratch_slice.len);
     }
 
+    /// On a data endpoint this lets `poll` report the next packet, and that is all: the
+    /// endpoint takes a packet whenever it is empty (see out_flow.zig).
     fn ep_listen(
-        _: *usb.DeviceInterface,
+        itf: *usb.DeviceInterface,
         ep_num: usb.types.Endpoint.Num,
         len: usb.types.Len,
     ) void {
+        const self: *Self = @fieldParentPtr("interface", itf);
         log.debug("ep_listen {t}: ({} bytes)", .{ ep_num, len });
 
         if (ep_num == .ep0) {
             peripherals.USBD.TASKS_EP0RCVOUT.write_raw(1);
+            return;
         }
+        // A packet that is waiting already raised its event long ago. An application that
+        // runs `poll` from the USBD interrupt would not hear of it until some other event
+        // came, so the interrupt is made pending. One that calls `poll` in a loop has the
+        // interrupt off and gets the packet on its next turn.
+        if (self.out.listen(@intCast(@backingInt(ep_num))) and cpu.interrupt.is_enabled(.USBD))
+            cpu.interrupt.set_pending(.USBD);
     }
 
     /// Limitation: a packet that EasyDMA has already copied into a data IN endpoint when the
@@ -821,6 +843,7 @@ pub const USBD = struct {
             .out => {
                 self.eps_out[i].max_packet_size = desc.max_packet_size.native();
                 self.opened_out |= @intCast(mask);
+                if (ep.num != .ep0) self.out.forget(@intCast(i));
                 peripherals.USBD.EPOUTEN.write_raw(peripherals.USBD.EPOUTEN.raw | mask);
                 // Nor one it received and never read. Dropping the report alone would leave
                 // the endpoint answering NAK for good: "a NAK is returned until the software
