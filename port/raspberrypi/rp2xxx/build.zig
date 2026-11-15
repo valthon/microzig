@@ -333,6 +333,13 @@ pub fn build(b: *std.Build) !void {
     const unit_tests_run = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run platform agnostic unit tests");
     test_step.dependOn(&unit_tests_run.step);
+
+    // The PIO self-test runner's own unit tests need a Python 3 on PATH as
+    // `python3`, so they are a separate step rather than part of `test`.
+    const hwtest_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-q", "-s" });
+    hwtest_tests.addDirectoryArg(b.path("tools/pio-hwtest"));
+    const hwtest_step = b.step("test-hwtest-runner", "Run the PIO self-test runner's unit tests (needs python3)");
+    hwtest_step.dependOn(&hwtest_tests.step);
 }
 
 const BootROM = union(enum) {
