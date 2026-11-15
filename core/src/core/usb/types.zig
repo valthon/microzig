@@ -291,7 +291,7 @@ pub const TransferType = enum(u2) {
     Interrupt = 3,
 };
 
-/// The types of USB SETUP requests that we understand.
+/// Standard request codes: bRequest of USB 2.0, Table 9-4.
 pub const SetupRequest = enum(u8) {
     get_status = 0x00,
     clear_feature = 0x01,
@@ -301,6 +301,9 @@ pub const SetupRequest = enum(u8) {
     set_descriptor = 0x07,
     get_configuration = 0x08,
     set_configuration = 0x09,
+    get_interface = 0x0A,
+    set_interface = 0x0B,
+    synch_frame = 0x0C,
     _,
 };
 
@@ -482,3 +485,18 @@ pub const Version = extern struct {
 
 /// Represents packet length.
 pub const Len = u11;
+
+test "every named standard request has its code in SetupRequest" {
+    // Resolves each `StandardRequest` constant, so one that names a request `SetupRequest` does
+    // not declare fails to compile.
+    std.testing.refAllDecls(SetupPacket.StandardRequest);
+
+    // bRequest values of USB 2.0, Table 9-4.
+    try std.testing.expectEqual(10, @backingInt(SetupRequest.get_interface));
+    try std.testing.expectEqual(11, @backingInt(SetupRequest.set_interface));
+    try std.testing.expectEqual(12, @backingInt(SetupRequest.synch_frame));
+    try std.testing.expectEqual(
+        SetupRequest.set_interface,
+        SetupPacket.StandardRequest.set_interface.request,
+    );
+}
