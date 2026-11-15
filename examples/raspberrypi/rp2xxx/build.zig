@@ -46,12 +46,19 @@ pub fn build(b: *std.Build) void {
         .{ .target = raspberrypi.pico2_arm, .name = "pico2_arm_always_on_timer", .file = "src/rp2350_only/always_on_timer.zig" },
         .{ .target = raspberrypi.pico2_riscv, .name = "pico2_riscv_always_on_timer", .file = "src/rp2350_only/always_on_timer.zig" },
 
+        .{ .target = raspberrypi.pico2_arm, .name = "pico2_arm_pio-registers", .file = "src/rp2350_only/pio_registers.zig" },
+        .{ .target = raspberrypi.pico2_riscv, .name = "pico2_riscv_pio-registers", .file = "src/rp2350_only/pio_registers.zig" },
+        .{ .target = raspberrypi.pico2_arm, .name = "pico2_arm_pio-cross-irq", .file = "src/rp2350_only/pio_cross_irq.zig" },
+        .{ .target = raspberrypi.pico2_riscv, .name = "pico2_riscv_pio-cross-irq", .file = "src/rp2350_only/pio_cross_irq.zig" },
+
         // Adafruit boards
         .{ .target = mb.ports.rp2xxx.boards.adafruit.feather_rp2350, .name = "adafruit_feather_rp2350_blinky", .file = "src/board_blinky.zig" },
         .{ .target = mb.ports.rp2xxx.boards.adafruit.feather_rp2350, .name = "adafruit_feather_rp2350_multicore", .file = "src/blinky_core1.zig" },
         .{ .target = mb.ports.rp2xxx.boards.adafruit.feather_rp2350, .name = "adafruit_feather_rp2350_usb-cdc", .file = "src/usb_cdc.zig" },
         .{ .target = mb.ports.rp2xxx.boards.adafruit.feather_rp2350, .name = "adafruit_feather_rp2350_usb-hid", .file = "src/usb_hid.zig" },
         .{ .target = mb.ports.rp2xxx.boards.adafruit.metro_rp2350, .name = "adafruit_metro_rp2350_blinky", .file = "src/board_blinky.zig" },
+
+        .{ .target = mb.ports.rp2xxx.boards.adafruit.metro_rp2350, .name = "adafruit_metro_rp2350_pio-gpio-base", .file = "src/rp2350_only/pio_gpio_base.zig" },
 
         // WaveShare Boards:
         .{ .target = mb.ports.rp2xxx.boards.waveshare.rp2040_matrix, .name = "rp2040_matrix_tiles", .file = "src/rp2040_only/tiles.zig" },
@@ -72,6 +79,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "spi-master", .file = "src/spi_master.zig" },
         .{ .name = "spi-slave", .file = "src/spi_slave.zig" },
         .{ .name = "spi-loopback-dma", .file = "src/spi_loopback_dma.zig" },
+        .{ .name = "pio-sync", .file = "src/pio_sync.zig" },
+        .{ .name = "pio-irq", .file = "src/pio_irq.zig" },
+        .{ .name = "pio-dma-status", .file = "src/pio_dma_status.zig" },
         .{ .name = "pio-runtime", .file = "src/pio_runtime.zig" },
         .{ .name = "squarewave", .file = "src/squarewave.zig" },
         .{ .name = "ws2812", .file = "src/ws2812.zig" },

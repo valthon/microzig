@@ -1,8 +1,9 @@
+//! Drive a WS2812 data input on GPIO 23; expect red, green, blue once per second.
+//! Build-only; not run on hardware.
 const microzig = @import("microzig");
 const rp2xxx = microzig.hal;
 const gpio = rp2xxx.gpio;
 const Pio = rp2xxx.pio.Pio;
-const StateMachine = rp2xxx.pio.StateMachine;
 
 const ws2812_program = blk: {
     @setEvalBranchQuota(10_000);
@@ -32,7 +33,6 @@ const ws2812_program = blk: {
 };
 
 const pio: Pio = rp2xxx.pio.num(0);
-const sm: StateMachine = .sm0;
 const led_pin = gpio.num(23);
 
 pub const panic = microzig.panic;
@@ -44,6 +44,7 @@ comptime {
 }
 
 pub fn main() !void {
+    const sm = try pio.claim_unused_state_machine();
     pio.gpio_init(led_pin);
     try pio.sm_set_pindir(sm, led_pin, 1, .out);
 
@@ -53,7 +54,7 @@ pub fn main() !void {
     const div = @as(f32, @floatFromInt(rp2xxx.clock_config.sys.?.frequency())) /
         (800_000 * cycles_per_bit);
 
-    _ = pio.sm_load_and_start_program(sm, ws2812_program, .{
+    _ = try pio.sm_load_and_start_program(sm, ws2812_program, .{
         .clkdiv = .from_float(div),
         .pin_mappings = .{
             .side_set = .single(led_pin),
@@ -64,7 +65,7 @@ pub fn main() !void {
             .pull_threshold = 24,
             .join_tx = true,
         },
-    }) catch unreachable;
+    });
     pio.sm_set_enabled(sm, true);
 
     while (true) {
