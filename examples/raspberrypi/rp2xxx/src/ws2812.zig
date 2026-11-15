@@ -53,7 +53,7 @@ pub fn main() !void {
     const div = @as(f32, @floatFromInt(rp2xxx.clock_config.sys.?.frequency())) /
         (800_000 * cycles_per_bit);
 
-    pio.sm_load_and_start_program(sm, ws2812_program, .{
+    _ = pio.sm_load_and_start_program(sm, ws2812_program, .{
         .clkdiv = .from_float(div),
         .pin_mappings = .{
             .side_set = .single(led_pin),

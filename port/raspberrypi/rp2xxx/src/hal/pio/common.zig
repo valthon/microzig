@@ -118,6 +118,81 @@ pub const PinMappingOptions = struct {
     in_base: ?gpio.Pin = null,
 };
 
+fn can_add_program_at_offset_mask(used_mask: u32, program: Program, offset: u5) bool {
+    if (program.origin) |origin|
+        if (origin != offset) return false;
+    if (program.instructions.len == 0 or program.instructions.len > 32 - @as(usize, offset)) return false;
+    return (used_mask & (program.get_mask() << offset)) == 0;
+}
+
+fn find_offset_for_program_mask(used_mask: u32, program: Program) error{NoSpace}!u5 {
+    if (program.instructions.len == 0 or program.instructions.len > 32) return error.NoSpace;
+    return if (program.origin) |origin|
+        if (can_add_program_at_offset_mask(used_mask, program, origin)) origin else error.NoSpace
+    else for (0..(33 - program.instructions.len)) |i| {
+        const offset: u5 = @intCast(i);
+        if (can_add_program_at_offset_mask(used_mask, program, offset)) break offset;
+    } else error.NoSpace;
+}
+
+fn program_wrap(program: Program, offset: u5) u5 {
+    return if (program.wrap) |wrap| wrap + offset else offset + @as(u5, @intCast(program.instructions.len - 1));
+}
+
+fn relocate_instruction(comptime chip: Chip, insn: u16, reloc: assembler.Relocation, offset: u5) u16 {
+    return switch (reloc) {
+        .none => insn,
+        .jmpslot => blk: {
+            var jmp: Instruction(chip) = @bitCast(insn);
+            jmp.payload.jmp.address += offset;
+            break :blk @bitCast(jmp);
+        },
+    };
+}
+
+// Keep the load/init sequence independent of MMIO so host tests can retain
+// and check the returned offset alongside the configured addresses.
+fn load_and_init_program(pio: anytype, sm: anytype, program: Program, options: anytype) !u5 {
+    // We don't account for the optional bit here because it's not known to the pin_mappings
+    const expected_side_set_pins = if (program.side_set) |side_set|
+        side_set.count
+    else
+        0;
+
+    const config_count = if (options.pin_mappings.side_set) |side_set| side_set.count() else 0;
+    assert(expected_side_set_pins == config_count);
+
+    // TODO: check program settings vs pin mapping
+    const offset = try pio.add_program(program);
+
+    try pio.sm_init(sm, offset, .{
+        .clkdiv = options.clkdiv,
+        .shift = options.shift,
+        .pin_mappings = options.pin_mappings,
+        .exec = .{
+            .wrap = program_wrap(program, offset),
+
+            .wrap_target = if (program.wrap_target) |wrap_target|
+                wrap_target + offset // program.wrap_target is relative but actual wrap is absolute
+            else
+                offset,
+
+            .side_pindir = if (program.side_set) |side_set|
+                side_set.pindir
+            else
+                false,
+
+            .side_set_optional = if (program.side_set) |side_set|
+                side_set.optional
+            else
+                false,
+
+            .jmp_pin = options.exec.jmp_pin,
+        },
+    });
+    return offset;
+}
+
 pub fn PioImpl(EnumType: type, chip: Chip) type {
     return struct {
         pub fn get_instruction_memory(self: EnumType) *volatile [32]u32 {
@@ -126,33 +201,11 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
         }
 
         pub fn can_add_program_at_offset(self: EnumType, program: Program, offset: u5) bool {
-            if (program.origin) |origin|
-                if (origin != offset)
-                    return false;
-
-            // Will never fit in the first place:
-            if (offset + program.instructions.len > 32)
-                return false;
-
-            const used_mask = UsedInstructionSpace(chip).val[@backingInt(self)];
-            const program_mask = (program.get_mask() << offset);
-
-            // We can add the program if the masks don't overlap, if there is
-            // overlap the result of a bitwise AND will have a non-zero result
-            return (used_mask & program_mask) == 0;
+            return can_add_program_at_offset_mask(UsedInstructionSpace(chip).val[@backingInt(self)], program, offset);
         }
 
         pub fn find_offset_for_program(self: EnumType, program: Program) !u5 {
-            return if (program.origin) |origin|
-                if (self.can_add_program_at_offset(program, origin))
-                    origin
-                else
-                    error.NoSpace
-            else for (0..(32 - program.instructions.len)) |i| {
-                const offset = @as(u5, @intCast(i));
-                if (self.can_add_program_at_offset(program, offset))
-                    break offset;
-            } else error.NoSpace;
+            return find_offset_for_program_mask(UsedInstructionSpace(chip).val[@backingInt(self)], program);
         }
 
         pub fn add_program_at_offset_unlocked(self: EnumType, program: Program, offset: u5) !void {
@@ -161,15 +214,7 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
 
             const instruction_memory = self.get_instruction_memory();
             for (program.instructions, program.relocations, offset..) |insn, reloc, i|
-                instruction_memory[i] = switch (reloc) {
-                    .none => insn,
-                    .jmpslot => blk: {
-                        // Add the base address of the program to the jmp offset so it's relative to the start
-                        var jmp: Instruction(chip) = @bitCast(insn);
-                        jmp.payload.jmp.address += offset;
-                        break :blk @as(u16, @bitCast(jmp));
-                    },
-                };
+                instruction_memory[i] = relocate_instruction(chip, insn, reloc, offset);
 
             const program_mask = program.get_mask();
             UsedInstructionSpace(chip).val[@backingInt(self)] |= program_mask << offset;
@@ -503,47 +548,8 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
             sm: StateMachine,
             program: Program,
             options: LoadAndStartProgramOptions(chip),
-        ) !void {
-            // We don't account for the optional bit here because it's not known to the pin_mappings
-            const expected_side_set_pins = if (program.side_set) |side_set|
-                side_set.count
-            else
-                0;
-
-            const config_count = if (options.pin_mappings.side_set) |side_set| side_set.count() else 0;
-            assert(expected_side_set_pins == config_count);
-
-            // TODO: check program settings vs pin mapping
-            const offset = try self.add_program(program);
-
-            try self.sm_init(sm, offset, .{
-                .clkdiv = options.clkdiv,
-                .shift = options.shift,
-                .pin_mappings = options.pin_mappings,
-                .exec = .{
-                    .wrap = if (program.wrap) |wrap|
-                        wrap + offset // program.wrap is relative but actual wrap is absolute
-                    else
-                        offset + @as(u5, @intCast(program.instructions.len)),
-
-                    .wrap_target = if (program.wrap_target) |wrap_target|
-                        wrap_target + offset // program.wrap_target is relative but actual wrap is absolute
-                    else
-                        offset,
-
-                    .side_pindir = if (program.side_set) |side_set|
-                        side_set.pindir
-                    else
-                        false,
-
-                    .side_set_optional = if (program.side_set) |side_set|
-                        side_set.optional
-                    else
-                        false,
-
-                    .jmp_pin = options.exec.jmp_pin,
-                },
-            });
+        ) !u5 {
+            return load_and_init_program(self, sm, program, options);
         }
 
         pub fn sm_exec_set_x(self: EnumType, sm: StateMachine, value: u32) void {
@@ -631,4 +637,121 @@ pub fn LoadAndStartProgramOptions(chip: Chip) type {
         pin_mappings: PinMappingOptions = .{},
         exec: ExecOptions = .{},
     };
+}
+
+test "loader searches final slot and whole instruction memory" {
+    const one = comptime assembler.assemble(.RP2040, ".program one\nnop", .{}).get_program_by_name("one");
+    try std.testing.expectEqual(@as(u5, 31), try find_offset_for_program_mask(0x7fffffff, one));
+    var full = one;
+    const instructions: [32]u16 = @splat(0xa042);
+    full.instructions = &instructions;
+    try std.testing.expectEqual(@as(u5, 0), try find_offset_for_program_mask(0, full));
+    try std.testing.expectError(error.NoSpace, find_offset_for_program_mask(1, full));
+}
+
+test "loader wrap ends at last instruction" {
+    const program = comptime assembler.assemble(.RP2040, ".program two\nnop\nnop", .{}).get_program_by_name("two");
+    try std.testing.expectEqual(@as(u5, 1), program_wrap(program, 0));
+    try std.testing.expectEqual(@as(u5, 31), program_wrap(program, 30));
+}
+
+test "loader origin relocation and raw words" {
+    @setEvalBranchQuota(100_000);
+    inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
+        const program = comptime assembler.assemble(chip,
+            \\.program relocated
+            \\.origin 4
+            \\nop
+            \\.wrap_target
+            \\target:
+            \\jmp target
+            \\.word 0
+            \\.wrap
+        , .{}).get_program_by_name("relocated");
+        const offset = try find_offset_for_program_mask(0, program);
+        try std.testing.expectEqual(@as(u5, 4), offset);
+        try std.testing.expect(!can_add_program_at_offset_mask(0, program, 0));
+        try std.testing.expectError(error.NoSpace, find_offset_for_program_mask(0x10, program));
+        try std.testing.expectEqual(@as(u16, 5), relocate_instruction(chip, program.instructions[1], program.relocations[1], offset));
+        try std.testing.expectEqual(@as(u16, 0), relocate_instruction(chip, program.instructions[2], program.relocations[2], offset));
+        try std.testing.expectEqual(@as(u5, 6), program_wrap(program, offset));
+        try std.testing.expectEqual(@as(u5, 5), offset + program.wrap_target.?);
+    }
+}
+
+test "load and init returns the offset used for subsequent program jumps" {
+    const TestMapping = struct {
+        fn count(_: @This()) u3 {
+            return 0;
+        }
+    };
+    const TestPio = struct {
+        initial_pc: u5 = 0,
+        wrap: u5 = 0,
+        wrap_target: u5 = 0,
+        fn add_program(_: *@This(), program: Program) !u5 {
+            return find_offset_for_program_mask(0xf, program);
+        }
+        fn sm_init(self: *@This(), _: u2, pc: u5, options: anytype) !void {
+            self.initial_pc = pc;
+            self.wrap = options.exec.wrap;
+            self.wrap_target = options.exec.wrap_target;
+        }
+    };
+    @setEvalBranchQuota(100_000);
+    inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
+        const program = comptime assembler.assemble(chip,
+            \\.program resume
+            \\nop
+            \\.wrap_target
+            \\nop
+            \\.wrap
+        , .{}).get_program_by_name("resume");
+        var pio: TestPio = .{};
+        const offset = try load_and_init_program(&pio, @as(u2, 0), program, .{
+            .pin_mappings = .{ .side_set = @as(?TestMapping, null) },
+            .clkdiv = {},
+            .shift = {},
+            .exec = .{ .jmp_pin = null },
+        });
+        try std.testing.expectEqual(@as(u5, 4), offset);
+        try std.testing.expectEqual(offset, pio.initial_pc);
+        try std.testing.expectEqual(@as(u5, 5), pio.wrap);
+        try std.testing.expectEqual(@as(u5, 5), offset + program.wrap_target.?);
+        try std.testing.expectEqual(pio.wrap_target, offset + program.wrap_target.?);
+    }
+}
+
+fn TestLoader(comptime chip: Chip) type {
+    return enum(u1) {
+        pio0,
+        pio1,
+        const Self = @This();
+        const Impl = PioImpl(Self, chip);
+        var memory: [32]u32 = @splat(0);
+        fn get_instruction_memory(_: Self) *volatile [32]u32 {
+            return &memory;
+        }
+        const can_add_program_at_offset = Impl.can_add_program_at_offset;
+        const find_offset_for_program = Impl.find_offset_for_program;
+        const add_program_at_offset_unlocked = Impl.add_program_at_offset_unlocked;
+        const add_program = Impl.add_program;
+    };
+}
+
+test "loader writes all 32 instructions and reserves the whole memory" {
+    @setEvalBranchQuota(100_000);
+    inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
+        const program = comptime assembler.assemble(chip, ".program full\n" ++ "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n", .{}).get_program_by_name("full");
+        const pio: TestLoader(chip) = .pio0;
+        const previous = UsedInstructionSpace(chip).val[0];
+        UsedInstructionSpace(chip).val[0] = 0;
+        defer UsedInstructionSpace(chip).val[0] = previous;
+        TestLoader(chip).memory = @splat(0xffffffff);
+        try std.testing.expectEqual(@as(u5, 0), try pio.add_program(program));
+        for (TestLoader(chip).memory) |word| try std.testing.expectEqual(@as(u32, 0xa042), word);
+        try std.testing.expectEqual(@as(u32, 0xffffffff), UsedInstructionSpace(chip).val[0]);
+        try std.testing.expectError(error.NoSpace, pio.add_program(program));
+        try std.testing.expectEqual(@as(u5, 31), program_wrap(program, 0));
+    }
 }

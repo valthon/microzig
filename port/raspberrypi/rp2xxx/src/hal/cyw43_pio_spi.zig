@@ -67,7 +67,7 @@ pub fn init(config: CYW43_PIO_SPI_Config) !CYW43_PIO_SPI {
     config.clk_pin.set_drive_strength(.@"12mA");
     config.clk_pin.set_slew_rate(.fast);
 
-    try config.pio.sm_load_and_start_program(sm, cyw43spi_program, .{
+    const offset = try config.pio.sm_load_and_start_program(sm, cyw43spi_program, .{
         // Default max value from pico-sdk 62.5Mhz
         .clkdiv = .from_float(2.0),
         .pin_mappings = .{
@@ -93,6 +93,7 @@ pub fn init(config: CYW43_PIO_SPI_Config) !CYW43_PIO_SPI {
     return .{
         .pio = config.pio,
         .sm = sm,
+        .offset = offset,
         .cs_pin = config.cs_pin,
         .io_pin = config.io_pin,
         .clk_pin = config.clk_pin,
@@ -104,6 +105,7 @@ pub const CYW43_PIO_SPI = struct {
 
     pio: hal.pio.Pio,
     sm: hal.pio.StateMachine,
+    offset: u5,
     cs_pin: hal.gpio.Pin,
     io_pin: hal.gpio.Pin,
     clk_pin: hal.gpio.Pin,
@@ -131,7 +133,7 @@ pub const CYW43_PIO_SPI = struct {
         self.pio.sm_exec_set_y(self.sm, read_bits);
         self.pio.sm_exec_set_x(self.sm, write_bits);
         self.pio.sm_exec_set_pindir(self.sm, 0b1);
-        self.pio.sm_exec_jmp(self.sm, cyw43spi_program.wrap_target.?);
+        self.pio.sm_exec_jmp(self.sm, self.offset + cyw43spi_program.wrap_target.?);
 
         self.pio.sm_set_enabled(self.sm, true);
 
@@ -183,7 +185,7 @@ pub const CYW43_PIO_SPI = struct {
         self.pio.sm_exec_set_x(self.sm, write_bits);
         self.pio.sm_exec_set_y(self.sm, read_bits);
         self.pio.sm_exec_set_pindir(self.sm, 0b1);
-        self.pio.sm_exec_jmp(self.sm, cyw43spi_program.wrap_target.?);
+        self.pio.sm_exec_jmp(self.sm, self.offset + cyw43spi_program.wrap_target.?);
 
         self.pio.sm_set_enabled(self.sm, true);
 

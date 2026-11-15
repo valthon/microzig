@@ -43,5 +43,6 @@ pub fn num(n: u2) Pio {
 pub const Pio = chip_specific.Pio;
 
 test "pio" {
+    _ = common;
     std.testing.refAllDecls(assembler);
 }
