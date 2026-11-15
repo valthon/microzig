@@ -188,6 +188,9 @@ test "shared register layouts and claim transitions on both chips" {
     }
     try std.testing.expectEqual(Fdebug{ .rx_stall = true, .rx_under = false, .tx_over = true, .tx_stall = false }, fdebug(0x00040004, .sm2));
     try std.testing.expectEqual(DebugConfig{ .fifo_depth = 4, .sm_count = 4, .instruction_count = 32 }, debug_config(0x200404));
+    // Distinct field values, reserved bits and VERSION set: a swapped or
+    // misplaced field shows (50DS §11.7 DBG_CFGINFO: 21:16, 11:8, 5:0).
+    try std.testing.expectEqual(DebugConfig{ .fifo_depth = 8, .sm_count = 3, .instruction_count = 17 }, debug_config(0x1fd1_f3c8));
 }
 
 test "divider boundaries and fractional clocks" {
