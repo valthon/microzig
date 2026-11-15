@@ -42,13 +42,13 @@ pub const CPU_Options = struct {
     /// of the interrupt handlers which print the interrupt name.
     ///
     /// NOTE: This option is enabled in debug builds by default.
-    verbose_unhandled_irq: bool = (builtin.mode == .debug),
+    verbose_unhandled_irq: bool = (builtin.optimize == .debug),
 
     /// If true, the FPU will be enabled in the startup code.
     ///
     /// NOTE: This option is enabled by default if hard float is enabled.
     /// NOTE: Not supported on cortex_m0, cortex_m0plus and cortex_m3.
-    enable_fpu: bool = builtin.abi.float() == .hard,
+    enable_fpu: bool = builtin.target.abi.float() == .hard,
 };
 
 pub const interrupt = struct {
@@ -295,7 +295,7 @@ pub const atomic = struct {
     }
 
     /// Atomic load
-    pub fn load(comptime T: type, ptr: *const T, comptime ordering: std.builtin.AtomicOrder) T {
+    pub fn load(comptime T: type, ptr: *const T, comptime ordering: std.lang.AtomicOrder) T {
         if (has_native_atomics) {
             return @atomicLoad(T, ptr, ordering);
         } else {
@@ -307,7 +307,7 @@ pub const atomic = struct {
     }
 
     /// Atomic store
-    pub fn store(comptime T: type, ptr: *T, value: T, comptime ordering: std.builtin.AtomicOrder) void {
+    pub fn store(comptime T: type, ptr: *T, value: T, comptime ordering: std.lang.AtomicOrder) void {
         if (has_native_atomics) {
             @atomicStore(T, ptr, value, ordering);
         } else {
@@ -324,8 +324,8 @@ pub const atomic = struct {
         ptr: *T,
         expected_value: T,
         new_value: T,
-        comptime success_ordering: std.builtin.AtomicOrder,
-        comptime failure_ordering: std.builtin.AtomicOrder,
+        comptime success_ordering: std.lang.AtomicOrder,
+        comptime failure_ordering: std.lang.AtomicOrder,
     ) ?T {
         if (has_native_atomics) {
             return @cmpxchgWeak(T, ptr, expected_value, new_value, success_ordering, failure_ordering);
@@ -346,9 +346,9 @@ pub const atomic = struct {
     pub fn rmw(
         comptime T: type,
         ptr: *T,
-        comptime op: std.builtin.AtomicRmwOp,
+        comptime op: std.lang.AtomicRmwOp,
         operand: T,
-        comptime ordering: std.builtin.AtomicOrder,
+        comptime ordering: std.lang.AtomicOrder,
     ) T {
         if (has_native_atomics) {
             return @atomicRmw(T, ptr, op, operand, ordering);
@@ -544,7 +544,7 @@ pub const startup_logic = struct {
     }
 
     fn default_exception_handler(comptime name: []const u8) microzig.interrupt.Handler {
-        return switch (builtin.mode) {
+        return switch (builtin.optimize) {
             .debug => .{ .c = DebugExceptionHandler(name).handle },
             else => .{ .c = ReleaseExceptionHandler.handle },
         };

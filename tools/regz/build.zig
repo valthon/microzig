@@ -9,7 +9,7 @@ pub fn build(b: *Build) !void {
 
     const libxml2_dep = b.dependency("libxml2", .{
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .iconv = false,
     });
 

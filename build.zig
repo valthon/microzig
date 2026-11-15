@@ -161,7 +161,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
             var field_names: [count][]const u8 = undefined;
             var field_types: [count]type = undefined;
-            var field_attrs: [count]std.builtin.Type.Struct.FieldAttributes = undefined;
+            var field_attrs: [count]std.lang.Type.Struct.FieldAttributes = undefined;
 
             if (count > 0) {
                 var i: usize = 0;
@@ -203,7 +203,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
             if (InitReturnType == noreturn) {
                 inline for (port_list) |port| {
                     if (@field(port_select, port.name)) {
-                        _ = dep.builder.lazyDependency(port.dep_name, .{});
+                        _ = dep.builder.dependencyLazy(port.dep_name, .{}) catch null;
                     }
                 }
                 return null;
@@ -212,7 +212,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
             var ports: SelectedPorts = undefined;
             inline for (port_list) |port| {
                 if (@field(port_select, port.name)) {
-                    const port_dep = dep.builder.lazyDependency(port.dep_name, .{}) orelse return null;
+                    const port_dep = dep.builder.dependencyLazy(port.dep_name, .{}) catch return null;
                     @field(ports, port.name) = custom_lazy_import(port.dep_name).?.init(port_dep) orelse return null;
                 }
             }
@@ -236,9 +236,9 @@ pub fn MicroBuild(port_select: PortSelect) type {
             /// The MicroZig target that the firmware is built for. Either a board or a chip.
             target: *const Target,
 
-            /// The optimization level that should be used. Usually `ReleaseSmall` or `Debug` is a good choice.
+            /// The optimization level that should be used. Usually `.small` or `.debug` is a good choice.
             /// Also using `std.Build.standardOptimizeOption` is a good idea.
-            optimize: std.builtin.OptimizeMode,
+            optimize: std.lang.Optimize,
 
             /// The root source file for the application. This is your `src/main.zig` file.
             root_source_file: LazyPath,
@@ -286,7 +286,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
             strip_unused_symbols: bool = true,
 
             /// Unwind tables option for the firmware executable.
-            unwind_tables: ?std.builtin.UnwindTables = null,
+            unwind_tables: ?std.lang.UnwindTables = null,
 
             /// Error tracing option for the firmware executable.
             error_tracing: ?bool = null,
@@ -369,7 +369,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
             cpu_mod.addImport("microzig", core_mod);
             core_mod.addImport("cpu", cpu_mod);
 
-            const regz_exe = b.dependency("tools/regz", .{ .optimize = .ReleaseSafe }).artifact("regz");
+            const regz_exe = b.dependency("tools/regz", .{ .optimize = .safe }).artifact("regz");
             const chip_source = switch (target.chip.register_definition) {
                 .atdf, .svd => |file| blk: {
                     const regz_run = b.addRunArtifact(regz_exe);
@@ -378,14 +378,14 @@ pub fn MicroBuild(port_select: PortSelect) type {
                     regz_run.addArg(@tagName(target.chip.register_definition));
 
                     regz_run.addArg("--output_path"); // Write to a file
-                    const chips_dir = regz_run.addOutputDirectoryArg("chips");
+                    const chips_dir = regz_run.addOutputDirectoryArg2("chips", .{});
 
                     for (target.chip.patch_files) |patch_file| {
                         regz_run.addArg("--patch_path");
-                        regz_run.addFileArg(patch_file);
+                        regz_run.addFileArg2(patch_file, .{});
                     }
 
-                    regz_run.addFileArg(file);
+                    regz_run.addFileArg2(file, .{});
                     break :blk chips_dir.path(b, b.fmt("{s}.zig", .{target.chip.name}));
                 },
                 .embassy => |embassy| blk: {
@@ -395,11 +395,11 @@ pub fn MicroBuild(port_select: PortSelect) type {
                     regz_run.addArg(@tagName(target.chip.register_definition));
 
                     regz_run.addArg("--output_path"); // Write to a file
-                    const chips_dir = regz_run.addOutputDirectoryArg("chips");
+                    const chips_dir = regz_run.addOutputDirectoryArg2("chips", .{});
 
                     for (target.chip.patch_files) |patch_file| {
                         regz_run.addArg("--patch_path");
-                        regz_run.addFileArg(patch_file);
+                        regz_run.addFileArg2(patch_file, .{});
                     }
 
                     if (embassy.device) |device| {
@@ -407,7 +407,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
                         regz_run.addArg(device);
                     }
 
-                    regz_run.addDirectoryArg(embassy.path);
+                    regz_run.addDirectoryArg2(embassy.path, .{});
                     break :blk chips_dir.path(b, b.fmt("{s}.zig", .{target.chip.name}));
                 },
                 .targetdb => |targetdb| blk: {
@@ -417,17 +417,17 @@ pub fn MicroBuild(port_select: PortSelect) type {
                     regz_run.addArg(@tagName(target.chip.register_definition));
 
                     regz_run.addArg("--output_path"); // Write to a file
-                    const chips_dir = regz_run.addOutputDirectoryArg("chips");
+                    const chips_dir = regz_run.addOutputDirectoryArg2("chips", .{});
 
                     for (target.chip.patch_files) |patch_file| {
                         regz_run.addArg("--patch_path");
-                        regz_run.addFileArg(patch_file);
+                        regz_run.addFileArg2(patch_file, .{});
                     }
 
                     regz_run.addArg("--device");
                     regz_run.addArg(targetdb.device);
 
-                    regz_run.addDirectoryArg(targetdb.path);
+                    regz_run.addDirectoryArg2(targetdb.path, .{});
                     break :blk chips_dir.path(b, b.fmt("{s}.zig", .{target.chip.name}));
                 },
                 .zig => |src| src,
@@ -519,9 +519,9 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
                 const generate_linker_script_run = b.addRunArtifact(generate_linker_script_exe);
                 generate_linker_script_run.addArg(args_str);
-                const output = generate_linker_script_run.addOutputFileArg("linker.ld");
+                const output = generate_linker_script_run.addOutputFileArg2("linker.ld", .{});
                 if (linker_script_options.file) |file| {
-                    generate_linker_script_run.addFileArg(file);
+                    generate_linker_script_run.addFileArg2(file, .{});
                 }
                 break :blk output;
             };
@@ -634,7 +634,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
                         .uf2 => |options| @import("tools/uf2").from_elf(
                             fw.mb.dep.builder.dependency("tools/uf2", .{
-                                .optimize = .ReleaseSafe,
+                                .optimize = .safe,
                             }),
                             elf_file,
                             options,
@@ -642,7 +642,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
                         .dfu => |options| @import("tools/dfu").from_elf(
                             fw.mb.dep.builder.dependency("tools/dfu", .{
-                                .optimize = .ReleaseSafe,
+                                .optimize = .safe,
                             }),
                             elf_file,
                             options,
@@ -650,7 +650,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
 
                         .esp => |options| @import("tools/esp-image").from_elf(
                             fw.mb.dep.builder.dependency("tools/esp-image", .{
-                                .optimize = .ReleaseSafe,
+                                .optimize = .safe,
                             }),
                             elf_file,
                             options,
@@ -759,7 +759,7 @@ pub fn MicroBuild(port_select: PortSelect) type {
                         },
                     }) catch @panic("OOM"),
                 };
-            } else if (target.cpu.arch.isRISCV() and target.ptrBitWidth() == 32) {
+            } else if (target.cpu.arch.isRiscv() and target.ptrBitWidth() == 32) {
                 return .{
                     .name = "riscv32",
                     .root_source_file = mb.core_dep.namedLazyPath("cpu_riscv32"),
