@@ -79,9 +79,19 @@ pub fn main(init: std.process.Init) !void {
     defer elf_file.close(io);
     var elf_reader = elf_file.reader(io, &elf_reader_buf);
 
-    try archive.add_elf(&elf_reader, .{
+    archive.add_elf(&elf_reader, .{
         .family_id = family_id,
-    });
+    }) catch |err| switch (err) {
+        error.ElfHeadersInSegment => {
+            std.log.err("{s}: a LOAD segment holds the ELF file's own headers, which would be written" ++
+                " to the target as if they were firmware. The linker puts them below the first" ++
+                " section when its page has room for them: link with a maximum page size of 1" ++
+                " (-z max-page-size=1) or with --nmagic.", .{elf_path});
+            // The message says it all: returning the error would report it a second time.
+            std.process.exit(1);
+        },
+        else => return err,
+    };
 
     const dest_file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
     defer dest_file.close(io);
