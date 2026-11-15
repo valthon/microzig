@@ -491,6 +491,15 @@ pub fn MicroBuild(port_select: PortSelect) type {
             fw.exe.link_data_sections = options.strip_unused_symbols;
             fw.exe.entry = options.entry orelse target.entry orelse .default;
 
+            // Firmware is not paged. With the linker's page size (64 KiB on Arm), a first
+            // section that does not start on a page boundary leaves room below it in its
+            // page, and the linker puts the ELF file's own headers there, in a LOAD segment
+            // of their own: for a flash region at 0x26000 that is a segment at 0x20000. The
+            // tools that go by segments (UF2, Intel HEX) then write the headers to that
+            // address, which is below the region and may hold a bootloader or a SoftDevice.
+            // With a page size of 1 there is never such room.
+            fw.exe.link_z_max_page_size = 1;
+
             const linker_script_options = options.linker_script orelse target.linker_script;
             const linker_script = blk: {
                 const GenerateLinkerScriptArgs = @import("tools/generate_linker_script.zig").Args;

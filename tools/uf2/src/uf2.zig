@@ -83,9 +83,14 @@ pub const Archive = struct {
 
     /// Adds an elf to the archive. Returns error if the family id (if
     /// specified) is already present in the archive.
+    ///
+    /// Returns `error.ElfHeadersInSegment` for a LOAD segment that takes in the ELF header
+    /// or the program header table. A linker makes such a segment when the page of the
+    /// first section has room for the headers below it, at an address the image does not
+    /// own: for firmware that starts at 0x26000, with 64 KiB pages, at 0x20000.
     pub fn add_elf(self: *Archive, reader: *std.Io.File.Reader, opts: ELF_Options) !void {
         if (opts.family_id) |family_id|
-            if (try self.families.fetchPut(self.allocator, family_id, {}) != null)
+            if (self.families.contains(family_id))
                 return error.FamilyIdCollision;
 
         const Segment = struct {
@@ -106,6 +111,8 @@ pub const Archive = struct {
         while (try it.next()) |prog_hdr|
             if (prog_hdr.type == std.elf.PT.LOAD and prog_hdr.memsz > 0 and prog_hdr.filesz > 0) {
                 std.log.debug("segment: {}", .{prog_hdr});
+                if (holds_elf_headers(&header, prog_hdr.offset, prog_hdr.filesz))
+                    return error.ElfHeadersInSegment;
                 try segments.append(self.allocator, .{
                     .addr = @as(u32, @intCast(prog_hdr.paddr)),
                     .file_offset = @as(u32, @intCast(prog_hdr.offset)),
@@ -115,6 +122,10 @@ pub const Archive = struct {
 
         if (segments.items.len == 0)
             return error.NoSegments;
+
+        // Only now, so that an ELF file that was refused leaves its family id free.
+        if (opts.family_id) |family_id|
+            try self.families.put(self.allocator, family_id, {});
 
         std.sort.insertion(Segment, segments.items, {}, Segment.less_than);
         // TODO: check for overlaps, assert no zero sized segments
@@ -161,6 +172,15 @@ pub const Archive = struct {
 
         if (opts.bundle_source)
             @panic("TODO: bundle source in UF2 file");
+    }
+
+    /// Whether `filesz` bytes of the file at `offset` take in any of the ELF header or of
+    /// the program header table.
+    fn holds_elf_headers(header: *const std.elf.Header, offset: u64, filesz: u64) bool {
+        const ehsize: u64 = if (header.is_64) @sizeOf(std.elf.Elf64.Ehdr) else @sizeOf(std.elf.Elf32.Ehdr);
+        const phsize = @as(u64, header.phentsize) * header.phnum;
+        const end = offset + filesz;
+        return offset < ehsize or (offset < header.phoff + phsize and header.phoff < end);
     }
 
     pub fn add_file(self: *Archive, path: []const u8) !void {
@@ -575,4 +595,92 @@ test "File tracking - long path" {
     // Verify path spans multiple blocks
     const file_blocks = archive.get_file_blocks(0).?;
     try std.testing.expect(file_blocks.end > file_blocks.start);
+}
+
+/// A 32-bit little-endian ELF file of 0x100 bytes whose program header table, right after
+/// the ELF header, has `segments` as LOAD segments. Byte n of the file past the headers is n.
+fn test_elf(comptime segments: []const struct { offset: u32, paddr: u32, size: u32 }) [0x100]u8 {
+    var elf: [0x100]u8 = undefined;
+    for (&elf, 0..) |*byte, n| byte.* = @intCast(n);
+    const ehsize = @sizeOf(std.elf.Elf32.Ehdr);
+    const phentsize = @sizeOf(std.elf.Elf32.Phdr);
+    @memset(elf[0 .. ehsize + segments.len * phentsize], 0);
+    @memcpy(elf[0..7], "\x7fELF\x01\x01\x01"); // magic, 32-bit, little-endian, version 1
+    std.mem.writeInt(u16, elf[0x10..0x12], 2, .little); // e_type: executable
+    std.mem.writeInt(u16, elf[0x12..0x14], 40, .little); // e_machine: Arm
+    std.mem.writeInt(u32, elf[0x14..0x18], 1, .little); // e_version
+    std.mem.writeInt(u32, elf[0x1c..0x20], ehsize, .little); // e_phoff
+    std.mem.writeInt(u16, elf[0x28..0x2a], ehsize, .little); // e_ehsize
+    std.mem.writeInt(u16, elf[0x2a..0x2c], phentsize, .little); // e_phentsize
+    std.mem.writeInt(u16, elf[0x2c..0x2e], segments.len, .little); // e_phnum
+    for (segments, 0..) |segment, i| {
+        const phdr = elf[ehsize + i * phentsize ..][0..phentsize];
+        std.mem.writeInt(u32, phdr[0x00..0x04], 1, .little); // p_type: LOAD
+        std.mem.writeInt(u32, phdr[0x04..0x08], segment.offset, .little); // p_offset
+        std.mem.writeInt(u32, phdr[0x08..0x0c], segment.paddr, .little); // p_vaddr
+        std.mem.writeInt(u32, phdr[0x0c..0x10], segment.paddr, .little); // p_paddr
+        std.mem.writeInt(u32, phdr[0x10..0x14], segment.size, .little); // p_filesz
+        std.mem.writeInt(u32, phdr[0x14..0x18], segment.size, .little); // p_memsz
+        std.mem.writeInt(u32, phdr[0x18..0x1c], 4, .little); // p_flags: R
+        std.mem.writeInt(u32, phdr[0x1c..0x20], 4, .little); // p_align
+    }
+    return elf;
+}
+
+fn add_test_elf(archive: *Archive, name: []const u8, elf: []const u8) !void {
+    const io = std.testing.io;
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, name, .{});
+        defer file.close(io);
+        var writer_buf: [512]u8 = undefined;
+        var writer = file.writer(io, &writer_buf);
+        try writer.interface.writeAll(elf);
+        try writer.flush();
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, name) catch {};
+
+    const file = try std.Io.Dir.cwd().openFile(io, name, .{});
+    defer file.close(io);
+    var reader_buf: [1024]u8 = undefined;
+    var reader = file.reader(io, &reader_buf);
+    try archive.add_elf(&reader, .{ .family_id = .NRF52840 });
+}
+
+test "add_elf - a segment of firmware" {
+    var archive = Archive.init(std.testing.allocator, std.testing.io);
+    defer archive.deinit();
+
+    const elf = comptime test_elf(&.{.{ .offset = 0x80, .paddr = 0x26000, .size = 0x10 }});
+    try add_test_elf(&archive, "test_firmware.elf", &elf);
+
+    try std.testing.expectEqual(1, archive.blocks.items.len);
+    try std.testing.expectEqual(0x26000, archive.blocks.items[0].target_addr);
+    try std.testing.expectEqualSlices(u8, elf[0x80..0x90], archive.blocks.items[0].data[0..0x10]);
+}
+
+// What a linker with 64 KiB pages makes of firmware that starts at 0x26000: the ELF header
+// and the program header table in a segment at the start of the page, 0x20000.
+test "add_elf - a segment with the ELF file's headers" {
+    var archive = Archive.init(std.testing.allocator, std.testing.io);
+    defer archive.deinit();
+
+    const elf = comptime test_elf(&.{
+        .{ .offset = 0, .paddr = 0x20000, .size = 0x74 },
+        .{ .offset = 0x80, .paddr = 0x26000, .size = 0x10 },
+    });
+    try std.testing.expectError(error.ElfHeadersInSegment, add_test_elf(&archive, "test_headers.elf", &elf));
+    try std.testing.expectEqual(0, archive.blocks.items.len);
+
+    // The family id is still free: the same archive takes the firmware linked without pages.
+    const relinked = comptime test_elf(&.{.{ .offset = 0x80, .paddr = 0x26000, .size = 0x10 }});
+    try add_test_elf(&archive, "test_relinked.elf", &relinked);
+    try std.testing.expectEqual(1, archive.blocks.items.len);
+}
+
+test "add_elf - a segment that starts inside the program header table" {
+    var archive = Archive.init(std.testing.allocator, std.testing.io);
+    defer archive.deinit();
+
+    const elf = comptime test_elf(&.{.{ .offset = 0x40, .paddr = 0x26000, .size = 0x50 }});
+    try std.testing.expectError(error.ElfHeadersInSegment, add_test_elf(&archive, "test_phdrs.elf", &elf));
 }

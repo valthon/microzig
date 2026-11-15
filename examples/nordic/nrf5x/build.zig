@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     const pca10040 = mb.ports.nrf5x.boards.nordic.pca10040;
     const microbit_v1 = mb.ports.nrf5x.boards.bbc.microbit_v1;
     const microbit_v2 = mb.ports.nrf5x.boards.bbc.microbit_v2;
+    const nice_nano = mb.ports.nrf5x.boards.nicekeyboards.nice_nano;
 
     const available_examples = [_]Example{
         .{ .target = nrf52840_dongle, .name = "nrf52840_dongle_blinky", .file = "src/blinky.zig" },
@@ -42,6 +43,9 @@ pub fn build(b: *std.Build) void {
 
         .{ .target = microbit_v1, .name = "microbit_v1_display", .file = "src/microbit/display.zig" },
         .{ .target = microbit_v2, .name = "microbit_v2_display", .file = "src/microbit/display.zig" },
+
+        // A UF2 image for a flash region that starts behind a SoftDevice, at 0x26000.
+        .{ .target = nice_nano, .name = "nice_nano_uart", .file = "src/uart.zig" },
     };
 
     for (available_examples) |example| {
