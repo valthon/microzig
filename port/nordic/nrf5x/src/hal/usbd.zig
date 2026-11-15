@@ -38,6 +38,18 @@ const NUM_EP = 8;
 /// application has started the RTC.
 const EASYDMA_WAIT_TURNS: u32 = 1 << 20;
 
+/// How many times `leave_low_power` reads EVENTCAUSE for USBWUALLOWED before it goes on
+/// without it. Like `EASYDMA_WAIT_TURNS` a bound, not a timing figure: the product
+/// specification says that the bit is set "upon writing the ForceNormal in register
+/// LOWPOWER" (nRF52840 PS v1.1, 6.35.7.3) and gives no duration. `poll` never waits this
+/// out: it does not call `leave_low_power`.
+const WAKE_WAIT_TURNS: u32 = 1 << 20;
+
+// EVENTCAUSE (nRF52840 PS v1.1, 6.35.13.25); every bit is cleared by writing 1 to it.
+const CAUSE_SUSPEND: u32 = 1 << 8;
+const CAUSE_RESUME: u32 = 1 << 9;
+const CAUSE_USBWUALLOWED: u32 = 1 << 10;
+
 const PowerState = union(enum) {
     detached,
     enabling,
@@ -60,6 +72,10 @@ pub const USBD = struct {
     control: ep0.Control = .{},
     /// A packet was handed to data IN endpoint n and the host has not taken it yet.
     in_busy: [NUM_EP]bool = @splat(false),
+    /// The bus is suspended and the peripheral has been put in its low power mode (see
+    /// `enter_low_power`). Tasks and the registers of 6.35.12 are then out of reach. `poll`
+    /// clears it when it sees the host on the bus again.
+    low_power: bool = false,
 
     interface: usb.DeviceInterface,
 
@@ -145,6 +161,44 @@ pub const USBD = struct {
                 }
             },
             .connected => {
+                // In low power mode nothing below may be done: the SETUP registers, tasks
+                // and the endpoint registers cannot be accessed "when USBD is in low power
+                // mode while the USB bus is suspended" (nRF52840 PS v1.1, 6.35.12). The
+                // events and EVENTCAUSE are not on that list, and they say when the host
+                // is back.
+                //
+                // Nothing is written to bring the peripheral back then, and nothing is
+                // waited for, because nrfx v3.9.0 does neither (drivers/src/nrfx_usbd.c).
+                // Its handlers for RESUME and for a bus reset only note that the bus is no
+                // longer suspended (`ev_usbevent_handler`, lines 1253-1261, and
+                // `ev_usbreset_handler`, 885-895), and its handler for a SETUP packet reads
+                // the SETUP registers as at any other time (`ev_setup_handler`,
+                // 1200-1208). It writes ForceNormal in two places only: for a remote
+                // wake-up (`nrfx_usbd_wakeup_req`, 1921), and when the host resumed while
+                // LowPower was being written (`nrfx_usbd_suspend`, 1899-1902; see
+                // `enter_low_power`). That the peripheral is back in normal mode by itself
+                // once the host is on the bus is concluded from that code, and from the
+                // words "while the USB bus is suspended" above. It has not been observed on
+                // a board, and two sentences read the other way. The product specification
+                // says of the value ForceNormal of LOWPOWER: "Software must write this value
+                // to exit low power mode and before performing a remote wake-up"
+                // (6.35.13.50). nrfx's header says of the write that the event "will be
+                // generated and then the USBD registers can be accessed" (hal/nrf_usbd.h,
+                // lines 1023-1025, on `nrf_usbd_lowpower_disable`).
+                //
+                // USBEVENT is cleared here because the return below comes before the place
+                // where it is cleared otherwise. A driver's write during the suspend leaves
+                // it set (the ForceNormal of `leave_low_power` raises it), and an
+                // application that runs `poll` from the USBD interrupt would be back in the
+                // interrupt at once, for as long as the bus is suspended. It is cleared
+                // before the bus is looked at, so that a RESUME that comes after the look
+                // raises it again.
+                if (self.low_power) {
+                    peripherals.USBD.EVENTS_USBEVENT.write_raw(0);
+                    if (!bus_active()) return;
+                    self.low_power = false;
+                }
+
                 // Bus reset
                 if (peripherals.USBD.EVENTS_USBRESET.raw != 0) {
                     peripherals.USBD.EVENTS_USBRESET.write_raw(0);
@@ -247,16 +301,31 @@ pub const USBD = struct {
                     }
                 }
 
-                // TODO: Implement `Suspend`
-                if (peripherals.USBD.EVENTCAUSE.read().SUSPEND == .Detected) {
-                    peripherals.USBD.EVENTCAUSE.write(.{ .SUSPEND = .Detected });
+                // Suspend and resume
+                const cause = peripherals.USBD.EVENTCAUSE.raw &
+                    (CAUSE_SUSPEND | CAUSE_RESUME | CAUSE_USBWUALLOWED);
+                if (cause != 0) {
+                    peripherals.USBD.EVENTCAUSE.write_raw(cause); // W1C
                     peripherals.USBD.EVENTS_USBEVENT.write_raw(0);
-                }
-
-                // TODO: Implement `Resume`
-                if (peripherals.USBD.EVENTCAUSE.read().RESUME == .Detected) {
-                    peripherals.USBD.EVENTCAUSE.write(.{ .RESUME = .Detected });
-                    peripherals.USBD.EVENTS_USBEVENT.write_raw(0);
+                    // USBWUALLOWED answers a ForceNormal (6.35.7.3). Nothing here waits for
+                    // it, so it is only cleared: nrfx's handler acts on it for a remote
+                    // wake-up alone (`ev_usbevent_handler`, 1262-1278), which this HAL
+                    // does not request.
+                    //
+                    // With both bits set the bus went idle and came back between two calls
+                    // of `poll`, or the other way round, which cannot be told apart. The
+                    // peripheral is put in normal mode: it then answers the host in either
+                    // case, at the price of the suspend current in the second.
+                    //
+                    // Put there, by a write: in the second case it may have been in low
+                    // power mode until this call, which saw the RESUME, took the host
+                    // to be back and wrote nothing. Left like that, with the bus suspended
+                    // and `low_power` false, a driver's write would trigger a task the
+                    // peripheral cannot take. Nothing is waited for, so a write that
+                    // follows at once may still be too early for it.
+                    if (cause & CAUSE_SUSPEND != 0) {
+                        if (cause & CAUSE_RESUME == 0) self.enter_low_power() else force_normal();
+                    }
                 }
 
                 // TODO: ISO endpoints
@@ -271,6 +340,18 @@ pub const USBD = struct {
         // But in this case it won't happen because
         // we busywait for ENDEP* with interrupts disabled
 
+        if (self.low_power) {
+            // USBPULLUP cannot be accessed in low power mode either (6.35.12), so it is
+            // left alone and disabling the peripheral has to take the pull-up off the bus.
+            // LOWPOWER is written back to its reset value: the specification does not say
+            // that ENABLE resets it, and a peripheral that came up in low power mode at
+            // the next connection would be out of reach.
+            peripherals.USBD.LOWPOWER.write_raw(0);
+            self.low_power = false;
+            peripherals.USBD.ENABLE.write_raw(0);
+            return;
+        }
+
         // USBPULLUP cannot be accessed before READY (nRF52840 PS v1.1, 6.35.12), and until
         // then nothing has turned the pull-up on: `poll` writes 0 at READY and 1 when the
         // regulator is ready.
@@ -279,6 +360,105 @@ pub const USBD = struct {
             .waiting_pwrrdy, .connected => peripherals.USBD.USBPULLUP.write_raw(0),
         }
         peripherals.USBD.ENABLE.write_raw(0);
+    }
+
+    /// The host is on the bus again, or was while the peripheral went to low power mode:
+    /// "If the host resumes bus activity with or without a RESUME condition (in other
+    /// words: bus activity is defined as any non-J state), the USBD peripheral will generate
+    /// a USBEVENT event, with RESUME bit set in register EVENTCAUSE" (nRF52840 PS v1.1,
+    /// 6.35.7.2). A bus reset or a SETUP packet that shows without the bit is taken for
+    /// the same.
+    ///
+    /// Anomaly 211, "Device remains in SUSPEND too long when host resumes a bus activity
+    /// (sending SOF packets) without a RESUME condition" (the title in nrfx_usbd.c, lines
+    /// 89-90), is not worked around. nrfx v3.9.0 lists it for the nRF52820, for the
+    /// nRF52833 and for every nRF52840 but the one whose variant word (0x10000134) reads 0
+    /// (`nrf52_errata_211` in mdk/nrf52_erratas.h), so also for current silicon, and has
+    /// its workaround off by default (`NRFX_USBD_USE_WORKAROUND_FOR_ANOMALY_211`, line 91).
+    /// That workaround keeps the register write of anomaly 187 in place for as long as the
+    /// peripheral is enabled (`nrfx_usbd_enable`, 1740-1783) instead of ending it at READY,
+    /// as `errata.post_enable` does here. A host that resumes in that way may thus find the
+    /// device late.
+    fn bus_active() bool {
+        return peripherals.USBD.EVENTCAUSE.raw & CAUSE_RESUME != 0 or
+            peripherals.USBD.EVENTS_USBRESET.raw != 0 or
+            peripherals.USBD.EVENTS_EP0SETUP.raw != 0;
+    }
+
+    /// The bus is suspended: "In order to reduce idle current of USBD, the software must
+    /// explicitly place the USBD in low power mode through writing LowPower to register
+    /// LOWPOWER" (nRF52840 PS v1.1, 6.35.7.1), "after DMA and software have finished
+    /// interacting with the USB peripheral" (6.35.13.50). No EasyDMA transfer is running
+    /// where this is called: each one is waited for where it is started.
+    ///
+    /// The checks for a host that resumed in the meantime, before and after the write, are
+    /// those of nrfx's `nrfx_usbd_suspend` (v3.9.0, nrfx_usbd.c lines 1889-1912), and so is
+    /// what follows the second: ForceNormal is written back, and nothing is waited for.
+    /// The high frequency crystal oscillator is left running; an application that stops it
+    /// for the suspend has to start it again before the host resumes.
+    fn enter_low_power(self: *Self) void {
+        if (peripherals.USBD.EVENTCAUSE.raw & CAUSE_RESUME != 0) return;
+        peripherals.USBD.LOWPOWER.write_raw(1);
+        _ = peripherals.USBD.LOWPOWER.raw; // read back, as nrfx's `nrf_usbd_lowpower_enable`
+        if (peripherals.USBD.EVENTCAUSE.raw & CAUSE_RESUME != 0) {
+            force_normal();
+            return;
+        }
+        self.low_power = true;
+    }
+
+    /// Writes ForceNormal to LOWPOWER and waits for nothing, which is what nrfx does when
+    /// the host resumed while it wrote LowPower (`nrfx_usbd_suspend`, v3.9.0, nrfx_usbd.c
+    /// lines 1899-1902). The USBWUALLOWED that answers the write is cleared by the next
+    /// `poll`.
+    fn force_normal() void {
+        peripherals.USBD.LOWPOWER.write_raw(0);
+        _ = peripherals.USBD.LOWPOWER.raw; // read back, as nrfx's `nrf_usbd_lowpower_disable`
+    }
+
+    /// Brings the peripheral back to normal mode while the bus is still suspended, for an
+    /// EasyDMA transfer of the software's own (see `easydma_out` and `ep_writev`), and waits
+    /// until it can be used: "Upon writing the ForceNormal in register LOWPOWER, a USBEVENT
+    /// event is generated with the USBWUALLOWED bit set in register EVENTCAUSE" (nRF52840
+    /// PS v1.1, 6.35.7.3), described as "USB MAC has been woken up and operational"
+    /// (6.35.13.25). nrfx's header says of the same write that the event "will be generated
+    /// and then the USBD registers can be accessed" (hal/nrf_usbd.h,
+    /// `nrf_usbd_lowpower_disable`).
+    ///
+    /// The bus is not driven: this is never a remote wake-up request. Nor is it what
+    /// happens when the host resumes, which takes no write and no wait (see `poll`).
+    ///
+    /// The wait has no model in nrfx v3.9.0, where nothing looks at the mode before a
+    /// transfer is started, and it is a busy one because the transfer's caller is waiting
+    /// for the packet. `poll` does not get here: it runs the controller and the drivers
+    /// only after it has seen the host on the bus and cleared `low_power`, so the caller is
+    /// the application, writing or reading during a suspend.
+    ///
+    /// Around the wake-up goes the workaround for anomaly 171 of the nRF52840, "USB might
+    /// not power up", which is said to apply to leaving low power mode as it does to
+    /// ENABLE. nrfx v3.9.0 applies its first half in `nrfx_usbd_wakeup_req` and never the
+    /// second there; the second half at USBWUALLOWED follows Nordic's online errata, which
+    /// was not checked against the PDF. It is undone when the wait is given up, too, so
+    /// that it does not outlast this function.
+    fn leave_low_power(self: *Self) void {
+        self.low_power = false;
+        errata.pre_wakeup();
+        // A bit left by an earlier ForceNormal must not end this wait.
+        peripherals.USBD.EVENTCAUSE.write_raw(CAUSE_USBWUALLOWED); // W1C
+        peripherals.USBD.LOWPOWER.write_raw(0);
+        _ = peripherals.USBD.LOWPOWER.raw; // read back, as nrfx's `nrf_usbd_lowpower_disable`
+        var turns: u32 = 0;
+        while (turns < WAKE_WAIT_TURNS) : (turns += 1) {
+            if (peripherals.USBD.EVENTCAUSE.raw & CAUSE_USBWUALLOWED != 0) {
+                peripherals.USBD.EVENTCAUSE.write_raw(CAUSE_USBWUALLOWED); // W1C
+                break;
+            }
+        } else {
+            // Gone on without it: the transfer that follows may reach a peripheral that
+            // is not ready, and then does not end (see `wait_easydma`).
+            log.warn("USBWUALLOWED did not come after leaving low power mode", .{});
+        }
+        errata.post_wakeup();
     }
 
     fn reset(self: *Self) void {
@@ -384,7 +564,19 @@ pub const USBD = struct {
 
     /// Copies the packet that OUT endpoint `i` holds into `bufs_out[i]` and returns its
     /// length, or null if EasyDMA did not finish.
+    ///
+    /// A driver may come for a packet after the bus was suspended. The peripheral is then
+    /// woken for the copy, without a word to the host, and put back afterwards.
     fn easydma_out(self: *Self, i: u4) ?u32 {
+        const was_enabled = cpu.interrupt.is_enabled(.USBD);
+        defer if (was_enabled) cpu.interrupt.enable(.USBD);
+        usbd_interrupt_off();
+
+        // Neither SIZE.EPOUT[n] nor the task can be reached in low power mode (6.35.12).
+        const was_low_power = self.low_power;
+        if (was_low_power) self.leave_low_power();
+        defer if (was_low_power) self.enter_low_power();
+
         const scratch_buf = &self.bufs_out[i];
         // SIZE.EPOUT[n] is a 7-bit field and can read up to 127; the buffer EasyDMA copies
         // into holds one 64-byte packet.
@@ -394,10 +586,6 @@ pub const USBD = struct {
         peripherals.USBD.EPOUT[i].PTR.write_raw(@intFromPtr(scratch_buf));
         peripherals.USBD.EPOUT[i].MAXCNT.write_raw(size);
 
-        // Start DMA
-        const was_enabled = cpu.interrupt.is_enabled(.USBD);
-        defer if (was_enabled) cpu.interrupt.enable(.USBD);
-        usbd_interrupt_off();
         // An end event left by a transfer that was given up on must not end this wait.
         peripherals.USBD.EVENTS_ENDEPOUT[i].write_raw(0);
         return if (run_easydma(.out, i)) size else null;
@@ -458,6 +646,14 @@ pub const USBD = struct {
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled) cpu.interrupt.enable(.USBD);
         usbd_interrupt_off();
+        // A driver may write while the bus is suspended. The task that starts the copy
+        // cannot be triggered in low power mode (6.35.12), so the peripheral is woken for
+        // it, without a word to the host, and put back afterwards; the host finds the
+        // packet when it resumes. Refusing the packet instead would break what drivers
+        // rely on, that an idle endpoint takes a packet whole.
+        const was_low_power = self.low_power;
+        if (was_low_power) self.leave_low_power();
+        defer if (was_low_power) self.enter_low_power();
         // An end event left by a transfer that was given up on must not end this wait.
         peripherals.USBD.EVENTS_ENDEPIN[i].write_raw(0);
         // Nor may a completion from before be taken for this packet's. The endpoint is not
