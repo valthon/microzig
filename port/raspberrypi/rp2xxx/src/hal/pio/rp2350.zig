@@ -22,6 +22,42 @@ pub const Pio = enum(u2) {
         };
     }
 
+    pub const add_program_at_offset = PioImpl.add_program_at_offset;
+    pub const remove_program = PioImpl.remove_program;
+    pub const clear_instruction_memory = PioImpl.clear_instruction_memory;
+    pub const claim_state_machine = PioImpl.claim_state_machine;
+    pub const claim_sm_mask = PioImpl.claim_sm_mask;
+    pub const unclaim = PioImpl.unclaim;
+    pub const is_claimed = PioImpl.is_claimed;
+    pub const set_input_sync_bypass_mask = PioImpl.set_input_sync_bypass_mask;
+    pub const irq_flags = PioImpl.irq_flags;
+    pub const clear_irq_flags = PioImpl.clear_irq_flags;
+    pub const force_irq_flags = PioImpl.force_irq_flags;
+    pub const set_interrupt_enabled = PioImpl.set_interrupt_enabled;
+    pub const set_interrupt_forced = PioImpl.set_interrupt_forced;
+    pub const interrupt_status = PioImpl.interrupt_status;
+    pub const irq_number = PioImpl.irq_number;
+    pub const sm_dreq = PioImpl.sm_dreq;
+    pub const set_sm_mask_enabled = PioImpl.set_sm_mask_enabled;
+    pub const restart_sm_mask = PioImpl.restart_sm_mask;
+    pub const clkdiv_restart_sm_mask = PioImpl.clkdiv_restart_sm_mask;
+    pub const enable_sm_mask_in_sync = PioImpl.enable_sm_mask_in_sync;
+    pub const sm_get_pc = PioImpl.sm_get_pc;
+    pub const sm_is_exec_stalled = PioImpl.sm_is_exec_stalled;
+    pub const sm_exec_wait_blocking = PioImpl.sm_exec_wait_blocking;
+    pub const sm_is_rx_fifo_full = PioImpl.sm_is_rx_fifo_full;
+    pub const sm_is_tx_fifo_empty = PioImpl.sm_is_tx_fifo_empty;
+    pub const sm_drain_tx_fifo = PioImpl.sm_drain_tx_fifo;
+    pub const sm_fdebug = PioImpl.sm_fdebug;
+    pub const dbg_padout = PioImpl.dbg_padout;
+    pub const dbg_padoe = PioImpl.dbg_padoe;
+    pub const dbg_cfginfo = PioImpl.dbg_cfginfo;
+    pub const sm_set_consecutive_pindirs = PioImpl.sm_set_consecutive_pindirs;
+    pub const sm_set_pins_with_mask = PioImpl.sm_set_pins_with_mask;
+    pub const sm_set_pindirs_with_mask = PioImpl.sm_set_pindirs_with_mask;
+    pub const lock_resources = common.lock_resources;
+    pub const unlock_resources = common.unlock_resources;
+
     pub const get_instruction_memory = PioImpl.get_instruction_memory;
 
     pub fn gpio_init(self: Pio, pin: gpio.Pin) void {
@@ -34,7 +70,6 @@ pub const Pio = enum(u2) {
 
     pub const can_add_program_at_offset = PioImpl.can_add_program_at_offset;
     pub const find_offset_for_program = PioImpl.find_offset_for_program;
-    pub const add_program_at_offset_unlocked = PioImpl.add_program_at_offset_unlocked;
     pub const add_program = PioImpl.add_program;
     pub const claim_unused_state_machine = PioImpl.claim_unused_state_machine;
     pub const set_input_sync_bypass = PioImpl.set_input_sync_bypass;
@@ -107,8 +142,6 @@ pub const Pio = enum(u2) {
     }
 
     pub const sm_fifo_level = PioImpl.sm_fifo_level;
-    pub const sm_clear_interrupt = PioImpl.sm_clear_interrupt;
-    pub const sm_enable_interrupt = PioImpl.sm_enable_interrupt;
     pub const sm_restart = PioImpl.sm_restart;
     pub const sm_clkdiv_restart = PioImpl.sm_clkdiv_restart;
     pub const sm_init = PioImpl.sm_init;

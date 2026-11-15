@@ -22,17 +22,17 @@ pub fn sm_clear_debug(debug: anytype, sm: u2) void {
     debug.write_raw(debug_mask(sm));
 }
 
-pub fn sm_clear_interrupt(irq: anytype, sm: u2) void {
+pub fn clear_irq_flags(irq: anytype, mask: u8) void {
     // IRQ flags are W1C, indexed directly rather than by the INTE layout.
-    irq.write_raw(sm_mask(sm));
+    irq.write_raw(mask);
 }
 
 pub fn interrupt_mask(sm: u2, source: u2) u32 {
     return @as(u32, 1) << (@as(u5, 4) * source + sm);
 }
 
-pub fn sm_enable_interrupt(enable: anytype, sm: u2, source: u2) void {
-    hw.set_alias(enable).write_raw(interrupt_mask(sm, source));
+pub fn set_interrupt_mask(enable: anytype, mask: u32, enabled: bool) void {
+    (if (enabled) hw.set_alias(enable) else hw.clear_alias(enable)).write_raw(mask);
 }
 
 // These register models record bus writes, including the reads hidden by modify.
@@ -65,7 +65,7 @@ const TestDebug = extern struct {
 
 test "IRQ clear writes only the selected SM flag" {
     var irq: TestCtrl = .{ .raw = 0xff };
-    sm_clear_interrupt(&irq, 2);
+    clear_irq_flags(&irq, 4);
     try std.testing.expectEqual(@as(u32, 4), irq.raw);
 }
 
@@ -88,7 +88,7 @@ test "enable writes use hardware SET and CLR aliases" {
     sm_set_enabled(ctrl, 2, false);
     try std.testing.expectEqual(@as(u32, 4), bank[0x3000 / 4]);
     enable.raw = 1;
-    sm_enable_interrupt(enable, 3, 2);
+    set_interrupt_mask(enable, interrupt_mask(3, 2), true);
     try std.testing.expectEqual(@as(u32, 1), enable.raw);
     try std.testing.expectEqual(@as(u32, 1 << 11), bank[32 + 0x2000 / 4]);
 }

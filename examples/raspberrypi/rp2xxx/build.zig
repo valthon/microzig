@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "spi-master", .file = "src/spi_master.zig" },
         .{ .name = "spi-slave", .file = "src/spi_slave.zig" },
         .{ .name = "spi-loopback-dma", .file = "src/spi_loopback_dma.zig" },
+        .{ .name = "pio-runtime", .file = "src/pio_runtime.zig" },
         .{ .name = "squarewave", .file = "src/squarewave.zig" },
         .{ .name = "ws2812", .file = "src/ws2812.zig" },
         .{ .name = "blinky", .file = "src/blinky.zig" },

@@ -80,7 +80,7 @@ comptime {
 
 pub fn main() !void {
     pio.gpio_init(led_pin);
-    sm_set_consecutive_pindirs(pio, sm, @backingInt(led_pin), 1, true);
+    try pio.sm_set_consecutive_pindirs(sm, led_pin, 1, .out);
 
     const cycles_per_bit: comptime_int = ws2812_program.defines[0].value + //T1
         ws2812_program.defines[1].value + //T2
@@ -129,24 +129,4 @@ pub fn main() !void {
         }
         rp2xxx.time.sleep_ms(50);
     }
-}
-
-fn sm_set_consecutive_pindirs(_pio: Pio, _sm: StateMachine, pin: u5, count: u3, is_out: bool) void {
-    const sm_regs = _pio.get_sm_regs(_sm);
-    const pinctrl_saved = sm_regs.pinctrl.raw;
-    sm_regs.pinctrl.modify(.{
-        .SET_BASE = pin,
-        .SET_COUNT = count,
-    });
-    _pio.sm_exec(_sm, rp2xxx.pio.Instruction{
-        .tag = .set,
-        .delay_side_set = 0,
-        .payload = .{
-            .set = .{
-                .data = @intFromBool(is_out),
-                .destination = .pindirs,
-            },
-        },
-    });
-    sm_regs.pinctrl.raw = pinctrl_saved;
 }

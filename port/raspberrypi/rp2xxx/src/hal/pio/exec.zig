@@ -152,3 +152,120 @@ test "scratch initialization followed by FIFO output sends the command word" {
         }
     }
 }
+
+const runtime = @import("runtime.zig");
+pub const SetDestination = enum { pins, pindirs };
+
+pub fn drain_instruction(comptime chip: Chip, autopull: bool) Instruction(chip) {
+    return if (autopull)
+        .{ .tag = .out, .delay_side_set = 0, .payload = .{ .out = .{ .destination = .null, .bit_count = 0 } } }
+    else
+        .{ .tag = .push_pull_mov_rx, .delay_side_set = 0, .payload = .{ .pull = .{ .block = 0, .if_empty = 0 } } };
+}
+
+fn inject_set(comptime chip: Chip, pio: anytype, sm: anytype, chunk: runtime.PinChunk, destination: SetDestination) void {
+    pio.get_sm_regs(sm).pinctrl.write_raw(runtime.set_pinctrl(chunk));
+    pio.sm_exec(sm, Instruction(chip){ .tag = .set, .delay_side_set = 0, .payload = .{ .set = .{
+        .destination = if (destination == .pins) .pins else .pindirs,
+        .data = chunk.data,
+    } } });
+}
+
+pub fn set_with_mask(comptime chip: Chip, pio: anytype, sm: anytype, values: u32, mask: u32, destination: SetDestination) void {
+    const regs = pio.get_sm_regs(sm);
+    const pinctrl = regs.pinctrl.raw;
+    const execctrl = regs.execctrl.raw;
+    defer regs.pinctrl.write_raw(pinctrl);
+    defer regs.execctrl.write_raw(execctrl);
+    // OUT_STICKY must not keep an earlier write asserted while injecting SET.
+    // Side-set is suppressed by set_pinctrl (40DS §3.7, 50DS §11.7).
+    regs.execctrl.write_raw(execctrl & ~@as(u32, 1 << 17));
+    var remaining = mask;
+    while (remaining != 0) {
+        const base: u5 = @intCast(@ctz(remaining));
+        inject_set(chip, pio, sm, .{ .base = base, .count = 1, .data = @intCast((values >> base) & 1) }, destination);
+        remaining &= remaining - 1;
+    }
+}
+
+pub fn set_consecutive_pindirs(comptime chip: Chip, pio: anytype, sm: anytype, base: u5, count: u6, is_out: bool) void {
+    const regs = pio.get_sm_regs(sm);
+    const pinctrl = regs.pinctrl.raw;
+    const execctrl = regs.execctrl.raw;
+    defer regs.pinctrl.write_raw(pinctrl);
+    defer regs.execctrl.write_raw(execctrl);
+    regs.execctrl.write_raw(execctrl & ~@as(u32, 1 << 17));
+    var remaining = count;
+    var pin = base;
+    while (remaining != 0) {
+        const chunk = runtime.pindir_chunk(pin, remaining, is_out);
+        inject_set(chip, pio, sm, chunk, .pindirs);
+        remaining -= chunk.count;
+        pin +%= chunk.count;
+    }
+}
+
+fn TestPins(comptime chip: Chip) type {
+    return struct {
+        const Register = struct {
+            raw: u32,
+            fn write_raw(self: *@This(), value: u32) void {
+                self.raw = value;
+            }
+        };
+        regs: struct { pinctrl: Register = .{ .raw = 0xffffffff }, execctrl: Register = .{ .raw = 0x7fffffff } } = .{},
+        pins: u32 = 0,
+        dirs: u32 = 0,
+        chunks: [32]runtime.PinChunk = undefined,
+        count: usize = 0,
+        fn get_sm_regs(self: *@This(), _: u2) @TypeOf(&self.regs) {
+            return &self.regs;
+        }
+        fn sm_exec(self: *@This(), _: u2, instruction: Instruction(chip)) void {
+            std.debug.assert(self.regs.execctrl.raw & (1 << 17) == 0);
+            const chunk: runtime.PinChunk = .{
+                .base = @truncate(self.regs.pinctrl.raw >> 5),
+                .count = @truncate(self.regs.pinctrl.raw >> 26),
+                .data = instruction.payload.set.data,
+            };
+            std.debug.assert(self.regs.pinctrl.raw >> 29 == 0);
+            self.chunks[self.count] = chunk;
+            self.count += 1;
+            const target = if (instruction.payload.set.destination == .pins) &self.pins else &self.dirs;
+            for (0..chunk.count) |i| {
+                const index: u5 = @intCast(i);
+                const bit = @as(u32, 1) << (chunk.base +% index);
+                if ((chunk.data >> @as(u3, @intCast(index))) & 1 != 0) target.* |= bit else target.* &= ~bit;
+            }
+        }
+    };
+}
+
+test "injected pin writes preserve configuration, unrelated pins, and chunk at five" {
+    inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
+        var pio: TestPins(chip) = .{};
+        set_with_mask(chip, &pio, @as(u2, 0), 0x80000001, 0x80000003, .pins);
+        try std.testing.expectEqual(@as(u32, 0x80000001), pio.pins);
+        try std.testing.expectEqual(@as(u32, 0xffffffff), pio.regs.pinctrl.raw);
+        try std.testing.expectEqual(@as(u32, 0x7fffffff), pio.regs.execctrl.raw);
+        pio.count = 0;
+        set_consecutive_pindirs(chip, &pio, @as(u2, 0), 30, 12, true);
+        try std.testing.expectEqual(@as(usize, 3), pio.count);
+        try std.testing.expectEqual(runtime.PinChunk{ .base = 30, .count = 5, .data = 31 }, pio.chunks[0]);
+        try std.testing.expectEqual(runtime.PinChunk{ .base = 3, .count = 5, .data = 31 }, pio.chunks[1]);
+        try std.testing.expectEqual(runtime.PinChunk{ .base = 8, .count = 2, .data = 31 }, pio.chunks[2]);
+        try std.testing.expectEqual(@as(u32, 0xc00003ff), pio.dirs);
+        set_with_mask(chip, &pio, @as(u2, 0), 0, 3, .pindirs);
+        try std.testing.expectEqual(@as(u32, 0xc00003fc), pio.dirs);
+        pio.count = 0;
+        set_consecutive_pindirs(chip, &pio, @as(u2, 0), 0, 0, false);
+        try std.testing.expectEqual(@as(usize, 0), pio.count);
+        set_consecutive_pindirs(chip, &pio, @as(u2, 0), 0, 32, false);
+        try std.testing.expectEqual(@as(u32, 0), pio.dirs);
+        try std.testing.expectEqual(@as(usize, 7), pio.count);
+        try std.testing.expectEqual(@as(u32, 0xffffffff), pio.regs.pinctrl.raw);
+        try std.testing.expectEqual(@as(u32, 0x7fffffff), pio.regs.execctrl.raw);
+        try std.testing.expectEqual(@as(u16, 0x6060), @as(u16, @bitCast(drain_instruction(chip, true))));
+        try std.testing.expectEqual(@as(u16, 0x8080), @as(u16, @bitCast(drain_instruction(chip, false))));
+    }
+}

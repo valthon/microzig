@@ -18,6 +18,20 @@ pub const LoadAndStartProgramOptions = common.LoadAndStartProgramOptions(chip);
 pub const ClkDivOptions = common.ClkDivOptions;
 pub const ShiftOptions = common.ShiftOptions(chip);
 
+pub const Fifo = common.Fifo;
+pub const ExecOptions = common.ExecOptions;
+pub const ExecOverrides = common.ExecOverrides;
+pub const Status = common.Status;
+pub const InterruptSource = common.InterruptSource;
+pub const InterruptLine = common.InterruptLine;
+pub const Fdebug = common.Fdebug;
+pub const DebugConfig = common.DebugConfig;
+pub const clkdiv_from_hz = common.clkdiv_from_hz;
+pub const ProgramConfig = assembler.Config;
+pub fn default_config(program: Program) !StateMachineInitOptions {
+    return common.default_config(chip, program);
+}
+
 pub const assembler = @import("pio/assembler.zig");
 
 pub const Program = assembler.Program;
@@ -44,6 +58,7 @@ pub const Pio = chip_specific.Pio;
 
 test "pio" {
     _ = common;
+    _ = @import("pio/runtime.zig");
     _ = @import("pio/registers.zig");
     _ = @import("pio/exec.zig");
     std.testing.refAllDecls(assembler);

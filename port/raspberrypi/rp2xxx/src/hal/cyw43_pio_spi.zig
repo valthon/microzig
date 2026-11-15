@@ -225,11 +225,11 @@ pub const CYW43_PIO_SPI = struct {
     }
 
     inline fn get_pio_tx_dreq(self: *Self) hal.dma.Dreq {
-        return @fromBackingInt(@backingInt(self.pio) * @as(u6, 8) + @backingInt(self.sm));
+        return self.pio.sm_dreq(self.sm, .tx);
     }
 
     inline fn get_pio_rx_dreq(self: *Self) hal.dma.Dreq {
-        return @fromBackingInt(@backingInt(self.pio) * @as(u6, 8) + @backingInt(self.sm) + 4);
+        return self.pio.sm_dreq(self.sm, .rx);
     }
 
     /// CYW43_SPI interface implementation
