@@ -52,6 +52,10 @@ const CAUSE_SUSPEND: u32 = 1 << 8;
 const CAUSE_RESUME: u32 = 1 << 9;
 const CAUSE_USBWUALLOWED: u32 = 1 << 10;
 
+// CLOCK's HFCLKSTAT (nRF52840 PS v1.1, 5.4.3.17): SRC = Xtal in bit 0, STATE = Running in
+// bit 16.
+const HFCLK_XTAL_RUNNING: u32 = 1 << 16 | 1 << 0;
+
 const PowerState = union(enum) {
     detached,
     enabling,
@@ -63,6 +67,14 @@ const EP_Config = struct {
     max_packet_size: u16 = MAX_PACKET_SIZE,
 };
 
+/// The application starts the high frequency crystal oscillator before it calls `poll`,
+/// with `clocks.hfxo.start()`, and keeps it running: "The USBD will not be able to respond
+/// to USB traffic unless HFXO is enabled and stable" (nRF52840 PS v1.1, 6.35.7.1). The
+/// same section allows it to be stopped "during the USB suspend, while the USB pull-up is
+/// disconnected, or when VBUS is not present", and "software must explicitly enable it at
+/// any other time". This HAL neither starts nor stops it (nrfx_usbd.c of nrfx v3.9.0 does
+/// not touch the oscillator either); it logs a warning if the oscillator is not running
+/// when it connects the pull-up.
 pub const USBD = struct {
     power: PowerState = .detached,
 
@@ -165,6 +177,9 @@ pub const USBD = struct {
             },
             .waiting_pwrrdy => {
                 if (peripherals.POWER.USBREGSTATUS.read().OUTPUTRDY == .Ready) {
+                    // The host is about to talk to a device that cannot answer.
+                    if (peripherals.CLOCK.HFCLKSTAT.raw & HFCLK_XTAL_RUNNING != HFCLK_XTAL_RUNNING)
+                        log.warn("the crystal oscillator (HFXO) is not running: start it before USB", .{});
                     peripherals.USBD.USBPULLUP.write_raw(1);
                     self.power = .connected;
                 }
