@@ -14,6 +14,40 @@ pub fn build(b: *std.Build) void {
 
     const raspberrypi = mb.ports.rp2xxx.boards.raspberrypi;
 
+    // Boards for the on-target PIO self-test. RAM images: a UF2 copy
+    // loads into SRAM and leaves the board's flash untouched, so any reset
+    // returns the board to the firmware already in flash.
+    const xiao_rp2040_ram = raspberrypi.pico_flashless.derive(.{
+        .board = .{
+            .name = "Seeed XIAO RP2040 (ram image)",
+            .url = "https://wiki.seeedstudio.com/XIAO-RP2040/",
+            .root_source_file = b.path("src/boards/seeed_xiao_rp2040.zig"),
+        },
+    });
+    const xiao_rp2350_ram = raspberrypi.pico2_arm_flashless.derive(.{
+        .board = .{
+            .name = "Seeed XIAO RP2350 (ram image)",
+            .url = "https://wiki.seeedstudio.com/getting-started-xiao-rp2350/",
+            .root_source_file = b.path("src/boards/seeed_xiao_rp2350.zig"),
+        },
+    });
+
+    const pico2_w_ram = raspberrypi.pico2_arm_flashless.derive(.{
+        .board = .{
+            .name = "Raspberry Pi Pico 2 W (ram image)",
+            .url = "https://datasheets.raspberrypi.com/pico/pico-2-w-datasheet.pdf",
+            .root_source_file = b.path("src/boards/pico2_w.zig"),
+        },
+    });
+
+    const pizero_rp2350_ram = raspberrypi.pico2_arm_flashless.derive(.{
+        .board = .{
+            .name = "Waveshare RP2350-PiZero (ram image)",
+            .url = "https://www.waveshare.com/wiki/RP2350-PiZero",
+            .root_source_file = b.path("src/boards/waveshare_rp2350_pizero.zig"),
+        },
+    });
+
     const specific_examples: []const Example = &.{
         // RaspberryPi Boards:
         .{ .target = raspberrypi.pico, .name = "pico_board_blinky", .file = "src/board_blinky.zig" },
@@ -50,6 +84,19 @@ pub fn build(b: *std.Build) void {
         .{ .target = raspberrypi.pico2_riscv, .name = "pico2_riscv_pio-registers", .file = "src/rp2350_only/pio_registers.zig" },
         .{ .target = raspberrypi.pico2_arm, .name = "pico2_arm_pio-cross-irq", .file = "src/rp2350_only/pio_cross_irq.zig" },
         .{ .target = raspberrypi.pico2_riscv, .name = "pico2_riscv_pio-cross-irq", .file = "src/rp2350_only/pio_cross_irq.zig" },
+
+        .{ .target = xiao_rp2040_ram, .name = "xiao_rp2040_ram_pio-selftest", .file = "src/pio_selftest.zig" },
+        .{ .target = xiao_rp2350_ram, .name = "xiao_rp2350_ram_pio-selftest", .file = "src/pio_selftest.zig" },
+        .{ .target = pizero_rp2350_ram, .name = "pizero_rp2350_ram_pio-selftest", .file = "src/pio_selftest.zig" },
+        .{ .target = pico2_w_ram, .name = "pico2_w_ram_pio-selftest", .file = "src/pio_selftest.zig" },
+        .{ .target = xiao_rp2040_ram, .name = "xiao_rp2040_ram_pio-selftest-nousb", .file = "src/pio_selftest_nousb.zig" },
+        .{ .target = xiao_rp2350_ram, .name = "xiao_rp2350_ram_pio-selftest-nousb", .file = "src/pio_selftest_nousb.zig" },
+        .{ .target = pizero_rp2350_ram, .name = "pizero_rp2350_ram_pio-selftest-nousb", .file = "src/pio_selftest_nousb.zig" },
+        .{ .target = pico2_w_ram, .name = "pico2_w_ram_pio-selftest-nousb", .file = "src/pio_selftest_nousb.zig" },
+        .{ .target = xiao_rp2040_ram, .name = "xiao_rp2040_ram_pio-selftest-exit", .file = "src/pio_selftest_exit.zig" },
+        .{ .target = xiao_rp2350_ram, .name = "xiao_rp2350_ram_pio-selftest-exit", .file = "src/pio_selftest_exit.zig" },
+        .{ .target = pizero_rp2350_ram, .name = "pizero_rp2350_ram_pio-selftest-exit", .file = "src/pio_selftest_exit.zig" },
+        .{ .target = pico2_w_ram, .name = "pico2_w_ram_pio-selftest-exit", .file = "src/pio_selftest_exit.zig" },
 
         // Adafruit boards
         .{ .target = mb.ports.rp2xxx.boards.adafruit.feather_rp2350, .name = "adafruit_feather_rp2350_blinky", .file = "src/board_blinky.zig" },
