@@ -76,6 +76,11 @@ pub const USBD = struct {
     /// `enter_low_power`). Tasks and the registers of 6.35.12 are then out of reach. `poll`
     /// clears it when it sees the host on the bus again.
     low_power: bool = false,
+    /// The data endpoints `ep_open` was called for since the last SETUP packet, bit n for
+    /// endpoint n. After a SET_CONFIGURATION these are the endpoints of the configuration
+    /// the host selected, and all others are disabled (see `poll`).
+    opened_in: u8 = 0,
+    opened_out: u8 = 0,
 
     interface: usb.DeviceInterface,
 
@@ -227,9 +232,27 @@ pub const USBD = struct {
                         .request = setup.request,
                         .length = setup.length.native(),
                     });
+                    self.opened_in = 0;
+                    self.opened_out = 0;
                     controller.on_setup_req(&self.interface, &setup);
                     // The controller answers a request before it returns, or not at all.
                     ep0_trigger(self.control.setup_handled());
+
+                    // The host selected a configuration, or none (value 0). The controller
+                    // opened the endpoints of the one it selected and has no word for those
+                    // of the one before, so they are closed here: an endpoint that stays
+                    // enabled goes on answering the host, with the packet it still holds or
+                    // with an ACK for one nobody will read, in a configuration that does
+                    // not have it. nrfx offers its users `nrfx_usbd_ep_disable` for the
+                    // same.
+                    if (self.control.configured()) {
+                        peripherals.USBD.EPINEN.write_raw(0x01 | @as(u32, self.opened_in));
+                        peripherals.USBD.EPOUTEN.write_raw(0x01 | @as(u32, self.opened_out));
+                        // Nor does a closed endpoint report the packet it was holding.
+                        for (1..NUM_EP) |i| {
+                            if (self.opened_in >> @intCast(i) & 1 == 0) self.in_busy[i] = false;
+                        }
+                    }
                 }
 
                 // EP0 data-phase completions
@@ -487,6 +510,8 @@ pub const USBD = struct {
         self.eps_out = @splat(.{});
         self.control = .{};
         self.in_busy = @splat(false);
+        self.opened_in = 0;
+        self.opened_out = 0;
     }
 
     /// Busy-waits for the EasyDMA transfer just started on an endpoint to end, and clears
@@ -783,12 +808,14 @@ pub const USBD = struct {
             .in => {
                 self.eps_in[i].max_packet_size = desc.max_packet_size.native();
                 self.in_busy[i] = false;
+                self.opened_in |= @intCast(mask);
                 // A packet the earlier configuration sent must not be reported to this one.
                 peripherals.USBD.EPDATASTATUS.write_raw(mask); // W1C, EPINn is bit n
                 peripherals.USBD.EPINEN.write_raw(peripherals.USBD.EPINEN.raw | mask);
             },
             .out => {
                 self.eps_out[i].max_packet_size = desc.max_packet_size.native();
+                self.opened_out |= @intCast(mask);
                 peripherals.USBD.EPOUTEN.write_raw(peripherals.USBD.EPOUTEN.raw | mask);
                 // Nor one it received and never read. Dropping the report alone would leave
                 // the endpoint answering NAK for good: "a NAK is returned until the software

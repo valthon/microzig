@@ -46,6 +46,8 @@ pub const Control = struct {
     /// consequence, the software shall not process this command other than updating its
     /// state machine [...], nor initiate a status stage" (6.35.9).
     set_address: bool = false,
+    /// The request is SET_CONFIGURATION (see `is_set_configuration`).
+    set_configuration: bool = false,
 
     /// A SETUP packet arrived. It ends the transfer before it, finished or not.
     pub fn setup(self: *Control, packet: Setup) void {
@@ -53,7 +55,15 @@ pub const Control = struct {
             .direction = if (packet.request_type & 0x80 != 0) .in else .out,
             .remaining = packet.length,
             .set_address = is_set_address(packet),
+            .set_configuration = is_set_configuration(packet),
         };
+    }
+
+    /// The controller has accepted a SET_CONFIGURATION: the endpoints it opened while it
+    /// handled the request are those of the configuration the host selected, and no others
+    /// belong to it. Not for a request the controller refused, which changes nothing.
+    pub fn configured(self: *const Control) bool {
+        return self.set_configuration and self.answered;
     }
 
     /// A control read still owes the host bytes of wLength: a zero-length write is then a
@@ -160,6 +170,12 @@ pub const Control = struct {
 /// (bmRequestType 0x00), with bRequest 5.
 fn is_set_address(packet: Setup) bool {
     return packet.request_type == 0x00 and packet.request == 0x05;
+}
+
+/// Whether a SETUP packet is SET_CONFIGURATION: a standard request to the device, host to
+/// device (bmRequestType 0x00), with bRequest 9.
+fn is_set_configuration(packet: Setup) bool {
+    return packet.request_type == 0x00 and packet.request == 0x09;
 }
 
 // CDC SET_LINE_CODING: class request to an interface, host to device, 7 bytes of data.
@@ -389,4 +405,31 @@ test "SET_ADDRESS gets neither a status stage nor a stall" {
     try std.testing.expectEqual(Action.status, ep0.ack());
     ep0.setup(.{ .request_type = 0x21, .request = 5, .length = 0 });
     try std.testing.expectEqual(Action.stall, ep0.setup_handled());
+}
+
+test "only an accepted SET_CONFIGURATION changes the configuration" {
+    const set_configuration: Setup = .{ .request_type = 0x00, .request = 9, .length = 0 };
+    var ep0: Control = .{};
+
+    // Not before the controller has answered, and not if it does not.
+    ep0.setup(set_configuration);
+    try std.testing.expect(!ep0.configured());
+    try std.testing.expectEqual(Action.stall, ep0.setup_handled());
+    try std.testing.expect(!ep0.configured());
+
+    ep0.setup(set_configuration);
+    try std.testing.expectEqual(Action.status, ep0.ack());
+    try std.testing.expect(ep0.configured());
+
+    // No other request does, accepted or not: request 9 of a class, SET_ADDRESS, and
+    // GET_CONFIGURATION (8), which is answered with a packet.
+    ep0.setup(.{ .request_type = 0x21, .request = 9, .length = 0 });
+    _ = ep0.ack();
+    try std.testing.expect(!ep0.configured());
+    ep0.setup(.{ .request_type = 0x00, .request = 5, .length = 0 });
+    _ = ep0.ack();
+    try std.testing.expect(!ep0.configured());
+    ep0.setup(.{ .request_type = 0x80, .request = 8, .length = 1 });
+    ep0.in_packet(1, 64);
+    try std.testing.expect(!ep0.configured());
 }
