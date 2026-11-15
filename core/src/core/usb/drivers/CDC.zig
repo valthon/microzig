@@ -270,12 +270,33 @@ pub fn class_request(self: *@This(), setup: *const usb.types.SetupPacket) ?[]con
     log.debug("cdc setup: {any} {} {}", .{ mgmt_request, setup.length.native(), setup.value.native() });
 
     return switch (mgmt_request) {
-        .SetLineCoding => usb.ack, // we should handle data phase somehow to read sent line_coding
+        // The line coding itself is the data stage, which `class_data` is given.
+        .SetLineCoding => usb.ack,
         .GetLineCoding => std.mem.asBytes(&self.line_coding),
         .SetControlLineState => usb.ack,
         .SendBreak => usb.ack,
         else => usb.nak,
     };
+}
+
+/// The longest data stage of a request this driver takes: SET_LINE_CODING's 7 bytes.
+pub const class_data_len = @sizeOf(LineCoding);
+
+/// The data stage of a request `class_request` accepted, on a device that hands it over
+/// (`usb.DeviceInterface.VTable.control_out_data`); returns whether the request is still
+/// accepted. On any other device the request has its answer before the data arrives, and
+/// `line_coding` keeps its initial value whatever the host sets.
+pub fn class_data(self: *@This(), setup: *const usb.types.SetupPacket, data: []const u8) bool {
+    const mgmt_request: ManagementRequestType = @fromBackingInt(setup.request);
+    switch (mgmt_request) {
+        .SetLineCoding => {
+            if (data.len != @sizeOf(LineCoding)) return false;
+            @memcpy(std.mem.asBytes(&self.line_coding), data);
+            return true;
+        },
+        // The other requests that are accepted carry no data this driver has a use for.
+        else => return true,
+    }
 }
 
 pub fn on_rx(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
