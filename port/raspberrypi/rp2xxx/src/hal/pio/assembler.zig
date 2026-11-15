@@ -36,7 +36,7 @@ pub const Program = struct {
     wrap: ?u5,
 
     pub fn get_mask(program: Program) u32 {
-        return (@as(u32, 1) << @as(u5, @intCast(program.instructions.len))) - 1;
+        return @intCast((@as(u64, 1) << @as(u6, @intCast(program.instructions.len))) - 1);
     }
 
     pub fn get_label_index(program: Program, name: []const u8) ?u5 {
@@ -205,4 +205,26 @@ test "format compile error" {
         \\ invalid instruction
         \\
     , result);
+}
+
+test "word keeps relocation entries aligned" {
+    @setEvalBranchQuota(100_000);
+    inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
+        const program = comptime assemble(chip,
+            \\.program words
+            \\.word 0
+            \\jmp 0
+            \\.word 0xffff
+        , .{}).get_program_by_name("words");
+        try std.testing.expectEqual(program.instructions.len, program.relocations.len);
+        try std.testing.expectEqual(Relocation.none, program.relocations[0]);
+        try std.testing.expectEqual(Relocation.jmpslot, program.relocations[1]);
+        try std.testing.expectEqual(Relocation.none, program.relocations[2]);
+    }
+}
+
+test "full instruction memory mask" {
+    @setEvalBranchQuota(100_000);
+    const program = comptime assemble(.RP2040, ".program full\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n", .{}).get_program_by_name("full");
+    try std.testing.expectEqual(@as(u32, 0xffffffff), program.get_mask());
 }

@@ -350,7 +350,10 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                     .wait = .{
                         .polarity = wait.polarity,
                         .source = wait.source,
-                        .index = try self.evaluate(u5, program.*, wait.num, token_index, diags),
+                        // RP2040 §3.4.3: IRQ REL is bit 4. RP2350 §11.4.3.2:
+                        // IdxMode[4:3] = 0b10 selects relative IRQ indexing.
+                        .index = (try self.evaluate(u5, program.*, wait.num, token_index, diags)) |
+                            (if (wait.rel) @as(u5, 0x10) else 0),
                     },
                 },
                 .in => |in| .{
@@ -516,7 +519,7 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
 
         fn encode_instruction_body(self: *Self, program: *BoundedProgram, diags: *?Diagnostics) !void {
             // first scan through body for labels
-            var instr_index: ?u5 = program.origin orelse 0;
+            var instr_index: ?u5 = 0;
             for (self.tokens[self.index..]) |token| {
                 switch (token.data) {
                     .label => |label| try program.labels.append(.{
@@ -553,9 +556,10 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             for (self.tokens[self.index..], self.index..) |token, i| {
                 switch (token.data) {
                     .instruction => |instr| try self.encode_instruction(program, instr, token.index, diags),
-                    .word => |word| try program.instructions.append(
-                        @as(Instruction(chip), @bitCast(try self.evaluate(u16, program.*, word, token.index, diags))),
-                    ),
+                    .word => |word| {
+                        try program.instructions.append(@bitCast(try self.evaluate(u16, program.*, word, token.index, diags)));
+                        try program.relocations.append(.none);
+                    },
                     // already processed
                     .label, .wrap_target, .wrap => {},
                     .program => {
@@ -1124,14 +1128,14 @@ test "encode.jmp.label origin" {
 
         const label = program.labels.get(0);
         try expectEqualStrings("program_at_4__label", label.name);
-        try expectEqual(@as(u32, 5), label.index);
+        try expectEqual(@as(u32, 1), label.index);
         try expectEqual(false, label.public);
 
         const instr = program.instructions.get(2);
         try expectEqual(Instruction(.RP2040).Tag.jmp, instr.tag);
         try expectEqual(@as(u5, 0), instr.delay_side_set);
         try expectEqual(Token(.RP2040).Instruction.Jmp.Condition.always, instr.payload.jmp.condition);
-        try expectEqual(@as(u5, 5), instr.payload.jmp.address);
+        try expectEqual(@as(u5, 1), instr.payload.jmp.address);
     }
 
     {
@@ -1140,14 +1144,14 @@ test "encode.jmp.label origin" {
 
         const label = program.labels.get(0);
         try expectEqualStrings("program_at_20__label", label.name);
-        try expectEqual(@as(u32, 22), label.index);
+        try expectEqual(@as(u32, 2), label.index);
         try expectEqual(false, label.public);
 
         const instr = program.instructions.get(3);
         try expectEqual(Instruction(.RP2040).Tag.jmp, instr.tag);
         try expectEqual(@as(u5, 0), instr.delay_side_set);
         try expectEqual(Token(.RP2040).Instruction.Jmp.Condition.always, instr.payload.jmp.condition);
-        try expectEqual(@as(u5, 22), instr.payload.jmp.address);
+        try expectEqual(@as(u5, 2), instr.payload.jmp.address);
     }
 }
 

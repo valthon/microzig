@@ -131,3 +131,16 @@ test "pio.comparison.uart_tx" {
 test "pio.comparison.ws2812" {
     try pio_comparison(@embedFile("comparison_tests/ws2812.pio"));
 }
+
+// Headers generated with pico-sdk 2.1.1 pioasm -v 0 -o c-sdk.
+test "pio.comparison.origin and wait irq rel" {
+    @setEvalBranchQuota(100_000);
+    try pio_comparison(@embedFile("comparison_tests/correctness.pio"));
+    inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
+        const program = comptime assembler.assemble(chip, @embedFile("comparison_tests/correctness.pio"), .{}).get_program_by_name("origin_four");
+        try std.testing.expectEqual(@as(?u5, 4), program.origin);
+        try std.testing.expectEqual(@as(?u5, c.origin_four_wrap), program.wrap);
+        try std.testing.expectEqual(@as(?u5, c.origin_four_wrap_target), program.wrap_target);
+        try std.testing.expectEqual(@as(?u5, c.origin_four_offset_loop), program.get_label_index("loop"));
+    }
+}
