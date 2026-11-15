@@ -63,3 +63,12 @@ test "pio" {
     _ = @import("pio/exec.zig");
     std.testing.refAllDecls(assembler);
 }
+
+test "RP2350-only PIO methods are absent on RP2040" {
+    const rp2040 = @import("pio/rp2040.zig").Pio;
+    const rp2350 = @import("pio/rp2350.zig").Pio;
+    inline for (.{ "set_gpio_base", "claim_sm_and_add_program_for_gpio_range", "sm_rxfifo_get", "sm_rxfifo_put", "enable_in_sync", "disable", "clkdiv_restart" }) |name| {
+        try std.testing.expect(!@hasDecl(rp2040, name));
+        try std.testing.expect(@hasDecl(rp2350, name));
+    }
+}

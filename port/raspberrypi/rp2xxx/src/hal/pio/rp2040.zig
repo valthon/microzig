@@ -9,10 +9,13 @@ pub const Pio = enum(u1) {
 
     const PioImpl = common.PioImpl(Pio, .RP2040);
     pub fn get_regs(self: Pio) *volatile common.PIO {
-        return switch (self) {
+        const regs = switch (self) {
             .pio0 => common.PIO0,
             .pio1 => common.PIO1,
         };
+        // 50DS §11.7 DBG_CFGINFO: version 0 has the upper bits reserved as zero.
+        if (@import("builtin").mode == .debug) @import("std").debug.assert(regs.DBG_CFGINFO.raw >> 28 == 0);
+        return regs;
     }
 
     pub const add_program_at_offset = PioImpl.add_program_at_offset;

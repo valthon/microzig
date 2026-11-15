@@ -3,7 +3,20 @@ const std = @import("std");
 const Chip = @import("../chip.zig").Chip;
 const assembler = @import("assembler.zig");
 
-pub const Status = union(enum) { tx_level: u4, rx_level: u4 };
+pub const IrqStatus = struct { flag: u3, block: enum { this, prev, next } = .this };
+pub fn StatusFor(comptime chip: Chip) type {
+    return if (chip == .RP2040) union(enum) { tx_level: u4, rx_level: u4 } else union(enum) { tx_level: u4, rx_level: u4, irq: IrqStatus };
+}
+pub const Status = StatusFor(.RP2350);
+
+/// 50DS §11.7, SMx_EXECCTRL.STATUS_N.
+pub fn status_n(irq: IrqStatus) u5 {
+    return @as(u5, irq.flag) + @as(u5, switch (irq.block) {
+        .this => 0,
+        .prev => 8,
+        .next => 16,
+    });
+}
 pub const Fifo = enum { tx, rx };
 pub const InterruptLine = enum(u1) { irq0, irq1 };
 pub const StateMachine = enum(u2) { sm0, sm1, sm2, sm3 };
@@ -16,11 +29,10 @@ pub const InterruptSource = union(enum) {
 };
 
 pub fn interrupt_mask(comptime chip: Chip, source: InterruptSource) error{UnsupportedInterruptFlag}!u32 {
-    _ = chip;
     const bit: u5 = switch (source) {
         .rx_not_empty => |sm| @backingInt(sm),
         .tx_not_full => |sm| 4 + @as(u5, @backingInt(sm)),
-        .flag => |flag| if (flag < 4) 8 + @as(u5, flag) else return error.UnsupportedInterruptFlag,
+        .flag => |flag| if (chip == .RP2350 or flag < 4) 8 + @as(u5, flag) else return error.UnsupportedInterruptFlag,
     };
     return @as(u32, 1) << bit;
 }
@@ -67,8 +79,12 @@ pub fn first_unused(claimed: u4) error{NoSpace}!StateMachine {
     return error.NoSpace;
 }
 
-pub fn exec_bits(options: anytype, jmp_pin: u5) u32 {
-    const status: u32 = switch (options.status) {
+pub fn exec_bits(comptime chip: Chip, options: anytype, jmp_pin: u5) u32 {
+    const status: u32 = if (comptime @hasField(@TypeOf(options.status), "irq")) switch (options.status) {
+        .tx_level => |n| n,
+        .rx_level => |n| @as(u32, n) | @as(u32, if (chip == .RP2040) 0x10 else 0x20),
+        .irq => |irq| @as(u32, status_n(irq)) | 0x40,
+    } else switch (options.status) {
         .tx_level => |n| n,
         .rx_level => |n| @as(u32, n) | 0x10,
     };
@@ -127,10 +143,14 @@ pub fn default_config(program: assembler.Program) error{ UnsupportedConfig, Inva
         config.side_set_count = side.count;
     }
     if (program.config.mov_status) |status| {
-        if (status.source == .irq or status.n > 15) return error.UnsupportedConfig;
-        config.status = if (status.source == .txfifo) .{ .tx_level = @intCast(status.n) } else .{ .rx_level = @intCast(status.n) };
+        if (status.source == .irq) {
+            if (status.n > 7) return error.UnsupportedConfig;
+            config.status = .{ .irq = .{ .flag = @intCast(status.n), .block = @fromBackingInt(@intCast(@backingInt(status.block))) } };
+        } else {
+            if (status.n > 15) return error.UnsupportedConfig;
+            config.status = if (status.source == .txfifo) .{ .tx_level = @intCast(status.n) } else .{ .rx_level = @intCast(status.n) };
+        }
     }
-    if (config.fifo != .txrx and config.fifo != .tx and config.fifo != .rx) return error.UnsupportedConfig;
     return config;
 }
 
@@ -146,7 +166,7 @@ test "shared register layouts and claim transitions on both chips" {
                 try std.testing.expectEqual(@as(u6, @intCast(p * 8 + index + 4)), try dreq_number(chip, @intCast(p), sm, .rx));
             }
         }
-        try std.testing.expectError(error.UnsupportedInterruptFlag, interrupt_mask(chip, .{ .flag = 4 }));
+        if (chip == .RP2040) try std.testing.expectError(error.UnsupportedInterruptFlag, interrupt_mask(chip, .{ .flag = 4 }));
         try std.testing.expectEqual(@as(u6, if (chip == .RP2040) 10 else 18), try irq_number(chip, 1, .irq1));
     }
     try std.testing.expectError(error.InvalidPio, dreq_number(.RP2040, 2, .sm0, .tx));
@@ -239,7 +259,7 @@ pub fn validate_program_counts(program: assembler.Program, counts: PinCounts, ha
 
 test "exec fields occupy the documented positions and mapping mismatches are errors" {
     const options = .{ .status = Status{ .rx_level = 9 }, .wrap_target = @as(u5, 2), .wrap = @as(u5, 17), .out_sticky = true, .inline_out_en = true, .out_en_sel = @as(u5, 13), .side_pindir = true, .side_set_optional = true };
-    try std.testing.expectEqual(@as(u32, 0x656f1119), exec_bits(options, 5));
+    try std.testing.expectEqual(@as(u32, 0x656f1119), exec_bits(.RP2040, options, 5));
     try std.testing.expectError(error.InvalidSetCount, validate_pin_counts(.{ .set = 6 }, false));
     try std.testing.expectError(error.InvalidSideSetCount, validate_pin_counts(.{ .side_set = 5 }, true));
     try std.testing.expectError(error.InvalidOutCount, validate_pin_counts(.{ .out = 33 }, false));
@@ -320,6 +340,10 @@ pub fn default_shift_config(comptime chip: Chip, defaults: ProgramConfig) ShiftO
         config.autopull = output.auto;
         config.pull_threshold = @truncate(output.threshold);
     }
+    if (chip == .RP2350) {
+        config.fjoin_rx_put = defaults.fifo == .txput or defaults.fifo == .putget;
+        config.fjoin_rx_get = defaults.fifo == .txget or defaults.fifo == .putget;
+    }
     config.join_tx = defaults.fifo == .tx;
     config.join_rx = defaults.fifo == .rx;
     return config;
@@ -361,4 +385,239 @@ test "every exec override is applied, including explicit false and zero" {
     try std.testing.expectEqualDeep(wanted, apply_exec_overrides(Exec{}, overrides));
     try std.testing.expectEqualDeep(wanted, apply_exec_overrides(wanted, Overrides{}));
     try std.testing.expectEqualDeep(Exec{}, apply_exec_overrides(wanted, Overrides{ .jmp_pin = 0, .wrap = 31, .wrap_target = 0, .side_pindir = false, .side_set_optional = false, .status = .{ .tx_level = 0 }, .out_sticky = false, .inline_out_en = false, .out_en_sel = 0 }));
+}
+
+/// 50DS §11.7 GPIOBASE: the 32-pin window is independent of the package.
+pub const GpioBase = enum(u5) { gpio0 = 0, gpio16 = 16 };
+pub fn pin_index(base: GpioBase, pin: u32) error{InvalidPin}!u5 {
+    const first: u32 = @backingInt(base);
+    if (pin < first or pin >= first + 32 or pin >= 48) return error.InvalidPin;
+    return @intCast(pin - first);
+}
+pub fn gpio_compatible(base: GpioBase, ranges: u3) bool {
+    return ranges & @as(u3, if (base == .gpio0) 4 else 1) == 0;
+}
+pub fn validate_gpio_base(used: u32, claimed: u4) error{ InstructionMemoryInUse, StateMachinesClaimed }!void {
+    if (used != 0) return error.InstructionMemoryInUse;
+    // An SM can retain pin configuration without a loaded program when driven
+    // through SMx_INSTR (50DS §11.5.7). Its GPIO window must remain unchanged.
+    if (claimed != 0) return error.StateMachinesClaimed;
+}
+/// 50DS §11.4.3; pico-sdk 2.1.1 pio.c:165–172. Only absolute WAIT GPIO.
+pub fn fixup_wait_gpio(instruction: u16, base: GpioBase) u16 {
+    return instruction ^ @as(u16, if (instruction & 0xe060 == 0x2000) @backingInt(base) else 0);
+}
+pub fn gpio_range_mask(base: u6, count: u6) error{InvalidPin}!u3 {
+    if (count == 0 or base >= 48 or @as(u7, base) + count > 48) return error.InvalidPin;
+    var ranges: u3 = 0;
+    for (base..@as(u7, base) + count) |pin| ranges |= @as(u3, 1) << @as(u2, @intCast(pin / 16));
+    return ranges;
+}
+pub const BlockResources = struct { base: GpioBase, used: u32, claimed: u4, offset: ?u5 };
+pub const GpioSelection = struct { block: u2, base: GpioBase, sm: StateMachine, offset: u5 };
+/// Prefer a compatible current base; change it only with no memory used or SMs claimed.
+pub fn select_gpio_program(blocks: [3]BlockResources, used_ranges: u3, pin: u6, count: u6) !GpioSelection {
+    const ranges = used_ranges | try gpio_range_mask(pin, count);
+    for (blocks, 0..) |block, i| {
+        const sm = first_unused(block.claimed) catch continue;
+        const offset = block.offset orelse continue;
+        if (gpio_compatible(block.base, ranges)) return .{ .block = @intCast(i), .base = block.base, .sm = sm, .offset = offset };
+        validate_gpio_base(block.used, block.claimed) catch continue;
+        const other: GpioBase = if (block.base == .gpio0) .gpio16 else .gpio0;
+        if (gpio_compatible(other, ranges)) return .{ .block = @intCast(i), .base = other, .sm = sm, .offset = offset };
+    }
+    return error.NoSpace;
+}
+/// 50DS §11.5.4.1: automatic PUSH is incompatible with random RX access.
+pub fn validate_shift(options: ShiftOptions(.RP2350)) error{InvalidShiftOptions}!void {
+    if (options.fjoin_rx_put or options.fjoin_rx_get) {
+        if (options.autopush or options.join_tx or options.join_rx) return error.InvalidShiftOptions;
+    }
+}
+/// 50DS §11.4.8.2 / §11.4.9.2. Direction names refer to the system.
+pub fn validate_putget(shiftctrl: u32, write: bool) error{InvalidFifoMode}!void {
+    const mode = shiftctrl & 0xc000;
+    if (mode != @as(u32, if (write) 0x4000 else 0x8000) or shiftctrl & 0xc0010000 != 0) return error.InvalidFifoMode;
+}
+/// Byte offset within PIO, 50DS §11.7 Table 1037.
+pub fn putget_offset(sm: StateMachine, index: u2) u16 {
+    return 0x128 + @as(u16, @backingInt(sm)) * 16 + @as(u16, index) * 4;
+}
+pub const BlockMasks = struct { pio0: u4 = 0, pio1: u4 = 0, pio2: u4 = 0 };
+pub const CrossControl = enum { enable_in_sync, disable, clkdiv_restart };
+/// 50DS §11.7 Table 1038. Preserve unselected local SM_ENABLE bits.
+pub fn cross_ctrl(block: u2, masks: BlockMasks, enabled: u4, action: CrossControl) u32 {
+    std.debug.assert(block < 3);
+    const all = [3]u4{ masks.pio0, masks.pio1, masks.pio2 };
+    const local = all[block];
+    const next = all[(@as(u3, block) + 1) % 3];
+    const prev = all[(@as(u3, block) + 2) % 3];
+    const neighbors = (@as(u32, prev) << 16) | (@as(u32, next) << 20);
+    return neighbors | switch (action) {
+        .enable_in_sync => @as(u32, enabled | local) | (@as(u32, local) << 8) | (1 << 24) | (1 << 26),
+        .disable => @as(u32, enabled & ~local) | (1 << 25),
+        .clkdiv_restart => @as(u32, enabled) | (@as(u32, local) << 8) | (1 << 26),
+    };
+}
+
+pub fn valid_pin_mask(base: GpioBase, mask: u32, has_rp2350b: bool) bool {
+    const count: u6 = if (has_rp2350b) 32 else if (base == .gpio0) 30 else 14;
+    return @as(u64, mask) >> count == 0;
+}
+
+test "RP2350 interrupt routes and IRQ status encodings" {
+    for (4..8) |flag| try std.testing.expectEqual(@as(u32, 1) << @as(u5, @intCast(8 + flag)), try interrupt_mask(.RP2350, .{ .flag = @intCast(flag) }));
+    inline for (.{ .this, .prev, .next }, .{ 0, 8, 16 }) |block, base| {
+        for (0..8) |flag| {
+            const irq: IrqStatus = .{ .flag = @intCast(flag), .block = block };
+            try std.testing.expectEqual(@as(u5, @intCast(base + flag)), status_n(irq));
+        }
+    }
+    try std.testing.expect(!@hasField(StatusFor(.RP2040), "irq"));
+    try std.testing.expect(@hasField(StatusFor(.RP2350), "irq"));
+    const p = comptime assembler.assemble(.RP2350, ".program p\n.mov_status irq next set 7\nmov x, status", .{}).get_program_by_name("p");
+    const c = try default_config(p);
+    try std.testing.expectEqual(Status{ .irq = .{ .flag = 7, .block = .next } }, c.status);
+    const options = .{ .status = c.status, .wrap_target = @as(u5, 0), .wrap = @as(u5, 0), .out_sticky = false, .inline_out_en = false, .out_en_sel = @as(u5, 0), .side_pindir = false, .side_set_optional = false };
+    try std.testing.expectEqual(@as(u32, 0x57), exec_bits(.RP2350, options, 0));
+    var rx = options;
+    rx.status = .{ .rx_level = 3 };
+    try std.testing.expectEqual(@as(u32, 0x23), exec_bits(.RP2350, rx, 0));
+}
+
+test "GPIO windows, package masks and real assembled WAIT fixup" {
+    @setEvalBranchQuota(100_000);
+    for (0..48) |pin| {
+        if (pin < 32) try std.testing.expectEqual(@as(u5, @intCast(pin)), try pin_index(.gpio0, @intCast(pin))) else try std.testing.expectError(error.InvalidPin, pin_index(.gpio0, @intCast(pin)));
+        if (pin >= 16) try std.testing.expectEqual(@as(u5, @intCast(pin - 16)), try pin_index(.gpio16, @intCast(pin))) else try std.testing.expectError(error.InvalidPin, pin_index(.gpio16, @intCast(pin)));
+    }
+    try std.testing.expectError(error.InvalidPin, pin_index(.gpio16, 48));
+    try validate_gpio_base(0, 0);
+    try std.testing.expectError(error.InstructionMemoryInUse, validate_gpio_base(1, 0));
+    try std.testing.expect(valid_pin_mask(.gpio0, 0x3fffffff, false));
+    try std.testing.expect(!valid_pin_mask(.gpio0, 0x40000000, false));
+    try std.testing.expect(valid_pin_mask(.gpio16, 0x3fff, false));
+    try std.testing.expect(!valid_pin_mask(.gpio16, 0x4000, false));
+    try std.testing.expect(valid_pin_mask(.gpio16, 0xffffffff, true));
+    const p = comptime assembler.assemble(.RP2350, ".program p\nwait 1 gpio 16\nwait 0 gpio 47\nwait 1 pin 4\nwait 1 irq 2\nwait 1 jmppin\nnop", .{}).get_program_by_name("p");
+    for (p.instructions, 0..) |instruction, i| {
+        try std.testing.expectEqual(instruction, fixup_wait_gpio(instruction, .gpio0));
+        try std.testing.expectEqual(instruction ^ @as(u16, if (i < 2) 16 else 0), fixup_wait_gpio(instruction, .gpio16));
+    }
+}
+
+test "GPIO program selection respects ranges, occupied memory, claims and space" {
+    var blocks: [3]BlockResources = @splat(.{ .base = .gpio0, .used = 0, .claimed = 0, .offset = 2 });
+    try std.testing.expectEqual(GpioSelection{ .block = 0, .base = .gpio16, .sm = .sm0, .offset = 2 }, try select_gpio_program(blocks, 4, 32, 16));
+    blocks[0].used = 1;
+    blocks[1].claimed = 15;
+    try std.testing.expectEqual(@as(u2, 2), (try select_gpio_program(blocks, 4, 32, 1)).block);
+    blocks[2].offset = null;
+    try std.testing.expectError(error.NoSpace, select_gpio_program(blocks, 4, 32, 1));
+    try std.testing.expectError(error.NoSpace, select_gpio_program(blocks, 5, 16, 1));
+    try std.testing.expectError(error.InvalidPin, select_gpio_program(blocks, 0, 47, 2));
+    try std.testing.expectError(error.InvalidPin, select_gpio_program(blocks, 0, 0, 0));
+    try std.testing.expectEqual(@as(u3, 7), try gpio_range_mask(0, 48));
+    try std.testing.expectEqual(@as(u3, 6), try gpio_range_mask(31, 2));
+}
+
+test "RX random access addresses, directions and shift validation" {
+    for (0..4) |sm| for (0..4) |index| {
+        try std.testing.expectEqual(@as(u16, @intCast(0x128 + sm * 16 + index * 4)), putget_offset(@fromBackingInt(@as(u2, @intCast(sm))), @intCast(index)));
+    };
+    for (0..4) |mode| {
+        const bits = @as(u32, @intCast(mode)) << 14;
+        if (mode == 2) try validate_putget(bits, false) else try std.testing.expectError(error.InvalidFifoMode, validate_putget(bits, false));
+        if (mode == 1) try validate_putget(bits, true) else try std.testing.expectError(error.InvalidFifoMode, validate_putget(bits, true));
+    }
+    try std.testing.expectError(error.InvalidFifoMode, validate_putget(0x18000, false));
+    inline for (.{ assembler.Config.Fifo.txput, .txget, .putget }) |fifo| {
+        const shift = default_shift_config(.RP2350, .{ .wrap = 0, .wrap_target = 0, .fifo = fifo });
+        try validate_shift(shift);
+        try std.testing.expect(shift.fjoin_rx_put == (fifo != .txget));
+        try std.testing.expect(shift.fjoin_rx_get == (fifo != .txput));
+        var bad = shift;
+        bad.autopush = true;
+        try std.testing.expectError(error.InvalidShiftOptions, validate_shift(bad));
+        bad = shift;
+        bad.join_tx = true;
+        try std.testing.expectError(error.InvalidShiftOptions, validate_shift(bad));
+    }
+}
+
+test "cross-PIO control words for all target blocks and actions" {
+    const masks: BlockMasks = .{ .pio0 = 1, .pio1 = 2, .pio2 = 4 };
+    const neighbor_bits = [_]u32{ 0x240000, 0x410000, 0x120000 };
+    for (0..3) |block| {
+        const local: u4 = @as(u4, 1) << @as(u2, @intCast(block));
+        const n = neighbor_bits[block];
+        try std.testing.expectEqual(n | 0x05000000 | (@as(u32, local) << 8) | (8 | @as(u32, local)), cross_ctrl(@intCast(block), masks, 8, .enable_in_sync));
+        try std.testing.expectEqual(n | 0x02000000 | (15 & ~@as(u32, local)), cross_ctrl(@intCast(block), masks, 15, .disable));
+        try std.testing.expectEqual(n | 0x04000000 | (@as(u32, local) << 8) | 8, cross_ctrl(@intCast(block), masks, 8, .clkdiv_restart));
+    }
+}
+
+/// Check WAIT's absolute pins as well as the assembler's coarse 16-pin ranges.
+pub fn validate_program_gpio(program: assembler.Program, base: GpioBase, has_rp2350b: bool) error{InvalidPin}!void {
+    if (!gpio_compatible(base, program.used_gpio_ranges)) return error.InvalidPin;
+    const limit: u32 = if (has_rp2350b) 48 else 30;
+    for (program.instructions) |instruction| {
+        if (instruction & 0xe060 == 0x2000) {
+            const pin = @as(u32, fixup_wait_gpio(instruction, base) & 31) + @backingInt(base);
+            if (pin >= limit) return error.InvalidPin;
+        }
+    }
+}
+
+test "absolute WAIT rejects pins absent on the selected package" {
+    @setEvalBranchQuota(100_000);
+    const a = comptime assembler.assemble(.RP2350, ".program p\nwait 1 gpio 29", .{}).get_program_by_name("p");
+    const b = comptime assembler.assemble(.RP2350, ".program p\nwait 1 gpio 30", .{}).get_program_by_name("p");
+    const upper = comptime assembler.assemble(.RP2350, ".program p\nwait 1 gpio 47", .{}).get_program_by_name("p");
+    try validate_program_gpio(a, .gpio0, false);
+    try validate_program_gpio(a, .gpio16, false);
+    try std.testing.expectError(error.InvalidPin, validate_program_gpio(b, .gpio0, false));
+    try std.testing.expectError(error.InvalidPin, validate_program_gpio(b, .gpio16, false));
+    try std.testing.expectError(error.InvalidPin, validate_program_gpio(upper, .gpio16, false));
+    try validate_program_gpio(upper, .gpio16, true);
+}
+
+/// PINCTRL groups wrap within the 32-pin window (50DS §11.5.6).
+pub fn mapping_mask(first: u5, count: u6) error{InvalidPinCount}!u32 {
+    if (count > 32) return error.InvalidPinCount;
+    var mask: u32 = 0;
+    for (0..count) |i| mask |= @as(u32, 1) << (first +% @as(u5, @intCast(i)));
+    return mask;
+}
+
+test "mapping masks include every pin across the window wrap" {
+    try std.testing.expectEqual(@as(u32, 0xc0000003), try mapping_mask(30, 4));
+    try std.testing.expectEqual(@as(u32, 0xffffffff), try mapping_mask(16, 32));
+    try std.testing.expectEqual(@as(u32, 0), try mapping_mask(0, 0));
+    try std.testing.expectError(error.InvalidPinCount, mapping_mask(0, 33));
+    try std.testing.expect(!valid_pin_mask(.gpio0, try mapping_mask(29, 4), false));
+}
+
+test "GPIOBASE changes reject every claimed SM even without loaded instructions" {
+    try validate_gpio_base(0, 0);
+    for (1..16) |claimed| {
+        try std.testing.expectError(error.StateMachinesClaimed, validate_gpio_base(0, @intCast(claimed)));
+    }
+    try std.testing.expectError(error.InstructionMemoryInUse, validate_gpio_base(1, 0));
+    try std.testing.expectError(error.InstructionMemoryInUse, validate_gpio_base(1, 1));
+}
+
+test "GPIO program selection preserves the window of an SM driven by injected instructions" {
+    var blocks: [3]BlockResources = @splat(.{ .base = .gpio0, .used = 0, .claimed = 0, .offset = 0 });
+    // SM0 can have a configured pin mapping even though no program is loaded.
+    blocks[0].claimed = 1;
+    try std.testing.expectEqual(GpioSelection{ .block = 1, .base = .gpio16, .sm = .sm0, .offset = 0 }, try select_gpio_program(blocks, 0, 32, 1));
+    blocks[1].claimed = 1;
+    blocks[2].claimed = 1;
+    try std.testing.expectError(error.NoSpace, select_gpio_program(blocks, 0, 32, 1));
+    // Sharing a block remains valid if its existing window is compatible.
+    try std.testing.expectEqual(GpioSelection{ .block = 0, .base = .gpio0, .sm = .sm1, .offset = 0 }, try select_gpio_program(blocks, 0, 16, 1));
+    // The same guard applies when changing back from base 16 to base 0.
+    for (&blocks) |*block| block.base = .gpio16;
+    try std.testing.expectError(error.NoSpace, select_gpio_program(blocks, 0, 0, 1));
 }

@@ -17,6 +17,7 @@ comptime {
 }
 
 pub fn main() !void {
+    if (comptime hal.compatibility.chip == .RP2350) try exercise_rp2350();
     const sm: hal.pio.StateMachine = .sm0;
     pio.clear_instruction_memory();
     try pio.claim_state_machine(sm);
@@ -68,4 +69,23 @@ pub fn main() !void {
     _ = pio.sm_dreq(sm, .rx);
     pio.sm_drain_tx_fifo(sm);
     pio.sm_exec_wait_blocking(sm, @bitCast(@as(u16, 0xa042))); // MOV Y, Y (NOP)
+}
+
+fn exercise_rp2350() !void {
+    try pio.set_gpio_base(.gpio0);
+    const loaded = try hal.pio.Pio.claim_sm_and_add_program_for_gpio_range(program, 0, 1);
+    defer loaded.pio.unclaim(loaded.sm);
+    defer loaded.pio.remove_program(program, loaded.offset) catch @panic("reservation lost");
+    const sm = loaded.sm;
+    try loaded.pio.sm_set_exec_options(sm, .{ .status = .{ .irq = .{ .flag = 7, .block = .prev } } });
+    try loaded.pio.set_interrupt_enabled(.irq0, .{ .flag = 7 }, false);
+    loaded.pio.sm_set_shift_options(sm, .{ .fjoin_rx_get = true });
+    try loaded.pio.sm_rxfifo_put(sm, 3, 42);
+    loaded.pio.sm_set_shift_options(sm, .{ .fjoin_rx_put = true });
+    _ = try loaded.pio.sm_rxfifo_get(sm, 3);
+    loaded.pio.sm_set_shift_options(sm, .{});
+    // Empty masks exercise control composition without starting another SM.
+    pio.enable_in_sync(.{});
+    pio.disable(.{});
+    pio.clkdiv_restart(.{});
 }

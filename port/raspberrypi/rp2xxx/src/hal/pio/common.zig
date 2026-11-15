@@ -61,14 +61,14 @@ pub const InterruptLine = runtime.InterruptLine;
 pub const InterruptSource = union(enum) {
     rx_not_empty: StateMachine,
     tx_not_full: StateMachine,
-    flag: u3,
+    flag: if (@import("../compatibility.zig").chip == .RP2040) u2 else u3,
 };
 pub const InterruptRegs = extern struct {
     enable: @TypeOf(PIO0.IRQ0_INTE),
     force: @TypeOf(PIO0.IRQ0_INTF),
     status: @TypeOf(PIO0.IRQ0_INTS),
 };
-pub const Status = runtime.Status;
+pub const Status = runtime.StatusFor(@import("../compatibility.zig").chip);
 pub const Fdebug = runtime.Fdebug;
 pub const DebugConfig = runtime.DebugConfig;
 
@@ -102,7 +102,8 @@ pub fn PinMapping(comptime Count: type) type {
         }
 
         pub fn with_base(mapping: @This(), base: gpio.Pin) @This() {
-            return .{ .low = base, .high = @fromBackingInt(@as(u5, @truncate(@backingInt(base) + @as(u8, mapping.count()) - 1))) };
+            const end = @as(u8, @intCast(@backingInt(base))) + mapping.count() - 1;
+            return .{ .low = base, .high = if (@import("../compatibility.zig").chip == .RP2350) @fromBackingInt(@as(u6, @intCast(end))) else @fromBackingInt(@as(u5, @truncate(end))) };
         }
 
         low: gpio.Pin,
@@ -177,6 +178,18 @@ fn load_and_init_program(pio: anytype, sm: anytype, program: Program, options: a
 
 pub fn PioImpl(EnumType: type, chip: Chip) type {
     return struct {
+        pub fn used_instruction_space(self: EnumType) u32 {
+            return UsedInstructionSpace(chip).val[@backingInt(self)];
+        }
+        pub fn claimed_state_machines(self: EnumType) u4 {
+            return ClaimedStateMachines(chip).val[@backingInt(self)];
+        }
+        pub fn claim_unlocked(self: EnumType, sm: StateMachine) void {
+            ClaimedStateMachines(chip).val[@backingInt(self)] |= @as(u4, 1) << @backingInt(sm);
+        }
+        pub fn program_offset_unlocked(self: EnumType, program: Program) ?u5 {
+            return find_offset_for_program_mask(used_instruction_space(self), program) catch null;
+        }
         pub fn get_instruction_memory(self: EnumType) *volatile [32]u32 {
             const regs = self.get_regs();
             return @as(*volatile [32]u32, @ptrCast(&regs.INSTR_MEM0));
@@ -194,12 +207,13 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
             return find_offset_for_program_mask(UsedInstructionSpace(chip).val[@backingInt(self)], program);
         }
 
-        fn add_program_unlocked(self: EnumType, program: Program, offset: u5) !void {
+        pub fn add_program_unlocked(self: EnumType, program: Program, offset: u5) !void {
             if (!can_add_program_at_offset_mask(UsedInstructionSpace(chip).val[@backingInt(self)], program, offset)) return error.NoSpace;
             if (program.pio_version > @as(u1, if (chip == .RP2040) 0 else 1)) return error.UnsupportedProgramVersion;
+            if (chip == .RP2350) try runtime.validate_program_gpio(program, @fromBackingInt(@intCast(self.get_gpio_base())), EnumType.has_rp2350b);
             const memory = self.get_instruction_memory();
             for (program.instructions, program.relocations, offset..) |insn, reloc, i|
-                memory[i] = relocate_instruction(chip, insn, reloc, offset);
+                memory[i] = if (chip == .RP2350) runtime.fixup_wait_gpio(relocate_instruction(chip, insn, reloc, offset), @fromBackingInt(@intCast(self.get_gpio_base()))) else relocate_instruction(chip, insn, reloc, offset);
             UsedInstructionSpace(chip).val[@backingInt(self)] |= program.get_mask() << offset;
         }
 
@@ -272,6 +286,9 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
 
         /// Mask bits are relative to this PIO's GPIO base.
         pub fn set_input_sync_bypass_mask(self: EnumType, mask: u32, bypass: bool) void {
+            if (chip == .RP2350) {
+                if (!runtime.valid_pin_mask(@fromBackingInt(@intCast(self.get_gpio_base())), mask, @import("../compatibility.zig").has_rp2350b)) @panic("PIO mask includes pins absent on the selected package");
+            }
             const reg = &self.get_regs().INPUT_SYNC_BYPASS;
             (if (bypass) hw.set_alias(reg) else hw.clear_alias(reg)).write_raw(mask);
         }
@@ -302,6 +319,8 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
 
         fn pin_to_index(self: EnumType, pin: gpio.Pin) error{InvalidPin}!u5 {
             const index = @backingInt(pin);
+            if (chip == .RP2350 and !@import("../compatibility.zig").has_rp2350b and index >= 30) return error.InvalidPin;
+            if (chip == .RP2350) return runtime.pin_index(@fromBackingInt(@intCast(self.get_gpio_base())), index);
             const base = self.get_gpio_base();
             if (index < base or index >= base + 32) {
                 return error.InvalidPin;
@@ -313,7 +332,7 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
             const sm_regs = self.get_sm_regs(sm);
             // EXEC_STALLED is read-only; write only the configured fields.
             // 40DS §3.7 / 50DS §11.7 SMx_EXECCTRL.
-            sm_regs.execctrl.write_raw(runtime.exec_bits(options, if (options.jmp_pin) |pin| try pin_to_index(self, pin) else 0));
+            sm_regs.execctrl.write_raw(runtime.exec_bits(chip, options, if (options.jmp_pin) |pin| try pin_to_index(self, pin) else 0));
         }
 
         pub fn sm_set_pin_mappings(self: EnumType, sm: StateMachine, options: PinMappingOptions, side_set_optional: bool) !void {
@@ -322,6 +341,12 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
                 if (@field(options, field)) |pins| {
                     _ = try pin_to_index(self, pins.low);
                     _ = try pin_to_index(self, pins.high);
+                    if (chip == .RP2350) {
+                        const low = try pin_to_index(self, pins.low);
+                        const high = try pin_to_index(self, pins.high);
+                        if ((@as(u6, high) + 32 - low) % 32 + 1 != pins.count()) return error.InvalidPin;
+                        if (!runtime.valid_pin_mask(@fromBackingInt(@intCast(self.get_gpio_base())), try runtime.mapping_mask(low, pins.count()), @import("../compatibility.zig").has_rp2350b)) return error.InvalidPin;
+                    }
                 }
             }
             const sm_regs = self.get_sm_regs(sm);
@@ -343,6 +368,11 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
         /// SM must be stopped; pin/exec configuration is restored after injection.
         pub fn sm_set_consecutive_pindirs(self: EnumType, sm: StateMachine, base: gpio.Pin, count: u6, dir: gpio.Direction) !void {
             if (count > 32) return error.InvalidPinCount;
+            if (chip == .RP2350 and count > 0) {
+                const last = @as(u32, @backingInt(base)) + count - 1;
+                if (last >= 48) return error.InvalidPin;
+                _ = try pin_to_index(self, @fromBackingInt(@as(u6, @intCast(last))));
+            }
             exec.set_consecutive_pindirs(chip, self, sm, try pin_to_index(self, base), count, dir == .out);
         }
         pub fn sm_set_pindir(self: EnumType, sm: StateMachine, base: gpio.Pin, count: u5, dir: gpio.Direction) !void {
@@ -350,13 +380,24 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
         }
         /// Mask bits are relative to this PIO's GPIO base. SM must be stopped.
         pub fn sm_set_pins_with_mask(self: EnumType, sm: StateMachine, values: u32, mask: u32) void {
+            if (chip == .RP2350) {
+                if (!runtime.valid_pin_mask(@fromBackingInt(@intCast(self.get_gpio_base())), mask, @import("../compatibility.zig").has_rp2350b)) @panic("PIO mask includes pins absent on the selected package");
+            }
             exec.set_with_mask(chip, self, sm, values, mask, .pins);
         }
         pub fn sm_set_pindirs_with_mask(self: EnumType, sm: StateMachine, dirs: u32, mask: u32) void {
+            if (chip == .RP2350) {
+                if (!runtime.valid_pin_mask(@fromBackingInt(@intCast(self.get_gpio_base())), mask, @import("../compatibility.zig").has_rp2350b)) @panic("PIO mask includes pins absent on the selected package");
+            }
             exec.set_with_mask(chip, self, sm, dirs, mask, .pindirs);
         }
         pub fn sm_set_pin(self: EnumType, sm: StateMachine, base: gpio.Pin, count: u5, value: u1) !void {
             const index = try pin_to_index(self, base);
+            if (chip == .RP2350 and count > 0) {
+                const last = @as(u32, @backingInt(base)) + count - 1;
+                if (last >= 48) return error.InvalidPin;
+                _ = try pin_to_index(self, @fromBackingInt(@as(u6, @intCast(last))));
+            }
             var mask: u32 = 0;
             for (0..count) |i| mask |= @as(u32, 1) << (index +% @as(u5, @intCast(i)));
             self.sm_set_pins_with_mask(sm, if (value == 1) mask else 0, mask);
@@ -534,6 +575,7 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
             self.sm_set_enabled(sm, false);
             self.sm_set_clkdiv(sm, options.clkdiv);
             try self.sm_set_exec_options(sm, options.exec);
+            if (chip == .RP2350) try runtime.validate_shift(options.shift);
             self.sm_set_shift_options(sm, options.shift);
             try self.sm_set_pin_mappings(sm, options.pin_mappings, options.exec.side_set_optional);
 
@@ -649,7 +691,11 @@ pub fn default_config(comptime chip: Chip, program: Program) !StateMachineInitOp
     config.exec.wrap_target = defaults.wrap_target;
     config.exec.side_pindir = defaults.side_pindir;
     config.exec.side_set_optional = defaults.side_set_optional;
-    config.exec.status = defaults.status;
+    config.exec.status = switch (defaults.status) {
+        .tx_level => |n| .{ .tx_level = n },
+        .rx_level => |n| .{ .rx_level = n },
+        .irq => |irq| if (chip == .RP2350) .{ .irq = irq } else return error.UnsupportedConfig,
+    };
     config.shift = runtime.default_shift_config(chip, defaults);
     if (defaults.out_shift) |output| if (output.count > 0) {
         config.pin_mappings.out = mapping_from_count(u6, output.count);
@@ -771,7 +817,11 @@ fn TestLoader(comptime chip: Chip) type {
         pio1,
         const Self = @This();
         const Impl = PioImpl(Self, chip);
+        const has_rp2350b = true;
         var memory: [32]u32 = @splat(0);
+        fn get_gpio_base(_: Self) u32 {
+            return 0;
+        }
         fn get_instruction_memory(_: Self) *volatile [32]u32 {
             return &memory;
         }
