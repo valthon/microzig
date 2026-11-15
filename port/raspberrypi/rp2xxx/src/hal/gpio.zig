@@ -193,7 +193,7 @@ pub const Mask =
                     },
                     .in => {
                         SIO.GPIO_OE_CLR.raw = lower_mask;
-                        SIO.GPIO_HI_OE_CLR.raw = lower_mask;
+                        SIO.GPIO_HI_OE_CLR.raw = upper_mask;
                     },
                 }
             }
