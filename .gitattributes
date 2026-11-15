@@ -1,4 +1,7 @@
 *.zig text=auto eol=lf
+# corpus_tests.zig pins this file's SHA-256, so its bytes must not
+# change with the platform's line endings.
+port/raspberrypi/rp2xxx/src/hal/pio/assembler/corpus.json text eol=lf
 flake.lock -diff
 
 # Mark auto-generated test artifacts as generated
