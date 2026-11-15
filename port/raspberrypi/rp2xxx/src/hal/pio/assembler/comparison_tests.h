@@ -31,4 +31,6 @@
 #include "comparison_tests/uart_tx.pio.h"
 #include "comparison_tests/ws2812.pio.h"
 
+#include "comparison_tests/config_v1.pio.h"
+
 #endif

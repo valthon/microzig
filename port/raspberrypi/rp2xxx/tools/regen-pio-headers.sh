@@ -31,9 +31,9 @@ status=0
 if ! "$corpus_only"; then
     for source in "$fixtures"/*.pio; do
         name=$(basename -- "$source")
-        # These two still use the old RP2350 spellings; the next PR replaces them.
-        case $name in irq.pio|movrx.pio) continue ;; esac
-        "$scratch/build/pioasm" -v 0 -o c-sdk "$source" "$scratch/$name.h"
+        version=0
+        case $name in irq.pio|movrx.pio|config_v1.pio) version=1 ;; esac
+        "$scratch/build/pioasm" -v "$version" -o c-sdk "$source" "$scratch/$name.h"
         if "$check"; then
             if ! diff -u -- "$source.h" "$scratch/$name.h"; then status=1; fi
         else
@@ -43,6 +43,7 @@ if ! "$corpus_only"; then
 fi
 assembler="$port/src/hal/pio/assembler"
 python3 "$port/tools/pio-corpus.py" "$scratch/build/pioasm" "$assembler/corpus.json" "$scratch/corpus_expected.zig" "$sdk/tools/pioasm/lexer.ll"
+zig fmt "$scratch/corpus_expected.zig" >/dev/null
 if "$check"; then
     if ! diff -u -- "$assembler/corpus_expected.zig" "$scratch/corpus_expected.zig"; then status=1; fi
 else

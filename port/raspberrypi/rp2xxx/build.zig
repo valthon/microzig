@@ -383,11 +383,22 @@ fn comparison_header(b: *std.Build) !std.Build.LazyPath {
         \\#include <stdbool.h>
         \\#include "comparison_tests.h"
         \\typedef unsigned int uint;
-        \\struct pio_program { const uint16_t *instructions; uint length; int origin; uint pio_version; };
-        \\typedef struct { uint side_count; bool side_optional; bool side_pindirs; } pio_sm_config;
+        \\struct pio_program { const uint16_t *instructions; uint length; int origin; uint pio_version; uint used_gpio_ranges; };
+        \\typedef struct { uint side_count; bool side_optional; bool side_pindirs; uint in_count, out_count, set_count, in_threshold, out_threshold; bool in_right, out_right, autopush, autopull; uint fifo, status_sel, status_n, div_int, div_frac; } pio_sm_config;
         \\static inline pio_sm_config pio_get_default_sm_config(void) { return (pio_sm_config){0}; }
         \\static inline void sm_config_set_wrap(pio_sm_config *c, uint target, uint wrap) { (void)c; (void)target; (void)wrap; }
         \\static inline void sm_config_set_sideset(pio_sm_config *c, uint n, bool opt, bool dirs) { c->side_count = n; c->side_optional = opt; c->side_pindirs = dirs; }
+        \\#define PICO_PIO_VERSION 1
+        \\enum { PIO_FIFO_JOIN_NONE, PIO_FIFO_JOIN_TX, PIO_FIFO_JOIN_RX, PIO_FIFO_JOIN_TXPUT, PIO_FIFO_JOIN_TXGET, PIO_FIFO_JOIN_PUTGET };
+        \\enum { STATUS_TX_LESSTHAN, STATUS_RX_LESSTHAN, STATUS_IRQ_INDEX };
+        \\static inline void sm_config_set_in_pin_count(pio_sm_config *c, uint n) { c->in_count = n; }
+        \\static inline void sm_config_set_out_pin_count(pio_sm_config *c, uint n) { c->out_count = n; }
+        \\static inline void sm_config_set_set_pin_count(pio_sm_config *c, uint n) { c->set_count = n; }
+        \\static inline void sm_config_set_in_shift(pio_sm_config *c, bool right, bool auto_, uint n) { c->in_right = right; c->autopush = auto_; c->in_threshold = n; }
+        \\static inline void sm_config_set_out_shift(pio_sm_config *c, bool right, bool auto_, uint n) { c->out_right = right; c->autopull = auto_; c->out_threshold = n; }
+        \\static inline void sm_config_set_fifo_join(pio_sm_config *c, uint n) { c->fifo = n; }
+        \\static inline void sm_config_set_mov_status(pio_sm_config *c, uint sel, uint n) { c->status_sel = sel; c->status_n = n; }
+        \\static inline void sm_config_set_clkdiv_int_frac(pio_sm_config *c, uint i, uint f) { c->div_int = i; c->div_frac = f; }
         \\
     );
     var lines = std.mem.splitScalar(u8, includes, '\n');

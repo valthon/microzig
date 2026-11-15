@@ -19,6 +19,24 @@ pub const Label = struct {
     index: u5,
 };
 
+/// Configuration requested by pioasm directives; no pin bases or runtime defaults.
+pub const Config = struct {
+    clock_div: ?f32 = null,
+    fifo: ?Fifo = null,
+    mov_status: ?MovStatus = null,
+    in: ?Shift = null,
+    out: ?Shift = null,
+    set: ?u3 = null,
+
+    pub const Fifo = enum { txrx, tx, rx, txput, txget, putget };
+    pub const Shift = struct { count: u6, right: bool, auto: bool, threshold: u6 };
+    pub const MovStatus = struct {
+        source: enum { txfifo, rxfifo, irq },
+        n: u5,
+        block: enum { this, prev, next } = .this,
+    };
+};
+
 pub const Program = struct {
     name: []const u8,
     defines: []const Define,
@@ -34,6 +52,16 @@ pub const Program = struct {
     side_set: ?encoder.SideSet,
     wrap_target: ?u5,
     wrap: ?u5,
+
+    config: Config = .{},
+    pio_version: u1 = 0,
+    used_gpio_ranges: u3 = 0,
+
+    pub fn get_define_by_name(comptime program: Program, comptime name: []const u8) i64 {
+        return for (program.defines) |define| {
+            if (std.mem.eql(u8, name, define.name)) break define.value;
+        } else @panic(std.fmt.comptimePrint("define '{s}' not found", .{name}));
+    }
 
     pub fn get_mask(program: Program) u32 {
         return @intCast((@as(u64, 1) << @as(u6, @intCast(program.instructions.len))) - 1);
@@ -167,6 +195,10 @@ test "tokenizer and encoder" {
     std.testing.refAllDecls(tokenizer);
     std.testing.refAllDecls(@import("assembler/Expression.zig"));
     std.testing.refAllDecls(encoder);
+}
+
+test "versions and configuration" {
+    std.testing.refAllDecls(@import("assembler/version_tests.zig"));
 }
 
 test "differential corpus" {

@@ -352,7 +352,7 @@ pub fn Tokenizer(chip: Chip) type {
 
         fn assert_is_lower(str: []const u8) void {
             for (str) |c|
-                assert(std.ascii.isLower(c) or c == '_');
+                assert(!std.ascii.isUpper(c));
         }
 
         fn eql_lower(comptime lhs: []const u8, rhs: []const u8) bool {
@@ -605,10 +605,84 @@ pub fn Tokenizer(chip: Chip) type {
             }
         }
 
+        fn keyword(self: *Self, comptime word: []const u8, diags: *?Diagnostics) TokenizeError!bool {
+            const arg = try self.peek_arg(diags) orelse return false;
+            if (!eql_lower(word, arg.str)) return false;
+            self.consume_peek(arg);
+            return true;
+        }
+
+        fn get_clock_literal(self: *Self, diags: *?Diagnostics) TokenizeError![]const u8 {
+            try self.skip_arg_space(&self.index, diags);
+            const start = self.index;
+            // FLOAT in lexer.ll is digits* '.' digits+, without an exponent.
+            if (self.peek() == '.') {
+                self.consume(1);
+            } else {
+                const arg = try self.get_arg(diags) orelse return error.MissingArg;
+                if (self.peek() != '.' or arg.len == 0 or !std.ascii.isDigit(arg[0])) return arg;
+                self.consume(1);
+            }
+            const fraction = self.index;
+            while (self.peek()) |c| {
+                if (!std.ascii.isDigit(c)) break;
+                self.consume(1);
+            }
+            if (fraction == self.index) return error.InvalidExpression;
+            return self.source[start..self.index];
+        }
+
+        fn get_config(self: *Self, name: []const u8, index: u32, diags: *?Diagnostics) TokenizeError!Token(chip) {
+            const Config = Token(chip).Config;
+            var config: Config = undefined;
+            if (eql_lower("pio_version", name)) {
+                const arg = try self.get_arg(diags) orelse return error.MissingArg;
+                config = .{ .pio_version = if (eql_lower("rp2040", arg)) .{ .integer = 0 } else if (eql_lower("rp2350", arg)) .{ .integer = 1 } else if (eql_lower("one", arg)) .{ .integer = 1 } else if (eql_lower("zero", arg)) .{ .integer = 0 } else .{ .integer = @intCast(lexer.integer(arg) catch return error.InvalidExpression) } };
+            } else if (eql_lower("clock_div", name)) {
+                config = .{ .clock_div = try self.get_clock_literal(diags) };
+            } else if (eql_lower("fifo", name)) {
+                const arg = try self.get_arg(diags) orelse return error.MissingArg;
+                const lower = try lowercase_bounded(32, arg);
+                config = .{ .fifo = std.meta.stringToEnum(assembler.Config.Fifo, lower.slice()) orelse return error.InvalidSource };
+            } else if (eql_lower("set", name)) {
+                config = .{ .set = try self.get_value(diags) };
+            } else if (eql_lower("in", name) or eql_lower("out", name)) {
+                const count = try self.get_value(diags);
+                var right = true;
+                if (try self.keyword("left", diags)) right = false else _ = try self.keyword("right", diags);
+                const auto = try self.keyword("auto", diags);
+                if (!auto) _ = try self.keyword("manual", diags);
+                const threshold: Value = if (try self.peek_arg(diags) != null) try self.get_value(diags) else .{ .integer = 32 };
+                const shift: Config.Shift = .{ .count = count, .right = right, .auto = auto, .threshold = threshold };
+                config = if (eql_lower("in", name)) .{ .in = shift } else .{ .out = shift };
+            } else {
+                var status: Config.MovStatus = undefined;
+                if (try self.keyword("irq", diags)) {
+                    status.source = .irq;
+                    status.block = if (try self.keyword("prev", diags)) .prev else if (try self.keyword("next", diags)) .next else .this;
+                    if (!try self.keyword("set", diags)) return error.InvalidSource;
+                } else {
+                    status.block = .this;
+                    status.source = if (try self.keyword("txfifo", diags)) .txfifo else if (try self.keyword("rxfifo", diags)) .rxfifo else return error.InvalidSource;
+                    if (!try self.keyword("<", diags)) return error.InvalidSource;
+                }
+                status.n = try self.get_value(diags);
+                config = .{ .mov_status = status };
+            }
+            return .{ .index = index, .data = .{ .config = config } };
+        }
+
         fn get_directive(self: *Self, diags: *?Diagnostics) !Token(chip) {
             const index = self.index;
             const identifier = try self.read_until_whitespace_or_end();
             const lower = try lowercase_bounded(256, identifier);
+            inline for (.{ "pio_version", "clock_div", "fifo", "mov_status", "in", "out", "set" }) |name| {
+                if (eql_lower(name, identifier)) {
+                    const token = try self.get_config(identifier, index, diags);
+                    try self.end_line(diags);
+                    return token;
+                }
+            }
             return if (directives.get(lower.slice())) |handler| ret: {
                 const ret = try handler(self, index, diags);
                 try self.end_line(diags);
@@ -694,61 +768,32 @@ pub fn Tokenizer(chip: Chip) type {
             const first = try self.peek_arg(diags) orelse return error.MissingArg;
             const omitted = eql_lower("gpio", first.str) or eql_lower("pin", first.str) or eql_lower("irq", first.str) or eql_lower("jmppin", first.str);
             const polarity: Value = if (omitted) .{ .integer = 1 } else try self.get_value(diags);
-            const source_str = (try self.get_arg(diags)) orelse return error.MissingArg;
-            try self.optional_comma(diags);
-            const pin = try self.get_value(diags);
-
-            if (source_str.len > 8) return error.InvalidSource;
-            var buf: [8]u8 = undefined;
-            for (source_str, 0..) |c, i|
-                buf[i] = std.ascii.toLower(c);
-
-            const source_lower = buf[0..source_str.len];
-            var source: Token(chip).Instruction.Wait.Source = undefined;
-            switch (comptime chip) {
-                .RP2040 => {
-                    source = if (std.mem.eql(u8, "gpio", source_lower))
-                        .gpio
-                    else if (std.mem.eql(u8, "pin", source_lower))
-                        .pin
-                    else if (std.mem.eql(u8, "irq", source_lower))
-                        .irq
-                    else
-                        return error.InvalidSource;
-                },
-                .RP2350 => {
-                    source = if (std.mem.eql(u8, "gpio", source_lower))
-                        .gpio
-                    else if (std.mem.eql(u8, "jmppin", source_lower))
-                        .jmppin
-                    else if (std.mem.eql(u8, "pin", source_lower))
-                        .pin
-                    else if (std.mem.eql(u8, "irq", source_lower))
-                        .irq
-                    else
-                        return error.InvalidSource;
-                },
+            const source_str = try self.get_arg(diags) orelse return error.MissingArg;
+            if (chip == .RP2040 and eql_lower("jmppin", source_str)) {
+                diags.* = Diagnostics.init(self.index, "instruction requires PIO version 1", .{});
+                return error.InvalidSource;
             }
-
-            const rel: bool = if (source == .irq)
-                if (try self.peek_arg(diags)) |rel_result| blk: {
-                    const is_rel = eql_lower("rel", rel_result.str);
-                    if (is_rel)
-                        self.consume_peek(rel_result);
-
-                    break :blk is_rel;
-                } else false
+            const lower = try lowercase_bounded(16, source_str);
+            const source = std.meta.stringToEnum(Token(chip).Instruction.Wait.Source, lower.slice()) orelse return error.InvalidSource;
+            var mode: u2 = 0;
+            if (source == .irq) {
+                try self.skip_arg_space(&self.index, diags);
+                if (self.peek() != ',') {
+                    if (try self.keyword("prev", diags)) mode = 1 else if (try self.keyword("next", diags)) mode = 3;
+                }
+                if (chip == .RP2040 and mode != 0) {
+                    diags.* = Diagnostics.init(self.index, "instruction requires PIO version 1", .{});
+                    return error.InvalidSource;
+                }
+            }
+            if (!(chip == .RP2350 and source == .jmppin)) try self.optional_comma(diags);
+            const num: Value = if (chip == .RP2350 and source == .jmppin)
+                if (try self.keyword("+", diags)) try self.get_value(diags) else .{ .integer = 0 }
             else
-                false;
-
-            return Token(chip).Instruction.Payload{
-                .wait = .{
-                    .polarity = polarity,
-                    .source = source,
-                    .num = pin,
-                    .rel = rel,
-                },
-            };
+                try self.get_value(diags);
+            const rel = source == .irq and try self.keyword("rel", diags);
+            if (rel and mode != 0) return error.InvalidSource;
+            return .{ .wait = .{ .polarity = polarity, .source = source, .num = num, .rel = rel, .irq_mode = mode } };
         }
 
         /// get the lowercase of a string, returns an error if it's too big
@@ -869,8 +914,12 @@ pub fn Tokenizer(chip: Chip) type {
             // Peek so that we can unwind for the mov_rx case
             const dest_str = try self.peek_arg(diags) orelse return error.MissingArg;
             const dest_lower = try lowercase_bounded(256, dest_str.str);
-            // If the destination is rxfifo_ or rxfifoy, then it's a mov (to) rx instruction
-            if (chip == .RP2350 and std.mem.startsWith(u8, dest_lower.slice(), "rxfifo")) {
+            if (chip == .RP2040 and (eql_lower("rxfifo", dest_str.str) or eql_lower("pindirs", dest_str.str))) {
+                diags.* = Diagnostics.init(self.index, "instruction requires PIO version 1", .{});
+                return error.InvalidDestination;
+            }
+            // RX FIFO moves use the push/pull instruction encoding.
+            if (chip == .RP2350 and eql_lower("rxfifo", dest_str.str)) {
                 return try self.get_movrx(diags);
             }
 
@@ -882,9 +931,12 @@ pub fn Tokenizer(chip: Chip) type {
             self.consume_peek(dest_str);
             try self.optional_comma(diags);
             const peek_source_str = try self.peek_arg(diags) orelse return error.MissingArg;
-            const peek_source_lower = try lowercase_bounded(256, peek_source_str.str);
-            // If the destination is osr, and the source is rxfifo_ or rxfifoy, then it's a mov (from) rx instruction
-            if (chip == .RP2350 and std.mem.startsWith(u8, peek_source_lower.slice(), "rxfifo")) {
+            if (chip == .RP2040 and eql_lower("rxfifo", peek_source_str.str)) {
+                diags.* = Diagnostics.init(self.index, "instruction requires PIO version 1", .{});
+                return error.InvalidSource;
+            }
+            // Detect a FIFO source before parsing ordinary MOV operands.
+            if (chip == .RP2350 and eql_lower("rxfifo", peek_source_str.str)) {
                 // Need to unconsume first arg
                 self.unconsume(dest_str);
 
@@ -934,175 +986,55 @@ pub fn Tokenizer(chip: Chip) type {
             };
         }
 
-        fn get_movrx(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
-            // NOTE: Assuming there's one space after opcode
-            const dest_idx = self.index + 1;
-            const dest_str = (try self.get_arg(diags)) orelse return error.MissingArg;
-            const dest_lower = try lowercase_bounded(256, dest_str);
-            // NOTE: Assuming there's a comma and one space
-            const source_idx = self.index + 2;
-            try self.optional_comma(diags);
-            const source_str = (try self.get_arg(diags)) orelse return error.MissingArg;
-            const source_lower = try lowercase_bounded(256, source_str);
-            if (std.mem.startsWith(u8, dest_lower.slice(), "rxfifo")) {
-                // MOV (to RX)
-                // -- Source must be isr
-                if (!std.mem.eql(u8, source_lower.slice(), "isr")) {
-                    diags.* = Diagnostics.init(source_idx, "mov (to rx): source must be isr", .{});
-                    return error.InvalidSource;
-                }
-                const dest_index_char = dest_lower.slice()["rxfifo".len - 0 ..];
-                if (dest_index_char.len == 0) return error.InvalidDestination;
-                if (dest_index_char[0] == 'y') {
-                    return Token(chip).Instruction.Payload{
-                        .movtorx = .{
-                            .idxl = true,
-                            .idx = 0,
-                        },
-                    };
-                } else {
-                    // -- Parse out the index
-                    diags.* = Diagnostics.init(
-                        dest_idx,
-                        "mov (to rx): destination must be rxfifoy or rxfifo[<index>]",
-                        .{},
-                    );
-                    const value = try std.fmt.parseInt(u8, dest_index_char, 10);
-                    if (value > 3) {
-                        return error.InvalidDestination;
-                    }
-                    diags.* = null;
-                    return Token(chip).Instruction.Payload{
-                        .movtorx = .{
-                            .idxl = false,
-                            .idx = @intCast(value),
-                        },
-                    };
-                }
-            } else if (std.mem.eql(u8, dest_lower.slice(), "osr")) {
-                // MOV (from RX)
-                var idxl: bool = false;
-                var idx: u3 = 0;
-                if (std.mem.startsWith(u8, source_lower.slice(), "rxfifo")) {
-                    const src_index_char = source_lower.slice()["rxfifo".len - 0 ..];
-                    if (src_index_char.len == 0) return error.InvalidSource;
-                    if (src_index_char[0] == 'y') {
-                        idxl = true;
-                        idx = 0;
-                    } else {
-                        // -- Parse out the index
-                        idxl = false;
-                        idx = 0;
-                        diags.* = Diagnostics.init(
-                            @intCast(source_idx + "rxfifo".len),
-                            "mov (from rx): source must be rxfifoy or rxfifo[<index>]",
-                            .{},
-                        );
-                        const value = try std.fmt.parseInt(u8, src_index_char, 10);
-                        if (value > 3) {
-                            return error.InvalidSource;
-                        }
-                        idx = @intCast(value);
-                    }
-                } else {
-                    diags.* = Diagnostics.init(
-                        @intCast(self.index - source_str.len),
-                        "mov (from rx): source must be rxfifoy or rxfifo[<index>]",
-                        .{},
-                    );
-                    return error.InvalidSource;
-                }
-                diags.* = null;
-                return Token(chip).Instruction.Payload{
-                    .movfromrx = .{
-                        .idxl = idxl,
-                        .idx = idx,
-                    },
-                };
-            } else {
-                diags.* = Diagnostics.init(
-                    dest_idx,
-                    "unknown destination",
-                    .{},
-                );
-                return error.InvalidDestination;
+        fn get_fifo_index(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.MovToRx {
+            const arg = try self.peek_arg(diags) orelse return error.MissingArg;
+            if (arg.str.len < 3 or arg.str[0] != '[' or arg.str[arg.str.len - 1] != ']') return error.InvalidSource;
+            self.consume_peek(arg);
+            // Keep source indices while limiting the ordinary operand tokenizer
+            // to the bracket contents. parser.yy permits Y or value here, whereas
+            // delay brackets permit an unparenthesized expression.
+            var contents = Self.init(self.source[0 .. self.index - 1]);
+            contents.index = arg.start + 1;
+            const idxl = try contents.keyword("y", diags);
+            const idx: Value = if (idxl) .{ .integer = 0 } else try contents.get_value(diags);
+            try contents.skip_arg_space(&contents.index, diags);
+            if (contents.index != contents.source.len) {
+                diags.* = Diagnostics.init(contents.index, "expected ']' after RX FIFO index", .{});
+                return error.InvalidExpression;
             }
+            return .{ .idxl = idxl, .idx = idx };
+        }
+
+        fn get_movrx(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
+            const dest = try self.get_arg(diags) orelse return error.MissingArg;
+            if (eql_lower("rxfifo", dest)) {
+                const index = try self.get_fifo_index(diags);
+                try self.optional_comma(diags);
+                if (!try self.keyword("isr", diags)) return error.InvalidSource;
+                return .{ .movtorx = index };
+            }
+            if (!eql_lower("osr", dest)) return error.InvalidDestination;
+            try self.optional_comma(diags);
+            if (!try self.keyword("rxfifo", diags)) return error.InvalidSource;
+            const index = try self.get_fifo_index(diags);
+            return .{ .movfromrx = .{ .idxl = index.idxl, .idx = index.idx } };
         }
 
         fn get_irq(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
-            const first = (try self.get_arg(diags)) orelse return error.MissingArg;
-
-            var clear = false;
-            var wait = false;
-            var has_mode = false;
-            const first_lower = try lowercase_bounded(256, first);
-            if (std.mem.eql(u8, "set", first_lower.slice())) {
-                has_mode = true;
-                // do nothing
-            } else if (std.mem.eql(u8, "nowait", first_lower.slice())) {
-                has_mode = true;
-                // do nothing
-            } else if (std.mem.eql(u8, "wait", first_lower.slice())) {
-                has_mode = true;
-                wait = true;
-            } else if (std.mem.eql(u8, "clear", first_lower.slice())) {
-                has_mode = true;
-                clear = true;
+            var mode: u2 = 0;
+            if (try self.keyword("prev", diags)) mode = 1 else if (try self.keyword("next", diags)) mode = 3;
+            if (chip == .RP2040 and mode != 0) {
+                diags.* = Diagnostics.init(self.index, "instruction requires PIO version 1", .{});
+                return error.InvalidSource;
             }
-
-            const num = if (has_mode)
-                try self.get_value(diags)
-            else
-                try Value.from_string(first);
-
-            switch (comptime chip) {
-                .RP2040 => {
-                    const rel: bool = if (try self.peek_arg(diags)) |result| blk: {
-                        const rel_lower = try lowercase_bounded(256, result.str);
-                        const is_rel = std.mem.eql(u8, "rel", rel_lower.slice());
-                        if (is_rel)
-                            self.consume_peek(result);
-
-                        break :blk is_rel;
-                    } else false;
-
-                    return Token(chip).Instruction.Payload{
-                        .irq = .{
-                            .clear = clear,
-                            .wait = wait,
-                            .num = num,
-                            .rel = rel,
-                        },
-                    };
-                },
-                .RP2350 => {
-                    const IdxMode = Token(chip).Instruction.Irq.IdxMode;
-                    const idx_mode: IdxMode = if (try self.peek_arg(diags)) |result| blk: {
-                        const idxmode_lower = try lowercase_bounded(256, result.str);
-                        if (std.mem.eql(u8, "rel", idxmode_lower.slice())) {
-                            self.consume_peek(result);
-                            break :blk .rel;
-                        } else if (std.mem.eql(u8, "prev", idxmode_lower.slice())) {
-                            self.consume_peek(result);
-                            break :blk .prev;
-                        } else if (std.mem.eql(u8, "next", idxmode_lower.slice())) {
-                            self.consume_peek(result);
-                            break :blk .next;
-                        } else {
-                            break :blk .direct;
-                        }
-                    } else .direct;
-
-                    return Token(chip).Instruction.Payload{
-                        .irq = .{
-                            .clear = clear,
-                            .wait = wait,
-                            .num = num,
-                            .idxmode = idx_mode,
-                        },
-                    };
-                },
-            }
+            const clear = try self.keyword("clear", diags);
+            const wait = !clear and try self.keyword("wait", diags);
+            if (!clear and !wait and !try self.keyword("set", diags)) _ = try self.keyword("nowait", diags);
+            const num = try self.get_value(diags);
+            const rel = try self.keyword("rel", diags);
+            if (rel and mode != 0) return error.InvalidSource;
+            if (chip == .RP2040) return .{ .irq = .{ .clear = clear, .wait = wait, .num = num, .rel = rel } };
+            return .{ .irq = .{ .clear = clear, .wait = wait, .num = num, .idxmode = @fromBackingInt(@intCast(if (rel) @as(u2, 2) else mode)) } };
         }
 
         fn get_set(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
@@ -1300,7 +1232,24 @@ pub fn Token(comptime chip: Chip) type {
             word: Value,
             label: Label,
             instruction: Instruction,
+            config: Config,
         },
+
+        pub const Config = union(enum) {
+            pio_version: Value,
+            clock_div: []const u8,
+            fifo: assembler.Config.Fifo,
+            mov_status: MovStatus,
+            in: Shift,
+            out: Shift,
+            set: Value,
+            pub const Shift = struct { count: Value, right: bool, auto: bool, threshold: Value };
+            pub const MovStatus = struct {
+                source: @FieldType(assembler.Config.MovStatus, "source"),
+                block: @FieldType(assembler.Config.MovStatus, "block"),
+                n: Value,
+            };
+        };
 
         pub const Tag = std.meta.Tag(@FieldType(Token(chip), "data"));
 
@@ -1353,6 +1302,7 @@ pub fn Token(comptime chip: Chip) type {
                 source: Source,
                 num: Value,
                 rel: bool,
+                irq_mode: u2 = 0,
 
                 pub const Source = switch (chip) {
                     .RP2040 => enum(u2) {
@@ -1456,11 +1406,11 @@ pub fn Token(comptime chip: Chip) type {
 
             pub const MovToRx = struct {
                 idxl: bool,
-                idx: u3,
+                idx: Value,
             };
             pub const MovFromRx = struct {
                 idxl: bool,
-                idx: u3,
+                idx: Value,
             };
 
             pub const Irq = switch (chip) {
@@ -2090,7 +2040,7 @@ test "tokenize.instr.wait.irq.rel" {
 
 test "tokenize.instr.wait.jmppin" {
     // JMPPIN is a valid source on RP2350
-    const tokens = try bounded_tokenize(.RP2350, "wait 1 jmppin 1");
+    const tokens = try bounded_tokenize(.RP2350, "wait 1 jmppin + 1");
     try expect_instr_wait(.RP2350, .{
         .polarity = 1,
         .source = .jmppin,
@@ -2307,7 +2257,7 @@ test "tokenize.instr.irq.rel" {
 }
 
 test "tokenize.instr.irq.relnext" {
-    const tokens = try bounded_tokenize(.RP2350, "irq set 2 next");
+    const tokens = try bounded_tokenize(.RP2350, "irq next set 2");
     try expect_instr_irq(.RP2350, .{
         .clear = false,
         .wait = false,
@@ -2458,7 +2408,7 @@ test "tokenize.trailing tokens and invalid input diagnostics" {
         .{ "nop side 0 side 1", error.InvalidExpression, 17, "InvalidExpression" },
         .{ "nop [1] [2]", error.InvalidExpression, 11, "InvalidExpression" },
         .{ "/x", error.InvalidCharacter, 2, "InvalidCharacter" },
-        .{ "wait 1 verylongsource 0", error.InvalidSource, 23, "InvalidSource" },
+        .{ "wait 1 verylongsource 0", error.InvalidSource, 21, "InvalidSource" },
         .{ "out pins, (1", error.InvalidExpression, 10, "mismatched parenthesis" },
         .{ "set", error.MissingArg, 3, "missing destination" },
         .{ "/", error.InvalidCharacter, 1, "InvalidCharacter" },

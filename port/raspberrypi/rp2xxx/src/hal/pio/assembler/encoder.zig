@@ -51,6 +51,7 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
         output: Self.Output,
         tokens: []const Token(chip),
         index: u32,
+        default_version: u1 = if (chip == .RP2350) 1 else 0,
 
         const Self = @This();
         const Output = struct {
@@ -81,6 +82,9 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             side_set: ?SideSet,
             wrap_target: ?u5,
             wrap: ?u5,
+            config: assembler.Config = .{},
+            pio_version: u1 = if (chip == .RP2350) 1 else 0,
+            used_gpio_ranges: u3 = 0,
 
             fn comptime_copy(comptime T: type, comptime slice: []const T) []const T {
                 const arr: [slice.len]T = slice[0..slice.len].*;
@@ -127,6 +131,9 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                     .side_set = bounded.side_set,
                     .wrap_target = bounded.wrap_target,
                     .wrap = bounded.wrap,
+                    .config = bounded.config,
+                    .pio_version = bounded.pio_version,
+                    .used_gpio_ranges = bounded.used_gpio_ranges,
                 };
             }
         };
@@ -337,36 +344,89 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
 
                     self.consume(1);
                 },
+                .config => |config| {
+                    if (config != .pio_version) return error.InvalidTokenInGlobalSpace;
+                    const version = try self.evaluate_global(u32, config.pio_version, token.index, diags);
+                    if (version > 1) return invalid_config(token.index, diags, "PIO version must be 0 or 1");
+                    if (chip == .RP2040 and version == 1) return invalid_config(token.index, diags, "PIO version 1 is not supported on RP2040");
+                    self.default_version = @intCast(version);
+                    self.consume(1);
+                },
                 .program => break,
                 else => return error.InvalidTokenInGlobalSpace,
             };
+        }
+
+        fn invalid_config(index: u32, diags: *?Diagnostics, comptime message: []const u8) error{InvalidConfig} {
+            diags.* = Diagnostics.init(index, message, .{});
+            return error.InvalidConfig;
+        }
+
+        fn require_v1(program: BoundedProgram, index: u32, diags: *?Diagnostics) !void {
+            if (program.pio_version == 0) return invalid_config(index, diags, "construct requires PIO version 1");
+        }
+
+        fn encode_config(self: *Self, program: *BoundedProgram, config: Token(chip).Config, index: u32, diags: *?Diagnostics) !void {
+            switch (config) {
+                .pio_version => |value| {
+                    const version = try self.evaluate(u32, program.*, value, index, diags);
+                    if (version > 1) return invalid_config(index, diags, "PIO version must be 0 or 1");
+                    if (chip == .RP2040 and version == 1) return invalid_config(index, diags, "PIO version 1 is not supported on RP2040");
+                    program.pio_version = @intCast(version);
+                },
+                .clock_div => |text| {
+                    const value: f32 = if (std.ascii.eqlIgnoreCase(text, "one")) 1 else if (std.ascii.eqlIgnoreCase(text, "zero")) 0 else value: {
+                        if (lexer.integer(text)) |integer| break :value @floatFromInt(integer) else |_| {}
+                        break :value std.fmt.parseFloat(f32, text) catch return invalid_config(index, diags, "clock_div requires a numeric literal");
+                    };
+                    if (!std.math.isFinite(value) or value < 1 or value >= 65536) return invalid_config(index, diags, "clock divider must be in 1..<65536");
+                    program.config.clock_div = value;
+                },
+                .fifo => |fifo| {
+                    if (@backingInt(fifo) >= @backingInt(assembler.Config.Fifo.txput)) try require_v1(program.*, index, diags);
+                    program.config.fifo = fifo;
+                },
+                .in, .out => |shift| {
+                    const is_in = config == .in;
+                    const dest = if (is_in) &program.config.in else &program.config.out;
+                    const count = try self.evaluate(i64, program.*, shift.count, index, diags);
+                    const threshold = try self.evaluate(i64, program.*, shift.threshold, index, diags);
+                    if (count < @as(i64, if (is_in) 1 else 0) or count > 32) return invalid_config(index, diags, "pin count out of range");
+                    if (is_in and program.pio_version == 0 and count != 32) return invalid_config(index, diags, ".in count must be 32 for PIO version 0");
+                    if (threshold < 1 or threshold > 32) return invalid_config(index, diags, "shift threshold must be in 1..32");
+                    dest.* = .{ .count = @intCast(count), .right = shift.right, .auto = shift.auto, .threshold = @intCast(threshold) };
+                },
+                .set => |value| {
+                    const count = try self.evaluate(i64, program.*, value, index, diags);
+                    if (count < 0 or count > 5) return invalid_config(index, diags, ".set count must be in 0..5");
+                    program.config.set = @intCast(count);
+                },
+                .mov_status => |status| {
+                    const n = try self.evaluate(i64, program.*, status.n, index, diags);
+                    if (status.source == .irq) try require_v1(program.*, index, diags);
+                    if (n < 0 or n > @as(i64, if (status.source == .irq) 7 else 31)) return invalid_config(index, diags, "mov_status index out of range");
+                    program.config.mov_status = .{ .source = status.source, .block = status.block, .n = @intCast(n) };
+                },
+            }
         }
 
         fn encode_program_init(self: *Self, program: *BoundedProgram, diags: *?Diagnostics) !void {
             while (self.peek_token()) |token| {
                 switch (token.data) {
                     .program, .label, .instruction, .word, .wrap_target => break,
+                    .config => |config| {
+                        switch (config) {
+                            .pio_version, .fifo, .clock_div => try self.encode_config(program, config, token.index, diags),
+                            else => {}, // Resolve values after collecting the program's defines.
+                        }
+                        self.consume(1);
+                    },
                     .define => |define| {
                         try self.add_define(program, define, token.index, diags);
                         self.consume(1);
                     },
-                    .origin => |value| {
-                        const origin = try self.evaluate(i32, program.*, value, token.index, diags);
-                        program.origin = if (origin == -1) null else origin;
-                        self.consume(1);
-                    },
-                    .side_set => |side_set| {
-                        program.side_set = .{
-                            .count = try self.evaluate(u3, program.*, side_set.count, token.index, diags),
-                            .optional = side_set.opt,
-                            .pindir = side_set.pindir,
-                        };
-                        if (program.side_set.?.count + @as(u4, @intFromBool(side_set.opt)) > 5) {
-                            diags.* = Diagnostics.init(token.index, "side-set requires more than 5 bits", .{});
-                            return error.InvalidSideSet;
-                        }
-                        self.consume(1);
-                    },
+                    // Values are resolved only for the final occurrence.
+                    .origin, .side_set => self.consume(1),
                     // ignore
                     .lang_opt => self.consume(1),
                     .wrap => {
@@ -394,6 +454,26 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             instruction_count: u32,
             diags: *?Diagnostics,
         ) !void {
+            const fifo = program.config.fifo orelse .txrx;
+            switch (token.payload) {
+                // RP2350 datasheet §11.4.6 forbids PUSH in PUT/GET modes.
+                .push => if (fifo != .txrx and fifo != .rx) return invalid_config(token_index, diags, "push requires txrx or rx FIFO configuration"),
+                .movtorx => {
+                    try require_v1(program.*, token_index, diags);
+                    if (fifo != .txput and fifo != .putget) return invalid_config(token_index, diags, "mov rxfifo[] requires txput or putget FIFO configuration");
+                },
+                .movfromrx => {
+                    try require_v1(program.*, token_index, diags);
+                    if (fifo != .txget and fifo != .putget) return invalid_config(token_index, diags, "mov osr, rxfifo[] requires txget or putget FIFO configuration");
+                },
+                .mov => |mov| if (chip == .RP2350 and mov.destination == .pindirs) {
+                    try require_v1(program.*, token_index, diags);
+                },
+                .irq => |irq| if (chip == .RP2350 and (irq.idxmode == .prev or irq.idxmode == .next)) {
+                    try require_v1(program.*, token_index, diags);
+                },
+                else => {},
+            }
             // guaranteed to be an instruction variant
             const payload: Instruction(chip).Payload = switch (token.payload) {
                 .nop => .{
@@ -411,15 +491,20 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                     }
                     break :blk .{ .jmp = .{ .condition = jmp.condition, .address = address } };
                 },
-                .wait => |wait| .{
-                    .wait = .{
+                .wait => |wait| blk: {
+                    if ((chip == .RP2350 and wait.source == .jmppin) or wait.irq_mode != 0) try require_v1(program.*, token_index, diags);
+                    const n = try self.evaluate(u32, program.*, wait.num, token_index, diags);
+                    const limit: u32 = if (wait.source == .irq) 7 else if (chip == .RP2350 and wait.source == .jmppin) 3 else if (wait.source == .gpio and program.pio_version == 1) 47 else 31;
+                    if (n > limit) return invalid_config(token_index, diags, "wait index out of range");
+                    if (wait.source == .gpio) {
+                        program.used_gpio_ranges |= @as(u3, 1) << @as(u2, @intCast(n / 16));
+                        if (program.used_gpio_ranges & 5 == 5) return invalid_config(token_index, diags, "absolute GPIO ranges 0..15 and 32..47 cannot be combined");
+                    }
+                    break :blk .{ .wait = .{
                         .polarity = try self.evaluate(u1, program.*, wait.polarity, token_index, diags),
                         .source = wait.source,
-                        // RP2040 §3.4.3: IRQ REL is bit 4. RP2350 §11.4.3.2:
-                        // IdxMode[4:3] = 0b10 selects relative IRQ indexing.
-                        .index = (if (wait.source == .irq) @as(u5, try self.evaluate(u3, program.*, wait.num, token_index, diags)) else try self.evaluate(u5, program.*, wait.num, token_index, diags)) |
-                            (if (wait.rel) @as(u5, 0x10) else 0),
-                    },
+                        .index = @as(u5, @truncate(n)) | (@as(u5, if (wait.rel) 2 else wait.irq_mode) << 3),
+                    } };
                 },
                 .in => |in| .{
                     .in = .{
@@ -455,14 +540,14 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                 // NOTE: These instructions values only exist for RP2350
                 .movtorx => |mov| .{
                     .movtorx = .{
-                        .idx = mov.idx,
-                        .idxl = @intFromBool(mov.idxl),
+                        .idx = try self.evaluate(u3, program.*, mov.idx, token_index, diags),
+                        .idxl = @intFromBool(!mov.idxl),
                     },
                 },
                 .movfromrx => |mov| .{
                     .movfromrx = .{
-                        .idx = mov.idx,
-                        .idxl = @intFromBool(mov.idxl),
+                        .idx = try self.evaluate(u3, program.*, mov.idx, token_index, diags),
+                        .idxl = @intFromBool(!mov.idxl),
                     },
                 },
                 .irq => |irq| blk: {
@@ -591,7 +676,7 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                 delay;
         }
 
-        fn encode_instruction_body(self: *Self, program: *BoundedProgram, diags: *?Diagnostics) !void {
+        fn encode_instruction_body(self: *Self, program: *BoundedProgram, config_start: u32, diags: *?Diagnostics) !void {
             // first scan through body for labels
             var instr_index: u32 = 0;
             var wrap_target_index: ?u32 = null;
@@ -642,12 +727,18 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                         program.wrap = @intCast(instr_index - 1);
                     },
                     .define => |define| try self.add_define(program, define, token.index, diags),
+                    .config => |config| {
+                        if (instr_index != 0 and config != .clock_div) return invalid_config(token.index, diags, "directive must precede instructions");
+                        switch (config) {
+                            .pio_version, .fifo, .clock_div => try self.encode_config(program, config, token.index, diags),
+                            else => {},
+                        }
+                    },
+                    .origin, .side_set => {
+                        if (instr_index != 0) return invalid_config(token.index, diags, "directive must precede instructions");
+                    },
                     .lang_opt => {},
                     .program => break,
-                    else => {
-                        diags.* = Diagnostics.init(token.index, "directive is not valid in the program body", .{});
-                        return error.InvalidDirective;
-                    },
                 }
             }
 
@@ -655,6 +746,64 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                 if (target >= instr_index) {
                     diags.* = Diagnostics.init(wrap_target_index.?, "wrap target is outside program", .{});
                     return error.InvalidWrap;
+                }
+            }
+
+            // pioasm stores the last value of each deferred directive. Walk
+            // backwards so overridden expressions are never resolved or checked.
+            // Version, divider and FIFO checks are immediate in pioasm and have
+            // already run in source order above.
+            var end = config_start;
+            while (end < self.tokens.len and self.tokens[end].data != .program) : (end += 1) {}
+            var seen_configs: [@typeInfo(Token(chip).Config).@"union".field_names.len]bool = @splat(false);
+            var seen_origin = false;
+            var seen_side_set = false;
+            while (end > config_start) {
+                end -= 1;
+                const token = self.tokens[end];
+                switch (token.data) {
+                    .config => |config| switch (config) {
+                        .pio_version, .fifo, .clock_div => {},
+                        else => {
+                            const tag = @backingInt(std.meta.activeTag(config));
+                            if (!seen_configs[tag]) {
+                                try self.encode_config(program, config, token.index, diags);
+                                seen_configs[tag] = true;
+                            }
+                        },
+                    },
+                    .origin => |value| if (!seen_origin) {
+                        const origin = try self.evaluate(i32, program.*, value, token.index, diags);
+                        program.origin = if (origin == -1) null else origin;
+                        seen_origin = true;
+                    },
+                    .side_set => |side_set| if (!seen_side_set) {
+                        const count = try self.evaluate(u3, program.*, side_set.count, token.index, diags);
+                        if (@as(u4, count) + @intFromBool(side_set.opt) > 5) {
+                            diags.* = Diagnostics.init(token.index, "side-set requires more than 5 bits", .{});
+                            return error.InvalidSideSet;
+                        }
+                        program.side_set = .{ .count = count, .optional = side_set.opt, .pindir = side_set.pindir };
+                        seen_side_set = true;
+                    },
+                    else => {},
+                }
+            }
+
+            const fifo = program.config.fifo orelse .txrx;
+            if (program.pio_version == 0) {
+                if (fifo == .txput or fifo == .txget or fifo == .putget) try require_v1(program.*, 0, diags);
+                if (program.config.in) |input| {
+                    if (input.count != 32) return invalid_config(0, diags, ".in count must be 32 for PIO version 0");
+                }
+                if (program.config.mov_status) |status| {
+                    if (status.source == .irq) try require_v1(program.*, 0, diags);
+                }
+            }
+            // RP2350 datasheet §11.5.4.1: autopush is undefined in PUT/GET modes.
+            if (fifo == .txput or fifo == .txget or fifo == .putget) {
+                if (program.config.in) |input| {
+                    if (input.auto) return invalid_config(0, diags, "autopush is incompatible with selected FIFO configuration");
                 }
             }
 
@@ -667,15 +816,10 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                         try program.relocations.append(.none);
                     },
                     // already processed
-                    .label, .wrap_target, .wrap, .define, .lang_opt => {},
+                    .label, .wrap_target, .wrap, .define, .lang_opt, .config, .origin, .side_set => {},
                     .program => {
                         self.index = @as(u32, @intCast(i));
                         break;
-                    },
-
-                    else => {
-                        diags.* = Diagnostics.init(token.index, "directive is not valid in the program body", .{});
-                        return error.InvalidDirective;
                     },
                 }
             } else if (self.tokens.len > 0)
@@ -696,6 +840,7 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
 
             var program = BoundedProgram{
                 .name = program_token.data.program,
+                .pio_version = self.default_version,
                 .defines = .{},
                 .private_defines = .{},
                 .instructions = .{},
@@ -707,8 +852,9 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                 .wrap = null,
             };
 
+            const config_start = self.index;
             try self.encode_program_init(&program, diags);
-            try self.encode_instruction_body(&program, diags);
+            try self.encode_instruction_body(&program, config_start, diags);
 
             return program;
         }
@@ -1374,8 +1520,8 @@ test "encode.range diagnostics" {
 
 test "encode.user input formerly unreachable diagnostics" {
     try expect_diagnostic(".program p\n.wrap", error.InvalidWrap, 12, ".wrap requires a preceding instruction");
-    try expect_diagnostic(".program p\nnop\n.origin 1", error.InvalidDirective, 16, "directive is not valid in the program body");
-    try expect_diagnostic(".program p\nnop\n.side_set 1", error.InvalidDirective, 16, "directive is not valid in the program body");
+    try expect_diagnostic(".program p\nnop\n.origin 1", error.InvalidConfig, 16, "directive must precede instructions");
+    try expect_diagnostic(".program p\nnop\n.side_set 1", error.InvalidConfig, 16, "directive must precede instructions");
 }
 
 test "encode.expressions and default wait polarity" {
