@@ -78,11 +78,13 @@ pub const USBD = struct {
 
     const Self = @This();
 
+    /// Nothing here touches USBPULLUP, EPINEN or EPOUTEN. They are among the registers that
+    /// "cannot be accessed" while the peripheral "is not enabled (using the ENABLE register)
+    /// and ready (signalled by the READY bit in EVENTCAUSE after a USBEVENT event)"
+    /// (nRF52840 PS v1.1, 6.35.12), and it is disabled here. `poll` writes them when READY
+    /// has come.
     pub fn init() Self {
-        peripherals.USBD.USBPULLUP.write_raw(0);
         peripherals.USBD.ENABLE.write_raw(0);
-        peripherals.USBD.EPINEN.write_raw(0x01); // only EP0 IN by default
-        peripherals.USBD.EPOUTEN.write_raw(0x01); // only EP0 OUT by default
         peripherals.USBD.EVENTCAUSE.write_raw(0xFFFFFFFF); // W1C all
         peripherals.USBD.EPSTATUS.write_raw(0xFFFFFFFF); // W1C all
         peripherals.USBD.EPDATASTATUS.write_raw(0xFFFFFFFF); // W1C all
@@ -126,6 +128,13 @@ pub const USBD = struct {
                     peripherals.USBD.EVENTCAUSE.write(.{ .READY = .Ready }); // W1C
                     peripherals.USBD.EVENTS_USBEVENT.write_raw(0);
                     errata.post_enable();
+                    // Enabled and ready: from here on the registers of 6.35.12 can be
+                    // accessed. The pull-up stays off until the regulator is ready, and
+                    // only endpoint 0 is enabled, whatever was left in the registers by
+                    // an earlier connection or by the program that ran before this one.
+                    peripherals.USBD.USBPULLUP.write_raw(0);
+                    peripherals.USBD.EPINEN.write_raw(0x01); // only EP0 IN
+                    peripherals.USBD.EPOUTEN.write_raw(0x01); // only EP0 OUT
                     self.power = .waiting_pwrrdy;
                 }
             },
@@ -255,13 +264,20 @@ pub const USBD = struct {
         }
     }
 
-    fn teardown(_: *Self) void {
+    fn teardown(self: *Self) void {
         // Upon VBUS removal detection, it is recommended to
         // let on-going EasyDMA transfers finish before disabling USBD
         //
         // But in this case it won't happen because
         // we busywait for ENDEP* with interrupts disabled
-        peripherals.USBD.USBPULLUP.write_raw(0);
+
+        // USBPULLUP cannot be accessed before READY (nRF52840 PS v1.1, 6.35.12), and until
+        // then nothing has turned the pull-up on: `poll` writes 0 at READY and 1 when the
+        // regulator is ready.
+        switch (self.power) {
+            .detached, .enabling => {},
+            .waiting_pwrrdy, .connected => peripherals.USBD.USBPULLUP.write_raw(0),
+        }
         peripherals.USBD.ENABLE.write_raw(0);
     }
 
