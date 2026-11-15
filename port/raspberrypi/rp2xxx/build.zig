@@ -409,14 +409,18 @@ fn comparison_header(b: *std.Build) !std.Build.LazyPath {
         \\
     );
     var lines = std.mem.splitScalar(u8, includes, '\n');
-    while (lines.next()) |line| {
+    // Trim '\r' so a CRLF checkout (Windows, core.autocrlf) reads the same
+    // as an LF one.
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
         if (!std.mem.startsWith(u8, line, "#include \"comparison_tests/")) continue;
         const file = line[10 .. line.len - 1];
         b.dependOnFileContents(b.path(b.fmt("{s}{s}", .{ directory, file })));
         const contents = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, try b.root.joinString(b.allocator, b.fmt("{s}{s}", .{ directory, file })), b.allocator, .limited(1024 * 1024));
         var source_lines = std.mem.splitScalar(u8, contents, '\n');
         var copying = false;
-        while (source_lines.next()) |source_line| {
+        while (source_lines.next()) |raw_source_line| {
+            const source_line = std.mem.trimEnd(u8, raw_source_line, "\r");
             if (std.mem.startsWith(u8, source_line, "static const struct pio_program ") or
                 std.mem.startsWith(u8, source_line, "static inline pio_sm_config ")) copying = true;
             if (copying) {
