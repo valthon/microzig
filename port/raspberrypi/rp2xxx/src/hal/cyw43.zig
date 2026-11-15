@@ -93,6 +93,8 @@ pub const gpio = struct {
     /// Set a GPIO pin high or low
     pub fn put(pin: Pin, value: bool) void {
         if (!state.initialized) return;
-        state.runner.wifi().gpio_set(@backingInt(pin), value) catch {};
+        state.runner.wifi().gpio_set(@backingInt(pin), value) catch |err| {
+            @import("std").log.err("CYW43 GPIO write failed: {}", .{err});
+        };
     }
 };
