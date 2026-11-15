@@ -66,6 +66,7 @@ const TOKEN_SETUP: u2 = 3;
 // --- endpoint response encodings ---
 const RES_ACK: u2 = 0;
 const RES_NAK: u2 = 2;
+const RES_STALL: u2 = 3;
 
 const TOG_DATA0: u2 = 0;
 const TOG_DATA1: u2 = 1;
@@ -95,7 +96,7 @@ const EP_Regs: *volatile [16]extern struct {
     UEP_T_LEN: Reg_U16,
     UEP_TX_CTRL: RegCtrl,
     UEP_RX_CTRL: RegCtrl,
-} = @ptrFromInt(0x400234d8);
+} = if (@import("builtin").is_test) @ptrCast(&microzig.testing_io.hs_ep_regs) else @ptrFromInt(0x400234d8);
 
 fn set_tx_ctrl(ep: u4, res: u2, tog: u2, auto: bool) void {
     // [1:0]=RES, [4:3]=TOG, [5]=AUTO
@@ -146,10 +147,13 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             .ep_readv = ep_readv,
             .ep_listen = ep_listen,
             .ep_open = ep_open,
+            .ep_close_all = ep_close_all,
+            .control_out_data = true,
             .set_address = set_address,
         };
 
         endpoints: PerEndpointArray(cfg.max_endpoints_count),
+        control: usb.ControlRequest = .{},
         // USB DMA addresses must be 4-byte aligned.
         pool: [cfg.buffer_bytes]u8 align(4) = undefined,
 
@@ -215,6 +219,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
         }
 
         fn on_bus_reset_local(self: *Self) void {
+            self.control = .{};
             // Clear state
             inline for (0..cfg.max_endpoints_count) |i| {
                 self.endpoints[i][@backingInt(types.Dir.out)].rx_armed = false;
@@ -316,10 +321,14 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
                     // After SETUP, EP0 IN data stage starts with DATA1.
                     set_tx_ctrl(0, RES_NAK, TOG_DATA1, false);
-                    set_rx_ctrl(0, RES_ACK, TOG_DATA1, false);
+                    set_rx_ctrl(0, RES_NAK, TOG_DATA1, false);
                     self.st(.ep0, .in).tx_busy = false;
 
+                    self.control.setup(&setup);
+
                     controller.on_setup_req(&self.interface, &setup);
+
+                    if (self.control.needs_stall()) self.stall_control();
 
                     // A new SETUP aborts the previous control transfer. The
                     // TRANSFER bit may still describe that previous packet;
@@ -359,13 +368,59 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                         const setup: types.SetupPacket = self.read_setup_from_ep0();
                         log.debug("Setup: {any}", .{setup});
                         set_tx_ctrl(0, RES_NAK, TOG_DATA1, false);
-                        set_rx_ctrl(0, RES_ACK, TOG_DATA1, false);
+                        set_rx_ctrl(0, RES_NAK, TOG_DATA1, false);
                         self.st(.ep0, .in).tx_busy = false;
+                        self.control.setup(&setup);
                         controller.on_setup_req(&self.interface, &setup);
+                        if (self.control.needs_stall()) self.stall_control();
                     }
                 },
             }
         }
+
+        pub const testing = if (@import("builtin").is_test) struct {
+            pub fn duplicate_out() !void {
+                const FakeController = struct {
+                    data: [128]u8 = undefined,
+                    len: usize = 0,
+                    calls: usize = 0,
+                    pub fn on_buffer(ctl: *@This(), itf: *usb.DeviceInterface, comptime ep: types.Endpoint) void {
+                        const dev: *Self = @fieldParentPtr("interface", itf);
+                        ctl.calls += 1;
+                        ctl.len += Self.ep_readv(itf, ep.num, &.{ctl.data[ctl.len..]});
+                        if (ctl.len < 128) Self.ep_listen(itf, .ep0, 64) else dev.control.reply();
+                    }
+                };
+                var buf: [64]u8 align(4) = @splat(0xA1);
+                var dev: Self = undefined;
+                dev.endpoints = @splat(@splat(.{}));
+                dev.control = .{ .direction = .out, .out_data = true };
+                dev.st(.ep0, .out).buf = &buf;
+                var ctl: FakeController = .{};
+                set_rx_ctrl(0, RES_ACK, TOG_DATA1, false);
+                dev.control.listen();
+                Regs.USB_RX_LEN.raw = 64;
+                Regs.USB_INT_ST.raw = 1;
+                dev.handle_out(0, &ctl);
+                try std.testing.expectEqual(64, ctl.len);
+                const rx = EP_Regs[0].UEP_RX_CTRL.raw;
+                const answered = dev.control.answered;
+                Regs.USB_INT_ST.raw = 0;
+                dev.handle_out(0, &ctl); // ACK for A was lost: A is retransmitted.
+                try std.testing.expectEqual(1, ctl.calls);
+                try std.testing.expectEqual(64, ctl.len);
+                try std.testing.expectEqual(0, dev.st(.ep0, .out).rx_last_len);
+                try std.testing.expectEqual(rx, EP_Regs[0].UEP_RX_CTRL.raw);
+                try std.testing.expectEqual(answered, dev.control.answered);
+                @memset(&buf, 0xB2);
+                Regs.USB_INT_ST.raw = 1;
+                dev.handle_out(0, &ctl);
+                try std.testing.expectEqual(2, ctl.calls);
+                try std.testing.expectEqual(128, ctl.len);
+                try std.testing.expectEqualSlices(u8, &@as([64]u8, @splat(0xA1)), ctl.data[0..64]);
+                try std.testing.expectEqualSlices(u8, &@as([64]u8, @splat(0xB2)), ctl.data[64..]);
+            }
+        } else struct {};
 
         fn handle_out(self: *Self, ep: u4, controller: anytype) void {
             const len: u16 = Regs.USB_RX_LEN.read().R16_USB_RX_LEN;
@@ -376,16 +431,20 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                 "OUT ep{} len={} tog_ok={} rx_res={} rx_tog={}",
                 .{ ep, len, stv.RB_UIS_TOG_OK, rx_ctrl.RES, rx_ctrl.TOG },
             );
-            if (ep != 0 and stv.RB_UIS_TOG_OK == 0) return;
+            // CH32FV2x_V3x RM v2.2, 22.2.2 / 23.2.2: a duplicate OUT
+            // must not consume data or advance the expected toggle, including EP0.
+            if (stv.RB_UIS_TOG_OK == 0) return;
 
-            // EP0 OUT is always armed; accept status ZLP.
+            // EP0 data OUT waits for the controller to accept or rearm it.
             if (ep == 0) {
                 const st_out = self.st(.ep0, .out);
                 st_out.rx_last_len = len;
                 const next = toggle_next(current_rx_tog(0));
-                set_rx_ctrl(0, RES_ACK, next, false);
-                // stay ACK
-                self.call_on_buffer(.out, 0, controller);
+                set_rx_ctrl(0, RES_NAK, next, false);
+                if (self.control.out_packet()) {
+                    self.call_on_buffer(.out, 0, controller);
+                    if (self.control.needs_stall()) self.stall_control();
+                }
                 return;
             }
 
@@ -435,6 +494,30 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             Regs.USB_DEV_AD.modify(.{ .MASK_USB_ADDR = addr });
         }
 
+        fn stall_control(self: *Self) void {
+            // USB 2.0, 9.2.7 / 8.5.3.4; CH32FV2x_V3x RM v2.2,
+            // 22.2.2.9-10, UEP_T_RES / UEP_R_RES.
+            self.control = .{};
+            set_tx_ctrl(0, RES_STALL, current_tx_tog(0), false);
+            set_rx_ctrl(0, RES_STALL, current_rx_tog(0), false);
+        }
+
+        fn ep_close_all(itf: *usb.DeviceInterface) void {
+            const self: *Self = @fieldParentPtr("interface", itf);
+            for (1..cfg.max_endpoints_count) |i| {
+                const ep: u4 = @intCast(i);
+                set_tx_ctrl(ep, RES_NAK, TOG_DATA0, false);
+                set_rx_ctrl(ep, RES_NAK, TOG_DATA0, false);
+                self.st(@fromBackingInt(ep), .in).tx_busy = false;
+                self.st(@fromBackingInt(ep), .out).rx_armed = false;
+                self.st(@fromBackingInt(ep), .out).rx_last_len = 0;
+            }
+            // CH32FV2x_V3x RM v2.2, 22.2.2.1, UEP_CONFIG: EP0 remains
+            // available for the next SETUP; all data endpoint directions are disabled.
+            Regs.UEP_CONFIG__UHOST_CTRL.write_raw(0);
+            Regs.UEP_TYPE.write_raw(0);
+        }
+
         fn ep_open(itf: *usb.DeviceInterface, desc_ptr: *const descriptor.Endpoint) void {
             const self: *Self = @fieldParentPtr("interface", itf);
             const desc = desc_ptr.*;
@@ -482,16 +565,23 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
                 const ptr_val: u32 = @as(u32, @intCast(@intFromPtr(st_ep.buf.ptr)));
 
+                // The host can configure again without a bus reset (SET_CONFIGURATION), so an
+                // endpoint may be opened while a packet from its previous configuration is still
+                // armed. The NAK below withdraws that packet; the software state has to follow,
+                // or the next ep_listen panics and the next ep_writev refuses the data.
                 if (e.dir == .out) {
                     const rx_dma: *volatile Reg_U32 = &UEP_RX_DMA[ep_i - 1];
                     rx_dma.raw = ptr_val;
                     const max_len: *volatile Reg_U16 = &UEP_MAX_LEN[ep_i];
                     max_len.raw = mps;
                     set_rx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
+                    st_ep.rx_armed = false;
+                    st_ep.rx_last_len = 0;
                 } else {
                     const tx_dma: *volatile Reg_U32 = &UEP_TX_DMA[ep_i - 1];
                     tx_dma.raw = ptr_val;
                     set_tx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
+                    st_ep.tx_busy = false;
                 }
             }
             log.debug("allocation and DMA setup done for ep{}", .{ep_i});
@@ -526,10 +616,12 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             log.info("ep_listen called for ep{} len={}", .{ ep_num, len });
             const self: *Self = @fieldParentPtr("interface", itf);
 
-            // EP0 OUT is always armed; ignore listen semantics here.
+            // EP0 data OUT is armed only when the controller asks for it.
             if (ep_num == .ep0) {
                 const st0 = self.st(.ep0, .out);
                 st0.rx_limit = @as(u16, @intCast(len));
+                self.control.listen();
+                set_rx_ctrl(0, RES_ACK, current_rx_tog(0), false);
                 // set_rx_ctrl(0, RES_ACK, TOG_DATA0, true);
                 return;
             }
@@ -599,6 +691,12 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             if (st_in.tx_busy) {
                 log.warn("ep_writev called while {} IN endpoint busy, returning 0", .{ep_num});
                 return 0;
+            }
+
+            if (ep_num == .ep0) {
+                self.control.reply();
+                if (self.control.direction == .in)
+                    set_rx_ctrl(0, RES_ACK, current_rx_tog(0), false);
             }
 
             // Copy vector into DMA buffer (up to MPS/buffer size)
