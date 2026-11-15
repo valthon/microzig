@@ -44,5 +44,7 @@ pub const Pio = chip_specific.Pio;
 
 test "pio" {
     _ = common;
+    _ = @import("pio/registers.zig");
+    _ = @import("pio/exec.zig");
     std.testing.refAllDecls(assembler);
 }

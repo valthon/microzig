@@ -12,6 +12,8 @@ pub const PIO1 = microzig.chip.peripherals.PIO1;
 pub const assembler = @import("assembler.zig");
 const encoder = @import("assembler/encoder.zig");
 const gpio = @import("../gpio.zig");
+const registers = @import("registers.zig");
+const exec = @import("exec.zig");
 
 pub const ClkDivOptions = microzig.utilities.IntFracDiv(16, 8);
 pub const Instruction = encoder.Instruction;
@@ -424,28 +426,11 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
         }
 
         pub fn sm_set_enabled(self: EnumType, sm: StateMachine, enabled: bool) void {
-            const regs = self.get_regs();
-
-            var value = regs.CTRL.read();
-            if (enabled)
-                value.SM_ENABLE |= @as(u4, 1) << @backingInt(sm)
-            else
-                value.SM_ENABLE &= ~(@as(u4, 1) << @backingInt(sm));
-
-            regs.CTRL.write(value);
+            registers.sm_set_enabled(&self.get_regs().CTRL, @backingInt(sm), enabled);
         }
 
         pub fn sm_clear_debug(self: EnumType, sm: StateMachine) void {
-            const regs = self.get_regs();
-            const mask: u4 = (@as(u4, 1) << @backingInt(sm));
-
-            // write 1 to clear this register
-            regs.FDEBUG.modify(.{
-                .RXSTALL = mask,
-                .RXUNDER = mask,
-                .TXOVER = mask,
-                .TXSTALL = mask,
-            });
+            registers.sm_clear_debug(&self.get_regs().FDEBUG, @backingInt(sm));
         }
 
         pub fn sm_fifo_level(self: EnumType, sm: StateMachine, fifo: Fifo) u4 {
@@ -461,22 +446,18 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
             return @as(u4, @truncate(levels >> (@as(u5, 8) * snum) + offset));
         }
 
-        fn interrupt_bit_pos(
-            sm: StateMachine,
-            source: Irq.Source,
-        ) u5 {
-            return (@as(u5, 4) * @backingInt(source)) + @backingInt(sm);
-        }
+        /// Clear this SM's IRQ flag. The flag is shared by both system IRQ lines.
+        /// FIFO sources are level-sensitive and must be cleared by servicing the FIFO.
         pub fn sm_clear_interrupt(
             self: EnumType,
             sm: StateMachine,
             irq: Irq,
             source: Irq.Source,
         ) void {
-            // TODO: why does the raw interrupt register no have irq1/0?
             _ = irq;
+            if (source != .statemachine) return;
             const regs = self.get_regs();
-            regs.IRQ.raw |= @as(u32, 1) << interrupt_bit_pos(sm, source);
+            registers.sm_clear_interrupt(&regs.IRQ, @backingInt(sm));
         }
 
         // TODO: be able to disable an interrupt
@@ -487,7 +468,7 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
             source: Irq.Source,
         ) void {
             const irq_regs = self.get_irq_regs(irq);
-            irq_regs.enable.raw |= @as(u32, 1) << interrupt_bit_pos(sm, source);
+            registers.sm_enable_interrupt(&irq_regs.enable, @backingInt(sm), @backingInt(source));
         }
 
         pub fn sm_restart(self: EnumType, sm: StateMachine) void {
@@ -552,18 +533,16 @@ pub fn PioImpl(EnumType: type, chip: Chip) type {
             return load_and_init_program(self, sm, program, options);
         }
 
+        /// Set X with the SM stopped and TX FIFO empty.
+        /// Leaves OSR empty (shift count 32); its previous value is lost.
         pub fn sm_exec_set_x(self: EnumType, sm: StateMachine, value: u32) void {
-            // 32 = .bit_count = 0
-            const inst = Instruction(chip){ .tag = .out, .delay_side_set = 0, .payload = .{ .out = .{ .destination = .x, .bit_count = 0 } } };
-            sm_write(self, sm, value);
-            sm_exec(self, sm, inst);
+            exec.set_scratch(chip, self, sm, .x, value);
         }
 
+        /// Set Y with the SM stopped and TX FIFO empty.
+        /// Leaves OSR empty (shift count 32); its previous value is lost.
         pub fn sm_exec_set_y(self: EnumType, sm: StateMachine, value: u32) void {
-            // 32 = .bit_count = 0
-            const inst = Instruction(chip){ .tag = .out, .delay_side_set = 0, .payload = .{ .out = .{ .destination = .y, .bit_count = 0 } } };
-            sm_write(self, sm, value);
-            sm_exec(self, sm, inst);
+            exec.set_scratch(chip, self, sm, .y, value);
         }
 
         pub fn sm_exec_set_pindir(self: EnumType, sm: StateMachine, data: u5) void {
