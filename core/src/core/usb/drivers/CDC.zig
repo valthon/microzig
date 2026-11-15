@@ -217,6 +217,12 @@ pub fn flush(self: *@This()) bool {
         return false;
     self.tx_ready.store(false, .seq_cst);
 
+    // The IN endpoint is idle here and `tx_data` is one max-size packet (`init` checked that), so
+    // the endpoint takes all of it. `tx_ready` is true only after `init`, when the controller
+    // opens the endpoint and `ep_open` leaves it idle, or after the HAL reported the previous
+    // packet sent. A HAL that returns short from `ep_writev` because its endpoint is still busy
+    // has broken that; the tail would be dropped, so stop here in the builds that check
+    // (`microzig.assert`). The others carry on without the tail.
     assert(self.tx_end == self.device.ep_writev(
         self.descriptor.ep_in.endpoint.num,
         &.{self.tx_data[0..self.tx_end]},
@@ -228,6 +234,8 @@ pub fn flush(self: *@This()) bool {
 // Called when the host selects a configuration.
 pub fn init(self: *@This(), desc: *const Descriptor, device: *usb.DeviceInterface, data: []u8) void {
     const len_half = @divExact(data.len, 2);
+    // `Descriptor.create` asks for two max-size packets. `ep_readv` needs a buffer that fits a
+    // whole packet, and `flush` relies on a tx buffer of one packet.
     assert(len_half == desc.ep_in.max_packet_size.native(), .{});
     assert(len_half == desc.ep_out.max_packet_size.native(), .{});
     self.* = .{
