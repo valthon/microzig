@@ -38,6 +38,52 @@ const consts = @import("consts.zig");
 
 const log = std.log.scoped(.sdpcm);
 
+/// Polls for an ioctl reply, at least 1 ms apart: 1 s, the reply timeout
+/// of pico-sdk 2.1.1 (CYW43_IOCTL_TIMEOUT_US in cyw43_configport.h).
+const ioctl_max_polls = 1000;
+
+test "cyw43 ioctl requires a reply for gets and sets" {
+    const TestBus = @import("test_bus.zig").TestBus;
+    for ([_]bool{ false, true }) |is_set| {
+        var peer = TestBus{ .reply = false };
+        var spi = peer.spi();
+        var bus = cyw43_bus.CYW43_Bus{
+            .spi = &spi,
+            .pwr_pin = undefined, // No power operations during ioctl.
+            .internal_delay_ms = TestBus.delay,
+        };
+        var transport = SDPCM.init(&bus);
+        // A failed request must invalidate data from an earlier response.
+        transport.last_control_valid = true;
+        transport.rx_control_len = 6;
+        try std.testing.expectError(error.Timeout, transport.ioctl(262, 0, is_set, &.{}));
+        try std.testing.expectEqual(ioctl_max_polls, peer.polls);
+        try std.testing.expectEqual(1, peer.writes);
+        try std.testing.expect(!transport.last_control_valid);
+        try std.testing.expectEqual(null, transport.get_last_control_data());
+    }
+}
+
+test "cyw43 ioctl accepts an empty acknowledgement on the final poll" {
+    const TestBus = @import("test_bus.zig").TestBus;
+    var peer = TestBus{ .empty_polls = ioctl_max_polls - 1 };
+    var spi = peer.spi();
+    var bus = cyw43_bus.CYW43_Bus{
+        .spi = &spi,
+        .pwr_pin = undefined,
+        .internal_delay_ms = TestBus.delay,
+    };
+    var transport = SDPCM.init(&bus);
+    try transport.ioctl_set_u32(2, 0, 1);
+    try std.testing.expectEqual(ioctl_max_polls, peer.polls);
+    try std.testing.expect(transport.last_control_valid);
+    try std.testing.expectEqual(2, transport.last_control_cmd);
+    try std.testing.expectEqual(null, transport.get_last_control_data());
+    peer.reply = false;
+    try std.testing.expectError(error.Timeout, transport.set_iovar_u32("gpioout", 1));
+    try std.testing.expect(!transport.last_control_valid);
+}
+
 // Channel types
 const CHANNEL_CONTROL: u8 = 0;
 const CHANNEL_EVENT: u8 = 1;
@@ -152,6 +198,7 @@ pub const SDPCM = struct {
         IovarTooLarge,
         MacNotAvailable,
         NoCredit,
+        Timeout,
     };
 
     bus: *cyw43_bus.CYW43_Bus,
@@ -453,13 +500,14 @@ pub const SDPCM = struct {
 
     /// Send ioctl command and poll for response.
     /// Control response is stored and can be retrieved via get_last_control_data().
+    /// Returns error.Timeout if no control response arrives within ioctl_max_polls.
     pub fn ioctl(self: *Self, cmd: u32, iface: u4, is_set: bool, data: []const u8) !void {
         self.last_control_valid = false;
         try self.send_control(cmd, iface, is_set, data);
 
         // Poll to receive response and update credits
         var attempts: u32 = 0;
-        while (attempts < 100) : (attempts += 1) {
+        while (attempts < ioctl_max_polls) : (attempts += 1) {
             // TODO: Events and data packets received while waiting for the control response
             // are currently dropped. Could add per-channel ring buffers to preserve them.
             if (try self.poll()) |result| {
@@ -473,6 +521,7 @@ pub const SDPCM = struct {
             }
             self.bus.internal_delay_ms(1);
         }
+        return error.Timeout;
     }
 
     /// Get the data from the last control response.

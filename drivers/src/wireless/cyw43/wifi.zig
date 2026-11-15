@@ -8,6 +8,35 @@ const consts = @import("consts.zig");
 
 const log = std.log.scoped(.wifi);
 
+test "cyw43 MAC is unavailable after missing or short replies" {
+    const TestBus = @import("test_bus.zig").TestBus;
+    const mac = [_]u8{ 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    var peer = TestBus{ .payload = &mac };
+    var spi = peer.spi();
+    var bus = cyw43_bus.CYW43_Bus{
+        .spi = &spi,
+        .pwr_pin = undefined,
+        .internal_delay_ms = TestBus.delay,
+    };
+    var wifi = CYW43_Wifi.init(&bus);
+    try std.testing.expectError(error.MacNotAvailable, wifi.get_mac_address());
+    try wifi.init_mac_address();
+    try std.testing.expectEqual(mac, try wifi.get_mac_address());
+
+    for (0..6) |len| {
+        peer.payload = mac[0..len];
+        try std.testing.expectError(error.MacNotAvailable, wifi.init_mac_address());
+        try std.testing.expectError(error.MacNotAvailable, wifi.get_mac_address());
+    }
+
+    // A failed refresh must also invalidate a previously valid address.
+    peer.payload = &mac;
+    try wifi.init_mac_address();
+    peer.reply = false;
+    try std.testing.expectError(error.Timeout, wifi.init_mac_address());
+    try std.testing.expectError(error.MacNotAvailable, wifi.get_mac_address());
+}
+
 // Ioctl commands
 const IOCTL_UP: u32 = 2;
 const IOCTL_SET_INFRA: u32 = 20;
@@ -652,6 +681,7 @@ pub const CYW43_Wifi = struct {
 
     /// Initialize MAC address from chip
     fn init_mac_address(self: *Self) !void {
+        self.mac_valid = false;
         var buf: [64]u8 = undefined;
         const name = "cur_etheraddr";
         @memcpy(buf[0..name.len], name);
@@ -671,9 +701,7 @@ pub const CYW43_Wifi = struct {
             }
         }
 
-        log.warn("MAC address not received, using fallback", .{});
-        self.mac_address = .{ 0x28, 0xCD, 0xC1, 0x00, 0x00, 0x00 };
-        self.mac_valid = true;
+        return error.MacNotAvailable;
     }
 
     /// Set country code
