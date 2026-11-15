@@ -226,11 +226,21 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target = b.standardTargetOptions(.{});
 
+    const usb_core = b.createModule(.{
+        .root_source_file = b.path("../../../core/src/microzig.zig"),
+        .target = b.graph.host,
+    });
+    const usb_test_microzig = b.createModule(.{
+        .root_source_file = b.path("src/usb_test_microzig.zig"),
+        .imports = &.{.{ .name = "usb", .module = usb_core }},
+    });
+
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/hal.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "microzig", .module = usb_test_microzig }},
         }),
     });
 

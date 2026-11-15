@@ -784,7 +784,11 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
         }
 
         fn process_set_config(self: *@This(), device_itf: *DeviceInterface, cfg_num: u16) void {
-            if (cfg_num == self.cfg_num) return;
+            // A request for the configuration that is already selected is carried out like any
+            // other. The host puts its data toggles back at DATA0 whenever it sends
+            // SET_CONFIGURATION (USB 2.0, 9.1.1.5 and 9.4.7), same value or not, and on the
+            // device's side that happens in `ep_open`. The drivers start over with their
+            // endpoints, as they do after any other SET_CONFIGURATION.
 
             if (self.driver_data) |data_old| {
                 _ = data_old;
@@ -834,6 +838,11 @@ pub fn DeviceController(config: Config, driver_args: config.DriverArgs()) type {
 const TestDevice = struct {
     interface: DeviceInterface = .{ .vtable = &vtable },
     opened: usize = 0,
+    closed: usize = 0,
+    data_armed: bool = false,
+    record_endpoint_calls: bool = false,
+    endpoint_calls: [32]u8 = undefined,
+    endpoint_calls_len: usize = 0,
 
     control: ControlRequest = .{},
     listened: usize = 0,
@@ -848,11 +857,18 @@ const TestDevice = struct {
     /// What the next `ep_readv` returns: the packet the host sent.
     rx_packet: []const u8 = "",
 
+    fn record(dev: *TestDevice, event: u8) void {
+        if (!dev.record_endpoint_calls) return;
+        dev.endpoint_calls[dev.endpoint_calls_len] = event;
+        dev.endpoint_calls_len += 1;
+    }
+
     const vtable: DeviceInterface.VTable = .{
         .ep_writev = ep_writev,
         .ep_readv = ep_readv,
         .ep_listen = ep_listen,
         .ep_open = ep_open,
+        .ep_close_all = ep_close_all,
         .set_address = set_address,
     };
 
@@ -862,6 +878,7 @@ const TestDevice = struct {
         .ep_readv = ep_readv,
         .ep_listen = ep_listen,
         .ep_open = ep_open,
+        .ep_close_all = ep_close_all,
         .set_address = set_address,
         .control_out_data = true,
     };
@@ -899,11 +916,22 @@ const TestDevice = struct {
 
     fn ep_listen(itf: *DeviceInterface, ep_num: types.Endpoint.Num, _: types.Len) void {
         if (ep_num == .ep0) from(itf).control.listen();
+        if (ep_num != .ep0) {
+            from(itf).record('l');
+            from(itf).data_armed = true;
+        }
         from(itf).listened += 1;
     }
 
     fn ep_open(itf: *DeviceInterface, _: *const descriptor.Endpoint) void {
+        from(itf).record('o');
         from(itf).opened += 1;
+    }
+
+    fn ep_close_all(itf: *DeviceInterface) void {
+        from(itf).record('c');
+        from(itf).closed += 1;
+        from(itf).data_armed = false;
     }
 
     fn set_address(itf: *DeviceInterface, address: u7) void {
@@ -1073,6 +1101,33 @@ test "a new setup request drops an address whose status packet the host never to
         ctl.on_buffer(&dev.interface, ep0_in);
         try std.testing.expectEqual(null, dev.address);
     }
+}
+
+test "SET_CONFIGURATION with the current value opens the endpoints again" {
+    const Controller = DeviceController(
+        test_config(struct { serial: drivers.CDC }),
+        .{.{ .serial = .{} }},
+    );
+    var dev: TestDevice = .{};
+    var ctl: Controller = .init;
+
+    // Three endpoints: notification IN, data OUT, data IN. The driver listens once on start.
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    try std.testing.expectEqual(3, dev.opened);
+    try std.testing.expectEqual(1, dev.listened);
+
+    // The host selects the same configuration again, which puts its data toggles back at
+    // DATA0. Only `ep_open` does that on the device's side, and the driver starts over.
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    try std.testing.expect(ctl.drivers() != null);
+    try std.testing.expectEqual(6, dev.opened);
+    try std.testing.expectEqual(2, dev.listened);
+
+    // Deselecting twice opens nothing and leaves no driver.
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(0));
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(0));
+    try std.testing.expect(ctl.drivers() == null);
+    try std.testing.expectEqual(6, dev.opened);
 }
 
 test "a control read that ends on a packet boundary short of wLength ends with a zero-length packet" {
@@ -1511,6 +1566,30 @@ test "a bus reset drops a control write whose data had not all arrived" {
     dev.rx_packet = &.{ 21, 22, 23, 24 };
     ctl.on_buffer(&dev.interface, ep0_out);
     try std.testing.expectEqualSlices(u8, &.{ 21, 22, 23, 24 }, driver.data[0..driver.data_len.?]);
+}
+
+test "reconfiguration and deconfiguration close the old endpoints before reuse" {
+    const Controller = DeviceController(
+        test_config(struct { serial: drivers.CDC }),
+        .{.{ .serial = .{} }},
+    );
+    var dev: TestDevice = .{ .record_endpoint_calls = true };
+    var ctl: Controller = .init;
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    try std.testing.expectEqual(0, dev.closed);
+    try std.testing.expect(dev.data_armed);
+    // OUT opens before init listens, then the two IN endpoints open.
+    try std.testing.expectEqualStrings("oloo", dev.endpoint_calls[0..dev.endpoint_calls_len]);
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    try std.testing.expectEqual(1, dev.closed);
+    // Closure must precede both reuse (open) and the new driver's listen.
+    try std.testing.expectEqualStrings("oloocoloo", dev.endpoint_calls[0..dev.endpoint_calls_len]);
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(0));
+    try std.testing.expectEqual(2, dev.closed);
+    try std.testing.expect(!dev.data_armed);
+    try std.testing.expectEqualStrings("oloocolooc", dev.endpoint_calls[0..dev.endpoint_calls_len]);
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(0));
+    try std.testing.expectEqual(2, dev.closed);
 }
 
 test "software EP0 delivers a control write before acknowledging it" {
