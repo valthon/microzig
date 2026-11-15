@@ -66,6 +66,19 @@ pub const USBD = struct {
     const Self = @This();
 
     pub fn init() Self {
+        // The EasyDMA registers, against the register table (nRF52840 PS v1.1, 6.35.13). A
+        // buffer pointer written anywhere else leaves the endpoint's real PTR as it was
+        // found, and a transfer then copies to or from wherever that points.
+        comptime {
+            const Regs = @TypeOf(peripherals.USBD.*);
+            std.debug.assert(@offsetOf(Regs, "EPIN") == 0x600);
+            std.debug.assert(@offsetOf(Regs, "ISOIN") == 0x6A0);
+            std.debug.assert(@offsetOf(Regs, "EPOUT") == 0x700);
+            std.debug.assert(@offsetOf(Regs, "ISOOUT") == 0x7A0);
+            std.debug.assert(@sizeOf(@TypeOf(peripherals.USBD.EPIN[0])) == 0x14);
+            std.debug.assert(@sizeOf(@TypeOf(peripherals.USBD.EPOUT[0])) == 0x14);
+        }
+
         peripherals.USBD.USBPULLUP.write_raw(0);
         peripherals.USBD.ENABLE.write_raw(0);
         peripherals.USBD.EPINEN.write_raw(0x01); // only EP0 IN by default
