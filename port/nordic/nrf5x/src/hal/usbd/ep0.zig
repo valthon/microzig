@@ -48,6 +48,18 @@ pub const Control = struct {
     set_address: bool = false,
     /// The request is SET_CONFIGURATION (see `is_set_configuration`).
     set_configuration: bool = false,
+    /// The controller takes the data stage of this control write: it listened for a packet
+    /// (`listen`) instead of accepting the request unseen (`ack`). Each packet is then
+    /// reported to it, and it says what follows.
+    deliver: bool = false,
+    /// A packet of that data stage was reported to the controller, which has not taken
+    /// it yet.
+    out_waiting: bool = false,
+    /// The controller has said what follows the packet it was last told of: the next
+    /// packet (`listen`) or the status stage (`ack`).
+    out_answered: bool = false,
+    /// A control write was stalled. Nothing else is triggered for it.
+    stalled: bool = false,
 
     /// A SETUP packet arrived. It ends the transfer before it, finished or not.
     pub fn setup(self: *Control, packet: Setup) void {
@@ -129,11 +141,66 @@ pub const Control = struct {
     /// to wait: "The software can then either prepare to receive the next data transaction
     /// [...] or initiate the status stage through the EP0STATUS task", once ENDEPOUT[0] has
     /// said that the data is in RAM (6.35.9.2). So the data stage is let through first.
+    ///
+    /// Not so when the controller has taken the data stage itself (`listen`). It accepts
+    /// the request when it has seen the data, and the status stage follows at once.
     pub fn ack(self: *Control) Action {
         self.answered = true;
         // The controller still sees SET_ADDRESS and accepts it: that is its state machine.
         if (self.set_address) return .none;
+        if (self.stalled) return .none;
+        if (self.deliver) {
+            self.out_answered = true;
+            self.remaining = 0;
+            return .status;
+        }
         return if (self.out_data_stage()) .rcvout else .status;
+    }
+
+    /// The controller listens on endpoint 0: it wants the next packet of a control
+    /// write's data stage, the first one while it handles the SETUP packet. That packet is
+    /// let in, and the request counts as taken up: its answer comes with the data.
+    ///
+    /// Outside the data stage of a control write there is no packet to let in, and a
+    /// listen there is no answer to anything.
+    pub fn listen(self: *Control) Action {
+        if (self.stalled or !self.out_data_stage()) return .none;
+        self.deliver = true;
+        self.answered = true;
+        self.out_answered = true;
+        return .rcvout;
+    }
+
+    /// EP0DATADONE in a control write whose data stage the controller takes: a packet
+    /// has been copied out of the endpoint, and the controller is told next. A packet that
+    /// could not be copied out does not get here (see `out_failed`).
+    pub fn out_arrived(self: *Control) void {
+        self.out_waiting = true;
+        self.out_answered = false;
+    }
+
+    /// Whether there is a packet for the controller to take; it is taken only once.
+    pub fn out_take(self: *Control) bool {
+        const waiting = self.out_waiting;
+        self.out_waiting = false;
+        return waiting;
+    }
+
+    /// The controller has taken the packet of `len` bytes that `out_take` allowed, or has
+    /// gone on without reading it. As in `out_packet`, the last byte of wLength or a short
+    /// packet ends the data stage; what follows is the controller's to say.
+    pub fn out_read(self: *Control, len: u16, max_packet_size: u16) void {
+        self.remaining = if (len < max_packet_size) 0 else self.remaining -| len;
+    }
+
+    /// The controller has returned from the packet it was told of. If it asked neither for
+    /// the next one nor for the status stage it has refused the request, which is stalled
+    /// like one it did not answer at the SETUP packet (see `setup_handled`).
+    pub fn out_handled(self: *Control) Action {
+        if (!self.deliver or self.out_answered or self.stalled) return .none;
+        self.stalled = true;
+        self.remaining = 0;
+        return .stall;
     }
 
     /// The controller has returned from the SETUP packet. A request it did not answer, by
@@ -159,9 +226,11 @@ pub const Control = struct {
     /// A packet of a control write's data stage could not be taken out of the endpoint.
     /// Neither the next packet nor the status stage may follow a copy that did not end
     /// (6.35.9.2), so the transfer is given up: "The software can choose to stall a command
-    /// (in both data and status stages) through the EP0STALL task" (6.35.9).
+    /// (in both data and status stages) through the EP0STALL task" (6.35.9). The controller
+    /// is not told of the packet, and whatever it says later triggers nothing.
     pub fn out_failed(self: *Control) Action {
         self.remaining = 0;
+        self.stalled = true;
         return .stall;
     }
 };
@@ -432,4 +501,147 @@ test "only an accepted SET_CONFIGURATION changes the configuration" {
     ep0.setup(.{ .request_type = 0x80, .request = 8, .length = 1 });
     ep0.in_packet(1, 64);
     try std.testing.expect(!ep0.configured());
+}
+
+test "a control write the controller listens for is answered after its data" {
+    var ep0: Control = .{};
+    ep0.setup(set_line_coding(7));
+    // The controller listens while it handles the SETUP packet: the packet is let in, and
+    // the request is not stalled for want of an answer.
+    try std.testing.expectEqual(Action.rcvout, ep0.listen());
+    try std.testing.expectEqual(Action.none, ep0.setup_handled());
+    try std.testing.expect(!ep0.out_take());
+
+    // The packet arrives and the controller reads it, once.
+    ep0.out_arrived();
+    try std.testing.expect(ep0.out_take());
+    try std.testing.expect(!ep0.out_take());
+    ep0.out_read(7, 64);
+    try std.testing.expect(!ep0.out_data_stage());
+
+    // It accepts: the status stage, and nothing more when it returns.
+    try std.testing.expectEqual(Action.status, ep0.ack());
+    try std.testing.expectEqual(Action.none, ep0.out_handled());
+}
+
+test "a control write the controller listens for runs packet by packet" {
+    var ep0: Control = .{};
+
+    // 130 bytes: the controller listens again after each full packet.
+    ep0.setup(set_line_coding(130));
+    try std.testing.expectEqual(Action.rcvout, ep0.listen());
+    for (0..2) |_| {
+        ep0.out_arrived();
+        try std.testing.expect(ep0.out_take());
+        ep0.out_read(64, 64);
+        try std.testing.expectEqual(Action.rcvout, ep0.listen());
+        try std.testing.expectEqual(Action.none, ep0.out_handled());
+        try std.testing.expect(ep0.out_data_stage());
+    }
+    ep0.out_arrived();
+    try std.testing.expect(ep0.out_take());
+    ep0.out_read(2, 64);
+    // Nothing is left to let in.
+    try std.testing.expectEqual(Action.none, ep0.listen());
+    try std.testing.expectEqual(Action.status, ep0.ack());
+    try std.testing.expectEqual(Action.none, ep0.out_handled());
+
+    // A short packet ends the data stage early, and the controller may accept then.
+    ep0.setup(set_line_coding(130));
+    try std.testing.expectEqual(Action.rcvout, ep0.listen());
+    ep0.out_arrived();
+    try std.testing.expect(ep0.out_take());
+    ep0.out_read(10, 64);
+    try std.testing.expect(!ep0.out_data_stage());
+    try std.testing.expectEqual(Action.status, ep0.ack());
+
+    // The controller may accept before the host has sent all it announced. That ends the
+    // data stage: no further packet is let in, taken out or reported.
+    ep0.setup(set_line_coding(130));
+    try std.testing.expectEqual(Action.rcvout, ep0.listen());
+    ep0.out_arrived();
+    try std.testing.expect(ep0.out_take());
+    ep0.out_read(64, 64);
+    try std.testing.expect(ep0.out_data_stage());
+    try std.testing.expectEqual(Action.status, ep0.ack());
+    try std.testing.expect(!ep0.out_data_stage());
+    try std.testing.expectEqual(Action.none, ep0.listen());
+}
+
+test "a control write whose data the controller refuses is stalled" {
+    var ep0: Control = .{};
+    ep0.setup(set_line_coding(7));
+    try std.testing.expectEqual(Action.rcvout, ep0.listen());
+    ep0.out_arrived();
+    try std.testing.expect(ep0.out_take());
+    ep0.out_read(3, 64);
+    // The controller returns without a word: stalled, once, and nothing after it.
+    try std.testing.expectEqual(Action.stall, ep0.out_handled());
+    try std.testing.expectEqual(Action.none, ep0.out_handled());
+    try std.testing.expectEqual(Action.none, ep0.ack());
+    try std.testing.expectEqual(Action.none, ep0.listen());
+
+    // Also when it did not read the packet, which then has not counted towards wLength.
+    // The stall ends the data stage all the same: nothing more of it is taken out of the
+    // endpoint or reported.
+    ep0.setup(set_line_coding(7));
+    try std.testing.expectEqual(Action.rcvout, ep0.listen());
+    ep0.out_arrived();
+    try std.testing.expect(ep0.out_data_stage());
+    try std.testing.expectEqual(Action.stall, ep0.out_handled());
+    try std.testing.expect(!ep0.out_data_stage());
+
+    // A packet that could not be taken out of the endpoint is stalled where the copy
+    // failed. The controller is not told of it: there is nothing for it to take, and
+    // nothing it says afterwards is acted on.
+    ep0.setup(set_line_coding(7));
+    try std.testing.expectEqual(Action.rcvout, ep0.listen());
+    try std.testing.expectEqual(Action.stall, ep0.out_failed());
+    try std.testing.expect(!ep0.out_data_stage());
+    try std.testing.expect(!ep0.out_take());
+    try std.testing.expectEqual(Action.none, ep0.ack());
+    try std.testing.expectEqual(Action.none, ep0.listen());
+    try std.testing.expectEqual(Action.none, ep0.out_handled());
+
+    // None of it carries over to the next request.
+    ep0.setup(set_line_coding(7));
+    try std.testing.expectEqual(Action.rcvout, ep0.listen());
+    ep0.out_arrived();
+    try std.testing.expect(ep0.out_take());
+    ep0.out_read(7, 64);
+    try std.testing.expectEqual(Action.status, ep0.ack());
+}
+
+test "a listen outside the data stage of a control write lets nothing in" {
+    var ep0: Control = .{};
+
+    // A control read, and a request without data: no packet, and the listen is no answer.
+    ep0.setup(get_descriptor(255));
+    try std.testing.expectEqual(Action.none, ep0.listen());
+    try std.testing.expectEqual(Action.stall, ep0.setup_handled());
+    ep0.setup(set_line_coding(0));
+    try std.testing.expectEqual(Action.none, ep0.listen());
+    try std.testing.expectEqual(Action.stall, ep0.setup_handled());
+
+    // A request the controller accepted unseen keeps the data stage to the HAL: nothing
+    // is reported, and nothing is stalled for it.
+    ep0.setup(set_line_coding(7));
+    try std.testing.expectEqual(Action.rcvout, ep0.ack());
+    try std.testing.expect(!ep0.deliver);
+    try std.testing.expectEqual(Action.none, ep0.out_handled());
+    try std.testing.expectEqual(Action.status, ep0.out_packet(7, 64));
+}
+
+test "a SETUP packet ends a control write the controller was listening for" {
+    var ep0: Control = .{};
+    ep0.setup(set_line_coding(130));
+    try std.testing.expectEqual(Action.rcvout, ep0.listen());
+    ep0.out_arrived();
+    // The host gives up before the controller has read the packet.
+    ep0.setup(get_descriptor(255));
+    try std.testing.expect(!ep0.deliver);
+    try std.testing.expect(!ep0.out_take());
+    try std.testing.expectEqual(Action.none, ep0.out_handled());
+    ep0.in_packet(18, 64);
+    try std.testing.expectEqual(Action.status, ep0.in_done());
 }

@@ -84,6 +84,9 @@ pub const USBD = struct {
     eps_out: [NUM_EP]EP_Config = @splat(.{}),
     /// Where the control transfer on endpoint 0 stands.
     control: ep0.Control = .{},
+    /// The length of the packet of a control write's data stage that `poll` copied into
+    /// `bufs_out[0]` and told the controller of.
+    control_out_len: u32 = 0,
     /// A packet was handed to data IN endpoint n and the host has not taken it yet.
     in_busy: [NUM_EP]bool = @splat(false),
     /// The bus is suspended and the peripheral has been put in its low power mode (see
@@ -111,6 +114,8 @@ pub const USBD = struct {
         .ep_listen = ep_listen,
         .ep_open = ep_open,
         .set_address = set_address,
+        // The data stage of a control write goes to the controller (see `poll`).
+        .control_out_data = true,
     };
 
     const Self = @This();
@@ -298,15 +303,33 @@ pub const USBD = struct {
                             ep0_trigger(self.control.in_done());
                             controller.on_buffer(&self.interface, .in(.ep0));
                         },
-                        // A packet of a control write's data stage is in the endpoint. The
-                        // controller has no use for it (its `on_buffer` only logs a packet
-                        // on EP0 OUT), so it is not told; but the packet has to be taken out
-                        // before anything else may follow: the next packet or the status
-                        // stage comes after ENDEPOUT[0] (nRF52840 PS v1.1, 6.35.9.2).
+                        // A packet of a control write's data stage is in the endpoint.
                         // Outside a data stage nothing let a packet in, so none is taken.
+                        //
+                        // The packet is taken out before anything else may follow: "The
+                        // software can then either prepare to receive the next data
+                        // transaction [...] or initiate the status stage through the
+                        // EP0STATUS task" once ENDEPOUT[0] has come (nRF52840 PS v1.1,
+                        // 6.35.9.2). If the copy does not end, the transfer is stalled and
+                        // the controller hears nothing: a packet it were told of and then
+                        // could not read would look to it like an empty one, which ends
+                        // the data stage and goes to the driver.
                         .out => if (self.control.out_data_stage()) {
                             if (self.easydma_out(0)) |size| {
-                                ep0_trigger(self.control.out_packet(@intCast(size), self.eps_out[0].max_packet_size));
+                                if (self.control.deliver) {
+                                    // The controller listened for it. It reads the packet
+                                    // (`ep_readv`) and asks for the next one or for the
+                                    // status stage; if it does neither, the request is
+                                    // stalled.
+                                    self.control_out_len = size;
+                                    self.control.out_arrived();
+                                    controller.on_buffer(&self.interface, .out(.ep0));
+                                    ep0_trigger(self.control.out_handled());
+                                } else {
+                                    // The controller accepted the request unseen and is
+                                    // not told of its data.
+                                    ep0_trigger(self.control.out_packet(@intCast(size), self.eps_out[0].max_packet_size));
+                                }
                             } else {
                                 log.err("EP0: EasyDMA did not finish, control write stalled", .{});
                                 ep0_trigger(self.control.out_failed());
@@ -643,6 +666,16 @@ pub const USBD = struct {
         return if (run_easydma(.out, i)) size else null;
     }
 
+    /// The length of the packet of a control write's data stage that `poll` told the
+    /// controller of, which is in `bufs_out[0]`. Null if there is none, or if it was taken
+    /// before: a packet is handed out once. Nothing is copied here, so nothing can fail:
+    /// `poll` took the packet out of the endpoint before it reported it.
+    fn ep0_take(self: *Self) ?u32 {
+        if (!self.control.out_take()) return null;
+        self.control.out_read(@intCast(self.control_out_len), self.eps_out[0].max_packet_size);
+        return self.control_out_len;
+    }
+
     fn ep_writev(
         itf: *usb.DeviceInterface,
         ep_num: usb.types.Endpoint.Num,
@@ -668,6 +701,8 @@ pub const USBD = struct {
         // other packet. Its return value is 0 either way: a caller cannot tell from it
         // whether the packet was taken or the endpoint was busy.
         if (ep_num == .ep0 and data[0].len == 0 and !self.control.in_data_stage()) {
+            // A packet the controller was told of and did not read is passed over.
+            _ = self.ep0_take();
             ep0_trigger(self.control.ack());
             return 0;
         }
@@ -777,10 +812,14 @@ pub const USBD = struct {
         const self: *Self = @fieldParentPtr("interface", itf);
         const i = @backingInt(ep_num);
         const scratch_buf = &self.bufs_out[i];
-        const size = self.easydma_out(i) orelse {
-            log.err("ep_readv {t}: EasyDMA did not finish", .{ep_num});
-            return 0;
-        };
+        // On endpoint 0 there is a packet only when `poll` has just reported one.
+        const size = if (ep_num == .ep0)
+            self.ep0_take() orelse return 0
+        else
+            self.easydma_out(i) orelse {
+                log.err("ep_readv {t}: EasyDMA did not finish", .{ep_num});
+                return 0;
+            };
 
         var scratch_slice: []align(1) u8 = scratch_buf[0..size];
 
@@ -807,7 +846,11 @@ pub const USBD = struct {
         log.debug("ep_listen {t}: ({} bytes)", .{ ep_num, len });
 
         if (ep_num == .ep0) {
-            peripherals.USBD.TASKS_EP0RCVOUT.write_raw(1);
+            // The controller wants the next packet of a control write's data stage (see
+            // `VTable.control_out_data` in core/usb.zig). One it did not read is passed
+            // over; outside such a data stage nothing is let in.
+            _ = self.ep0_take();
+            ep0_trigger(self.control.listen());
             return;
         }
         // A packet that is waiting already raised its event long ago. An application that
