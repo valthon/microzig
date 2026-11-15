@@ -9,6 +9,7 @@ const Token = tokenizer.Token;
 const Value = tokenizer.Value;
 
 const Expression = @import("Expression.zig");
+const lexer = @import("lexer.zig");
 const Chip = @import("../../chip.zig").Chip;
 
 const BoundedArray = @import("bounded-array").BoundedArray;
@@ -25,7 +26,7 @@ pub fn encode(
     comptime options: Options,
 ) !Encoder(chip, options).Output {
     var encoder = Encoder(chip, options).init(tokens);
-    return try encoder.encode_output(diags);
+    return encoder.encode_output(diags);
 }
 
 pub const SideSet = struct {
@@ -76,7 +77,7 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             instructions: BoundedInstructions,
             relocations: BoundedRelocations,
             labels: BoundedLabels,
-            origin: ?u5,
+            origin: ?i32,
             side_set: ?SideSet,
             wrap_target: ?u5,
             wrap: ?u5,
@@ -160,18 +161,6 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             self.index += count;
         }
 
-        fn evaluate_expr(
-            define_lists: []const []const Define,
-            expr: []const u8,
-            index: u32,
-            diags: *?Diagnostics,
-        ) !i128 {
-            _ = define_lists;
-            _ = expr;
-            _ = index;
-            _ = diags;
-        }
-
         fn evaluate_impl(
             comptime T: type,
             define_lists: []const []const DefineWithIndex,
@@ -180,11 +169,17 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             diags: *?Diagnostics,
         ) !T {
             return switch (value) {
-                .integer => |int| @as(T, @intCast(int)),
+                .integer => |int| blk: {
+                    if (int > std.math.maxInt(T)) {
+                        diags.* = Diagnostics.init(index, "value of {} does not fit in a u{}", .{ int, @bitSizeOf(T) });
+                        break :blk error.TooBig;
+                    }
+                    break :blk @as(T, @intCast(int));
+                },
                 .string => |str| outer: for (define_lists) |defines| {
                     for (defines) |define| {
                         if (std.mem.eql(u8, str, define.name)) {
-                            if (define.value > std.math.maxInt(T)) {
+                            if (define.value < std.math.minInt(T) or define.value > std.math.maxInt(T)) {
                                 diags.* = Diagnostics.init(
                                     index,
                                     "{s}'s value ({}) is too large to fit in {} bits",
@@ -205,9 +200,13 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                     break :outer error.DefineNotFound;
                 },
                 .expression => |expr_str| outer: {
-                    const expr = try Expression.tokenize(expr_str, index, diags);
-                    const result = try expr.evaluate(define_lists, diags);
-                    if (result < 0 or result > std.math.maxInt(T)) {
+                    // Most side-set and delay operands are single integers.
+                    // Avoid constructing a syntax tree for those common values.
+                    const result = lexer.integer(expr_str) catch result: {
+                        const expr = try Expression.tokenize(expr_str, index, diags);
+                        break :result try expr.evaluate(define_lists, diags);
+                    };
+                    if (result < std.math.minInt(T) or result > std.math.maxInt(T)) {
                         diags.* = Diagnostics.init(
                             index,
                             "value of {} does not fit in a u{}",
@@ -221,6 +220,21 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             };
         }
 
+        fn value_index(self: Self, value: Value, fallback: u32) u32 {
+            const text = switch (value) {
+                .integer => return fallback,
+                .string => |text| text,
+                .expression => |text| text,
+            };
+            if (self.tokens.len == 0) return fallback;
+            const source = self.tokens[0].source;
+            var i: usize = fallback;
+            while (i < source.len and source[i] != '\n') : (i += 1) {
+                if (source[i..].ptr == text.ptr) return @intCast(i);
+            }
+            return fallback;
+        }
+
         fn evaluate(
             self: *Self,
             comptime T: type,
@@ -229,12 +243,17 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             index: u32,
             diags: *?Diagnostics,
         ) !T {
+            var labels: BoundedArray(DefineWithIndex, 32) = .{};
+            for (program.labels.slice()) |label| {
+                labels.append(.{ .name = label.name, .value = label.index, .index = index }) catch unreachable;
+            }
             return evaluate_impl(T, &.{
                 self.output.global_defines.slice(),
                 self.output.private_defines.slice(),
                 program.defines.slice(),
                 program.private_defines.slice(),
-            }, value, index, diags);
+                labels.slice(),
+            }, value, self.value_index(value, index), diags);
         }
 
         fn evaluate_target(
@@ -247,7 +266,7 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             return for (program.labels.slice()) |label| {
                 if (std.mem.eql(u8, target, label.name))
                     break label.index;
-            } else try self.evaluate(u5, program, try Value.from_string(target), index, diags);
+            } else try self.evaluate(u5, program, .{ .expression = target }, index, diags);
         }
 
         fn evaluate_global(
@@ -260,7 +279,42 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             return evaluate_impl(T, &.{
                 self.output.global_defines.slice(),
                 self.output.private_defines.slice(),
-            }, value, index, diags);
+            }, value, self.value_index(value, index), diags);
+        }
+
+        fn check_symbol(self: Self, program: ?BoundedProgram, name: []const u8, index: u32, diags: *?Diagnostics) !void {
+            for (self.output.global_defines.slice()) |define| {
+                if (std.mem.eql(u8, define.name, name)) return duplicate_symbol(name, index, diags);
+            }
+            for (self.output.private_defines.slice()) |define| {
+                if (std.mem.eql(u8, define.name, name)) return duplicate_symbol(name, index, diags);
+            }
+            if (program) |p| {
+                for (p.defines.slice()) |define| {
+                    if (std.mem.eql(u8, define.name, name)) return duplicate_symbol(name, index, diags);
+                }
+                for (p.private_defines.slice()) |define| {
+                    if (std.mem.eql(u8, define.name, name)) return duplicate_symbol(name, index, diags);
+                }
+                for (p.labels.slice()) |label| {
+                    if (std.mem.eql(u8, label.name, name)) return duplicate_symbol(name, index, diags);
+                }
+            }
+        }
+
+        fn duplicate_symbol(name: []const u8, index: u32, diags: *?Diagnostics) error{DuplicateSymbol} {
+            diags.* = Diagnostics.init(index, "symbol '{s}' is already defined", .{name});
+            return error.DuplicateSymbol;
+        }
+
+        fn add_define(self: *Self, program: *BoundedProgram, define: Token(chip).Define, index: u32, diags: *?Diagnostics) !void {
+            try self.check_symbol(program.*, define.name, define.index, diags);
+            const result = DefineWithIndex{
+                .name = define.name,
+                .value = try self.evaluate(i64, program.*, define.value, index, diags),
+                .index = define.index,
+            };
+            if (define.public) try program.defines.append(result) else try program.private_defines.append(result);
         }
 
         fn encode_globals(self: *Self, diags: *?Diagnostics) !void {
@@ -269,9 +323,10 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             // read defines until program is had
             while (self.peek_token()) |token| switch (token.data) {
                 .define => |define| {
+                    try self.check_symbol(null, define.name, define.index, diags);
                     const result = DefineWithIndex{
                         .name = define.name,
-                        .value = try self.evaluate_global(i128, define.value, token.index, diags),
+                        .value = try self.evaluate_global(i64, define.value, token.index, diags),
                         .index = define.index,
                     };
 
@@ -292,21 +347,12 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                 switch (token.data) {
                     .program, .label, .instruction, .word, .wrap_target => break,
                     .define => |define| {
-                        const result = DefineWithIndex{
-                            .name = define.name,
-                            .value = try self.evaluate(i128, program.*, define.value, token.index, diags),
-                            .index = define.index,
-                        };
-
-                        if (define.public)
-                            try program.defines.append(result)
-                        else
-                            try program.private_defines.append(result);
-
+                        try self.add_define(program, define, token.index, diags);
                         self.consume(1);
                     },
                     .origin => |value| {
-                        program.origin = try self.evaluate(u5, program.*, value, token.index, diags);
+                        const origin = try self.evaluate(i32, program.*, value, token.index, diags);
+                        program.origin = if (origin == -1) null else origin;
                         self.consume(1);
                     },
                     .side_set => |side_set| {
@@ -315,13 +361,29 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                             .optional = side_set.opt,
                             .pindir = side_set.pindir,
                         };
+                        if (program.side_set.?.count + @as(u4, @intFromBool(side_set.opt)) > 5) {
+                            diags.* = Diagnostics.init(token.index, "side-set requires more than 5 bits", .{});
+                            return error.InvalidSideSet;
+                        }
                         self.consume(1);
                     },
                     // ignore
                     .lang_opt => self.consume(1),
-                    .wrap => unreachable,
+                    .wrap => {
+                        diags.* = Diagnostics.init(token.index, ".wrap requires a preceding instruction", .{});
+                        return error.InvalidWrap;
+                    },
                 }
             }
+        }
+
+        fn evaluate_bit_count(self: *Self, program: BoundedProgram, value: Value, index: u32, diags: *?Diagnostics) !u5 {
+            const count = try self.evaluate(i128, program, value, index, diags);
+            if (count < 1 or count > 32) {
+                diags.* = Diagnostics.init(index, "bit count must be in 1..32", .{});
+                return error.InvalidBitCount;
+            }
+            return @truncate(@as(u6, @intCast(count)));
         }
 
         fn encode_instruction(
@@ -329,6 +391,7 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             program: *BoundedProgram,
             token: Token(chip).Instruction,
             token_index: u32,
+            instruction_count: u32,
             diags: *?Diagnostics,
         ) !void {
             // guaranteed to be an instruction variant
@@ -340,32 +403,34 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                         .source = .y,
                     },
                 },
-                .jmp => |jmp| .{
-                    .jmp = .{
-                        .condition = jmp.condition,
-                        .address = try self.evaluate_target(program.*, jmp.target, token_index, diags),
-                    },
+                .jmp => |jmp| blk: {
+                    const address = try self.evaluate_target(program.*, jmp.target, token_index, diags);
+                    if (address >= instruction_count) {
+                        diags.* = Diagnostics.init(token_index, "jump target is outside program", .{});
+                        return error.InvalidJump;
+                    }
+                    break :blk .{ .jmp = .{ .condition = jmp.condition, .address = address } };
                 },
                 .wait => |wait| .{
                     .wait = .{
-                        .polarity = wait.polarity,
+                        .polarity = try self.evaluate(u1, program.*, wait.polarity, token_index, diags),
                         .source = wait.source,
                         // RP2040 §3.4.3: IRQ REL is bit 4. RP2350 §11.4.3.2:
                         // IdxMode[4:3] = 0b10 selects relative IRQ indexing.
-                        .index = (try self.evaluate(u5, program.*, wait.num, token_index, diags)) |
+                        .index = (if (wait.source == .irq) @as(u5, try self.evaluate(u3, program.*, wait.num, token_index, diags)) else try self.evaluate(u5, program.*, wait.num, token_index, diags)) |
                             (if (wait.rel) @as(u5, 0x10) else 0),
                     },
                 },
                 .in => |in| .{
                     .in = .{
                         .source = in.source,
-                        .bit_count = in.bit_count,
+                        .bit_count = try self.evaluate_bit_count(program.*, in.bit_count, token_index, diags),
                     },
                 },
                 .out => |out| .{
                     .out = .{
                         .destination = out.destination,
-                        .bit_count = out.bit_count,
+                        .bit_count = try self.evaluate_bit_count(program.*, out.bit_count, token_index, diags),
                     },
                 },
                 .push => |push| .{
@@ -403,7 +468,7 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                 .irq => |irq| blk: {
                     switch (chip) {
                         .RP2040 => {
-                            const irq_num = try self.evaluate(u5, program.*, irq.num, token_index, diags);
+                            const irq_num = try self.evaluate(u3, program.*, irq.num, token_index, diags);
                             break :blk .{
                                 .irq = .{
                                     .clear = @intFromBool(irq.clear),
@@ -473,11 +538,20 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             else
                 null;
 
-            const delay_side_set = try calc_delay_side_set(
+            const delay_side_set = calc_delay_side_set(
                 program.side_set,
                 side_set,
                 delay,
-            );
+            ) catch |err| {
+                diags.* = Diagnostics.init(token_index, "delay exceeds available delay bits", .{});
+                return err;
+            };
+            if (side_set) |value| {
+                if (@as(u6, value) >= @as(u6, 1) << program.side_set.?.count) {
+                    diags.* = Diagnostics.init(token_index, "side-set value exceeds declared width", .{});
+                    return error.InvalidSideSet;
+                }
+            }
 
             try program.instructions.append(Instruction(chip){
                 .tag = tag,
@@ -519,17 +593,28 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
 
         fn encode_instruction_body(self: *Self, program: *BoundedProgram, diags: *?Diagnostics) !void {
             // first scan through body for labels
-            var instr_index: ?u5 = 0;
+            var instr_index: u32 = 0;
+            var wrap_target_index: ?u32 = null;
             for (self.tokens[self.index..]) |token| {
                 switch (token.data) {
-                    .label => |label| try program.labels.append(.{
-                        .name = label.name,
-                        .public = label.public,
-                        .index = instr_index.?,
-                    }),
+                    .label => |label| {
+                        try self.check_symbol(program.*, label.name, token.index, diags);
+                        if (instr_index >= 32) {
+                            diags.* = Diagnostics.init(token.index, "label exceeds instruction memory", .{});
+                            return error.TooBig;
+                        }
+                        try program.labels.append(.{
+                            .name = label.name,
+                            .public = label.public,
+                            .index = @intCast(instr_index),
+                        });
+                    },
                     .instruction, .word => {
-                        const result, const ov = @addWithOverflow(instr_index.?, 1);
-                        instr_index = if (ov != 0) null else result;
+                        if (instr_index >= 32) {
+                            diags.* = Diagnostics.init(token.index, "program exceeds 32 instructions", .{});
+                            return error.TooBig;
+                        }
+                        instr_index += 1;
                     },
                     .wrap_target => {
                         if (program.wrap_target != null) {
@@ -537,7 +622,12 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                             return error.WrapTargetAlreadySet;
                         }
 
-                        program.wrap_target = instr_index.?;
+                        if (instr_index >= 32) {
+                            diags.* = Diagnostics.init(token.index, "wrap target exceeds instruction memory", .{});
+                            return error.InvalidWrap;
+                        }
+                        program.wrap_target = @intCast(instr_index);
+                        wrap_target_index = token.index;
                     },
                     .wrap => {
                         if (program.wrap != null) {
@@ -545,29 +635,48 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                             return error.WrapAlreadySet;
                         }
 
-                        program.wrap = if (instr_index) |idx| idx - 1 else 31;
+                        if (instr_index == 0) {
+                            diags.* = Diagnostics.init(token.index, ".wrap requires a preceding instruction", .{});
+                            return error.InvalidWrap;
+                        }
+                        program.wrap = @intCast(instr_index - 1);
                     },
+                    .define => |define| try self.add_define(program, define, token.index, diags),
+                    .lang_opt => {},
                     .program => break,
-                    else => unreachable, // invalid
+                    else => {
+                        diags.* = Diagnostics.init(token.index, "directive is not valid in the program body", .{});
+                        return error.InvalidDirective;
+                    },
+                }
+            }
+
+            if (program.wrap_target) |target| {
+                if (target >= instr_index) {
+                    diags.* = Diagnostics.init(wrap_target_index.?, "wrap target is outside program", .{});
+                    return error.InvalidWrap;
                 }
             }
 
             // encode instructions, labels will be populated
             for (self.tokens[self.index..], self.index..) |token, i| {
                 switch (token.data) {
-                    .instruction => |instr| try self.encode_instruction(program, instr, token.index, diags),
+                    .instruction => |instr| try self.encode_instruction(program, instr, token.index, instr_index, diags),
                     .word => |word| {
                         try program.instructions.append(@bitCast(try self.evaluate(u16, program.*, word, token.index, diags)));
                         try program.relocations.append(.none);
                     },
                     // already processed
-                    .label, .wrap_target, .wrap => {},
+                    .label, .wrap_target, .wrap, .define, .lang_opt => {},
                     .program => {
                         self.index = @as(u32, @intCast(i));
                         break;
                     },
 
-                    else => unreachable, // invalid
+                    else => {
+                        diags.* = Diagnostics.init(token.index, "directive is not valid in the program body", .{});
+                        return error.InvalidDirective;
+                    },
                 }
             } else if (self.tokens.len > 0)
                 self.index = @as(u32, @intCast(self.tokens.len));
@@ -577,6 +686,13 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
             const program_token = self.get_token() orelse return null;
             if (program_token.data != .program)
                 return error.ExpectedProgramToken;
+
+            for (self.output.programs.slice()) |previous| {
+                if (std.mem.eql(u8, previous.name, program_token.data.program)) {
+                    diags.* = Diagnostics.init(program_token.index, "program is already defined", .{});
+                    return error.DuplicateProgram;
+                }
+            }
 
             var program = BoundedProgram{
                 .name = program_token.data.program,
@@ -598,6 +714,16 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
         }
 
         fn encode_output(self: *Self, diags: *?Diagnostics) !Self.Output {
+            return self.encode_output_impl(diags) catch |err| {
+                if (diags.* == null) {
+                    const idx = if (self.tokens.len == 0) 0 else self.tokens[@min(self.index, self.tokens.len - 1)].index;
+                    diags.* = Diagnostics.init(idx, "{s}", .{@errorName(err)});
+                }
+                return err;
+            };
+        }
+
+        fn encode_output_impl(self: *Self, diags: *?Diagnostics) !Self.Output {
             try self.encode_globals(diags);
 
             while (try self.encode_program(diags)) |program|
@@ -849,7 +975,7 @@ test "encode.origin" {
     try expectEqualStrings("arst", program.name);
     try expectEqual(@as(usize, 0), program.instructions.len);
 
-    try expectEqual(@as(?u5, 0), program.origin);
+    try expectEqual(@as(?i32, 0), program.origin);
 }
 
 test "encode.wrap_target" {
@@ -1061,7 +1187,7 @@ test "encode.evaluate.bit reversal" {
 
     try expectEqual(@as(usize, 1), output.global_defines.len);
     try expectEqualStrings("FOO", output.global_defines.get(0).name);
-    try expectEqual(@as(i128, 0x80000000), output.global_defines.get(0).value);
+    try expectEqual(@as(i128, -0x80000000), output.global_defines.get(0).value);
 }
 
 test "encode.evaluate.value size" {
@@ -1192,14 +1318,14 @@ test "encode.error.sideset delay collision" {
 test "encode.error.sideset opt delay collision" {
     const collision = encode_bounded_output(.RP2040,
         \\.program sideset_delay_collision
-        \\.side_set 2, opt
+        \\.side_set 2 opt
         \\nop side 3 [4]
     );
     try expectError(error.SideSetDelayCollision, collision);
 
     _ = try encode_bounded_output(.RP2040,
         \\.program sideset_delay_collision
-        \\.side_set 2, opt
+        \\.side_set 2 opt
         \\nop side 3 [3]
     );
 }
@@ -1222,3 +1348,114 @@ test "encode.error.sideset opt delay collision" {
 // - .wrap must only be used once in a program
 // -
 //
+fn expect_diagnostic(comptime source: []const u8, expected_error: anyerror, index: u32, message: []const u8) !void {
+    inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
+        var diags: ?Diagnostics = null;
+        try expectError(expected_error, encode_bounded_output_impl(chip, source, &diags));
+        try expectEqual(index, diags.?.index);
+        try expectEqualStrings(message, diags.?.message.slice());
+    }
+}
+
+test "encode.range diagnostics" {
+    try expect_diagnostic(".program p\nin pins, 0", error.InvalidBitCount, 11, "bit count must be in 1..32");
+    try expect_diagnostic(".program p\nout pins, 33", error.InvalidBitCount, 11, "bit count must be in 1..32");
+    try expect_diagnostic(".program p\nout pins, 64", error.InvalidBitCount, 11, "bit count must be in 1..32");
+    try expect_diagnostic(".program p\nin pins, (-1)", error.InvalidBitCount, 11, "bit count must be in 1..32");
+    try expect_diagnostic(".program p\nset pins, 32", error.TooBig, 11, "value of 32 does not fit in a u5");
+    try expect_diagnostic(".program p\n.side_set 1\nnop side 2", error.InvalidSideSet, 23, "side-set value exceeds declared width");
+    try expect_diagnostic(".program p\n.side_set 1 opt\nnop side 2", error.InvalidSideSet, 27, "side-set value exceeds declared width");
+    try expect_diagnostic(".program p\n.side_set 1\nnop side 1 [16]", error.SideSetDelayCollision, 23, "delay exceeds available delay bits");
+    try expect_diagnostic(".program p\n.side_set 1 opt\nnop [8]", error.SideSetDelayCollision, 27, "delay exceeds available delay bits");
+    try expect_diagnostic(".program p\n.side_set 6\nnop", error.InvalidSideSet, 12, "side-set requires more than 5 bits");
+    try expect_diagnostic(".program p\n.side_set 5 opt\nnop", error.InvalidSideSet, 12, "side-set requires more than 5 bits");
+    try expect_diagnostic(".program p\nnop [32]", error.TooBig, 16, "value of 32 does not fit in a u5");
+}
+
+test "encode.user input formerly unreachable diagnostics" {
+    try expect_diagnostic(".program p\n.wrap", error.InvalidWrap, 12, ".wrap requires a preceding instruction");
+    try expect_diagnostic(".program p\nnop\n.origin 1", error.InvalidDirective, 16, "directive is not valid in the program body");
+    try expect_diagnostic(".program p\nnop\n.side_set 1", error.InvalidDirective, 16, "directive is not valid in the program body");
+}
+
+test "encode.expressions and default wait polarity" {
+    const output = try encode_bounded_output(.RP2040,
+        \\.define N 8 * 2 | 1
+        \\.program p
+        \\*entry:
+        \\in pins, N
+        \\out pins, (1 << 5)
+        \\wait gpio 2
+        \\wait (1-1) irq (2+1) rel
+    );
+    const program = output.programs.get(0);
+    try expectEqual(@as(u5, 24), program.instructions.get(0).payload.in.bit_count);
+    try expectEqual(@as(u5, 0), program.instructions.get(1).payload.out.bit_count);
+    try expectEqual(@as(u1, 1), program.instructions.get(2).payload.wait.polarity);
+    try expectEqual(@as(u1, 0), program.instructions.get(3).payload.wait.polarity);
+    try expect(program.labels.get(0).public);
+}
+// Each expression below was rejected by pico-sdk 2.1.1 pioasm after its
+// signed 32-bit evaluation. Check both the rejection and the operand caret.
+test "encode.negative int32 expression diagnostics" {
+    const cases = .{
+        .{ "((1 << 31) >> 31)", -1 },
+        .{ "(2147483647 + 1)", -2147483648 },
+        .{ "((-2147483647) - 1)", -2147483648 },
+        .{ "((1 << 30) * 2)", -2147483648 },
+        .{ "((1 << 31) / 2)", -1073741824 },
+        .{ "(-(1 << 31))", -2147483648 },
+        .{ "((1 << 31) | 1)", -2147483647 },
+        .{ "((1 << 31) & (-1))", -2147483648 },
+        .{ "((1 << 31) ^ 1)", -2147483647 },
+        .{ "(::1)", -2147483648 },
+        .{ "(1 << (-1))", -2147483648 },
+    };
+    inline for (cases) |case| {
+        try expect_diagnostic(".program p\nset pins, " ++ case[0], error.TooBig, 21, std.fmt.comptimePrint("value of {} does not fit in a u5", .{case[1]}));
+    }
+}
+
+// Differential rejection probes against pico-sdk 2.1.1 lexer.ll/parser.yy.
+test "encode.expression token boundary diagnostics" {
+    const cases = .{
+        .{ "(--1)", 22, "unexpected decrement token in expression" },
+        .{ "(1--2)", 23, "unexpected decrement token in expression" },
+        .{ "(−−1)", 22, "unexpected decrement token in expression" },
+        .{ "(1::2)", 23, "expected binary operator" },
+        .{ "(1!=2)", 23, "invalid expression token" },
+        .{ "(1 < < 2)", 24, "expected shift operator" },
+        .{ "(1>>>2)", 25, "expected shift operator" },
+        .{ "(1&&2)", 24, "expected expression" },
+        .{ "(1||2)", 24, "expected expression" },
+        .{ "(0o10)", 23, "expected binary operator" },
+        .{ "(1_0)", 23, "expected binary operator" },
+        .{ "(0x1_f)", 25, "expected binary operator" },
+        .{ "(0b1_0)", 25, "expected binary operator" },
+        .{ "(1e1)", 23, "expected binary operator" },
+        .{ "(1.0)", 23, "invalid expression token" },
+        .{ "(1 + +2)", 26, "expected expression" },
+        .{ "(pins)", 22, "keyword is not valid in an expression" },
+        .{ "(::)", 24, "expected expression" },
+        .{ "(1\n+2)", 23, "invalid expression token" },
+    };
+    inline for (cases) |case| {
+        try expect_diagnostic(".program p\nset pins, " ++ case[0], error.InvalidExpression, case[1], case[2]);
+    }
+}
+test "encode.lang_opt quoting and label line diagnostics" {
+    try expect_diagnostic(".program p\n.lang_opt c_sdk foo = \"unterminated", error.InvalidExpression, 33, "unterminated .lang_opt string");
+    try expect_diagnostic(".program p\n.lang_opt c_sdk foo = 1 ;x", error.InvalidExpression, 35, "unexpected token after .lang_opt value");
+    try expect_diagnostic(".program p\n.lang_opt 1 foo = bar", error.InvalidExpression, 21, "expected .lang_opt language name = value");
+    try expect_diagnostic(".program p\n.lang_opt c_sdk foo = ", error.MissingArg, 33, "expected .lang_opt language name = value");
+    try expect_diagnostic(".program p\na:b:nop\n", error.InvalidExpression, 13, "only one label is allowed on a line");
+    try expect_diagnostic(".program p\na: .word 1\n", error.InvalidExpression, 14, "expected instruction after label");
+    try expect_diagnostic(".program p\na: % c-sdk {\n%}\n", error.InvalidExpression, 14, "expected instruction after label");
+}
+
+test "encode.corpus discovered rejection diagnostics" {
+    try expect_diagnostic(".program p\njmp 1\n", error.InvalidJump, 11, "jump target is outside program");
+    try expect_diagnostic(".program p\n.define N 1\n.define N 2\nset pins,N\n", error.DuplicateSymbol, 31, "symbol 'N' is already defined");
+    try expect_diagnostic(".program p\nnop\n.program p\nnop\n", error.DuplicateProgram, 16, "program is already defined");
+    try expect_diagnostic(".program p\nnop\n.wrap_target\n", error.InvalidWrap, 16, "wrap target is outside program");
+}

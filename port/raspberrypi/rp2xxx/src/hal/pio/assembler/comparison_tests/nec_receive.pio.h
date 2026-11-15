@@ -14,18 +14,19 @@
 
 #define nec_receive_wrap_target 0
 #define nec_receive_wrap 8
+#define nec_receive_pio_version 0
 
 static const uint16_t nec_receive_program_instructions[] = {
             //     .wrap_target
-    0xe03e, //  0: set    x, 30                      
-    0x2020, //  1: wait   0 pin, 0                   
-    0x00c7, //  2: jmp    pin, 7                     
-    0x0042, //  3: jmp    x--, 2                     
-    0xa0c3, //  4: mov    isr, null                  
-    0x20a0, //  5: wait   1 pin, 0                   
-    0x0000, //  6: jmp    0                          
+    0xe03e, //  0: set    x, 30
+    0x2020, //  1: wait   0 pin, 0
+    0x00c7, //  2: jmp    pin, 7
+    0x0042, //  3: jmp    x--, 2
+    0xa0c3, //  4: mov    isr, null
+    0x20a0, //  5: wait   1 pin, 0
+    0x0000, //  6: jmp    0
     0xae42, //  7: nop                           [14]
-    0x4001, //  8: in     pins, 1                    
+    0x4001, //  8: in     pins, 1
             //     .wrap
 };
 
@@ -34,6 +35,10 @@ static const struct pio_program nec_receive_program = {
     .instructions = nec_receive_program_instructions,
     .length = 9,
     .origin = -1,
+    .pio_version = nec_receive_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config nec_receive_program_get_default_config(uint offset) {

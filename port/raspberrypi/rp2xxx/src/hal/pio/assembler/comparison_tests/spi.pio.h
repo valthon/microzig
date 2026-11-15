@@ -14,11 +14,12 @@
 
 #define spi_cpha0_wrap_target 0
 #define spi_cpha0_wrap 1
+#define spi_cpha0_pio_version 0
 
 static const uint16_t spi_cpha0_program_instructions[] = {
             //     .wrap_target
-    0x6101, //  0: out    pins, 1         side 0 [1] 
-    0x5101, //  1: in     pins, 1         side 1 [1] 
+    0x6101, //  0: out    pins, 1         side 0 [1]
+    0x5101, //  1: in     pins, 1         side 1 [1]
             //     .wrap
 };
 
@@ -27,6 +28,10 @@ static const struct pio_program spi_cpha0_program = {
     .instructions = spi_cpha0_program_instructions,
     .length = 2,
     .origin = -1,
+    .pio_version = spi_cpha0_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config spi_cpha0_program_get_default_config(uint offset) {
@@ -43,12 +48,13 @@ static inline pio_sm_config spi_cpha0_program_get_default_config(uint offset) {
 
 #define spi_cpha1_wrap_target 0
 #define spi_cpha1_wrap 2
+#define spi_cpha1_pio_version 0
 
 static const uint16_t spi_cpha1_program_instructions[] = {
             //     .wrap_target
-    0x6021, //  0: out    x, 1            side 0     
-    0xb101, //  1: mov    pins, x         side 1 [1] 
-    0x4001, //  2: in     pins, 1         side 0     
+    0x6021, //  0: out    x, 1            side 0
+    0xb101, //  1: mov    pins, x         side 1 [1]
+    0x4001, //  2: in     pins, 1         side 0
             //     .wrap
 };
 
@@ -57,6 +63,10 @@ static const struct pio_program spi_cpha1_program = {
     .instructions = spi_cpha1_program_instructions,
     .length = 3,
     .origin = -1,
+    .pio_version = spi_cpha1_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config spi_cpha1_program_get_default_config(uint offset) {
@@ -100,20 +110,21 @@ static inline void pio_spi_init(PIO pio, uint sm, uint prog_offs, uint n_bits,
 
 #define spi_cpha0_cs_wrap_target 0
 #define spi_cpha0_cs_wrap 8
+#define spi_cpha0_cs_pio_version 0
 
 #define spi_cpha0_cs_offset_entry_point 8u
 
 static const uint16_t spi_cpha0_cs_program_instructions[] = {
             //     .wrap_target
-    0x6101, //  0: out    pins, 1         side 0 [1] 
-    0x4801, //  1: in     pins, 1         side 1     
-    0x0840, //  2: jmp    x--, 0          side 1     
-    0x6001, //  3: out    pins, 1         side 0     
-    0xa022, //  4: mov    x, y            side 0     
-    0x4801, //  5: in     pins, 1         side 1     
-    0x08e0, //  6: jmp    !osre, 0        side 1     
-    0xa142, //  7: nop                    side 0 [1] 
-    0x91e0, //  8: pull   ifempty block   side 2 [1] 
+    0x6101, //  0: out    pins, 1         side 0 [1]
+    0x4801, //  1: in     pins, 1         side 1
+    0x0840, //  2: jmp    x--, 0          side 1
+    0x6001, //  3: out    pins, 1         side 0
+    0xa022, //  4: mov    x, y            side 0
+    0x4801, //  5: in     pins, 1         side 1
+    0x08e0, //  6: jmp    !osre, 0        side 1
+    0xa142, //  7: nop                    side 0 [1]
+    0x91e0, //  8: pull   ifempty block   side 2 [1]
             //     .wrap
 };
 
@@ -122,6 +133,10 @@ static const struct pio_program spi_cpha0_cs_program = {
     .instructions = spi_cpha0_cs_program_instructions,
     .length = 9,
     .origin = -1,
+    .pio_version = spi_cpha0_cs_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config spi_cpha0_cs_program_get_default_config(uint offset) {
@@ -138,20 +153,21 @@ static inline pio_sm_config spi_cpha0_cs_program_get_default_config(uint offset)
 
 #define spi_cpha1_cs_wrap_target 0
 #define spi_cpha1_cs_wrap 8
+#define spi_cpha1_cs_pio_version 0
 
 #define spi_cpha1_cs_offset_entry_point 7u
 
 static const uint16_t spi_cpha1_cs_program_instructions[] = {
             //     .wrap_target
-    0x6901, //  0: out    pins, 1         side 1 [1] 
-    0x4001, //  1: in     pins, 1         side 0     
-    0x0040, //  2: jmp    x--, 0          side 0     
-    0x6801, //  3: out    pins, 1         side 1     
-    0xa822, //  4: mov    x, y            side 1     
-    0x4001, //  5: in     pins, 1         side 0     
-    0x00e0, //  6: jmp    !osre, 0        side 0     
-    0x91e0, //  7: pull   ifempty block   side 2 [1] 
-    0xa142, //  8: nop                    side 0 [1] 
+    0x6901, //  0: out    pins, 1         side 1 [1]
+    0x4001, //  1: in     pins, 1         side 0
+    0x0040, //  2: jmp    x--, 0          side 0
+    0x6801, //  3: out    pins, 1         side 1
+    0xa822, //  4: mov    x, y            side 1
+    0x4001, //  5: in     pins, 1         side 0
+    0x00e0, //  6: jmp    !osre, 0        side 0
+    0x91e0, //  7: pull   ifempty block   side 2 [1]
+    0xa142, //  8: nop                    side 0 [1]
             //     .wrap
 };
 
@@ -160,6 +176,10 @@ static const struct pio_program spi_cpha1_cs_program = {
     .instructions = spi_cpha1_cs_program_instructions,
     .length = 9,
     .origin = -1,
+    .pio_version = spi_cpha1_cs_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config spi_cpha1_cs_program_get_default_config(uint offset) {

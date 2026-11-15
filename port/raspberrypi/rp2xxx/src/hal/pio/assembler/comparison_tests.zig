@@ -16,7 +16,22 @@ fn pio_comparison_chip(comptime chip: Chip, comptime source: []const u8) !void {
     try std.testing.expect(output.programs.len > 0);
 
     inline for (output.programs) |program| {
+        inline for (program.defines) |define| {
+            try std.testing.expectEqual(@field(c, program.name ++ "_" ++ define.name), define.value);
+        }
         const expected_insns = @field(c, program.name ++ "_program_instructions");
+        if (comptime !std.mem.eql(u8, program.name, "irq") and !std.mem.eql(u8, program.name, "movrx")) {
+            const expected_program = @field(c, program.name ++ "_program");
+            try std.testing.expectEqual(expected_program.length, program.instructions.len);
+            try std.testing.expectEqual(expected_program.origin, if (program.origin) |origin| @as(i32, origin) else -1);
+            try std.testing.expectEqual(@field(c, program.name ++ "_wrap_target"), program.wrap_target orelse 0);
+            try std.testing.expectEqual(@field(c, program.name ++ "_wrap"), program.wrap orelse program.instructions.len - 1);
+            const config = @field(c, program.name ++ "_program_get_default_config")(0);
+            try std.testing.expectEqual(config.side_count, if (program.side_set) |side| @as(u32, side.count) + @intFromBool(side.optional) else 0);
+            try std.testing.expectEqual(config.side_optional, if (program.side_set) |side| side.optional else false);
+            try std.testing.expectEqual(config.side_pindirs, if (program.side_set) |side| side.pindir else false);
+        }
+
         for (program.instructions, expected_insns) |actual, expected| {
             std.log.debug("expected: 0x{x}", .{expected});
             std.log.debug("  actual: 0x{x}", .{actual});
@@ -138,9 +153,13 @@ test "pio.comparison.origin and wait irq rel" {
     try pio_comparison(@embedFile("comparison_tests/correctness.pio"));
     inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
         const program = comptime assembler.assemble(chip, @embedFile("comparison_tests/correctness.pio"), .{}).get_program_by_name("origin_four");
-        try std.testing.expectEqual(@as(?u5, 4), program.origin);
+        try std.testing.expectEqual(@as(?i32, 4), program.origin);
         try std.testing.expectEqual(@as(?u5, c.origin_four_wrap), program.wrap);
         try std.testing.expectEqual(@as(?u5, c.origin_four_wrap_target), program.wrap_target);
         try std.testing.expectEqual(@as(?u5, c.origin_four_offset_loop), program.get_label_index("loop"));
     }
+}
+
+test "pio.comparison.grammar" {
+    try pio_comparison(@embedFile("comparison_tests/grammar.pio"));
 }

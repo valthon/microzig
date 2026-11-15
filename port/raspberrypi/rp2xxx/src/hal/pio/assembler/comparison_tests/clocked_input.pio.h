@@ -14,12 +14,13 @@
 
 #define clocked_input_wrap_target 0
 #define clocked_input_wrap 2
+#define clocked_input_pio_version 0
 
 static const uint16_t clocked_input_program_instructions[] = {
             //     .wrap_target
-    0x2021, //  0: wait   0 pin, 1                   
-    0x20a1, //  1: wait   1 pin, 1                   
-    0x4001, //  2: in     pins, 1                    
+    0x2021, //  0: wait   0 pin, 1
+    0x20a1, //  1: wait   1 pin, 1
+    0x4001, //  2: in     pins, 1
             //     .wrap
 };
 
@@ -28,6 +29,10 @@ static const struct pio_program clocked_input_program = {
     .instructions = clocked_input_program_instructions,
     .length = 3,
     .origin = -1,
+    .pio_version = clocked_input_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config clocked_input_program_get_default_config(uint offset) {

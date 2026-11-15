@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 
 const assembler = @import("../assembler.zig");
 const Diagnostics = assembler.Diagnostics;
+const lexer = @import("lexer.zig");
 
 const Chip = @import("../../chip.zig").Chip;
 
@@ -20,8 +21,18 @@ pub fn tokenize(
 ) !BoundedArray(Token(chip), options.capacity) {
     var tokens = BoundedArray(Token(chip), options.capacity).init(0) catch unreachable;
     var tokenizer = Tokenizer(chip).init(source);
-    while (try tokenizer.next(diags)) |token|
-        try tokens.append(token);
+    errdefer if (diags.* == null) {
+        diags.* = Diagnostics.init(tokenizer.index, "token capacity exceeded", .{});
+    };
+    while (try tokenizer.next(diags)) |token| {
+        if (token.data == .label and !lexer.is_identifier(token.data.label.name)) {
+            diags.* = Diagnostics.init(token.index, "invalid label name", .{});
+            return error.InvalidExpression;
+        }
+        var located = token;
+        located.source = source;
+        try tokens.append(located);
+    }
 
     return tokens;
 }
@@ -44,14 +55,17 @@ pub const Value = union(enum) {
         }
     }
 
-    pub fn from_string(str: []const u8) !Value {
-        return Value{
-            .integer = std.fmt.parseInt(u32, str, 0) catch {
-                return Value{
-                    .string = str,
-                };
-            },
-        };
+    pub fn from_string(str: []const u8) error{InvalidExpression}!Value {
+        if (std.ascii.eqlIgnoreCase(str, "one")) return .{ .integer = 1 };
+        if (std.ascii.eqlIgnoreCase(str, "zero")) return .{ .integer = 0 };
+        if (std.mem.startsWith(u8, str, "(")) return .{ .expression = str };
+        if (str.len == 0) return error.InvalidExpression;
+        if (std.ascii.isDigit(str[0])) {
+            const number = lexer.integer(str) catch return error.InvalidExpression;
+            return .{ .integer = @intCast(number) };
+        }
+        if (!lexer.is_identifier(str)) return error.InvalidExpression;
+        return .{ .string = str };
     }
 };
 
@@ -66,6 +80,7 @@ pub fn Tokenizer(chip: Chip) type {
         const Self = @This();
         source: []const u8,
         index: u32,
+        label_on_line: bool = false,
 
         pub fn format(
             self: Self,
@@ -117,36 +132,33 @@ pub fn Tokenizer(chip: Chip) type {
         }
 
         fn skip_line(self: *Self) void {
-            while (self.get()) |c|
-                if (c == '\n')
+            while (self.get()) |c| {
+                if (c == '\n') {
+                    self.label_on_line = false;
                     return;
-        }
-
-        fn skip_until_end_of_comment_block(self: *Self) void {
-            while (self.get()) |c| {
-                if (c == '*') {
-                    if (self.peek()) |p| {
-                        self.consume(1);
-                        if (p == '/') {
-                            return;
-                        }
-                    }
                 }
             }
         }
 
-        fn skip_until_end_of_code_block(self: *Self) void {
-            // TODO: assert we have the code identifier and open curly bracket
+        fn skip_until_end_of_comment_block(self: *Self) error{}!void {
             while (self.get()) |c| {
-                if (c == '%') {
-                    if (self.peek()) |p| {
-                        self.consume(1);
-                        if (p == '}') {
-                            return;
-                        }
-                    }
+                if (c == '*' and self.peek() == '/') {
+                    self.consume(1);
+                    return;
                 }
             }
+            // lexer.ll accepts EOF in its block-comment state.
+            return;
+        }
+
+        fn skip_until_end_of_code_block(self: *Self) error{UnterminatedCodeBlock}!void {
+            while (self.get()) |c| {
+                if (c == '%' and self.peek() == '}') {
+                    self.consume(1);
+                    return;
+                }
+            }
+            return error.UnterminatedCodeBlock;
         }
 
         fn read_until_whitespace_or_end(self: *Self) ![]const u8 {
@@ -154,7 +166,7 @@ pub fn Tokenizer(chip: Chip) type {
             var end: ?u32 = null;
             while (self.peek()) |p| {
                 switch (p) {
-                    ' ', '\n', '\r', '\t', ',' => {
+                    ' ', '\n', '\r', '\t', ',', ';', '/', '[', '(' => {
                         end = self.index;
                         break;
                     },
@@ -163,24 +175,6 @@ pub fn Tokenizer(chip: Chip) type {
             } else end = self.index;
 
             return self.source[start .. end orelse return error.EndOfStream];
-        }
-
-        fn skip_whitespace(self: *Self) void {
-            while (self.peek()) |p| {
-                switch (p) {
-                    ' ', '\t', '\r', '\n', ',' => self.consume(1),
-                    else => return,
-                }
-            }
-        }
-
-        /// returns array of args
-        fn get_args(self: *Self, comptime num: u32, diags: *?Diagnostics) TokenizeError![num]?[]const u8 {
-            var args: [num]?[]const u8 = undefined;
-            for (&args) |*arg|
-                arg.* = try self.get_arg(diags);
-
-            return args;
         }
 
         const PeekResult = struct {
@@ -209,14 +203,7 @@ pub fn Tokenizer(chip: Chip) type {
             index: *u32,
             diags: *?Diagnostics,
         ) TokenizeError!?PeekResult {
-
-            // skip whitespace
-            while (index.* < self.source.len) {
-                switch (self.source[index.*]) {
-                    ' ', '\t', ',' => index.* += 1,
-                    else => break,
-                }
-            }
+            try self.skip_arg_space(index, diags);
 
             if (index.* == self.source.len)
                 return null;
@@ -227,6 +214,10 @@ pub fn Tokenizer(chip: Chip) type {
                     '(' => blk: {
                         var depth: u32 = 0;
                         break :blk while (index.* < self.source.len) : (index.* += 1) {
+                            if (lexer.comment_end(self.source, index.*)) |comment_end| {
+                                index.* = @intCast(comment_end - 1);
+                                continue;
+                            }
                             switch (self.source[index.*]) {
                                 '(' => depth += 1,
                                 ')' => {
@@ -245,6 +236,10 @@ pub fn Tokenizer(chip: Chip) type {
                         };
                     },
                     '[' => while (index.* < self.source.len) : (index.* += 1) {
+                        if (lexer.comment_end(self.source, index.*)) |comment_end| {
+                            index.* = @intCast(comment_end - 1);
+                            continue;
+                        }
                         if (self.source[index.*] == ']') {
                             index.* += 1;
                             break index.*;
@@ -253,13 +248,23 @@ pub fn Tokenizer(chip: Chip) type {
                         diags.* = Diagnostics.init(start, "mismatched parenthesis", .{});
                         return error.InvalidExpression;
                     },
-                    else => while (index.* < self.source.len) {
-                        switch (self.source[index.*]) {
-                            // ; and / are to stop at comments
-                            ' ', '\t', '\r', '\n', ',', ';', '/' => break index.*,
-                            else => index.* += 1,
+                    else => blk: {
+                        const c = self.source[start];
+                        if (c == ',') {
+                            diags.* = Diagnostics.init(start, "unexpected comma", .{});
+                            return error.InvalidExpression;
                         }
-                    } else index.*,
+                        if (c == '\n' or c == '\r' or c == ';' or
+                            std.mem.startsWith(u8, self.source[start..], "//")) break :blk start;
+                        if (std.ascii.isDigit(c)) {
+                            index.* = @intCast(lexer.number_end(self.source, start));
+                        } else if (std.ascii.isAlphabetic(c) or c == '_') {
+                            index.* = @intCast(lexer.identifier_end(self.source, start));
+                        } else {
+                            index.* += if (std.mem.startsWith(u8, self.source[start..], "::")) @as(u32, 2) else 1;
+                        }
+                        break :blk index.*;
+                    },
                 };
             };
 
@@ -272,6 +277,27 @@ pub fn Tokenizer(chip: Chip) type {
                 null;
         }
 
+        fn skip_arg_space(self: Self, index: *u32, diags: *?Diagnostics) TokenizeError!void {
+            while (index.* < self.source.len) {
+                switch (self.source[index.*]) {
+                    ' ', '\t', '\r' => index.* += 1,
+                    else => {
+                        if (lexer.comment_end(self.source, index.*)) |end| {
+                            index.* = @intCast(end);
+                        } else if (std.mem.startsWith(u8, self.source[index.*..], "/*")) {
+                            diags.* = Diagnostics.init(index.*, "unterminated comment", .{});
+                            return error.InvalidExpression;
+                        } else return;
+                    },
+                }
+            }
+        }
+
+        fn optional_comma(self: *Self, diags: *?Diagnostics) TokenizeError!void {
+            try self.skip_arg_space(&self.index, diags);
+            if (self.peek() == ',') self.consume(1);
+        }
+
         fn get_arg(self: *Self, diags: *?Diagnostics) TokenizeError!?[]const u8 {
             return if (try self.peek_arg_impl(&self.index, diags)) |result|
                 result.str
@@ -282,14 +308,20 @@ pub fn Tokenizer(chip: Chip) type {
         const Identifier = struct {
             index: u32,
             str: []const u8,
+            label: bool = false,
         };
 
-        fn get_identifier(self: *Self) TokenizeError!Identifier {
-            self.skip_whitespace();
-            return Identifier{
-                .index = self.index,
-                .str = try self.read_until_whitespace_or_end(),
-            };
+        fn get_identifier(self: *Self, diags: *?Diagnostics) TokenizeError!Identifier {
+            try self.skip_arg_space(&self.index, diags);
+            const start = self.index;
+            if (self.peek() == '*') self.consume(1);
+            self.index = @intCast(lexer.identifier_end(self.source, self.index));
+            const end = self.index;
+            var probe = end;
+            try self.skip_arg_space(&probe, diags);
+            const label = probe < self.source.len and self.source[probe] == ':' and !std.mem.startsWith(u8, self.source[probe..], "::");
+            if (label) self.index = probe + 1;
+            return .{ .index = start, .str = self.source[start..end], .label = label };
         }
 
         const TokenizeError = error{
@@ -320,7 +352,7 @@ pub fn Tokenizer(chip: Chip) type {
 
         fn assert_is_lower(str: []const u8) void {
             for (str) |c|
-                assert(std.ascii.isLower(c));
+                assert(std.ascii.isLower(c) or c == '_');
         }
 
         fn eql_lower(comptime lhs: []const u8, rhs: []const u8) bool {
@@ -335,103 +367,89 @@ pub fn Tokenizer(chip: Chip) type {
             return std.mem.eql(u8, &buf, lhs);
         }
 
-        fn get_define(self: *Self, index: u32, diags: *?Diagnostics) TokenizeError!Token(chip) {
-            const maybe_public = try self.get_identifier();
-            const is_public = eql_lower("public", maybe_public.str);
+        fn get_line_expression(self: *Self, diags: *?Diagnostics) TokenizeError![]const u8 {
+            while (self.peek()) |c| {
+                if (c != ' ' and c != '\t') break;
+                self.consume(1);
+            }
+            const start = self.index;
+            while (self.peek()) |c| {
+                if (lexer.comment_end(self.source, self.index)) |end| {
+                    self.index = @intCast(end);
+                    continue;
+                }
+                if (c == '\n' or c == ';' or std.mem.startsWith(u8, self.source[self.index..], "//")) break;
+                self.consume(1);
+            }
+            const expr = std.mem.trimEnd(u8, self.source[start..self.index], " \t");
+            if (expr.len == 0) {
+                diags.* = Diagnostics.init(start, "expected expression", .{});
+                return error.InvalidExpression;
+            }
+            return expr;
+        }
 
+        fn get_define(self: *Self, index: u32, diags: *?Diagnostics) TokenizeError!Token(chip) {
+            const maybe_public = try self.get_identifier(diags);
+            const is_public = eql_lower("public", maybe_public.str) or std.mem.eql(u8, "*", maybe_public.str);
+
+            const starred = std.mem.startsWith(u8, maybe_public.str, "*");
             const name = if (is_public)
-                try self.get_identifier()
+                try self.get_identifier(diags)
+            else if (starred)
+                Identifier{ .index = maybe_public.index + 1, .str = maybe_public.str[1..] }
             else
                 maybe_public;
 
+            if (name.label or !lexer.is_identifier(name.str)) {
+                diags.* = Diagnostics.init(name.index, "invalid define name", .{});
+                return error.InvalidExpression;
+            }
             return Token(chip){
                 .index = index,
                 .data = .{
                     .define = .{
                         .name = name.str,
                         .value = Value{
-                            .expression = (try self.get_arg(diags)) orelse {
-                                diags.* = Diagnostics.init(index, "failed to get expression", .{});
-                                return error.InvalidExpression;
-                            },
+                            .expression = try self.get_line_expression(diags),
                         },
-                        .public = is_public,
+                        .public = is_public or starred,
                         .index = name.index,
                     },
                 },
             };
         }
 
-        fn get_expression(self: *Self) TokenizeError!Value {
-            const start = self.index;
-            var count: u32 = 1;
-
-            if (self.get()) |c|
-                if (c != '(')
-                    return error.NotAnExpression;
-
-            while (self.get()) |c| {
-                switch (c) {
-                    '(' => count += 1,
-                    ')' => {
-                        count -= 1;
-                    },
-                    else => {},
-                }
-
-                if (count == 0) {
-                    return Value{
-                        .expression = self.source[start..self.index],
-                    };
-                }
-            } else {
-                return error.NotAnExpression;
-            }
-        }
-
-        fn get_value(self: *Self) TokenizeError!Value {
-            self.skip_whitespace();
-
-            if (self.peek()) |p|
-                if (p == '(')
-                    return try self.get_expression()
-                else {
-                    const identifier = try self.get_identifier();
-                    return try Value.from_string(identifier.str);
-                }
-            else
-                return error.NoValue;
+        fn get_value(self: *Self, diags: *?Diagnostics) TokenizeError!Value {
+            const arg = try self.get_arg(diags) orelse return error.MissingArg;
+            if (arg[0] == '(') return .{ .expression = arg };
+            return Value.from_string(arg);
         }
 
         fn get_origin(self: *Self, index: u32, diags: *?Diagnostics) TokenizeError!Token(chip) {
-            _ = diags;
             return Token(chip){
                 .index = index,
                 .data = .{
-                    .origin = try self.get_value(),
+                    .origin = try self.get_value(diags),
                 },
             };
         }
 
         fn get_side_set(self: *Self, index: u32, diags: *?Diagnostics) TokenizeError!Token(chip) {
-            const args = try self.get_args(3, diags);
-            const count = try Value.from_string(args[0] orelse {
-                diags.* = Diagnostics.init(index, "missing count", .{});
-                return error.MissingArg;
-            });
+            const count = try self.get_value(diags);
             var opt = false;
             var pindirs = false;
-
-            if (args[1]) |arg| {
-                if (std.mem.eql(u8, "opt", arg))
-                    opt = true
-                else if (std.mem.eql(u8, "pindirs", arg))
-                    pindirs = true;
+            if (try self.peek_arg(diags)) |arg| {
+                if (eql_lower("opt", arg.str) or eql_lower("optional", arg.str)) {
+                    opt = true;
+                    self.consume_peek(arg);
+                }
             }
-
-            if (args[2]) |arg| {
-                if (std.mem.eql(u8, "pindirs", arg))
+            if (try self.peek_arg(diags)) |arg| {
+                if (eql_lower("pindirs", arg.str)) {
                     pindirs = true;
+                    self.consume_peek(arg);
+                }
             }
 
             return Token(chip){
@@ -460,25 +478,85 @@ pub fn Tokenizer(chip: Chip) type {
             };
         }
 
-        fn get_lang_opt(self: *Self, index: u32, diags: *?Diagnostics) TokenizeError!Token(chip) {
-            _ = diags;
-            return Token(chip){
-                .index = index,
-                .data = .{
-                    .lang_opt = .{
-                        .lang = (try self.get_identifier()).str,
-                        .name = (try self.get_identifier()).str,
-                        .option = (try self.get_identifier()).str,
-                    },
-                },
+        const LangToken = struct {
+            tag: enum { text, string, integer, assign },
+            str: []const u8,
+            index: u32,
+        };
+
+        // lexer.ll's lang_opt state has no comment rules. Its STRING rule is
+        // greedy through the last quote on the line, and NON_WS excludes '='.
+        fn lang_token(self: *Self, diags: *?Diagnostics) TokenizeError!?LangToken {
+            while (self.peek()) |c| {
+                if (c != ' ' and c != '\t' and c != '\r') break;
+                var blank_end = self.index;
+                while (blank_end < self.source.len and std.mem.indexOfScalar(u8, " \t\r", self.source[blank_end]) != null) : (blank_end += 1) {}
+                // NON_WS includes CR in lexer.ll. If it matches more than
+                // the blank rule, flex chooses it (e.g. a language "1\r").
+                if (c == '\r') {
+                    var text_end = self.index;
+                    while (text_end < self.source.len and std.mem.indexOfScalar(u8, " \t\n\"=", self.source[text_end]) == null) : (text_end += 1) {}
+                    if (text_end > blank_end) break;
+                }
+                self.index = blank_end;
+            }
+            const start = self.index;
+            const first = self.peek() orelse return null;
+            if (first == '\n') return null;
+            if (first == '=') {
+                self.consume(1);
+                return .{ .tag = .assign, .str = self.source[start..self.index], .index = start };
+            }
+            if (first == '"') {
+                const line_end = if (std.mem.indexOfScalar(u8, self.source[start..], '\n')) |end| start + end else self.source.len;
+                const close = std.mem.lastIndexOfScalar(u8, self.source[start + 1 .. line_end], '"') orelse {
+                    diags.* = Diagnostics.init(start, "unterminated .lang_opt string", .{});
+                    return error.InvalidExpression;
+                };
+                self.index = @intCast(start + 1 + close + 1);
+                return .{ .tag = .string, .str = self.source[start..self.index], .index = start };
+            }
+            while (self.peek()) |c| {
+                if (std.mem.indexOfScalar(u8, " \t\n\"=", c) != null) break;
+                self.consume(1);
+            }
+            const str = self.source[start..self.index];
+            const numeric = std.ascii.isDigit(first) and lexer.number_end(str, 0) == str.len;
+            if (numeric) _ = lexer.integer(str) catch {
+                diags.* = Diagnostics.init(start, "integer literal must fit in a signed 32-bit value", .{});
+                return error.InvalidExpression;
+            };
+            return .{ .tag = if (numeric) .integer else .text, .str = str, .index = start };
+        }
+
+        fn lang_arg(self: *Self, diags: *?Diagnostics) TokenizeError!LangToken {
+            return try self.lang_token(diags) orelse {
+                diags.* = Diagnostics.init(self.index, "expected .lang_opt language name = value", .{});
+                return error.MissingArg;
             };
         }
 
+        fn get_lang_opt(self: *Self, index: u32, diags: *?Diagnostics) TokenizeError!Token(chip) {
+            const lang = try self.lang_arg(diags);
+            const name = try self.lang_arg(diags);
+            const equal = try self.lang_arg(diags);
+            const option = try self.lang_arg(diags);
+            if (lang.tag != .text or name.tag != .text or equal.tag != .assign or option.tag == .assign) {
+                const bad_index = if (lang.tag != .text) lang.index else if (name.tag != .text) name.index else if (equal.tag != .assign) equal.index else option.index;
+                diags.* = Diagnostics.init(bad_index, "expected .lang_opt language name = value", .{});
+                return error.InvalidExpression;
+            }
+            if (try self.lang_token(diags)) |extra| {
+                diags.* = Diagnostics.init(extra.index, "unexpected token after .lang_opt value", .{});
+                return error.InvalidExpression;
+            }
+            return .{ .index = index, .data = .{ .lang_opt = .{ .lang = lang.str, .name = name.str, .option = option.str } } };
+        }
+
         fn get_word(self: *Self, index: u32, diags: *?Diagnostics) TokenizeError!Token(chip) {
-            _ = diags;
             return Token(chip){
                 .index = index,
-                .data = .{ .word = try self.get_value() },
+                .data = .{ .word = try self.get_value(diags) },
             };
         }
 
@@ -493,12 +571,47 @@ pub fn Tokenizer(chip: Chip) type {
             .{ "word", get_word },
         });
 
+        fn end_line(self: *Self, diags: *?Diagnostics) !void {
+            while (self.peek()) |c| {
+                switch (c) {
+                    ' ', '\t', '\r' => self.consume(1),
+                    '\n' => {
+                        self.consume(1);
+                        self.label_on_line = false;
+                        return;
+                    },
+                    ';' => {
+                        self.skip_line();
+                        return;
+                    },
+                    '/' => {
+                        if (self.index + 1 < self.source.len and self.source[self.index + 1] == '/') {
+                            self.skip_line();
+                            return;
+                        }
+                        if (self.index + 1 < self.source.len and self.source[self.index + 1] == '*') {
+                            self.consume(2);
+                            try self.skip_until_end_of_comment_block();
+                            continue;
+                        }
+                        diags.* = Diagnostics.init(self.index, "unexpected trailing token", .{});
+                        return error.TrailingToken;
+                    },
+                    else => {
+                        diags.* = Diagnostics.init(self.index, "unexpected trailing token", .{});
+                        return error.TrailingToken;
+                    },
+                }
+            }
+        }
+
         fn get_directive(self: *Self, diags: *?Diagnostics) !Token(chip) {
             const index = self.index;
             const identifier = try self.read_until_whitespace_or_end();
-            return if (directives.get(identifier)) |handler| ret: {
+            const lower = try lowercase_bounded(256, identifier);
+            return if (directives.get(lower.slice())) |handler| ret: {
                 const ret = try handler(self, index, diags);
-                self.skip_line();
+                try self.end_line(diags);
                 break :ret ret;
             } else error.InvalidDirective;
         }
@@ -509,53 +622,83 @@ pub fn Tokenizer(chip: Chip) type {
             };
         }
 
-        fn target_from_string(str: []const u8) TokenizeError!Token(chip).Instruction.Jmp.Target {
-            const value = Value.from_string(str);
-            return Token(chip).Instruction.Payload{
-                .jmp = .{
-                    .condition = .always,
-                    .target = switch (value) {
-                        .string => |label| Token(chip).Instruction.Jmp.Target{
-                            .label = label,
-                        },
-                        else => Token(chip).Instruction.Jmp.Target{
-                            .value = value,
-                        },
-                    },
-                },
-            };
+        fn condition_atom(self: Self, index: *u32, diags: *?Diagnostics) TokenizeError!?PeekResult {
+            try self.skip_arg_space(index, diags);
+            const start = index.*;
+            if (start == self.source.len) return null;
+            const rest = self.source[start..];
+            if (std.ascii.isAlphabetic(rest[0]) or rest[0] == '_') {
+                index.* = @intCast(lexer.identifier_end(self.source, start));
+            } else if (std.mem.startsWith(u8, rest, "−−")) {
+                index.* += "−−".len;
+            } else if (std.mem.startsWith(u8, rest, "--") or std.mem.startsWith(u8, rest, "!=")) {
+                index.* += 2;
+            } else if (rest[0] == '!' or rest[0] == '~') {
+                index.* += 1;
+            } else return null;
+            return .{ .str = self.source[start..index.*], .start = start };
         }
 
         fn get_jmp(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
             const Condition = Token(chip).Instruction.Jmp.Condition;
-            const conditions = std.StaticStringMap(Condition).initComptime(.{
-                .{ "!x", .x_is_zero },
-                .{ "x--", .x_dec },
-                .{ "!y", .y_is_zero },
-                .{ "y--", .y_dec },
-                .{ "x!=y", .x_is_not_y },
-                .{ "pin", .pin },
-                .{ "!osre", .osre_not_empty },
-            });
-
-            const maybe_cond = (try self.get_arg(diags)) orelse return error.MissingArg;
-            const maybe_cond_lower = try lowercase_bounded(256, maybe_cond);
-            const cond: Condition = conditions.get(maybe_cond_lower.slice()) orelse .always;
-            const target_str = if (cond == .always)
-                maybe_cond
-            else
-                (try self.get_arg(diags)) orelse return error.MissingArg;
-
-            return Token(chip).Instruction.Payload{
-                .jmp = .{ .condition = cond, .target = target_str },
-            };
+            var cond: Condition = .always;
+            var probe = self.index;
+            if (try self.condition_atom(&probe, diags)) |first| {
+                if (eql_lower("pin", first.str)) {
+                    cond = .pin;
+                } else if (std.mem.eql(u8, first.str, "!") or std.mem.eql(u8, first.str, "~")) {
+                    const reg = try self.condition_atom(&probe, diags) orelse return error.InvalidCondition;
+                    cond = if (eql_lower("x", reg.str)) .x_is_zero else if (eql_lower("y", reg.str)) .y_is_zero else if (eql_lower("osre", reg.str)) .osre_not_empty else return error.InvalidCondition;
+                } else if (eql_lower("x", first.str) or eql_lower("y", first.str)) {
+                    const op = try self.condition_atom(&probe, diags) orelse return error.InvalidCondition;
+                    if (std.mem.eql(u8, op.str, "--") or std.mem.eql(u8, op.str, "−−")) {
+                        cond = if (eql_lower("x", first.str)) .x_dec else .y_dec;
+                    } else if (eql_lower("x", first.str) and std.mem.eql(u8, op.str, "!=")) {
+                        const reg = try self.condition_atom(&probe, diags) orelse return error.InvalidCondition;
+                        if (!eql_lower("y", reg.str)) return error.InvalidCondition;
+                        cond = .x_is_not_y;
+                    } else return error.InvalidCondition;
+                }
+                if (cond != .always) self.index = probe;
+            }
+            try self.optional_comma(diags);
+            try self.skip_arg_space(&self.index, diags);
+            const start = self.index;
+            var depth: u32 = 0;
+            while (self.index < self.source.len) {
+                if (lexer.comment_end(self.source, self.index)) |end| {
+                    self.index = @intCast(end);
+                    continue;
+                }
+                const c = self.source[self.index];
+                if (depth == 0) {
+                    if (c == '[' or c == ';' or c == '\n' or std.mem.startsWith(u8, self.source[self.index..], "//")) break;
+                    if (std.ascii.isAlphabetic(c) or c == '_') {
+                        const end = lexer.identifier_end(self.source, self.index);
+                        const word = self.source[self.index..end];
+                        if (eql_lower("side", word) or eql_lower("sideset", word) or eql_lower("side_set", word)) break;
+                        self.index = @intCast(end);
+                        continue;
+                    }
+                }
+                if (c == '(') depth += 1;
+                if (c == ')' and depth > 0) depth -= 1;
+                self.consume(1);
+            }
+            const target = std.mem.trimEnd(u8, self.source[start..self.index], " \t");
+            if (target.len == 0) return error.MissingArg;
+            return .{ .jmp = .{ .condition = cond, .target = target } };
         }
 
         fn get_wait(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
-            const polarity = try std.fmt.parseInt(u1, (try self.get_arg(diags)) orelse return error.MissingArg, 0);
+            const first = try self.peek_arg(diags) orelse return error.MissingArg;
+            const omitted = eql_lower("gpio", first.str) or eql_lower("pin", first.str) or eql_lower("irq", first.str) or eql_lower("jmppin", first.str);
+            const polarity: Value = if (omitted) .{ .integer = 1 } else try self.get_value(diags);
             const source_str = (try self.get_arg(diags)) orelse return error.MissingArg;
-            const pin = try Value.from_string((try self.get_arg(diags)) orelse return error.MissingArg);
+            try self.optional_comma(diags);
+            const pin = try self.get_value(diags);
 
+            if (source_str.len > 8) return error.InvalidSource;
             var buf: [8]u8 = undefined;
             for (source_str, 0..) |c, i|
                 buf[i] = std.ascii.toLower(c);
@@ -589,7 +732,7 @@ pub fn Tokenizer(chip: Chip) type {
 
             const rel: bool = if (source == .irq)
                 if (try self.peek_arg(diags)) |rel_result| blk: {
-                    const is_rel = std.mem.eql(u8, "rel", rel_result.str);
+                    const is_rel = eql_lower("rel", rel_result.str);
                     if (is_rel)
                         self.consume_peek(rel_result);
 
@@ -620,20 +763,13 @@ pub fn Tokenizer(chip: Chip) type {
             return ret;
         }
 
-        // TODO: I need to take a break. There is no rush to finish this. The thing
-        // I need to keep in mind with `get_args()` is that I must only consume the
-        // args that are used. side set and delay may be on the same line
-
         fn get_in(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
             const source_str = (try self.get_arg(diags)) orelse return error.MissingArg;
+            try self.optional_comma(diags);
             const bit_count_str = (try self.get_arg(diags)) orelse return error.MissingArg;
 
             const source_lower = try lowercase_bounded(256, source_str);
-            const bit_count_tmp = try std.fmt.parseInt(u6, bit_count_str, 0);
-            const bit_count = if (bit_count_tmp == 32)
-                @as(u5, 0)
-            else
-                @as(u5, @intCast(bit_count_tmp));
+            const bit_count = try Value.from_string(bit_count_str);
 
             return Token(chip).Instruction.Payload{
                 .in = .{
@@ -645,14 +781,11 @@ pub fn Tokenizer(chip: Chip) type {
 
         fn get_out(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
             const dest_src = (try self.get_arg(diags)) orelse return error.MissingArg;
+            try self.optional_comma(diags);
             const bit_count_str = (try self.get_arg(diags)) orelse return error.MissingArg;
 
             const dest_lower = try lowercase_bounded(256, dest_src);
-            const bit_count_tmp = try std.fmt.parseInt(u6, bit_count_str, 0);
-            const bit_count = if (bit_count_tmp == 32)
-                @as(u5, 0)
-            else
-                @as(u5, @intCast(bit_count_tmp));
+            const bit_count = try Value.from_string(bit_count_str);
 
             return Token(chip).Instruction.Payload{
                 .out = .{
@@ -747,6 +880,7 @@ pub fn Tokenizer(chip: Chip) type {
             //
             // Determine if it's a mov from rx based on source
             self.consume_peek(dest_str);
+            try self.optional_comma(diags);
             const peek_source_str = try self.peek_arg(diags) orelse return error.MissingArg;
             const peek_source_lower = try lowercase_bounded(256, peek_source_str.str);
             // If the destination is osr, and the source is rxfifo_ or rxfifoy, then it's a mov (from) rx instruction
@@ -807,6 +941,7 @@ pub fn Tokenizer(chip: Chip) type {
             const dest_lower = try lowercase_bounded(256, dest_str);
             // NOTE: Assuming there's a comma and one space
             const source_idx = self.index + 2;
+            try self.optional_comma(diags);
             const source_str = (try self.get_arg(diags)) orelse return error.MissingArg;
             const source_lower = try lowercase_bounded(256, source_str);
             if (std.mem.startsWith(u8, dest_lower.slice(), "rxfifo")) {
@@ -817,6 +952,7 @@ pub fn Tokenizer(chip: Chip) type {
                     return error.InvalidSource;
                 }
                 const dest_index_char = dest_lower.slice()["rxfifo".len - 0 ..];
+                if (dest_index_char.len == 0) return error.InvalidDestination;
                 if (dest_index_char[0] == 'y') {
                     return Token(chip).Instruction.Payload{
                         .movtorx = .{
@@ -849,6 +985,7 @@ pub fn Tokenizer(chip: Chip) type {
                 var idx: u3 = 0;
                 if (std.mem.startsWith(u8, source_lower.slice(), "rxfifo")) {
                     const src_index_char = source_lower.slice()["rxfifo".len - 0 ..];
+                    if (src_index_char.len == 0) return error.InvalidSource;
                     if (src_index_char[0] == 'y') {
                         idxl = true;
                         idx = 0;
@@ -913,15 +1050,10 @@ pub fn Tokenizer(chip: Chip) type {
                 clear = true;
             }
 
-            const num = Value{
-                .expression = if (has_mode)
-                    (try self.get_arg(diags)) orelse {
-                        diags.* = Diagnostics.init(self.index, "irq (mode) <num> (prev,rel,next): failed to get num argument", .{});
-                        return error.MissingArg;
-                    }
-                else
-                    first,
-            };
+            const num = if (has_mode)
+                try self.get_value(diags)
+            else
+                try Value.from_string(first);
 
             switch (comptime chip) {
                 .RP2040 => {
@@ -975,10 +1107,11 @@ pub fn Tokenizer(chip: Chip) type {
 
         fn get_set(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
             const dest_str = (try self.get_arg(diags)) orelse {
-                diags.* = Diagnostics.init(0, "missing destination", .{});
+                diags.* = Diagnostics.init(self.index, "missing destination", .{});
                 return error.MissingArg;
             };
-            const value = try self.get_value();
+            try self.optional_comma(diags);
+            const value = try self.get_value(diags);
 
             const dest_lower = try lowercase_bounded(256, dest_str);
 
@@ -1016,10 +1149,11 @@ pub fn Tokenizer(chip: Chip) type {
             var delay: ?Value = null;
 
             if (try self.peek_arg(diags)) |result| {
-                if (eql_lower("side", result.str)) {
+                if ((eql_lower("side", result.str) or eql_lower("sideset", result.str) or eql_lower("side_set", result.str))) {
                     self.consume_peek(result);
 
                     const side_set_str = (try self.get_arg(diags)) orelse return error.MissingArg;
+                    _ = try Value.from_string(side_set_str);
                     side_set = Value{ .expression = side_set_str };
                 } else if (std.mem.startsWith(u8, result.str, "[") and std.mem.endsWith(u8, result.str, "]")) {
                     self.consume_peek(result);
@@ -1028,22 +1162,23 @@ pub fn Tokenizer(chip: Chip) type {
             }
 
             if (try self.peek_arg(diags)) |result| {
-                if (eql_lower("side", result.str)) {
+                if ((eql_lower("side", result.str) or eql_lower("sideset", result.str) or eql_lower("side_set", result.str))) {
                     self.consume_peek(result);
 
                     const side_set_str = (try self.get_arg(diags)) orelse return error.MissingArg;
-                    assert(side_set == null);
+                    if (side_set != null) return error.InvalidExpression;
+                    _ = try Value.from_string(side_set_str);
                     side_set = Value{ .expression = side_set_str };
                 } else if (std.mem.startsWith(u8, result.str, "[") and std.mem.endsWith(u8, result.str, "]")) {
                     self.consume_peek(result);
-                    assert(delay == null);
+                    if (delay != null) return error.InvalidExpression;
                     delay = Value{
                         .expression = result.str[1 .. result.str.len - 1],
                     };
                 }
             }
 
-            self.skip_line();
+            try self.end_line(diags);
             return Token(chip){
                 .index = name.index,
                 .data = .{
@@ -1057,9 +1192,30 @@ pub fn Tokenizer(chip: Chip) type {
         }
 
         fn next(self: *Self, diags: *?assembler.Diagnostics) !?Token(chip) {
+            const result = self.next_impl(diags) catch |err| {
+                if (diags.* == null) diags.* = Diagnostics.init(self.index, "{s}", .{@errorName(err)});
+                return err;
+            };
+            if (result) |token| {
+                if (token.data == .label) {
+                    if (self.label_on_line) {
+                        diags.* = Diagnostics.init(token.index, "only one label is allowed on a line", .{});
+                        return error.InvalidExpression;
+                    }
+                    self.label_on_line = true;
+                }
+            }
+            return result;
+        }
+
+        fn next_impl(self: *Self, diags: *?assembler.Diagnostics) !?Token(chip) {
             while (self.peek()) |p| {
                 switch (p) {
-                    ' ', '\t', '\n', '\r', ',' => self.consume(1),
+                    ' ', '\t', '\r' => self.consume(1),
+                    '\n' => {
+                        self.consume(1);
+                        self.label_on_line = false;
+                    },
                     ';' => self.skip_line(),
                     '/' => {
                         self.consume(1);
@@ -1067,42 +1223,52 @@ pub fn Tokenizer(chip: Chip) type {
                             self.consume(1);
                             switch (p2) {
                                 '/' => self.skip_line(),
-                                '*' => self.skip_until_end_of_comment_block(),
-                                else => unreachable,
+                                '*' => try self.skip_until_end_of_comment_block(),
+                                else => return error.InvalidCharacter,
                             }
-                        } else return null;
+                        } else return error.InvalidCharacter;
                     },
                     '%' => {
+                        if (self.label_on_line) {
+                            diags.* = Diagnostics.init(self.index, "expected instruction after label", .{});
+                            return error.InvalidExpression;
+                        }
                         self.consume(1);
-                        self.skip_until_end_of_code_block();
+                        try self.skip_until_end_of_code_block();
                     },
                     '.' => {
+                        if (self.label_on_line) {
+                            diags.* = Diagnostics.init(self.index, "expected instruction after label", .{});
+                            return error.InvalidExpression;
+                        }
                         self.consume(1);
                         return try self.get_directive(diags);
                     },
-                    'a'...'z', 'A'...'Z', '0'...'9', '_' => {
-                        const first = try self.get_identifier();
+                    '*', 'a'...'z', 'A'...'Z', '0'...'9', '_' => {
+                        const first = try self.get_identifier(diags);
 
                         // definitely a label
-                        return if (eql_lower("public", first.str))
+                        return if (eql_lower("public", first.str) or std.mem.eql(u8, "*", first.str))
                             Token(chip){
                                 .index = first.index,
                                 .data = .{
                                     .label = .{
                                         .public = true,
                                         .name = blk: {
-                                            const tmp = (try self.get_identifier()).str;
-                                            break :blk tmp[0 .. tmp.len - 1];
+                                            const tmp = try self.get_identifier(diags);
+                                            if (!tmp.label) return error.InvalidExpression;
+                                            break :blk tmp.str;
                                         },
                                     },
                                 },
                             }
-                        else if (std.mem.endsWith(u8, first.str, ":"))
+                        else if (first.label)
                             Token(chip){
                                 .index = first.index,
                                 .data = .{
                                     .label = .{
-                                        .name = first.str[0 .. first.str.len - 1],
+                                        .name = first.str[@intFromBool(first.str[0] == '*')..],
+                                        .public = first.str[0] == '*',
                                     },
                                 },
                             }
@@ -1122,6 +1288,7 @@ pub fn Token(comptime chip: Chip) type {
     return struct {
         const Self = @This();
         index: u32,
+        source: []const u8 = "",
         data: union(enum) {
             program: []const u8,
             define: Self.Define,
@@ -1182,7 +1349,7 @@ pub fn Token(comptime chip: Chip) type {
             };
 
             pub const Wait = struct {
-                polarity: u1,
+                polarity: Value,
                 source: Source,
                 num: Value,
                 rel: bool,
@@ -1204,13 +1371,14 @@ pub fn Token(comptime chip: Chip) type {
 
             pub const In = struct {
                 source: Source,
-                bit_count: u5,
+                bit_count: Value,
 
                 pub const Source = enum(u3) {
                     pins = 0b00,
                     x = 0b001,
                     y = 0b010,
                     null = 0b011,
+                    status = 0b101,
                     isr = 0b110,
                     osr = 0b111,
                 };
@@ -1218,7 +1386,7 @@ pub fn Token(comptime chip: Chip) type {
 
             pub const Out = struct {
                 destination: Destination,
-                bit_count: u5,
+                bit_count: Value,
 
                 pub const Destination = enum(u3) {
                     pins = 0b000,
@@ -1519,7 +1687,7 @@ fn expect_instr_wait(comptime chip: Chip, expected: ExpectedWaitInstr(chip), act
     try expect_opt_value(expected.side_set, instr.side_set);
 
     const wait = instr.payload.wait;
-    try expectEqual(expected.polarity, wait.polarity);
+    try expect_value(.{ .integer = expected.polarity }, wait.polarity);
     try expectEqual(expected.source, wait.source);
     try expect_value(expected.num, wait.num);
 }
@@ -1543,7 +1711,7 @@ fn expect_instr_in(comptime chip: Chip, expected: ExpectedInInstr(chip), actual:
 
     const in = instr.payload.in;
     try expectEqual(expected.source, in.source);
-    try expectEqual(expected.bit_count, in.bit_count);
+    try expect_value(.{ .integer = expected.bit_count }, in.bit_count);
 }
 
 fn ExpectedOutInstr(comptime chip: Chip) type {
@@ -1565,7 +1733,7 @@ fn expect_instr_out(comptime chip: Chip, expected: ExpectedOutInstr(chip), actua
 
     const out = instr.payload.out;
     try expectEqual(expected.destination, out.destination);
-    try expectEqual(expected.bit_count, out.bit_count);
+    try expect_value(.{ .integer = expected.bit_count }, out.bit_count);
 }
 
 const ExpectedPushInstr = struct {
@@ -1829,7 +1997,7 @@ test "tokenize.directive.wrap" {
 
 test "tokenize.directive.lang_opt" {
     inline for (comptime .{ Chip.RP2040, Chip.RP2350 }) |chip| {
-        const tokens = try bounded_tokenize(chip, ".lang_opt c flag foo");
+        const tokens = try bounded_tokenize(chip, ".lang_opt c flag = foo");
         try expect_lang_opt(chip, .{ .lang = "c", .name = "flag", .option = "foo" }, tokens.get(0));
     }
 }
@@ -2280,4 +2448,91 @@ test "format tokenizer" {
         \\
         \\out 1
     ++ "\n\x1b[30;42;1m^\x1b[0m\n", string);
+}
+test "tokenize.trailing tokens and invalid input diagnostics" {
+    const cases = .{
+        .{ "nop garbage", error.TrailingToken, 4, "unexpected trailing token" },
+        .{ ".program p garbage", error.TrailingToken, 11, "unexpected trailing token" },
+        .{ ".wrap extra", error.TrailingToken, 6, "unexpected trailing token" },
+        .{ ".side_set 1 banana", error.TrailingToken, 12, "unexpected trailing token" },
+        .{ "nop side 0 side 1", error.InvalidExpression, 17, "InvalidExpression" },
+        .{ "nop [1] [2]", error.InvalidExpression, 11, "InvalidExpression" },
+        .{ "/x", error.InvalidCharacter, 2, "InvalidCharacter" },
+        .{ "wait 1 verylongsource 0", error.InvalidSource, 23, "InvalidSource" },
+        .{ "out pins, (1", error.InvalidExpression, 10, "mismatched parenthesis" },
+        .{ "set", error.MissingArg, 3, "missing destination" },
+        .{ "/", error.InvalidCharacter, 1, "InvalidCharacter" },
+        .{ "% c-sdk {", error.UnterminatedCodeBlock, 9, "UnterminatedCodeBlock" },
+    };
+    inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
+        inline for (cases) |case| {
+            var diags: ?Diagnostics = null;
+            try std.testing.expectError(case[1], tokenize(chip, case[0], &diags, .{}));
+            try expectEqual(@as(u32, case[2]), diags.?.index);
+            try expectEqualStrings(case[3], diags.?.message.slice());
+        }
+    }
+}
+test "tokenize.pioasm values and public labels" {
+    inline for (.{ Chip.RP2040, Chip.RP2350 }) |chip| {
+        const tokens = try bounded_tokenize(chip, "*entry:\nin pins, COUNT\nout pins, (1 << 5)\nwait gpio 2");
+        try expectEqualStrings("entry", tokens.get(0).data.label.name);
+        try std.testing.expect(tokens.get(0).data.label.public);
+        try expect_value(.{ .string = "COUNT" }, tokens.get(1).data.instruction.payload.in.bit_count);
+        try expect_value(.{ .expression = "(1 << 5)" }, tokens.get(2).data.instruction.payload.out.bit_count);
+        try expect_value(.{ .integer = 1 }, tokens.get(3).data.instruction.payload.wait.polarity);
+    }
+}
+
+test "tokenize.value expressions require parentheses" {
+    const cases = .{
+        .{ "in pins, 1+2", 10 },
+        .{ "out pins, 1<<2", 11 },
+        .{ "irq 1+2", 5 },
+        .{ "nop side 1+2", 10 },
+    };
+    inline for (cases) |case| {
+        var diags: ?Diagnostics = null;
+        try std.testing.expectError(error.TrailingToken, tokenize(.RP2040, case[0], &diags, .{}));
+        try expectEqual(@as(u32, case[1]), diags.?.index);
+        try expectEqualStrings("unexpected trailing token", diags.?.message.slice());
+    }
+}
+
+test "tokenize.commas are grammar tokens" {
+    const cases = .{
+        .{ "set pins,,1", 9 },
+        .{ "in ,pins,1", 3 },
+        .{ "nop,", 3 },
+        .{ ".side_set 2,opt", 11 },
+    };
+    inline for (cases) |case| {
+        var diags: ?Diagnostics = null;
+        try std.testing.expectError(error.InvalidExpression, tokenize(.RP2040, case[0], &diags, .{}));
+        try expectEqual(@as(u32, case[1]), diags.?.index);
+        try expectEqualStrings("unexpected comma", diags.?.message.slice());
+    }
+}
+
+test "tokenize.expression symbols use lexer identifiers" {
+    const cases = .{
+        .{ ".define x 1", 8, "invalid define name" },
+        .{ ".define foo: 1", 8, "invalid define name" },
+        .{ "pin:", 0, "invalid label name" },
+        .{ "123:", 0, "invalid label name" },
+    };
+    inline for (cases) |case| {
+        var diags: ?Diagnostics = null;
+        try std.testing.expectError(error.InvalidExpression, tokenize(.RP2040, case[0], &diags, .{}));
+        try expectEqual(@as(u32, case[1]), diags.?.index);
+        try expectEqualStrings(case[2], diags.?.message.slice());
+    }
+}
+
+test "tokenize.lang_opt strings preserve comment delimiters" {
+    inline for (.{ "\"http://example\"", "\"a;b\"", "\"a/*b*/c\"", "\"a\" \"b\"" }) |value| {
+        const tokens = try bounded_tokenize(.RP2040, ".program p\n.lang_opt c_sdk foo = " ++ value ++ "\nnop\n");
+        try expectEqualStrings(value, tokens.get(1).data.lang_opt.option);
+        try expectEqual(@as(usize, 3), tokens.len);
+    }
 }

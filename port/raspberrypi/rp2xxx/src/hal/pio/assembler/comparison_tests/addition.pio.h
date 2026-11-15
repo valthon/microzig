@@ -14,18 +14,19 @@
 
 #define addition_wrap_target 0
 #define addition_wrap 8
+#define addition_pio_version 0
 
 static const uint16_t addition_program_instructions[] = {
             //     .wrap_target
-    0x80a0, //  0: pull   block                      
-    0xa02f, //  1: mov    x, !osr                    
-    0x80a0, //  2: pull   block                      
-    0xa047, //  3: mov    y, osr                     
-    0x0006, //  4: jmp    6                          
-    0x0046, //  5: jmp    x--, 6                     
-    0x0085, //  6: jmp    y--, 5                     
-    0xa0c9, //  7: mov    isr, !x                    
-    0x8020, //  8: push   block                      
+    0x80a0, //  0: pull   block
+    0xa02f, //  1: mov    x, ~osr
+    0x80a0, //  2: pull   block
+    0xa047, //  3: mov    y, osr
+    0x0006, //  4: jmp    6
+    0x0046, //  5: jmp    x--, 6
+    0x0085, //  6: jmp    y--, 5
+    0xa0c9, //  7: mov    isr, ~x
+    0x8020, //  8: push   block
             //     .wrap
 };
 
@@ -34,6 +35,10 @@ static const struct pio_program addition_program = {
     .instructions = addition_program_instructions,
     .length = 9,
     .origin = -1,
+    .pio_version = addition_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config addition_program_get_default_config(uint offset) {

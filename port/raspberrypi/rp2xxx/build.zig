@@ -309,12 +309,13 @@ pub fn build(b: *std.Build) !void {
     const bounded_array_dep = b.dependency("bounded-array", .{});
 
     const translate_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/hal/pio/assembler/comparison_tests.h"),
+        .root_source_file = try comparison_header(b),
         .target = target,
         .optimize = optimize,
         .link_libc = false,
     });
     translate_c.defineCMacro("PICO_NO_HARDWARE", "1");
+    translate_c.addIncludePath(b.path("src/hal/pio/assembler"));
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -369,4 +370,42 @@ fn get_bootrom(b: *std.Build, target: *const microzig.Target, rom: BootROM) std.
     });
 
     return rom_objcopy.getOutput();
+}
+
+// Translate the generated data and default configurations without the SDK's
+// MMIO implementation or the examples' hardware helper functions.
+fn comparison_header(b: *std.Build) !std.Build.LazyPath {
+    const directory = "src/hal/pio/assembler/";
+    b.dependOnFileContents(b.path(directory ++ "comparison_tests.h"));
+    const includes = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, try b.root.joinString(b.allocator, directory ++ "comparison_tests.h"), b.allocator, .limited(1024 * 1024));
+    var header: std.Io.Writer.Allocating = .init(b.allocator);
+    try header.writer.writeAll(
+        \\#include <stdbool.h>
+        \\#include "comparison_tests.h"
+        \\typedef unsigned int uint;
+        \\struct pio_program { const uint16_t *instructions; uint length; int origin; uint pio_version; };
+        \\typedef struct { uint side_count; bool side_optional; bool side_pindirs; } pio_sm_config;
+        \\static inline pio_sm_config pio_get_default_sm_config(void) { return (pio_sm_config){0}; }
+        \\static inline void sm_config_set_wrap(pio_sm_config *c, uint target, uint wrap) { (void)c; (void)target; (void)wrap; }
+        \\static inline void sm_config_set_sideset(pio_sm_config *c, uint n, bool opt, bool dirs) { c->side_count = n; c->side_optional = opt; c->side_pindirs = dirs; }
+        \\
+    );
+    var lines = std.mem.splitScalar(u8, includes, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "#include \"comparison_tests/")) continue;
+        const file = line[10 .. line.len - 1];
+        b.dependOnFileContents(b.path(b.fmt("{s}{s}", .{ directory, file })));
+        const contents = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, try b.root.joinString(b.allocator, b.fmt("{s}{s}", .{ directory, file })), b.allocator, .limited(1024 * 1024));
+        var source_lines = std.mem.splitScalar(u8, contents, '\n');
+        var copying = false;
+        while (source_lines.next()) |source_line| {
+            if (std.mem.startsWith(u8, source_line, "static const struct pio_program ") or
+                std.mem.startsWith(u8, source_line, "static inline pio_sm_config ")) copying = true;
+            if (copying) {
+                try header.writer.print("{s}\n", .{source_line});
+                if (std.mem.eql(u8, source_line, "};") or std.mem.eql(u8, source_line, "}")) copying = false;
+            }
+        }
+    }
+    return b.addWriteFiles().add("pio_comparison_metadata.h", header.written());
 }

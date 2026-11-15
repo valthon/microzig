@@ -14,16 +14,17 @@
 
 #define nec_carrier_burst_wrap_target 0
 #define nec_carrier_burst_wrap 4
+#define nec_carrier_burst_pio_version 0
 
 #define nec_carrier_burst_TICKS_PER_LOOP 4
 
 static const uint16_t nec_carrier_burst_program_instructions[] = {
             //     .wrap_target
-    0xe034, //  0: set    x, 20                      
-    0x20c7, //  1: wait   1 irq, 7                   
-    0xe001, //  2: set    pins, 1                    
-    0xe100, //  3: set    pins, 0                [1] 
-    0x0042, //  4: jmp    x--, 2                     
+    0xe034, //  0: set    x, 20
+    0x20c7, //  1: wait   1 irq, 7
+    0xe001, //  2: set    pins, 1
+    0xe100, //  3: set    pins, 0                [1]
+    0x0042, //  4: jmp    x--, 2
             //     .wrap
 };
 
@@ -32,6 +33,10 @@ static const struct pio_program nec_carrier_burst_program = {
     .instructions = nec_carrier_burst_program_instructions,
     .length = 5,
     .origin = -1,
+    .pio_version = nec_carrier_burst_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config nec_carrier_burst_program_get_default_config(uint offset) {

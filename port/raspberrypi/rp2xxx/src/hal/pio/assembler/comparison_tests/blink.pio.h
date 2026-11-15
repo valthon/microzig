@@ -14,17 +14,18 @@
 
 #define blink_wrap_target 2
 #define blink_wrap 7
+#define blink_pio_version 0
 
 static const uint16_t blink_program_instructions[] = {
-    0x80a0, //  0: pull   block                      
-    0x6040, //  1: out    y, 32                      
+    0x80a0, //  0: pull   block
+    0x6040, //  1: out    y, 32
             //     .wrap_target
-    0xa022, //  2: mov    x, y                       
-    0xe001, //  3: set    pins, 1                    
-    0x0044, //  4: jmp    x--, 4                     
-    0xa022, //  5: mov    x, y                       
-    0xe000, //  6: set    pins, 0                    
-    0x0047, //  7: jmp    x--, 7                     
+    0xa022, //  2: mov    x, y
+    0xe001, //  3: set    pins, 1
+    0x0044, //  4: jmp    x--, 4
+    0xa022, //  5: mov    x, y
+    0xe000, //  6: set    pins, 0
+    0x0047, //  7: jmp    x--, 7
             //     .wrap
 };
 
@@ -33,6 +34,10 @@ static const struct pio_program blink_program = {
     .instructions = blink_program_instructions,
     .length = 8,
     .origin = -1,
+    .pio_version = blink_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config blink_program_get_default_config(uint offset) {

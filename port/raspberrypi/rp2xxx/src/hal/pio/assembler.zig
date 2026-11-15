@@ -30,7 +30,7 @@ pub const Program = struct {
     /// For each instruction, stores the kind of relocation required on load.
     relocations: []const Relocation,
 
-    origin: ?u5,
+    origin: ?i32,
     side_set: ?encoder.SideSet,
     wrap_target: ?u5,
     wrap: ?u5,
@@ -97,7 +97,9 @@ pub const Diagnostics = struct {
 
         var writer = ret.message.writer();
 
-        writer.interface.print(fmt, args) catch unreachable;
+        // A long user identifier may exceed the diagnostic buffer. Keep the
+        // formatted prefix, which still explains the error at the same location.
+        writer.interface.print(fmt, args) catch return ret;
         return ret;
     }
 };
@@ -126,18 +128,11 @@ pub fn assemble_impl(comptime chip: Chip, comptime source: []const u8, diags: *?
 }
 
 fn format_compile_error(comptime message: []const u8, comptime source: []const u8, comptime index: u32) []const u8 {
-    var line_str: []const u8 = "";
-    var line_num: u32 = 1;
-    var column: u32 = 0;
-    var line_it = std.mem.tokenizeAny(u8, source, "\n\r");
-    while (line_it.next()) |line| : (line_num += 1) {
-        line_str = line_str ++ "\n" ++ line;
-        if (line_it.index >= index) {
-            column = line.len - (line_it.index - index);
-            line_str = line;
-            break;
-        }
-    }
+    const caret = @min(index, source.len);
+    const start = if (std.mem.lastIndexOfScalar(u8, source[0..caret], '\n')) |newline| newline + 1 else 0;
+    const end = if (std.mem.indexOfScalar(u8, source[caret..], '\n')) |newline| caret + newline else source.len;
+    const line_str = source[start..end];
+    const column = caret - start;
 
     const indent: [column]u8 = @splat(' ');
 
@@ -157,6 +152,9 @@ fn format_compile_error(comptime message: []const u8, comptime source: []const u
 }
 
 pub fn assemble(comptime chip: Chip, comptime source: []const u8, comptime options: AssembleOptions) Output {
+    // Budget the lexer and expression parser here instead of requiring callers
+    // to track the assembler's internal comptime work.
+    @setEvalBranchQuota(10_000);
     var diags: ?Diagnostics = null;
     return assemble_impl(chip, source, &diags, options) catch |err| {
         if (diags) |d|
@@ -169,6 +167,10 @@ test "tokenizer and encoder" {
     std.testing.refAllDecls(tokenizer);
     std.testing.refAllDecls(@import("assembler/Expression.zig"));
     std.testing.refAllDecls(encoder);
+}
+
+test "differential corpus" {
+    std.testing.refAllDecls(@import("assembler/corpus_tests.zig"));
 }
 
 test "comparison" {
@@ -227,4 +229,10 @@ test "full instruction memory mask" {
     @setEvalBranchQuota(100_000);
     const program = comptime assemble(.RP2040, ".program full\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n", .{}).get_program_by_name("full");
     try std.testing.expectEqual(@as(u32, 0xffffffff), program.get_mask());
+}
+test "format compile error at empty input and after blank lines" {
+    const empty = comptime format_compile_error("missing value", "", 0);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "^\nmissing value") != null);
+    const after_blank = comptime format_compile_error("bad", "\n\n nop\n", 3);
+    try std.testing.expect(std.mem.indexOf(u8, after_blank, " nop\n ^\n bad") != null);
 }

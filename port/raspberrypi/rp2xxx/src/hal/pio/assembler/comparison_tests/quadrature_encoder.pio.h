@@ -14,38 +14,39 @@
 
 #define quadrature_encoder_wrap_target 15
 #define quadrature_encoder_wrap 28
+#define quadrature_encoder_pio_version 0
 
 static const uint16_t quadrature_encoder_program_instructions[] = {
-    0x000f, //  0: jmp    15                         
-    0x000e, //  1: jmp    14                         
-    0x001a, //  2: jmp    26                         
-    0x000f, //  3: jmp    15                         
-    0x001a, //  4: jmp    26                         
-    0x000f, //  5: jmp    15                         
-    0x000f, //  6: jmp    15                         
-    0x000e, //  7: jmp    14                         
-    0x000e, //  8: jmp    14                         
-    0x000f, //  9: jmp    15                         
-    0x000f, // 10: jmp    15                         
-    0x001a, // 11: jmp    26                         
-    0x000f, // 12: jmp    15                         
-    0x001a, // 13: jmp    26                         
-    0x008f, // 14: jmp    y--, 15                    
+    0x000f, //  0: jmp    15
+    0x000e, //  1: jmp    14
+    0x001a, //  2: jmp    26
+    0x000f, //  3: jmp    15
+    0x001a, //  4: jmp    26
+    0x000f, //  5: jmp    15
+    0x000f, //  6: jmp    15
+    0x000e, //  7: jmp    14
+    0x000e, //  8: jmp    14
+    0x000f, //  9: jmp    15
+    0x000f, // 10: jmp    15
+    0x001a, // 11: jmp    26
+    0x000f, // 12: jmp    15
+    0x001a, // 13: jmp    26
+    0x008f, // 14: jmp    y--, 15
             //     .wrap_target
-    0xe020, // 15: set    x, 0                       
-    0x8080, // 16: pull   noblock                    
-    0xa027, // 17: mov    x, osr                     
-    0xa0e6, // 18: mov    osr, isr                   
-    0x0036, // 19: jmp    !x, 22                     
-    0xa0c2, // 20: mov    isr, y                     
-    0x8020, // 21: push   block                      
-    0xa0c3, // 22: mov    isr, null                  
-    0x40e2, // 23: in     osr, 2                     
-    0x4002, // 24: in     pins, 2                    
-    0xa0a6, // 25: mov    pc, isr                    
-    0xa02a, // 26: mov    x, !y                      
-    0x005c, // 27: jmp    x--, 28                    
-    0xa049, // 28: mov    y, !x                      
+    0xe020, // 15: set    x, 0
+    0x8080, // 16: pull   noblock
+    0xa027, // 17: mov    x, osr
+    0xa0e6, // 18: mov    osr, isr
+    0x0036, // 19: jmp    !x, 22
+    0xa0c2, // 20: mov    isr, y
+    0x8020, // 21: push   block
+    0xa0c3, // 22: mov    isr, null
+    0x40e2, // 23: in     osr, 2
+    0x4002, // 24: in     pins, 2
+    0xa0a6, // 25: mov    pc, isr
+    0xa02a, // 26: mov    x, ~y
+    0x005c, // 27: jmp    x--, 28
+    0xa049, // 28: mov    y, ~x
             //     .wrap
 };
 
@@ -54,6 +55,10 @@ static const struct pio_program quadrature_encoder_program = {
     .instructions = quadrature_encoder_program_instructions,
     .length = 29,
     .origin = 0,
+    .pio_version = quadrature_encoder_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config quadrature_encoder_program_get_default_config(uint offset) {

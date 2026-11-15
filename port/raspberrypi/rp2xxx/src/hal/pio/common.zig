@@ -129,9 +129,11 @@ fn can_add_program_at_offset_mask(used_mask: u32, program: Program, offset: u5) 
 
 fn find_offset_for_program_mask(used_mask: u32, program: Program) error{NoSpace}!u5 {
     if (program.instructions.len == 0 or program.instructions.len > 32) return error.NoSpace;
-    return if (program.origin) |origin|
-        if (can_add_program_at_offset_mask(used_mask, program, origin)) origin else error.NoSpace
-    else for (0..(33 - program.instructions.len)) |i| {
+    return if (program.origin) |origin| fixed: {
+        if (origin < 0 or origin > 31) break :fixed error.NoSpace;
+        const offset: u5 = @intCast(origin);
+        break :fixed if (can_add_program_at_offset_mask(used_mask, program, offset)) offset else error.NoSpace;
+    } else for (0..(33 - program.instructions.len)) |i| {
         const offset: u5 = @intCast(i);
         if (can_add_program_at_offset_mask(used_mask, program, offset)) break offset;
     } else error.NoSpace;
@@ -733,4 +735,15 @@ test "loader writes all 32 instructions and reserves the whole memory" {
         try std.testing.expectError(error.NoSpace, pio.add_program(program));
         try std.testing.expectEqual(@as(u5, 31), program_wrap(program, 0));
     }
+}
+
+test "pioasm origins outside instruction memory cannot load" {
+    inline for (.{ 32, -2, 2147483647 }) |origin| {
+        const program = comptime assembler.assemble(.RP2040, std.fmt.comptimePrint(".program p\n.origin ({})\nnop\n", .{origin}), .{}).get_program_by_name("p");
+        try std.testing.expectEqual(@as(?i32, origin), program.origin);
+        try std.testing.expectError(error.NoSpace, find_offset_for_program_mask(0, program));
+    }
+    const automatic = comptime assembler.assemble(.RP2040, ".program p\n.origin (-1)\nnop\n", .{}).get_program_by_name("p");
+    try std.testing.expectEqual(@as(?i32, null), automatic.origin);
+    try std.testing.expectEqual(@as(u5, 0), try find_offset_for_program_mask(0, automatic));
 }

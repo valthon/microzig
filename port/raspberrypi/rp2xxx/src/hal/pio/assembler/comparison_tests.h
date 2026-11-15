@@ -2,6 +2,7 @@
 #define _RP2XXX_COMPARISON_TESTS_H_
 
 #include <stdint.h>
+#include "comparison_tests/grammar.pio.h"
 #include "comparison_tests/correctness.pio.h"
 #include "comparison_tests/addition.pio.h"
 #include "comparison_tests/apa102.pio.h"
