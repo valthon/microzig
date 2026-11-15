@@ -634,9 +634,14 @@ pub const USBD = struct {
         // Accepting a request starts its status stage, unless it is a control write whose
         // data the host has yet to send: then the data stage is let through, and `poll`
         // starts the status stage when the data has been taken (see `ep0.Control.ack`).
-        const ep0_data_stage = ep_num == .ep0 and self.control.in_data_stage();
-        if (data[0].len == 0 and !ep0_data_stage) {
-            if (ep_num == .ep0) ep0_trigger(self.control.ack());
+        //
+        // On a data endpoint a zero-length write is a zero-length packet, which ends a
+        // transfer whose last packet was full (USB 2.0, 5.8.3). It is loaded below with
+        // MAXCNT 0 and reported through `on_buffer` when the host has taken it, like any
+        // other packet. Its return value is 0 either way: a caller cannot tell from it
+        // whether the packet was taken or the endpoint was busy.
+        if (ep_num == .ep0 and data[0].len == 0 and !self.control.in_data_stage()) {
+            ep0_trigger(self.control.ack());
             return 0;
         }
 
