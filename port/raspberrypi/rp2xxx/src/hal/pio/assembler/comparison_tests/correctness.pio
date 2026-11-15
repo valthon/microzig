@@ -1,0 +1,10 @@
+.program origin_four
+.origin 4
+nop
+.wrap_target
+public loop:
+jmp loop
+.wrap
+
+.program wait_irq_rel
+wait 1 irq 2 rel

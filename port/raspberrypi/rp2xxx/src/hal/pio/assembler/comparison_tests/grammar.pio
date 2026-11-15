@@ -1,0 +1,100 @@
+.program grammar
+.define public BITS 8 * 2 | 1
+.define public MIXED 1 | 2 & 4 ^ 3
+.define public SHIFT 1 << 1 + 2
+.define public REVERSE ::1 + 2
+.define public NEGATIVE -1 + 2
+.define *EXPORTED 15 & 7
+*entry:
+in pins, BITS
+out pins, (32 >> 1)
+wait gpio 2
+wait (1 - 1) irq (1 ^ 2) rel
+set x, (2 + 3 * 4)
+jmp entry + 1
+set pins, (7 / 4)
+wait ZERO gpio ZERO
+
+.program grammar_sideset
+.side_set 2 opt pindirs
+nop side 3 [3]
+nop [2]
+
+.program grammar_five
+.side_set 5
+nop side 31
+
+; Differential probes: pico-sdk 2.1.1 pioasm, GCC 15.2.0, x86_64 Release.
+.program grammar_int32
+.define public SUM 2147483647 + 1
+.define public DIFFERENCE (1 << 31) - 1
+.define public PRODUCT 2147483647 * 2147483647
+.define public QUOTIENT (1 << 31) / 2
+.define public NEGATION -(1 << 31)
+.define public BIT_OR (1 << 31) | 1
+.define public BIT_AND (1 << 31) & (-1)
+.define public BIT_XOR (1 << 31) ^ (-1)
+.define public REVERSED ::(1 << 31)
+.define public LEFT_SHIFT (1 << 30) << 2
+.define public RIGHT_SHIFT (1 << 31) >> 31
+set pins, (SUM + SUM)
+set pins, (DIFFERENCE >> 27)
+set pins, PRODUCT
+set pins, ((QUOTIENT >> 31) & 31)
+set pins, (NEGATION - NEGATION)
+set pins, (BIT_OR ^ NEGATION)
+set pins, (BIT_AND ^ NEGATION)
+set pins, (BIT_XOR & 31)
+set pins, REVERSED
+set pins, LEFT_SHIFT
+set pins, (RIGHT_SHIFT & 31)
+
+.program grammar_int32_counts
+.define public SHIFT_32 1 << 32
+.define public SHIFT_33 1 << 33
+.define public SHIFT_64 1 << 64
+.define public SHIFT_NEGATIVE 1 << (-1)
+.define public RIGHT_32 (-8) >> 32
+.define public RIGHT_33 (-8) >> 33
+.define public RIGHT_NEGATIVE (-8) >> (-1)
+set pins, SHIFT_32
+set pins, SHIFT_33
+set pins, SHIFT_64
+set pins, (SHIFT_NEGATIVE & 31)
+set pins, (RIGHT_32 & 31)
+set pins, (RIGHT_33 & 31)
+set pins, (RIGHT_NEGATIVE & 31)
+
+; Lexer/token-boundary probes, including constructs with optional whitespace.
+.program grammar_tokens
+.define public DECIMAL 010
+.define public HEX 0X10
+.define public BINARY 0B10
+.define public NEGATE_TWICE - -1
+.define public SUBTRACT_NEGATIVE 1- -2
+.define public REVERSE_TWICE ::::1
+.define public COMMENTED 1/**/+2
+.define public COMMENT_PARENS (1/*)*/+2)
+.define public PREFIX_PRECEDENCE -::1+2
+set pins, DECIMAL
+set pins, HEX
+set pins, BINARY
+set pins, NEGATE_TWICE
+set pins, SUBTRACT_NEGATIVE
+set pins, REVERSE_TWICE
+set pins, COMMENTED
+set pins, COMMENT_PARENS
+out pins, 010
+set pins, /* ) ] */ 1
+set pins, (1/*)*/+2)
+nop[1]
+set pins,1[1]
+wait gpio,1
+mov x,::y
+* entry /* comment */ : nop
+jmp x --,0
+jmp y −−,0
+jmp x != y,0
+jmp ~ x,0
+jmp ! osre,0
+jmp entry+1

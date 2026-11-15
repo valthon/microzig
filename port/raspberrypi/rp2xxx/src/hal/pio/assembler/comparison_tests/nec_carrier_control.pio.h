@@ -14,20 +14,21 @@
 
 #define nec_carrier_control_wrap_target 0
 #define nec_carrier_control_wrap 10
+#define nec_carrier_control_pio_version 0
 
 static const uint16_t nec_carrier_control_program_instructions[] = {
             //     .wrap_target
-    0x80a0, //  0: pull   block                      
-    0xe02f, //  1: set    x, 15                      
-    0xc007, //  2: irq    nowait 7                   
-    0x0042, //  3: jmp    x--, 2                     
+    0x80a0, //  0: pull   block
+    0xe02f, //  1: set    x, 15
+    0xc007, //  2: irq    nowait 7
+    0x0042, //  3: jmp    x--, 2
     0xaf42, //  4: nop                           [15]
-    0xc107, //  5: irq    nowait 7               [1] 
-    0x6021, //  6: out    x, 1                       
-    0x0029, //  7: jmp    !x, 9                      
-    0xa342, //  8: nop                           [3] 
-    0xc007, //  9: irq    nowait 7                   
-    0x00e6, // 10: jmp    !osre, 6                   
+    0xc107, //  5: irq    nowait 7               [1]
+    0x6021, //  6: out    x, 1
+    0x0029, //  7: jmp    !x, 9
+    0xa342, //  8: nop                           [3]
+    0xc007, //  9: irq    nowait 7
+    0x00e6, // 10: jmp    !osre, 6
             //     .wrap
 };
 
@@ -36,6 +37,10 @@ static const struct pio_program nec_carrier_control_program = {
     .instructions = nec_carrier_control_program_instructions,
     .length = 11,
     .origin = -1,
+    .pio_version = nec_carrier_control_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config nec_carrier_control_program_get_default_config(uint offset) {

@@ -14,10 +14,11 @@
 
 #define pio_serialiser_wrap_target 0
 #define pio_serialiser_wrap 0
+#define pio_serialiser_pio_version 0
 
 static const uint16_t pio_serialiser_program_instructions[] = {
             //     .wrap_target
-    0x6001, //  0: out    pins, 1                    
+    0x6001, //  0: out    pins, 1
             //     .wrap
 };
 
@@ -26,6 +27,10 @@ static const struct pio_program pio_serialiser_program = {
     .instructions = pio_serialiser_program_instructions,
     .length = 1,
     .origin = -1,
+    .pio_version = pio_serialiser_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config pio_serialiser_program_get_default_config(uint offset) {

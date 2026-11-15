@@ -14,12 +14,13 @@
 
 #define hello_wrap_target 0
 #define hello_wrap 2
+#define hello_pio_version 0
 
 static const uint16_t hello_program_instructions[] = {
             //     .wrap_target
-    0x80a0, //  0: pull   block                      
-    0x6001, //  1: out    pins, 1                    
-    0x0000, //  2: jmp    0                          
+    0x80a0, //  0: pull   block
+    0x6001, //  1: out    pins, 1
+    0x0000, //  2: jmp    0
             //     .wrap
 };
 
@@ -28,6 +29,10 @@ static const struct pio_program hello_program = {
     .instructions = hello_program_instructions,
     .length = 3,
     .origin = -1,
+    .pio_version = hello_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config hello_program_get_default_config(uint offset) {

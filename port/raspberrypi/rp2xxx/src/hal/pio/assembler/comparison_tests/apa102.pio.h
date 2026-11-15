@@ -14,11 +14,12 @@
 
 #define apa102_mini_wrap_target 0
 #define apa102_mini_wrap 1
+#define apa102_mini_pio_version 0
 
 static const uint16_t apa102_mini_program_instructions[] = {
             //     .wrap_target
-    0x6001, //  0: out    pins, 1         side 0     
-    0xb042, //  1: nop                    side 1     
+    0x6001, //  0: out    pins, 1         side 0
+    0xb042, //  1: nop                    side 1
             //     .wrap
 };
 
@@ -27,6 +28,10 @@ static const struct pio_program apa102_mini_program = {
     .instructions = apa102_mini_program_instructions,
     .length = 2,
     .origin = -1,
+    .pio_version = apa102_mini_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config apa102_mini_program_get_default_config(uint offset) {
@@ -65,27 +70,28 @@ static inline void apa102_mini_program_init(PIO pio, uint sm, uint offset,
 
 #define apa102_rgb555_wrap_target 0
 #define apa102_rgb555_wrap 14
+#define apa102_rgb555_pio_version 0
 
 #define apa102_rgb555_offset_pixel_out 0u
 #define apa102_rgb555_offset_bit_run 9u
 
 static const uint16_t apa102_rgb555_program_instructions[] = {
             //     .wrap_target
-    0x80e0, //  0: pull   ifempty block              
-    0xe022, //  1: set    x, 2                       
-    0x40e5, //  2: in     osr, 5                     
-    0x6065, //  3: out    null, 5                    
-    0x4063, //  4: in     null, 3                    
-    0x0042, //  5: jmp    x--, 2                     
-    0x4048, //  6: in     y, 8                       
-    0xa0d6, //  7: mov    isr, ::isr                 
-    0x6061, //  8: out    null, 1                    
-    0xe03f, //  9: set    x, 31                      
-    0xe000, // 10: set    pins, 0                    
-    0xa606, // 11: mov    pins, isr              [6] 
-    0xe001, // 12: set    pins, 1                    
-    0x46c1, // 13: in     isr, 1                 [6] 
-    0x004a, // 14: jmp    x--, 10                    
+    0x80e0, //  0: pull   ifempty block
+    0xe022, //  1: set    x, 2
+    0x40e5, //  2: in     osr, 5
+    0x6065, //  3: out    null, 5
+    0x4063, //  4: in     null, 3
+    0x0042, //  5: jmp    x--, 2
+    0x4048, //  6: in     y, 8
+    0xa0d6, //  7: mov    isr, ::isr
+    0x6061, //  8: out    null, 1
+    0xe03f, //  9: set    x, 31
+    0xe000, // 10: set    pins, 0
+    0xa606, // 11: mov    pins, isr              [6]
+    0xe001, // 12: set    pins, 1
+    0x46c1, // 13: in     isr, 1                 [6]
+    0x004a, // 14: jmp    x--, 10
             //     .wrap
 };
 
@@ -94,6 +100,10 @@ static const struct pio_program apa102_rgb555_program = {
     .instructions = apa102_rgb555_program_instructions,
     .length = 15,
     .origin = -1,
+    .pio_version = apa102_rgb555_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config apa102_rgb555_program_get_default_config(uint offset) {

@@ -2,6 +2,8 @@
 #define _RP2XXX_COMPARISON_TESTS_H_
 
 #include <stdint.h>
+#include "comparison_tests/grammar.pio.h"
+#include "comparison_tests/correctness.pio.h"
 #include "comparison_tests/addition.pio.h"
 #include "comparison_tests/apa102.pio.h"
 #include "comparison_tests/blink.pio.h"
@@ -28,5 +30,7 @@
 #include "comparison_tests/uart_rx.pio.h"
 #include "comparison_tests/uart_tx.pio.h"
 #include "comparison_tests/ws2812.pio.h"
+
+#include "comparison_tests/config_v1.pio.h"
 
 #endif

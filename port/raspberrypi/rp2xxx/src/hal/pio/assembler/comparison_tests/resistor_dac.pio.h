@@ -14,10 +14,11 @@
 
 #define resistor_dac_5bit_wrap_target 0
 #define resistor_dac_5bit_wrap 0
+#define resistor_dac_5bit_pio_version 0
 
 static const uint16_t resistor_dac_5bit_program_instructions[] = {
             //     .wrap_target
-    0x6005, //  0: out    pins, 5                    
+    0x6005, //  0: out    pins, 5
             //     .wrap
 };
 
@@ -26,6 +27,10 @@ static const struct pio_program resistor_dac_5bit_program = {
     .instructions = resistor_dac_5bit_program_instructions,
     .length = 1,
     .origin = -1,
+    .pio_version = resistor_dac_5bit_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config resistor_dac_5bit_program_get_default_config(uint offset) {

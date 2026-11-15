@@ -14,17 +14,18 @@
 
 #define manchester_tx_wrap_target 0
 #define manchester_tx_wrap 5
+#define manchester_tx_pio_version 0
 
 #define manchester_tx_offset_start 4u
 
 static const uint16_t manchester_tx_program_instructions[] = {
             //     .wrap_target
-    0xb542, //  0: nop                    side 0 [5] 
-    0x1b04, //  1: jmp    4               side 1 [3] 
-    0xbd42, //  2: nop                    side 1 [5] 
-    0xb342, //  3: nop                    side 0 [3] 
-    0x6021, //  4: out    x, 1                       
-    0x0022, //  5: jmp    !x, 2                      
+    0xb542, //  0: nop                    side 0 [5]
+    0x1b04, //  1: jmp    4               side 1 [3]
+    0xbd42, //  2: nop                    side 1 [5]
+    0xb342, //  3: nop                    side 0 [3]
+    0x6021, //  4: out    x, 1
+    0x0022, //  5: jmp    !x, 2
             //     .wrap
 };
 
@@ -33,6 +34,10 @@ static const struct pio_program manchester_tx_program = {
     .instructions = manchester_tx_program_instructions,
     .length = 6,
     .origin = -1,
+    .pio_version = manchester_tx_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config manchester_tx_program_get_default_config(uint offset) {
@@ -63,15 +68,16 @@ static inline void manchester_tx_program_init(PIO pio, uint sm, uint offset, uin
 
 #define manchester_rx_wrap_target 3
 #define manchester_rx_wrap 5
+#define manchester_rx_pio_version 0
 
 static const uint16_t manchester_rx_program_instructions[] = {
-    0x2020, //  0: wait   0 pin, 0                   
-    0x4841, //  1: in     y, 1                   [8] 
-    0x00c0, //  2: jmp    pin, 0                     
+    0x2020, //  0: wait   0 pin, 0
+    0x4841, //  1: in     y, 1                   [8]
+    0x00c0, //  2: jmp    pin, 0
             //     .wrap_target
-    0x20a0, //  3: wait   1 pin, 0                   
-    0x4821, //  4: in     x, 1                   [8] 
-    0x00c0, //  5: jmp    pin, 0                     
+    0x20a0, //  3: wait   1 pin, 0
+    0x4821, //  4: in     x, 1                   [8]
+    0x00c0, //  5: jmp    pin, 0
             //     .wrap
 };
 
@@ -80,6 +86,10 @@ static const struct pio_program manchester_rx_program = {
     .instructions = manchester_rx_program_instructions,
     .length = 6,
     .origin = -1,
+    .pio_version = manchester_rx_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config manchester_rx_program_get_default_config(uint offset) {

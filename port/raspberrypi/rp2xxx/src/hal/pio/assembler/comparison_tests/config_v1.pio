@@ -1,0 +1,41 @@
+.program cfg_shift
+.pio_version 1
+.clock_div 2.5
+.fifo txrx
+.mov_status rxfifo < 7
+.in 16 left auto 12
+.out 8 right auto 8
+.set 5
+wait 1 gpio 16
+wait 0 gpio 47
+wait jmppin
+wait 0 jmppin + 3
+wait 1 irq prev 7
+wait 0 irq next 1
+mov pindirs, x
+
+.program cfg_irq_status
+.pio_version 1
+.mov_status irq next set 7
+.fifo txget
+mov osr, rxfifo[y]
+
+.program cfg_tx_status
+.pio_version 1
+.mov_status txfifo < 31
+.fifo txput
+mov rxfifo[3], isr
+
+.program cfg_prev_status
+.pio_version 1
+.mov_status irq prev set 0
+.fifo tx
+.out 0 left manual 32
+.set 0
+nop
+
+.program cfg_rx
+.pio_version 1
+.fifo rx
+.in 32
+push

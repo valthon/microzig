@@ -309,12 +309,13 @@ pub fn build(b: *std.Build) !void {
     const bounded_array_dep = b.dependency("bounded-array", .{});
 
     const translate_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/hal/pio/assembler/comparison_tests.h"),
+        .root_source_file = try comparison_header(b),
         .target = target,
         .optimize = optimize,
         .link_libc = false,
     });
     translate_c.defineCMacro("PICO_NO_HARDWARE", "1");
+    translate_c.addIncludePath(b.path("src/hal/pio/assembler"));
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -332,6 +333,13 @@ pub fn build(b: *std.Build) !void {
     const unit_tests_run = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run platform agnostic unit tests");
     test_step.dependOn(&unit_tests_run.step);
+
+    // The PIO self-test runner's own unit tests need a Python 3 on PATH as
+    // `python3`, so they are a separate step rather than part of `test`.
+    const hwtest_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-q", "-s" });
+    hwtest_tests.addDirectoryArg(b.path("tools/pio-hwtest"));
+    const hwtest_step = b.step("test-hwtest-runner", "Run the PIO self-test runner's unit tests (needs python3)");
+    hwtest_step.dependOn(&hwtest_tests.step);
 }
 
 const BootROM = union(enum) {
@@ -369,4 +377,53 @@ fn get_bootrom(b: *std.Build, target: *const microzig.Target, rom: BootROM) std.
     });
 
     return rom_objcopy.getOutput();
+}
+
+// Translate the generated data and default configurations without the SDK's
+// MMIO implementation or the examples' hardware helper functions.
+fn comparison_header(b: *std.Build) !std.Build.LazyPath {
+    const directory = "src/hal/pio/assembler/";
+    b.dependOnFileContents(b.path(directory ++ "comparison_tests.h"));
+    const includes = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, try b.root.joinString(b.allocator, directory ++ "comparison_tests.h"), b.allocator, .limited(1024 * 1024));
+    var header: std.Io.Writer.Allocating = .init(b.allocator);
+    try header.writer.writeAll(
+        \\#include <stdbool.h>
+        \\#include "comparison_tests.h"
+        \\typedef unsigned int uint;
+        \\struct pio_program { const uint16_t *instructions; uint length; int origin; uint pio_version; uint used_gpio_ranges; };
+        \\typedef struct { uint side_count; bool side_optional; bool side_pindirs; uint in_count, out_count, set_count, in_threshold, out_threshold; bool in_right, out_right, autopush, autopull; uint fifo, status_sel, status_n, div_int, div_frac; } pio_sm_config;
+        \\static inline pio_sm_config pio_get_default_sm_config(void) { return (pio_sm_config){0}; }
+        \\static inline void sm_config_set_wrap(pio_sm_config *c, uint target, uint wrap) { (void)c; (void)target; (void)wrap; }
+        \\static inline void sm_config_set_sideset(pio_sm_config *c, uint n, bool opt, bool dirs) { c->side_count = n; c->side_optional = opt; c->side_pindirs = dirs; }
+        \\#define PICO_PIO_VERSION 1
+        \\enum { PIO_FIFO_JOIN_NONE, PIO_FIFO_JOIN_TX, PIO_FIFO_JOIN_RX, PIO_FIFO_JOIN_TXPUT, PIO_FIFO_JOIN_TXGET, PIO_FIFO_JOIN_PUTGET };
+        \\enum { STATUS_TX_LESSTHAN, STATUS_RX_LESSTHAN, STATUS_IRQ_INDEX };
+        \\static inline void sm_config_set_in_pin_count(pio_sm_config *c, uint n) { c->in_count = n; }
+        \\static inline void sm_config_set_out_pin_count(pio_sm_config *c, uint n) { c->out_count = n; }
+        \\static inline void sm_config_set_set_pin_count(pio_sm_config *c, uint n) { c->set_count = n; }
+        \\static inline void sm_config_set_in_shift(pio_sm_config *c, bool right, bool auto_, uint n) { c->in_right = right; c->autopush = auto_; c->in_threshold = n; }
+        \\static inline void sm_config_set_out_shift(pio_sm_config *c, bool right, bool auto_, uint n) { c->out_right = right; c->autopull = auto_; c->out_threshold = n; }
+        \\static inline void sm_config_set_fifo_join(pio_sm_config *c, uint n) { c->fifo = n; }
+        \\static inline void sm_config_set_mov_status(pio_sm_config *c, uint sel, uint n) { c->status_sel = sel; c->status_n = n; }
+        \\static inline void sm_config_set_clkdiv_int_frac(pio_sm_config *c, uint i, uint f) { c->div_int = i; c->div_frac = f; }
+        \\
+    );
+    var lines = std.mem.splitScalar(u8, includes, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "#include \"comparison_tests/")) continue;
+        const file = line[10 .. line.len - 1];
+        b.dependOnFileContents(b.path(b.fmt("{s}{s}", .{ directory, file })));
+        const contents = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, try b.root.joinString(b.allocator, b.fmt("{s}{s}", .{ directory, file })), b.allocator, .limited(1024 * 1024));
+        var source_lines = std.mem.splitScalar(u8, contents, '\n');
+        var copying = false;
+        while (source_lines.next()) |source_line| {
+            if (std.mem.startsWith(u8, source_line, "static const struct pio_program ") or
+                std.mem.startsWith(u8, source_line, "static inline pio_sm_config ")) copying = true;
+            if (copying) {
+                try header.writer.print("{s}\n", .{source_line});
+                if (std.mem.eql(u8, source_line, "};") or std.mem.eql(u8, source_line, "}")) copying = false;
+            }
+        }
+    }
+    return b.addWriteFiles().add("pio_comparison_metadata.h", header.written());
 }

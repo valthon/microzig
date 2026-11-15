@@ -36,6 +36,7 @@ const Self = @This();
 
 pio: hal.pio.Pio,
 sm: hal.pio.StateMachine,
+offset: u5,
 channel: ?hal.dma.Channel = null, // current dma channel
 pins: Pins,
 
@@ -76,7 +77,7 @@ pub fn init(config: Config) !Self {
     pins.clk.set_drive_strength(.@"12mA");
     pins.clk.set_slew_rate(.fast);
 
-    try pio.sm_load_and_start_program(sm, cyw43spi_program, .{
+    const offset = try pio.sm_load_and_start_program(sm, cyw43spi_program, .{
         // 50MHz is recomended by datasheet
         .clkdiv = switch (hal.compatibility.chip) {
             .RP2040 => .from_float(2.0),
@@ -112,6 +113,7 @@ pub fn init(config: Config) !Self {
     return .{
         .pio = pio,
         .sm = sm,
+        .offset = offset,
         .pins = pins,
     };
 }
@@ -147,7 +149,7 @@ fn prep(self: *Self, read_bits: u32, write_bits: u32) void {
     self.pio.sm_exec_set_y(self.sm, read_bits);
     self.pio.sm_exec_set_x(self.sm, write_bits);
     self.pio.sm_exec_set_pindir(self.sm, 0b1);
-    self.pio.sm_exec_jmp(self.sm, cyw43spi_program.wrap_target.?);
+    self.pio.sm_exec_jmp(self.sm, self.offset + cyw43spi_program.wrap_target.?);
     self.pio.sm_set_enabled(self.sm, true);
 }
 
@@ -160,7 +162,7 @@ fn dma_read(self: *Self, data: []u32) void {
         .enable = true,
         .read_increment = false,
         .write_increment = true,
-        .dreq = @fromBackingInt(@backingInt(self.pio) * @as(u6, 8) + @backingInt(self.sm) + 4),
+        .dreq = self.pio.sm_dreq(self.sm, .rx),
     });
     ch.wait_for_finish_blocking();
 }
@@ -174,7 +176,7 @@ fn dma_write(self: *Self, data: []const u32) void {
         .enable = true,
         .read_increment = true,
         .write_increment = false,
-        .dreq = @fromBackingInt(@backingInt(self.pio) * @as(u6, 8) + @backingInt(self.sm)),
+        .dreq = self.pio.sm_dreq(self.sm, .tx),
     });
     ch.wait_for_finish_blocking();
 }

@@ -14,11 +14,12 @@
 
 #define st7789_lcd_wrap_target 0
 #define st7789_lcd_wrap 1
+#define st7789_lcd_pio_version 0
 
 static const uint16_t st7789_lcd_program_instructions[] = {
             //     .wrap_target
-    0x6001, //  0: out    pins, 1         side 0     
-    0xb042, //  1: nop                    side 1     
+    0x6001, //  0: out    pins, 1         side 0
+    0xb042, //  1: nop                    side 1
             //     .wrap
 };
 
@@ -27,6 +28,10 @@ static const struct pio_program st7789_lcd_program = {
     .instructions = st7789_lcd_program_instructions,
     .length = 2,
     .origin = -1,
+    .pio_version = st7789_lcd_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config st7789_lcd_program_get_default_config(uint offset) {

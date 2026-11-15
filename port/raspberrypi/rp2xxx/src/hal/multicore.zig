@@ -152,6 +152,7 @@ pub fn launch_core1_with_stack(entrypoint: *const fn () void, stack: []u32) void
 ///
 pub const Spinlock = struct {
     // Reserved spinlocks
+    pub const pio = init(29);
     pub const atomics = init(30);
     pub const mutexes = init(31);
 

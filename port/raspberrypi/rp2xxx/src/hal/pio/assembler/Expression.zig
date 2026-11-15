@@ -1,9 +1,4 @@
-//! Expressions for PIO are weird. The documentation states that an expression,
-//! when used as a "value", requires parenthesis. However the official PIO
-//! assembler allows for defines with a value of `::1` which is an expression.
-//!
-//! Annoyingly, looking at the parser, it seems that it supports a number of
-//! other operations not covered in the documentation.
+//! pioasm expressions in prefix order, with source indices for diagnostics.
 ops: BoundedOperations,
 values: BoundedValues,
 
@@ -19,6 +14,7 @@ const DefineWithIndex = encoder.DefineWithIndex;
 const BoundedArray = @import("bounded-array").BoundedArray;
 
 const Expression = @This();
+const lexer = @import("lexer.zig");
 const BoundedOperations = BoundedArray(OperationWithIndex, 32);
 const BoundedValues = BoundedArray(Value, 32);
 
@@ -39,13 +35,14 @@ pub const Operation = enum {
     sub,
     mul,
     div,
+    bit_or,
+    bit_and,
+    bit_xor,
+    shl,
+    shr,
     negative,
     bit_reverse,
     value,
-    // operations shown in pioasm's parser:
-    // - OR
-    // - AND
-    // - XOR
 
     pub fn format(
         op: Operation,
@@ -60,6 +57,11 @@ pub const Operation = enum {
             .sub => "sub",
             .mul => "mul",
             .div => "div",
+            .bit_or => "or",
+            .bit_and => "and",
+            .bit_xor => "xor",
+            .shl => "shl",
+            .shr => "shr",
             .negative => "neg",
             .bit_reverse => "rev",
             .value => "val",
@@ -67,190 +69,192 @@ pub const Operation = enum {
     }
 };
 
-pub fn tokenize(
-    str: []const u8,
-    /// starting index of the expression
-    index: u32,
-    diags: *?Diagnostics,
-) !Expression {
-    var ops = BoundedOperations.init(0) catch unreachable;
-    var values = BoundedValues.init(0) catch unreachable;
-
-    const call_depth: u32 = 0;
-    try recursive_tokenize(call_depth, &ops, &values, str, index, diags);
-    return Expression{
-        .ops = ops,
-        .values = values,
+pub fn tokenize(str: []const u8, index: u32, diags: *?Diagnostics) !Expression {
+    var parser = Parser{ .source = str, .source_index = index, .diags = diags };
+    errdefer if (diags.* == null) {
+        diags.* = Diagnostics.init(index + @as(u32, @intCast(parser.cursor)), "expression is too complex", .{});
     };
+    const root = try parser.expression(0, 1);
+    const tail = try parser.peek();
+    if (tail.tag != .end) {
+        diags.* = Diagnostics.init(tail.index, "{s}", .{if (tail.tag == .close) "mismatched parenthesis" else "expected binary operator"});
+        return if (tail.tag == .close) error.MismatchedParenthesis else error.InvalidExpression;
+    }
+    var result = Expression{ .ops = .{}, .values = .{} };
+    try parser.emit(root, &result);
+    return result;
 }
 
-const TrimResult = struct {
-    str: []const u8,
-    index: u32,
+const ParseError = error{ ExpressionTooDeep, InvalidExpression, MismatchedParenthesis, InvalidBitReverse, Overflow };
+const Parser = struct {
+    source: []const u8,
+    source_index: u32,
+    cursor: usize = 0,
+    diags: *?Diagnostics,
+    lookahead: ?LexToken = null,
+    nodes: BoundedArray(Node, 32) = .{},
 
-    fn default(str: []const u8) TrimResult {
-        return TrimResult{
-            .str = str,
-            .index = 0,
+    const Node = struct {
+        op: Operation,
+        index: u32,
+        str: []const u8 = "",
+        lhs: ?u5 = null,
+        rhs: ?u5 = null,
+    };
+    const LexToken = struct {
+        tag: enum { value, operator, open, close, end },
+        index: u32,
+        str: []const u8,
+        op: Operation = .value,
+    };
+
+    fn peek(self: *Parser) ParseError!LexToken {
+        if (self.lookahead) |token| return token;
+        const token = try self.read();
+        self.lookahead = token;
+        return token;
+    }
+
+    fn take(self: *Parser) ParseError!LexToken {
+        const token = try self.peek();
+        self.lookahead = null;
+        return token;
+    }
+
+    fn read(self: *Parser) ParseError!LexToken {
+        while (self.cursor < self.source.len) {
+            if (std.mem.indexOfScalar(u8, " \t\r", self.source[self.cursor]) != null) {
+                self.cursor += 1;
+            } else if (lexer.comment_end(self.source, self.cursor)) |end| {
+                self.cursor = end;
+            } else break;
+        }
+        const start = self.cursor;
+        const index = self.source_index + @as(u32, @intCast(start));
+        if (start == self.source.len) return .{ .tag = .end, .str = "", .index = index };
+        const rest = self.source[start..];
+        if (std.mem.startsWith(u8, rest, "--") or std.mem.startsWith(u8, rest, "−−")) {
+            self.diags.* = Diagnostics.init(index, "unexpected decrement token in expression", .{});
+            return error.InvalidExpression;
+        }
+        if (std.ascii.isDigit(rest[0])) {
+            self.cursor = lexer.number_end(self.source, start);
+            return .{ .tag = .value, .str = self.source[start..self.cursor], .index = index };
+        }
+        if (std.ascii.isAlphabetic(rest[0]) or rest[0] == '_') {
+            self.cursor = lexer.identifier_end(self.source, start);
+            const str = self.source[start..self.cursor];
+            if (!lexer.is_identifier(str) and !std.ascii.eqlIgnoreCase(str, "one") and !std.ascii.eqlIgnoreCase(str, "zero")) {
+                self.diags.* = Diagnostics.init(index, "keyword is not valid in an expression", .{});
+                return error.InvalidExpression;
+            }
+            return .{ .tag = .value, .str = str, .index = index };
+        }
+        self.cursor += 1;
+        switch (rest[0]) {
+            '(' => return .{ .tag = .open, .str = rest[0..1], .index = index },
+            ')' => return .{ .tag = .close, .str = rest[0..1], .index = index },
+            else => {},
+        }
+        const op: Operation = switch (rest[0]) {
+            '+' => .add,
+            '-' => .sub,
+            '*' => .mul,
+            '/' => .div,
+            '|' => .bit_or,
+            '&' => .bit_and,
+            '^' => .bit_xor,
+            '<', '>' => blk: {
+                if (rest.len < 2 or rest[1] != rest[0]) {
+                    self.diags.* = Diagnostics.init(index, "expected shift operator", .{});
+                    return error.InvalidExpression;
+                }
+                self.cursor += 1;
+                break :blk if (rest[0] == '<') .shl else .shr;
+            },
+            ':' => blk: {
+                if (rest.len < 2 or rest[1] != ':') {
+                    self.diags.* = Diagnostics.init(index, "invalid bit reverse", .{});
+                    return error.InvalidBitReverse;
+                }
+                self.cursor += 1;
+                break :blk .bit_reverse;
+            },
+            else => {
+                self.diags.* = Diagnostics.init(index, "invalid expression token", .{});
+                return error.InvalidExpression;
+            },
         };
+        return .{ .tag = .operator, .op = op, .str = self.source[start..self.cursor], .index = index };
+    }
+
+    fn append(self: *Parser, node: Node) ParseError!u5 {
+        try self.nodes.append(node);
+        return @intCast(self.nodes.len - 1);
+    }
+
+    // parser.yy, low to high: REVERSE; SHL SHR; PLUS MINUS;
+    // MULTIPLY DIVIDE; AND OR XOR. Binary operators associate left.
+    fn expression(self: *Parser, depth: u32, minimum: u8) ParseError!u5 {
+        const token = try self.take();
+        if (depth >= call_depth_max) return error.ExpressionTooDeep;
+        var lhs = switch (token.tag) {
+            .value => try self.append(.{ .op = .value, .index = token.index, .str = token.str }),
+            .open => blk: {
+                const inside = try self.expression(depth + 1, 1);
+                const close = try self.take();
+                if (close.tag == .end) {
+                    self.diags.* = Diagnostics.init(token.index, "mismatched parenthesis", .{});
+                    return error.MismatchedParenthesis;
+                }
+                if (close.tag != .close) {
+                    self.diags.* = Diagnostics.init(close.index, "expected binary operator", .{});
+                    return error.InvalidExpression;
+                }
+                break :blk inside;
+            },
+            .operator => blk: {
+                if (token.op != .sub and token.op != .bit_reverse) {
+                    self.diags.* = Diagnostics.init(token.index, "expected expression", .{});
+                    return error.InvalidExpression;
+                }
+                const rhs = try self.expression(depth + 1, if (token.op == .sub) 4 else 2);
+                break :blk try self.append(.{ .op = if (token.op == .sub) .negative else .bit_reverse, .index = token.index, .rhs = rhs });
+            },
+            else => {
+                self.diags.* = Diagnostics.init(token.index, "expected expression", .{});
+                return error.InvalidExpression;
+            },
+        };
+        while (true) {
+            const next = try self.peek();
+            if (next.tag != .operator or next.op == .bit_reverse) break;
+            const precedence: u8 = switch (next.op) {
+                .shl, .shr => 2,
+                .add, .sub => 3,
+                .mul, .div => 4,
+                .bit_and, .bit_or, .bit_xor => 5,
+                else => unreachable,
+            };
+            if (precedence < minimum) break;
+            _ = try self.take();
+            const rhs = try self.expression(depth + 1, precedence + 1);
+            lhs = try self.append(.{ .op = next.op, .index = next.index, .lhs = lhs, .rhs = rhs });
+        }
+        return lhs;
+    }
+
+    fn emit(self: *const Parser, index: u5, result: *Expression) error{Overflow}!void {
+        const node = self.nodes.get(index);
+        try result.ops.append(.{ .op = node.op, .index = node.index });
+        if (node.op == .value) try result.values.append(.{ .str = node.str, .index = node.index });
+        if (node.rhs) |rhs| try self.emit(rhs, result);
+        if (node.lhs) |lhs| try self.emit(lhs, result);
     }
 };
 
-fn trim_outer_parenthesis(str: []const u8) TrimResult {
-    // if the outer characters (not including whitespace) are parenthesis, then include the inside string
-
-    // scan the prefix
-    const start: usize = for (str, 0..) |c, i| {
-        switch (c) {
-            ' ',
-            '\t',
-            => {},
-            '(' => break i + 1,
-            else => return TrimResult.default(str),
-        }
-    } else return TrimResult.default(str);
-
-    const end: usize = blk: {
-        var i = str.len - 1;
-        break :blk while (i > 0) : (i -= 1) {
-            switch (str[i]) {
-                ' ',
-                '\t',
-                => {},
-                ')' => break i,
-                else => return TrimResult.default(str),
-            }
-        } else return TrimResult.default(str);
-    };
-
-    return TrimResult{
-        .str = str[start..end],
-        .index = @as(u32, @intCast(start)),
-    };
-}
-
-fn recursive_tokenize(
-    call_depth: u32,
-    ops: *BoundedOperations,
-    values: *BoundedValues,
-    str: []const u8,
-    index: u32,
-    diags: *?Diagnostics,
-) !void {
-    assert(call_depth < call_depth_max);
-    const trim_result = trim_outer_parenthesis(str);
-    const expr_str = trim_result.str;
-    const expr_index = index + trim_result.index;
-
-    var parenthesis_found = false;
-    var depth: u32 = 0;
-    var i = @as(i32, @intCast(expr_str.len - 1));
-    outer: while (i >= 0) : (i -= 1) {
-        const idx = @as(u32, @intCast(i));
-        // TODO: how about if the expression is fully enveloped in parenthesis?
-        switch (expr_str[idx]) {
-            ')' => {
-                depth += 1;
-                parenthesis_found = true;
-                continue :outer;
-            },
-            '(' => {
-                if (depth == 0) {
-                    diags.* = Diagnostics.init(expr_index + idx, "mismatched parenthesis", .{});
-                    return error.MismatchedParenthesis;
-                }
-
-                depth -= 1;
-                parenthesis_found = true;
-                if (depth != 0)
-                    continue :outer;
-            },
-            else => if (depth > 0)
-                continue :outer,
-        }
-
-        const op: Operation = switch (expr_str[idx]) {
-            '+' => .add,
-            // needs context to determine if it's a negative or subtraction
-            '-' => blk: {
-                // it's negative if we have nothing to the left. If an operator
-                // is found to the left we continue
-                const is_negative = (i == 0) or is_negative: {
-                    var j = i - 1;
-                    while (j >= 0) : (j -= 1) {
-                        const jdx = @as(u32, @intCast(j));
-                        switch (expr_str[jdx]) {
-                            ' ', '\t' => continue,
-                            '+', '-', '*', '/' => continue :outer,
-                            else => break :is_negative false,
-                        }
-                    }
-
-                    break :is_negative true;
-                };
-
-                if (is_negative) {
-                    try ops.append(.{
-                        .op = .negative,
-                        .index = expr_index + idx,
-                    });
-                    try recursive_tokenize(call_depth + 1, ops, values, expr_str[idx + 1 ..], expr_index + idx + 1, diags);
-                    return;
-                }
-
-                break :blk .sub;
-            },
-            '*' => .mul,
-            '/' => .div,
-            ':' => {
-                const is_bit_reverse = (i != 0) and expr_str[idx - 1] == ':';
-                if (is_bit_reverse) {
-                    try ops.append(.{
-                        .op = .bit_reverse,
-                        .index = expr_index + idx - 1,
-                    });
-                    try recursive_tokenize(call_depth + 1, ops, values, expr_str[idx + 1 ..], expr_index + idx + 1, diags);
-                    i -= 1;
-                    return;
-                }
-
-                return error.InvalidBitReverse;
-            },
-            else => continue,
-        };
-
-        try ops.append(.{
-            .op = op,
-            .index = expr_index + idx,
-        });
-        try recursive_tokenize(call_depth + 1, ops, values, expr_str[idx + 1 ..], expr_index + idx + 1, diags);
-        try recursive_tokenize(call_depth + 1, ops, values, expr_str[0..idx], expr_index, diags);
-        return;
-    } else if (parenthesis_found) {
-        try recursive_tokenize(call_depth + 1, ops, values, expr_str, expr_index, diags);
-    } else {
-        // if we hit this path, then the full string has been scanned, and no operators
-        const trimmed = std.mem.trim(u8, expr_str, " \t");
-        const value_index = expr_index + @as(u32, @intCast(std.mem.indexOf(u8, expr_str, trimmed).?));
-        try ops.append(.{
-            .op = .value,
-            .index = value_index,
-        });
-
-        try values.append(.{
-            .str = trimmed,
-            .index = value_index,
-        });
-    }
-
-    if (depth != 0) {
-        diags.* = Diagnostics.init(expr_index + @as(u32, @intCast(i)), "mismatched parenthesis", .{});
-        return error.MismatchedParenthesis;
-    }
-}
-
 const EvaluatedValue = struct {
-    num: i128,
+    num: i32,
     index: u32,
 
     pub fn format(
@@ -269,20 +273,25 @@ pub fn evaluate(
     self: Expression,
     define_lists: []const []const DefineWithIndex,
     diags: *?Diagnostics,
-) !i128 {
+) !i32 {
     var values = BoundedArray(EvaluatedValue, 32).init(0) catch unreachable;
     // parse/extract values into numbers
     for (self.values.slice()) |entry| {
-        const value: EvaluatedValue = if (std.fmt.parseInt(i128, entry.str, 0)) |num| .{
+        const literal: ?i32 = if (std.ascii.eqlIgnoreCase(entry.str, "one")) 1 else if (std.ascii.eqlIgnoreCase(entry.str, "zero")) 0 else lexer.integer(entry.str) catch null;
+        const value: EvaluatedValue = if (literal) |num| .{
             .num = num,
             .index = entry.index,
-        } else |_| blk: {
+        } else blk: {
+            if (entry.str.len > 0 and std.ascii.isDigit(entry.str[0])) {
+                diags.* = Diagnostics.init(entry.index, "integer literal must fit in a signed 32-bit value", .{});
+                return error.InvalidInteger;
+            }
             // if it fails, try looking up the strings in definitions
             for (define_lists) |define_list|
                 for (define_list) |define|
                     if (std.mem.eql(u8, define.name, entry.str))
                         break :blk .{
-                            .num = define.value,
+                            .num = @truncate(define.value),
                             .index = define.index,
                         };
 
@@ -307,7 +316,7 @@ pub fn evaluate(
 }
 
 const RecursiveEvalResult = struct {
-    value: i128,
+    value: i32,
     consumed: struct {
         ops: u32,
         values: u32,
@@ -334,32 +343,15 @@ fn recursive_evaluate(
                 .values = 1,
             },
         },
-        .negative => .{
-            .value = -values[0].num,
-            .index = values[0].index,
-            .consumed = .{
-                .ops = 2,
-                .values = 1,
-            },
-        },
-        .bit_reverse => blk: {
-            if (values[0].num >= std.math.maxInt(u32) or
-                values[0].num < std.math.minInt(i32))
-            {
-                diags.* = Diagnostics.init(owis[0].index, "Evaluated value does not fit in 32-bits: 0x{x}", .{values[0].num});
-                return error.EvaluatedValueDoesntFit;
-            }
-
+        .negative, .bit_reverse => blk: {
+            const rhs = try recursive_evaluate(call_depth + 1, owis[1..], values, diags);
             break :blk .{
-                .value = @as(i128, @bitCast(@bitReverse(@as(u128, @bitCast(values[0].num))) >> (128 - 32))),
-                .index = values[0].index,
-                .consumed = .{
-                    .ops = 2,
-                    .values = 1,
-                },
+                .value = if (owis[0].op == .negative) 0 -% rhs.value else @bitReverse(rhs.value),
+                .index = owis[0].index,
+                .consumed = .{ .ops = rhs.consumed.ops + 1, .values = rhs.consumed.values },
             };
         },
-        .add, .sub, .mul, .div => blk: {
+        .add, .sub, .mul, .div, .bit_or, .bit_and, .bit_xor, .shl, .shr => blk: {
             const rhs = try recursive_evaluate(call_depth + 1, owis[1..], values, diags);
             const lhs = try recursive_evaluate(call_depth + 1, owis[1 + rhs.consumed.ops ..], values[rhs.consumed.values..], diags);
             break :blk .{
@@ -369,17 +361,29 @@ fn recursive_evaluate(
                 },
                 .index = lhs.index,
                 .value = switch (owis[0].op) {
-                    .add => lhs.value + rhs.value,
-                    .sub => lhs.value - rhs.value,
-                    .mul => lhs.value * rhs.value,
+                    .add => lhs.value +% rhs.value,
+                    .sub => lhs.value -% rhs.value,
+                    .mul => lhs.value *% rhs.value,
                     .div => div: {
                         if (rhs.value == 0) {
                             diags.* = Diagnostics.init(owis[0].index, "divide by zero (denominator evaluates to zero)", .{});
                             return error.DivideByZero;
                         }
 
-                        // TODO: other requirement for @divExact
-                        break :div @divExact(lhs.value, rhs.value);
+                        if (lhs.value == std.math.minInt(i32) and rhs.value == -1) {
+                            diags.* = Diagnostics.init(owis[0].index, "integer division overflow", .{});
+                            return error.ExpressionOverflow;
+                        }
+                        break :div @divTrunc(lhs.value, rhs.value);
+                    },
+                    .bit_or => lhs.value | rhs.value,
+                    .bit_and => lhs.value & rhs.value,
+                    .bit_xor => lhs.value ^ rhs.value,
+                    .shl, .shr => shift: {
+                        // Differential probes of pico-sdk 2.1.1 pioasm built
+                        // with GCC on x86_64 mask counts, including negatives.
+                        const amount: u5 = @truncate(@as(u32, @bitCast(rhs.value)));
+                        break :shift if (owis[0].op == .shl) lhs.value << amount else lhs.value >> amount;
                     },
                     else => unreachable,
                 },
@@ -615,11 +619,11 @@ test "expr.tokenzie.parenthesis" {
         .{ .index = 21, .op = .sub },
         .{ .index = 23, .op = .value },
         .{ .index = 2, .op = .mul },
+        .{ .index = 5, .op = .bit_reverse },
         .{ .index = 9, .op = .add },
         .{ .index = 15, .op = .div },
         .{ .index = 17, .op = .value },
         .{ .index = 12, .op = .value },
-        .{ .index = 5, .op = .bit_reverse },
         .{ .index = 7, .op = .value },
         .{ .index = 0, .op = .value },
     }, expr.ops.slice());
@@ -698,10 +702,52 @@ test "expr.evaluate.negative" {
 }
 
 test "expr.evaluate.bit reverse" {
-    try evaluate_test(0x80000000, "::1", &.{});
+    try evaluate_test(-0x80000000, "::1", &.{});
 }
 
 test "expr.evaluate.parenthesis" {
     try evaluate_test(15, "5 * (1 + 2)", &.{});
-    try evaluate_test(1 * (@bitReverse(@as(u32, 2)) + (12 / 3)) - 5, "1 * (::2 + (12 / 3)) - 5", &.{});
+    try evaluate_test(1 * @bitReverse(@as(u32, 2 + (12 / 3))) - 5, "1 * (::2 + (12 / 3)) - 5", &.{});
+}
+test "expr.pioasm precedence and associativity" {
+    try evaluate_test(24, "8 * 2 | 1", &.{});
+    try evaluate_test(3, "1 | 2 & 4 ^ 3", &.{});
+    try evaluate_test(8, "1 << 1 + 2", &.{});
+    try evaluate_test(2, "16 >> 2 >> 1", &.{});
+    try evaluate_test(7, "15 & 7", &.{});
+    try evaluate_test(1, "-1 + 2", &.{});
+    try evaluate_test(1 - @as(i128, -1073741824), "1 - ::1 + 2", &.{});
+    try evaluate_test(0, "1 * -2 + 2", &.{});
+    try evaluate_test(1, "7 / 4", &.{});
+    try evaluate_test(-3, "-(1 + 2)", &.{});
+}
+
+test "expr.invalid input diagnostics" {
+    const cases = .{
+        .{ "", error.InvalidExpression, 5, "expected expression" },
+        .{ "(1", error.MismatchedParenthesis, 5, "mismatched parenthesis" },
+        .{ "1)", error.MismatchedParenthesis, 6, "mismatched parenthesis" },
+        .{ ":1", error.InvalidBitReverse, 5, "invalid bit reverse" },
+        .{ "1 < 2", error.InvalidExpression, 7, "expected shift operator" },
+        .{ "1 +", error.InvalidExpression, 8, "expected expression" },
+    };
+    inline for (cases) |case| {
+        var diags: ?Diagnostics = null;
+        try std.testing.expectError(case[1], tokenize(case[0], 5, &diags));
+        try expectEqual(@as(u32, case[2]), diags.?.index);
+        try expectEqualStrings(case[3], diags.?.message.slice());
+    }
+    const eval_cases = .{
+        .{ "1 / 0", error.DivideByZero, 2, "divide by zero (denominator evaluates to zero)" },
+        .{ "missing", error.UnresolvedValue, 0, "value doesn't parse as an integer, or define not found" },
+        .{ "2147483648", error.InvalidInteger, 0, "integer literal must fit in a signed 32-bit value" },
+        .{ "(1 << 31) / (-1)", error.ExpressionOverflow, 10, "integer division overflow" },
+    };
+    inline for (eval_cases) |case| {
+        var diags: ?Diagnostics = null;
+        const expr = try tokenize(case[0], 0, &diags);
+        try std.testing.expectError(case[1], expr.evaluate(&.{}, &diags));
+        try expectEqual(@as(u32, case[2]), diags.?.index);
+        try expectEqualStrings(case[3], diags.?.message.slice());
+    }
 }

@@ -1,14 +1,15 @@
-.program irq
+.pio_version 1
+.program irq_modes
 .side_set 1
 
 .wrap_target
-    irq set 1 prev side 0
+    irq prev set 1 side 0
     irq set 1 rel side 0
-    irq set 1 next side 0
-    irq wait 1 prev side 0
+    irq next set 1 side 0
+    irq prev wait 1 side 0
     irq wait 1 rel side 0
-    irq wait 1 next side 0
-    irq clear 1 prev side 0
+    irq next wait 1 side 0
+    irq prev clear 1 side 0
     irq clear 1 rel side 0
-    irq clear 1 next side 0
+    irq next clear 1 side 0
 .wrap

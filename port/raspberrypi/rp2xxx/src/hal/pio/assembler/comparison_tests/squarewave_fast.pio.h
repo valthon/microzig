@@ -14,12 +14,13 @@
 
 #define squarewave_fast_wrap_target 1
 #define squarewave_fast_wrap 2
+#define squarewave_fast_pio_version 0
 
 static const uint16_t squarewave_fast_program_instructions[] = {
-    0xe081, //  0: set    pindirs, 1                 
+    0xe081, //  0: set    pindirs, 1
             //     .wrap_target
-    0xe001, //  1: set    pins, 1                    
-    0xe000, //  2: set    pins, 0                    
+    0xe001, //  1: set    pins, 1
+    0xe000, //  2: set    pins, 0
             //     .wrap
 };
 
@@ -28,6 +29,10 @@ static const struct pio_program squarewave_fast_program = {
     .instructions = squarewave_fast_program_instructions,
     .length = 3,
     .origin = -1,
+    .pio_version = squarewave_fast_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config squarewave_fast_program_get_default_config(uint offset) {

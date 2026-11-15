@@ -18,6 +18,20 @@ pub const LoadAndStartProgramOptions = common.LoadAndStartProgramOptions(chip);
 pub const ClkDivOptions = common.ClkDivOptions;
 pub const ShiftOptions = common.ShiftOptions(chip);
 
+pub const Fifo = common.Fifo;
+pub const ExecOptions = common.ExecOptions;
+pub const ExecOverrides = common.ExecOverrides;
+pub const Status = common.Status;
+pub const InterruptSource = common.InterruptSource;
+pub const InterruptLine = common.InterruptLine;
+pub const Fdebug = common.Fdebug;
+pub const DebugConfig = common.DebugConfig;
+pub const clkdiv_from_hz = common.clkdiv_from_hz;
+pub const ProgramConfig = assembler.Config;
+pub fn default_config(program: Program) !StateMachineInitOptions {
+    return common.default_config(chip, program);
+}
+
 pub const assembler = @import("pio/assembler.zig");
 
 pub const Program = assembler.Program;
@@ -43,5 +57,18 @@ pub fn num(n: u2) Pio {
 pub const Pio = chip_specific.Pio;
 
 test "pio" {
+    _ = common;
+    _ = @import("pio/runtime.zig");
+    _ = @import("pio/registers.zig");
+    _ = @import("pio/exec.zig");
     std.testing.refAllDecls(assembler);
+}
+
+test "RP2350-only PIO methods are absent on RP2040" {
+    const rp2040 = @import("pio/rp2040.zig").Pio;
+    const rp2350 = @import("pio/rp2350.zig").Pio;
+    inline for (.{ "set_gpio_base", "claim_sm_and_add_program_for_gpio_range", "sm_rxfifo_get", "sm_rxfifo_put", "enable_in_sync", "disable", "clkdiv_restart" }) |name| {
+        try std.testing.expect(!@hasDecl(rp2040, name));
+        try std.testing.expect(@hasDecl(rp2350, name));
+    }
 }

@@ -14,21 +14,22 @@
 
 #define differential_manchester_tx_wrap_target 0
 #define differential_manchester_tx_wrap 9
+#define differential_manchester_tx_pio_version 0
 
 #define differential_manchester_tx_offset_start 0u
 
 static const uint16_t differential_manchester_tx_program_instructions[] = {
             //     .wrap_target
-    0x6021, //  0: out    x, 1                       
-    0x1e24, //  1: jmp    !x, 4           side 1 [6] 
-    0xa042, //  2: nop                               
-    0x1600, //  3: jmp    0               side 0 [6] 
-    0x0705, //  4: jmp    5                      [7] 
-    0x6021, //  5: out    x, 1                       
-    0x1629, //  6: jmp    !x, 9           side 0 [6] 
-    0xa042, //  7: nop                               
-    0x1e05, //  8: jmp    5               side 1 [6] 
-    0x0700, //  9: jmp    0                      [7] 
+    0x6021, //  0: out    x, 1
+    0x1e24, //  1: jmp    !x, 4           side 1 [6]
+    0xa042, //  2: nop
+    0x1600, //  3: jmp    0               side 0 [6]
+    0x0705, //  4: jmp    5                      [7]
+    0x6021, //  5: out    x, 1
+    0x1629, //  6: jmp    !x, 9           side 0 [6]
+    0xa042, //  7: nop
+    0x1e05, //  8: jmp    5               side 1 [6]
+    0x0700, //  9: jmp    0                      [7]
             //     .wrap
 };
 
@@ -37,6 +38,10 @@ static const struct pio_program differential_manchester_tx_program = {
     .instructions = differential_manchester_tx_program_instructions,
     .length = 10,
     .origin = -1,
+    .pio_version = differential_manchester_tx_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config differential_manchester_tx_program_get_default_config(uint offset) {
@@ -69,21 +74,22 @@ static inline void differential_manchester_tx_program_init(PIO pio, uint sm, uin
 
 #define differential_manchester_rx_wrap_target 5
 #define differential_manchester_rx_wrap 9
+#define differential_manchester_rx_pio_version 0
 
 #define differential_manchester_rx_offset_start 0u
 
 static const uint16_t differential_manchester_rx_program_instructions[] = {
     0x2ba0, //  0: wait   1 pin, 0               [11]
-    0x00c4, //  1: jmp    pin, 4                     
-    0x4021, //  2: in     x, 1                       
-    0x0000, //  3: jmp    0                          
-    0x4141, //  4: in     y, 1                   [1] 
+    0x00c4, //  1: jmp    pin, 4
+    0x4021, //  2: in     x, 1
+    0x0000, //  3: jmp    0
+    0x4141, //  4: in     y, 1                   [1]
             //     .wrap_target
     0x2b20, //  5: wait   0 pin, 0               [11]
-    0x00c9, //  6: jmp    pin, 9                     
-    0x4041, //  7: in     y, 1                       
-    0x0000, //  8: jmp    0                          
-    0x4121, //  9: in     x, 1                   [1] 
+    0x00c9, //  6: jmp    pin, 9
+    0x4041, //  7: in     y, 1
+    0x0000, //  8: jmp    0
+    0x4121, //  9: in     x, 1                   [1]
             //     .wrap
 };
 
@@ -92,6 +98,10 @@ static const struct pio_program differential_manchester_rx_program = {
     .instructions = differential_manchester_rx_program_instructions,
     .length = 10,
     .origin = -1,
+    .pio_version = differential_manchester_rx_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config differential_manchester_rx_program_get_default_config(uint offset) {

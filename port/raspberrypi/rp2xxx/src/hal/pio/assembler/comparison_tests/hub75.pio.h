@@ -14,12 +14,13 @@
 
 #define hub75_row_wrap_target 0
 #define hub75_row_wrap 2
+#define hub75_row_pio_version 0
 
 static const uint16_t hub75_row_program_instructions[] = {
             //     .wrap_target
-    0x7705, //  0: out    pins, 5         side 2 [7] 
-    0x7f3b, //  1: out    x, 27           side 3 [7] 
-    0x0042, //  2: jmp    x--, 2          side 0     
+    0x7705, //  0: out    pins, 5         side 2 [7]
+    0x7f3b, //  1: out    x, 27           side 3 [7]
+    0x0042, //  2: jmp    x--, 2          side 0
             //     .wrap
 };
 
@@ -28,6 +29,10 @@ static const struct pio_program hub75_row_program = {
     .instructions = hub75_row_program_instructions,
     .length = 3,
     .origin = -1,
+    .pio_version = hub75_row_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config hub75_row_program_get_default_config(uint offset) {
@@ -66,6 +71,7 @@ static inline void hub75_wait_tx_stall(PIO pio, uint sm) {
 
 #define hub75_data_rgb888_wrap_target 0
 #define hub75_data_rgb888_wrap 15
+#define hub75_data_rgb888_pio_version 0
 
 #define hub75_data_rgb888_offset_entry_point 0u
 #define hub75_data_rgb888_offset_shift0 0u
@@ -73,22 +79,22 @@ static inline void hub75_wait_tx_stall(PIO pio, uint sm) {
 
 static const uint16_t hub75_data_rgb888_program_instructions[] = {
             //     .wrap_target
-    0x80a0, //  0: pull   block           side 0     
-    0x40e1, //  1: in     osr, 1          side 0     
-    0x6068, //  2: out    null, 8         side 0     
-    0x40e1, //  3: in     osr, 1          side 0     
-    0x6068, //  4: out    null, 8         side 0     
-    0x40e1, //  5: in     osr, 1          side 0     
-    0x6060, //  6: out    null, 32        side 0     
-    0x80a0, //  7: pull   block           side 0     
-    0x50e1, //  8: in     osr, 1          side 1     
-    0x7068, //  9: out    null, 8         side 1     
-    0x50e1, // 10: in     osr, 1          side 1     
-    0x7068, // 11: out    null, 8         side 1     
-    0x50e1, // 12: in     osr, 1          side 1     
-    0x7060, // 13: out    null, 32        side 1     
-    0x507a, // 14: in     null, 26        side 1     
-    0xb016, // 15: mov    pins, ::isr     side 1     
+    0x80a0, //  0: pull   block           side 0
+    0x40e1, //  1: in     osr, 1          side 0
+    0x6068, //  2: out    null, 8         side 0
+    0x40e1, //  3: in     osr, 1          side 0
+    0x6068, //  4: out    null, 8         side 0
+    0x40e1, //  5: in     osr, 1          side 0
+    0x6060, //  6: out    null, 32        side 0
+    0x80a0, //  7: pull   block           side 0
+    0x50e1, //  8: in     osr, 1          side 1
+    0x7068, //  9: out    null, 8         side 1
+    0x50e1, // 10: in     osr, 1          side 1
+    0x7068, // 11: out    null, 8         side 1
+    0x50e1, // 12: in     osr, 1          side 1
+    0x7060, // 13: out    null, 32        side 1
+    0x507a, // 14: in     null, 26        side 1
+    0xb016, // 15: mov    pins, ::isr     side 1
             //     .wrap
 };
 
@@ -97,6 +103,10 @@ static const struct pio_program hub75_data_rgb888_program = {
     .instructions = hub75_data_rgb888_program_instructions,
     .length = 16,
     .origin = -1,
+    .pio_version = hub75_data_rgb888_pio_version,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x0
+#endif
 };
 
 static inline pio_sm_config hub75_data_rgb888_program_get_default_config(uint offset) {

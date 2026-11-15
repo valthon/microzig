@@ -1,9 +1,9 @@
-//! Hello world for the PIO module: generating a square wave
+//! Generate a square wave on GPIO 2; observe it with a scope.
+//! Build-only; not run on hardware.
 const microzig = @import("microzig");
 const rp2xxx = microzig.hal;
 const gpio = rp2xxx.gpio;
 const Pio = rp2xxx.pio.Pio;
-const StateMachine = rp2xxx.pio.StateMachine;
 
 const squarewave_program = blk: {
     @setEvalBranchQuota(3000);
@@ -22,11 +22,8 @@ const squarewave_program = blk: {
     , .{}).get_program_by_name("squarewave");
 };
 
-// Pick one PIO instance arbitrarily. We're also arbitrarily picking state
-// machine 0 on this PIO instance (the state machines are numbered 0 to 3
-// inclusive).
+// Pick a PIO block; main claims an available state machine.
 const pio: Pio = rp2xxx.pio.num(0);
-const sm: StateMachine = .sm0;
 const pin = gpio.num(2);
 
 pub const panic = microzig.panic;
@@ -38,13 +35,14 @@ comptime {
 }
 
 pub fn main() !void {
+    const sm = try pio.claim_unused_state_machine();
     pio.gpio_init(pin);
-    pio.sm_load_and_start_program(sm, squarewave_program, .{
+    _ = try pio.sm_load_and_start_program(sm, squarewave_program, .{
         .clkdiv = .from_float(125.0),
         .pin_mappings = .{
             .set = .single(pin),
         },
-    }) catch unreachable;
+    });
 
     pio.sm_set_enabled(sm, true);
 
