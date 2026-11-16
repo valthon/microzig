@@ -69,7 +69,7 @@ extern const _external_interrupt_table: usize; // For riscv only
 pub fn launch_core1_with_stack(entrypoint: *const fn () void, stack: []u32) void {
     // TODO: disable SIO interrupts
 
-    const wrapper = &struct {
+    const wrapper = if (microzig.hal.compatibility.arch != .riscv) &struct {
         // Account for the four arguments that are passed to the wrapper in registers so
         // we can get the two we put on the stack,
         fn _wrapper(_: u32, _: u32, _: u32, _: u32, entry: u32, stack_base: [*]u32) callconv(.c) void {
@@ -86,9 +86,7 @@ pub fn launch_core1_with_stack(entrypoint: *const fn () void, stack: []u32) void
             }
             @as(*const fn () void, @ptrFromInt(entry))();
         }
-    }._wrapper;
-
-    const wrapper_riscv = &struct {
+    }._wrapper else &struct {
         // Account for the eight arguments that are passed to the wrapper in registers so
         // we can get the two we put on the stack,
         fn _wrapper(_: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32, entry: u32, stack_base: [*]u32) callconv(.c) void {
@@ -122,7 +120,7 @@ pub fn launch_core1_with_stack(entrypoint: *const fn () void, stack: []u32) void
         else
             microzig.cpu.peripherals.scb.VTOR,
         stack_ptr,
-        @intFromPtr(if (microzig.hal.compatibility.arch == .riscv) wrapper_riscv else wrapper),
+        @intFromPtr(wrapper),
     };
 
     var seq: usize = 0;
