@@ -78,12 +78,11 @@ test "debug clear writes one SM without reading W1C state" {
 
 test "enable writes use hardware SET and CLR aliases" {
     // Aliases share the low 12 address bits (40DS §2.1.2, 50DS §2.1.3).
-    // Static, not a local: a 16 KiB-aligned stack frame crashed on Windows.
-    const S = struct {
-        var bank: [4096]u32 align(16384) = @splat(0);
-    };
-    const bank = &S.bank;
-    bank.* = @splat(0);
+    // Keep the bank off the stack and obtain its alignment at runtime: Windows
+    // executable layout did not preserve the static bank's declared alignment.
+    const bank = try std.testing.allocator.alignedAlloc(u32, .fromByteUnits(16384), 4096);
+    defer std.testing.allocator.free(bank);
+    @memset(bank, 0);
     const ctrl: *volatile TestCtrl = @ptrCast(&bank[0]);
     const enable: *volatile TestCtrl = @ptrCast(&bank[32]);
     ctrl.raw = 8;
