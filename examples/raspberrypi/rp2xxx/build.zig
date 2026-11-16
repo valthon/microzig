@@ -115,6 +115,7 @@ pub fn build(b: *std.Build) void {
     };
 
     const chip_agnostic_examples: []const ChipAgnosticExample = &.{
+        .{ .name = "pins", .file = "src/pins.zig" },
         .{ .name = "adc", .file = "src/adc.zig" },
         .{ .name = "i2c-accel", .file = "src/i2c_accel.zig" },
         .{ .name = "i2c-bus-scan", .file = "src/i2c_bus_scan.zig" },
