@@ -212,6 +212,9 @@ pub const MemoryProtectionUnit = extern struct {
         ADDR: u27,
     });
 
+    // Armv7-M ARM DDI0403E.e B3.5.9 (MPU_RASR): B[16], C[17],
+    // S[18], TEX[21:19], AP[26:24], reserved[27], XN[28], reserved[31:29].
+    // https://documentation-service.arm.com/static/606dc36485368c4c2b1bf62f
     pub const RASR_Register = mmio.Mmio(packed struct(u32) {
         /// Region enable bit
         ENABLE: u1,
@@ -231,9 +234,10 @@ pub const MemoryProtectionUnit = extern struct {
         reserved1: u2 = 0,
         /// ATTRS.AP
         AP: u3,
+        reserved2: u1 = 0,
         /// ATTRS.XN
         XN: u1,
-        padding: u4 = 0,
+        padding: u3 = 0,
     });
 };
 

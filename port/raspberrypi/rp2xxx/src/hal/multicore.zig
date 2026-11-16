@@ -71,10 +71,13 @@ pub fn launch_core1_with_stack(entrypoint: *const fn () void, stack: []u32) void
 
     const wrapper = if (microzig.hal.compatibility.arch != .riscv) &struct {
         // Account for the four arguments that are passed to the wrapper in registers so
-        // we can get the two we put on the stack,
-        fn _wrapper(_: u32, _: u32, _: u32, _: u32, entry: u32, stack_base: [*]u32) callconv(.c) void {
-            // TODO: protect stack using MPU
-            _ = stack_base;
+        // we can get the three we put on the stack.
+        fn _wrapper(_: u32, _: u32, _: u32, _: u32, entry: u32, stack_base: [*]u32, stack_top: usize) callconv(.c) void {
+            // Reserve any MPU guard inside the caller's buffer. A very small
+            // buffer may not fit a guard plus the active wrapper frames.
+            if (@hasDecl(microzig.cpu, "protect_main_stack")) {
+                _ = microzig.cpu.protect_main_stack(@intFromPtr(stack_base), stack_top);
+            }
             if (microzig.hal.compatibility.chip == .RP2350) {
                 if (microzig.options.cpu.enable_fpu) {
                     microzig.cpu.enable_fpu();
@@ -101,13 +104,17 @@ pub fn launch_core1_with_stack(entrypoint: *const fn () void, stack: []u32) void
     while (PSM.FRCE_OFF.read().PROC1 != 1) microzig.cpu.nop();
     PSM.FRCE_OFF.modify(.{ .PROC1 = 0 });
 
-    stack[stack.len - 2] = @intFromPtr(entrypoint);
-    stack[stack.len - 1] = @intFromPtr(stack.ptr);
+    // Keep SP eight-byte aligned when adding the ARM wrapper's third argument.
+    const argument_words: usize = if (microzig.hal.compatibility.arch == .riscv) 2 else 4;
+    stack[stack.len - argument_words] = @intFromPtr(entrypoint);
+    stack[stack.len - argument_words + 1] = @intFromPtr(stack.ptr);
+    if (microzig.hal.compatibility.arch != .riscv)
+        stack[stack.len - argument_words + 2] = @intFromPtr(stack.ptr) + stack.len * @sizeOf(u32);
 
     // calculate top of the stack
     const stack_ptr: u32 =
         @intFromPtr(stack.ptr) +
-        (stack.len - 2) * @sizeOf(u32); // account for the two elements we "pushed" above
+        (stack.len - argument_words) * @sizeOf(u32); // account for wrapper arguments
 
     // after reseting core1 is waiting for this specific sequence
 

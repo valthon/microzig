@@ -38,6 +38,13 @@ pub const CPU_Options = struct {
     /// NOTE: Not supported on cortex_m0.
     ram_vector_table: bool = false,
 
+    /// Protect the main stack with MSPLIM, or reserve the highest MPU region
+    /// for a no-access guard. MPU guards cannot catch accesses that jump over
+    /// the entire guard. Custom linker scripts may supply absolute symbols
+    /// microzig_stack_free_start_N/end_N (N is the RAM region index); otherwise
+    /// automatic protection is skipped. A symbol_name stack is also skipped.
+    stack_protection: bool = true,
+
     /// If true, the Cortex-M interrupts will be initialized with a more verbose variant
     /// of the interrupt handlers which print the interrupt name.
     ///
@@ -412,6 +419,161 @@ else
     @compileError("`ram_vector_table` is not available. Consider adding .cpu = .{ .ram_vector_table = true }" ++
         " to your microzig_options or using a RAM image");
 
+const stack_bounds = @import("cortex_m/stack_bounds.zig");
+const has_main_stack_limit = cortex_m == .cortex_m33 or cortex_m == .cortex_m55;
+const use_stack_mpu = !has_main_stack_limit and cortex_m != .cortex_m0 and
+    (microzig.chip.properties.has_mpu orelse false);
+
+fn default_stack_bounds() ?stack_bounds.Bounds {
+    const top = @intFromPtr(microzig.utilities.end_of_stack);
+    if (comptime microzig.config.stack == .address) {
+        // Overlapping/aliased descriptors do not identify one storage range.
+        const matches = comptime blk: {
+            var count: usize = 0;
+            for (microzig.config.memory_regions) |region| {
+                if (region.tag == .ram and microzig.config.stack.address > region.offset and
+                    microzig.config.stack.address <= region.offset + region.length) count += 1;
+            }
+            break :blk count;
+        };
+        if (matches != 1) return null;
+    }
+    comptime var ram_index: usize = 0;
+    inline for (microzig.config.memory_regions) |region| {
+        if (comptime region.tag == .ram) {
+            const selected = switch (microzig.config.stack) {
+                .ram_region_index => |index| index == ram_index,
+                .ram_region_name => |name| if (region.name) |n| std.mem.eql(u8, name, n) else false,
+                .address => |address| address > region.offset and address <= region.offset + region.length,
+                .symbol_name => false, // A symbol alone does not describe its storage.
+            };
+            if (selected) {
+                const start = @extern(*allowzero const u8, .{
+                    .name = std.fmt.comptimePrint("microzig_stack_free_start_{d}", .{ram_index}),
+                    .linkage = .weak,
+                });
+                const end = @extern(*allowzero const u8, .{
+                    .name = std.fmt.comptimePrint("microzig_stack_free_end_{d}", .{ram_index}),
+                    .linkage = .weak,
+                });
+                return stack_bounds.Bounds.init(@intFromPtr(start), @intFromPtr(end), top);
+            }
+            ram_index += 1;
+        }
+    }
+    return null;
+}
+
+fn main_stack_pointer() usize {
+    return asm volatile ("mrs %[sp], msp"
+        : [sp] "=r" (-> usize),
+    );
+}
+
+fn read_main_stack_limit() usize {
+    return asm volatile ("mrs %[limit], msplim"
+        : [limit] "=r" (-> usize),
+    );
+}
+
+/// Protect the calling core's main stack. The MPU guard is placed inside the
+/// supplied free range, consuming alignment padding plus one region. The last
+/// MPU region belongs to this facility until stack_protection is disabled.
+/// Must run privileged, before enabling interrupts or with interrupts masked.
+/// Returns false when no safe guard fits or the hardware is unavailable.
+pub fn protect_main_stack(low: usize, top: usize) bool {
+    if (!microzig.options.cpu.stack_protection) return false;
+    if (has_main_stack_limit) {
+        // Armv8-M ARM DDI0553B.y D1.2.177 (MSPLIM), B3.21 (stack
+        // limit checks). Applies to the current Security state's MSP only.
+        // RP2350: RP2350.svd, PPB.CFSR.UFSR_STKOF describes the
+        // corresponding stack-overflow fault status.
+        // https://documentation-service.arm.com/static/66b9cafa32f35b31ceb30a11
+        const limit = stack_bounds.main_limit(low, top) orelse return false;
+        if (limit >= main_stack_pointer()) return false;
+        asm volatile ("msr msplim, %[limit]"
+            :
+            : [limit] "r" (limit),
+            : .{ .memory = true });
+        return true;
+    } else if (use_stack_mpu) {
+        const mpu = peripherals.mpu;
+        const count = mpu.TYPE.read().DREGION;
+        if (count == 0) return false;
+        // Armv6-M ARM DDI0419C B3.5.4-B3.5.7; Armv7-M ARM
+        // DDI0403E.e B3.5.6-B3.5.9. Both specify probing RBAR to find
+        // the implemented minimum alignment. RP2040 datasheet 2.4.6
+        // specifies a 256-byte minimum; v7-M permits 32-byte regions.
+        asm volatile ("dsb" ::: .{ .memory = true });
+        const saved_region = mpu.RNR.read();
+        defer mpu.RNR.write(saved_region);
+        mpu.RNR.modify(.{ .REGION = count - 1 });
+        const saved_base = mpu.RBAR.read();
+        const saved_attributes = mpu.RASR.read();
+        mpu.RASR.modify(.{ .ENABLE = 0 });
+        mpu.RBAR.write(.{ .REGION = 0, .VALID = 0, .ADDR = 0x7ffffff });
+        const address_mask = @as(u32, mpu.RBAR.read().ADDR) << 5;
+        mpu.RBAR.write(saved_base);
+        mpu.RASR.write(saved_attributes);
+        const minimum_size = stack_bounds.mpu_minimum_size(address_mask) orelse return false;
+        const guard = stack_bounds.mpu_guard(low, top, minimum_size) orelse return false;
+        if (guard.limit >= main_stack_pointer()) return false;
+        mpu.RASR.modify(.{ .ENABLE = 0 });
+        mpu.RBAR.write(.{ .REGION = 0, .VALID = 0, .ADDR = @intCast(guard.base >> 5) });
+        // AP=000 denies both privileged and unprivileged accesses. Leave
+        // HFNMIENA clear so fault handling can use the default memory map.
+        var attributes = std.mem.zeroes(@TypeOf(mpu.RASR.read()));
+        attributes.ENABLE = 1;
+        attributes.SIZE = guard.size_field;
+        attributes.XN = 1;
+        mpu.RASR.write(attributes);
+        mpu.CTRL.write(.{ .ENABLE = 1, .HFNMIENA = 0, .PRIVDEFENA = 1 });
+        asm volatile ("dsb\nisb" ::: .{ .memory = true });
+        return true;
+    }
+    return false;
+}
+
+fn initialize_stack_protection() void {
+    if (!microzig.options.cpu.stack_protection) return;
+    if (!has_main_stack_limit and !use_stack_mpu) return;
+    if (default_stack_bounds()) |bounds| {
+        _ = protect_main_stack(bounds.low, bounds.top);
+    }
+}
+
+/// Called before the allocator hands out the linker heap. Claims are monotonic:
+/// a later heap(reserve) cannot expose an earlier claim to stack growth.
+/// Only updates a guard already installed for the default main stack on this
+/// core. Claim the shared heap on the startup core before launching other cores.
+pub fn claim_heap(heap_start: usize, heap_end: usize) void {
+    if (!microzig.options.cpu.stack_protection) return;
+    if (!has_main_stack_limit and !use_stack_mpu) return;
+    const bounds = default_stack_bounds() orelse return;
+    const claimed = bounds.with_heap(heap_start, heap_end);
+    if (claimed.low == bounds.low) return;
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    if (has_main_stack_limit) {
+        const previous = read_main_stack_limit();
+        if (previous < bounds.low or previous >= bounds.top) return;
+        if (!protect_main_stack(@max(previous, claimed.low), bounds.top))
+            @panic("heap claim leaves insufficient main stack space");
+    } else if (use_stack_mpu) {
+        const mpu = peripherals.mpu;
+        const count = mpu.TYPE.read().DREGION;
+        if (count == 0 or mpu.CTRL.read().ENABLE == 0) return;
+        const saved_region = mpu.RNR.read();
+        mpu.RNR.modify(.{ .REGION = count - 1 });
+        const previous = @as(usize, mpu.RBAR.read().ADDR) << 5;
+        const enabled = mpu.RASR.read().ENABLE;
+        mpu.RNR.write(saved_region);
+        if (enabled == 0 or previous < bounds.low or previous >= bounds.top) return;
+        if (!protect_main_stack(@max(previous, claimed.low), bounds.top))
+            @panic("heap claim leaves insufficient main stack space");
+    }
+}
+
 pub const startup_logic = struct {
     extern fn microzig_main() noreturn;
 
@@ -430,6 +592,7 @@ pub const startup_logic = struct {
 
     pub fn _start() callconv(.c) noreturn {
         microzig.utilities.initialize_system_memories(.auto);
+        initialize_stack_protection();
 
         if (using_ram_vector_table or is_ram_image) {
             switch (cortex_m) {

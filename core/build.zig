@@ -21,4 +21,21 @@ pub fn build(b: *std.Build) !void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    const stack_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cpus/cortex_m/stack_bounds.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(stack_tests).step);
+
+    const mpu_tests = b.addTest(.{
+        .name = "mpu-layout-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cpus/cortex_m/mpu_test.zig"),
+            .target = b.graph.host,
+            .imports = &.{.{ .name = "microzig", .module = unit_tests.root_module }},
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(mpu_tests).step);
 }
