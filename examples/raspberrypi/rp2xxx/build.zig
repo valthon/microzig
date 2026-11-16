@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
         .{ .target = raspberrypi.pico, .name = "pico_freertos-multitask-demo", .file = "src/freertos/multitask_demo.zig" },
 
         .{ .target = raspberrypi.pico2_arm, .name = "pico2_arm_multicore", .file = "src/blinky_core1.zig" },
+        .{ .target = raspberrypi.pico2_riscv, .name = "pico2_riscv_multicore", .file = "src/blinky_core1.zig" },
         .{ .target = raspberrypi.pico2_arm, .name = "pico2_arm_board_blinky", .file = "src/board_blinky.zig" },
         .{ .target = raspberrypi.pico2_arm, .name = "pico2_arm_freertos-hello-task", .file = "src/freertos/hello_task.zig" },
         .{ .target = raspberrypi.pico2_arm, .name = "pico2_arm_freertos-queue-demo", .file = "src/freertos/queue_demo.zig" },
