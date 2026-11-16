@@ -236,8 +236,8 @@ pub const MemoryProtectionUnit = extern struct {
         /// Specifies the size of the MPU region. The minimum permitted value is 7 (b00111).
         SIZE: u5,
         reserved0: u2 = 0,
-        /// Subregion disable bits.
-        SRD: u3,
+        /// Subregion disable bits (Arm DDI0419C B3.5.7, bits 15:8).
+        SRD: u8,
         /// Bufferable bit.
         B: u1,
         /// Cacheable bit.

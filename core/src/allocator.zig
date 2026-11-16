@@ -35,6 +35,9 @@ mutex: microzig.interrupt.Mutex = .{},
 /// In the default configurations, the stack will occupy the end of this
 /// memory area. The `reserve` parameter is used to reduce the size of the
 /// returned slice to reserve some memory for the stack's exclusive use.
+/// On Cortex-M this also raises an installed stack limit/guard before returning
+/// the memory. MPU guard alignment and size consume part of `reserve`. Claim
+/// the heap on the startup core before launching other cores.
 ///
 /// Parameters:
 /// - `reserve`: The number of bytes to omit at the end of the heap.
@@ -42,6 +45,9 @@ mutex: microzig.interrupt.Mutex = .{},
 pub fn heap(reserve: usize) []u8 {
     const heapPtr: [*]u8 = @ptrCast(&microzig_heap_start);
     const heap_len: usize = @intFromPtr(&microzig_heap_end) - @intFromPtr(&microzig_heap_start) - reserve;
+    if (@hasDecl(microzig.cpu, "claim_heap")) {
+        microzig.cpu.claim_heap(@intFromPtr(heapPtr), @intFromPtr(heapPtr) + heap_len);
+    }
     return heapPtr[0..heap_len];
 }
 

@@ -257,6 +257,18 @@ pub fn main(init: std.process.Init) !void {
             ram_region_name,
         });
 
+        // Only generated layouts can describe unused RAM safely. Custom scripts
+        // can supply these same symbols when they know their section placement.
+        var ram_index: usize = 0;
+        for (region_names, parsed_args.memory_regions) |name, region| {
+            if (region.tag != .ram) continue;
+            try writer.interface.print(
+                "  microzig_stack_free_start_{d} = {s};\n  microzig_stack_free_end_{d} = ORIGIN({s}) + LENGTH({s});\n",
+                .{ ram_index, if (ram_index == 0) "microzig_heap_start" else try std.fmt.allocPrint(allocator, "ORIGIN({s})", .{name}), ram_index, name, name },
+            );
+            ram_index += 1;
+        }
+
         if (!parsed_args.ram_image) {
             try writer.interface.print(
                 \\
