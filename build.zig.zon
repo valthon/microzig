@@ -55,6 +55,13 @@
         "drivers",
         "modules",
         "port",
-        "tools",
+        // Include firmware build tools, not release-test fixtures whose symlinks
+        // require extra privileges when fetching the package on Windows.
+        "tools/dfu",
+        "tools/esp-image",
+        "tools/flags",
+        "tools/generate_linker_script.zig",
+        "tools/regz",
+        "tools/uf2",
     },
 }
