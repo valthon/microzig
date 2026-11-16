@@ -65,13 +65,7 @@ pub fn SliceVector(comptime Slice: type) type {
         const Vector = @This();
 
         pub const Item = type_info.pointer.child;
-        pub const ItemPtr = @Pointer(.one, .{
-            .@"align" = type_info.pointer.attrs.@"align" orelse @alignOf(type_info.pointer.child),
-            .@"addrspace" = type_info.pointer.attrs.@"addrspace",
-            .@"const" = type_info.pointer.attrs.@"const",
-            .@"volatile" = type_info.pointer.attrs.@"volatile",
-            .@"allowzero" = type_info.pointer.attrs.@"allowzero",
-        }, type_info.pointer.child, null);
+        pub const ItemPtr = @Pointer(.one, type_info.pointer.attrs, type_info.pointer.child, null);
 
         /// The slice of slices. The first and the last slice of this slice must
         /// be non-empty or the slice-of-slices must be empty.
@@ -744,16 +738,16 @@ pub fn dump_trace_line(index: usize, address: usize) void {
 }
 
 pub const StackIterator = struct {
-    const native_arch = builtin.cpu.arch;
+    const native_arch = builtin.target.cpu.arch;
 
     // Last known value of the frame pointer register.
     fp: usize,
     first_address: ?usize,
 
     pub fn init(first_address: ?usize, fp: ?usize) StackIterator {
-        if (native_arch.isSPARC()) {
+        if (native_arch.isSparc()) {
             // Flush all the register windows on stack.
-            asm volatile (if (builtin.cpu.has(.sparc, .v9))
+            asm volatile (if (builtin.target.cpu.has(.sparc, .v9))
                     "flushw"
                 else
                     "ta 3" // ST_FLUSH_WINDOWS
@@ -772,18 +766,18 @@ pub const StackIterator = struct {
     }
 
     // Offset of the saved BP wrt the frame pointer.
-    const fp_offset = if (native_arch.isRISCV())
+    const fp_offset = if (native_arch.isRiscv())
         // On RISC-V the frame pointer points to the top of the saved register
         // area, on pretty much every other architecture it points to the stack
         // slot where the previous frame pointer is saved.
         2 * @sizeOf(usize)
-    else if (native_arch.isSPARC())
+    else if (native_arch.isSparc())
         // On SPARC the previous frame pointer is stored at 14 slots past %fp+BIAS.
         14 * @sizeOf(usize)
     else
         0;
 
-    const fp_bias = if (native_arch.isSPARC())
+    const fp_bias = if (native_arch.isSparc())
         // On SPARC frame pointers are biased by a constant.
         2047
     else
@@ -811,7 +805,7 @@ pub const StackIterator = struct {
     pub fn next_internal(it: *StackIterator) ?usize {
         if (builtin.omit_frame_pointer) return null;
 
-        const fp = if (comptime native_arch.isSPARC())
+        const fp = if (comptime native_arch.isSparc())
             // On SPARC the offset is positive. (!)
             std.math.add(usize, it.fp, fp_offset) catch return null
         else

@@ -94,8 +94,8 @@ pub fn build(b: *std.Build) void {
             const bin_filename = b.fmt("{s}.bin", .{example.name});
             const objcopy_run = b.addSystemCommand(&.{objcopy_path});
             objcopy_run.addArgs(&.{ "-O", "binary" });
-            objcopy_run.addArtifactArg(fw.exe);
-            const bin_output = objcopy_run.addOutputFileArg(bin_filename);
+            objcopy_run.addArtifactArg2(fw.exe, .{});
+            const bin_output = objcopy_run.addOutputFileArg2(bin_filename, .{});
             b.getInstallStep().dependOn(&b.addInstallFileWithDir(
                 bin_output,
                 .{ .custom = "firmware" },

@@ -149,7 +149,7 @@ fn write_device_file(
 
     try ast.render(arena, &rendered_buffer.writer, fixups);
 
-    const filename = try std.fmt.allocPrint(arena, "{s}.zig", .{device.name});
+    const filename = try arena.print("{s}.zig", .{device.name});
     try dir.writeFile(io, .{
         .sub_path = filename,
         .data = rendered_buffer.written(),
@@ -193,7 +193,7 @@ fn write_peripherals_files(io: std.Io, db: *Database, arena: Allocator, dir: std
             continue;
         };
 
-        const path = try std.fmt.allocPrint(arena, "{s}.zig", .{
+        const path = try arena.print("{s}.zig", .{
             peripheral.name,
         });
 
@@ -546,7 +546,7 @@ fn write_device_peripheral(
 
     var array_prefix_buf: [80]u8 = undefined;
     const array_prefix = if (instance.count) |count|
-        try std.fmt.bufPrint(&array_prefix_buf, "[{}]", .{count})
+        try std.mem.print(&array_prefix_buf, "[{}]", .{count})
     else
         "";
 
@@ -715,7 +715,7 @@ fn write_default_enum_value(db: *Database, arena: Allocator, e: *const Enum, def
         }
     }
 
-    try writer.print("@enumFromInt(0x{X})", .{default});
+    try writer.print("@fromBackingInt(0x{X})", .{default});
 }
 
 fn write_enum_fields(db: *Database, arena: Allocator, e: *const Enum, out_writer: *std.Io.Writer) !void {
@@ -891,7 +891,8 @@ const StructFieldIterator = struct {
             return switch (entry.*) {
                 .reserved => |reserved| reserved.size_bytes,
                 .register => |register| register.get_size_bytes(),
-                .nested_struct_field => |nsf| nsf.size_bytes.?,
+                // `size_bytes` is the size of one element: an array takes `count` of them.
+                .nested_struct_field => |nsf| nsf.size_bytes.? * (nsf.count orelse 1),
             };
         }
     };
@@ -1066,13 +1067,13 @@ fn write_nested_struct_field(db: *Database, arena: Allocator, nsf: *const Nested
 
     var offset_buf: [80]u8 = undefined;
     const offset_str: []const u8 =
-        try std.fmt.bufPrint(&offset_buf, "offset: 0x{x:0>2}", .{nsf.offset_bytes});
+        try std.mem.print(&offset_buf, "offset: 0x{x:0>2}", .{nsf.offset_bytes});
     try write_doc_comment(arena, offset_str, writer);
 
     try writer.print("{f}: ", .{std.zig.fmtId(nsf.name)});
     var array_prefix_buf: [80]u8 = undefined;
     const array_prefix: []const u8 = if (nsf.count) |count|
-        try std.fmt.bufPrint(&array_prefix_buf, "[{}]", .{count})
+        try std.mem.print(&array_prefix_buf, "[{}]", .{count})
     else
         "";
     try writer.print("{s}", .{array_prefix});
@@ -1144,12 +1145,12 @@ fn write_register(
     // Add offset comment
     var offset_buf: [80]u8 = undefined;
     const offset_str: []const u8 =
-        try std.fmt.bufPrint(&offset_buf, "offset: 0x{x:0>2}", .{register.offset_bytes});
+        try std.mem.print(&offset_buf, "offset: 0x{x:0>2}", .{register.offset_bytes});
     try write_doc_comment(arena, offset_str, writer);
 
     var array_prefix_buf: [80]u8 = undefined;
     const array_prefix: []const u8 = if (register.count) |count|
-        try std.fmt.bufPrint(&array_prefix_buf, "[{}]", .{count})
+        try std.mem.print(&array_prefix_buf, "[{}]", .{count})
     else
         "";
 
@@ -1241,8 +1242,8 @@ fn write_fields(
                 subfield.count = undefined;
                 subfield.stride = undefined;
                 subfield.offset_bits = field.offset_bits + @as(u8, @intCast(stride * i));
-                subfield.name = try std.fmt.allocPrint(arena, "{s}[{d}]", .{ field.name, i });
-                subfield.description = try std.fmt.allocPrint(arena, "({d}/{d} of {s}) {s}", .{ i + 1, count, field.name, field.description orelse "" });
+                subfield.name = try arena.print("{s}[{d}]", .{ field.name, i });
+                subfield.description = try arena.print("({d}/{d} of {s}) {s}", .{ i + 1, count, field.name, field.description orelse "" });
                 try expanded_fields.append(arena, subfield);
             }
         } else try expanded_fields.append(arena, field);
@@ -1271,13 +1272,13 @@ fn write_fields(
             // If the offset of this field is the exact same as for another shorter field,
             // then (because of the `field_comes_before()` sort order) we will already have seen the shorter field,
             // and here we are skipping the longer field.
-            const message = try std.fmt.allocPrint(arena, "skipped overlapping field {s} at offset {d} bits", .{ field.name, field.offset_bits });
+            const message = try arena.print("skipped overlapping field {s} at offset {d} bits", .{ field.name, field.offset_bits });
             log.debug("{s}", .{message});
             try write_regular_comment(arena, message, writer);
             continue;
         }
         if (offset + field.size_bits > register_size_bits) {
-            const message = try std.fmt.allocPrint(arena, "skipped too long field {s} at offset {d} bits, length {d} bits", .{ field.name, field.offset_bits, field.size_bits });
+            const message = try arena.print("skipped too long field {s} at offset {d} bits, length {d} bits", .{ field.name, field.offset_bits, field.size_bits });
             log.warn("{s}", .{message});
             try write_regular_comment(arena, message, writer);
             continue;
@@ -2470,7 +2471,7 @@ test "gen.field with named enum and unnamed default" {
             \\
             \\    /// offset: 0x00
             \\    TEST_REGISTER: mmio.Mmio(packed struct(u8) {
-            \\        TEST_FIELD: TEST_ENUM = @fromBackingInt(@intCast(0xA)),
+            \\        TEST_FIELD: TEST_ENUM = @fromBackingInt(0xA),
             \\        padding: u4 = 0,
             \\    }),
             \\};
@@ -4373,6 +4374,94 @@ test "gen.nested struct field next to register" {
             \\        TEST_FIELD: u1,
             \\        padding: u31 = 0,
             \\    }),
+            \\};
+            \\
+            ,
+        },
+    }, &vio);
+}
+
+// An array of nested structs takes `count` elements of `size_bytes` each (an SVD cluster with
+// `dim` and `dimIncrement`), so the gap before what follows it is measured from the end of the
+// last element. The nRF52840's USBD has this shape: EPIN[8] at 0x600 with an increment of 0x14,
+// then ISOIN at 0x6A0.
+test "gen.nested struct field with count next to register" {
+    var db = try Database.create(std.testing.allocator);
+    defer db.destroy();
+
+    const peripheral_id = try db.create_peripheral(.{
+        .name = "TEST_PERIPHERAL",
+        .description = "test peripheral",
+    });
+
+    const struct_id = try db.get_peripheral_struct(peripheral_id);
+    const nested_struct_id = try db.create_struct(.{});
+
+    _ = try db.create_register(nested_struct_id, .{
+        .name = "TEST_REGISTER",
+        .description = "test register",
+        .size_bits = 32,
+        .offset_bytes = 0,
+    });
+
+    try db.add_nested_struct_field(struct_id, .{
+        .name = "TEST_NESTED",
+        .description = "test nested struct",
+        .offset_bytes = 0,
+        .struct_id = nested_struct_id,
+        .count = 3,
+        .size_bytes = 8,
+    });
+
+    _ = try db.create_register(struct_id, .{
+        .name = "TEST_REGISTER",
+        .description = "test register",
+        .size_bits = 32,
+        .offset_bytes = 0x20,
+    });
+
+    var vio: VirtualIo = try .init(std.testing.allocator);
+    defer vio.deinit();
+
+    try db.to_zig(vio.io(), VirtualIo.root_dir, .{});
+    try expect_output(&.{
+        .{
+            .path = "types.zig",
+            .content =
+            \\pub const peripherals = @import("types/peripherals.zig");
+            \\
+            ,
+        },
+        .{
+            .path = "types/peripherals.zig",
+            .content =
+            \\pub const TEST_PERIPHERAL = @import("peripherals/TEST_PERIPHERAL.zig").TEST_PERIPHERAL;
+            \\
+            ,
+        },
+        .{
+            .path = "types/peripherals/TEST_PERIPHERAL.zig",
+            .content =
+            \\const microzig = @import("microzig");
+            \\const mmio = microzig.mmio;
+            \\
+            \\const types = @import("../../types.zig");
+            \\
+            \\/// test peripheral
+            \\pub const TEST_PERIPHERAL = extern struct {
+            \\    /// test nested struct
+            \\    /// offset: 0x00
+            \\    TEST_NESTED: [3]extern struct {
+            \\        /// test register
+            \\        /// offset: 0x00
+            \\        TEST_REGISTER: u32,
+            \\        padding: [4]u8,
+            \\    },
+            \\    /// offset: 0x18
+            \\    reserved24: [8]u8,
+            \\    /// test register
+            \\    /// offset: 0x20
+            \\    TEST_REGISTER: u32,
             \\};
             \\
             ,

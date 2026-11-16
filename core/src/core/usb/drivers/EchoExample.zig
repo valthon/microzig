@@ -31,8 +31,8 @@ pub const Descriptor = extern struct {
                     .interface_triple = .vendor_specific,
                     .interface_s = alloc.string(itf_string),
                 },
-                .ep_out = .bulk(alloc.next_ep(.Out), max_supported_packet_size),
-                .ep_in = .bulk(alloc.next_ep(.In), max_supported_packet_size),
+                .ep_out = .bulk(alloc.next_ep(.out), max_supported_packet_size),
+                .ep_in = .bulk(alloc.next_ep(.in), max_supported_packet_size),
             },
             // Buffers whose length is only known after creating the
             // descriptor can be allocated at this stage.

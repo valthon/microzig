@@ -36,9 +36,20 @@ pub const Allocator = @import("allocator.zig");
 
 pub const AssertOptions = struct {};
 
+/// Whether this module is built with safety checks. A constant rather than a call in `assert`,
+/// so that the condition there is decided at comptime before `config` is looked at.
+const runtime_safety = builtin.optimize.runtimeSafety();
+
+/// Panics if `expr` is false, in the builds that check: Debug and ReleaseSafe always, and
+/// ReleaseSmall and ReleaseFast when the firmware sets the `asserts` option of MicroBuild's
+/// `add_firmware`. In the other builds it does nothing.
+///
+/// Unlike `std.debug.assert`, a build that does not check does not assume `expr` either: a
+/// false `expr` there is ignored, it is not undefined behaviour. `expr` is an argument, so it
+/// is evaluated in every build.
 pub fn assert(expr: bool, opts: AssertOptions) void {
     _ = opts;
-    if (!config.asserts)
+    if (!(runtime_safety or config.asserts))
         return;
 
     if (!expr) {
@@ -187,7 +198,7 @@ fn microzig_main() callconv(.c) noreturn {
                 };
 
                 var buf: [msg_base.len + max_error_size]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "{s}{s}", .{ msg_base, @errorName(err) }) catch @panic(msg_base);
+                const msg = std.mem.print(&buf, "{s}{s}", .{ msg_base, @errorName(err) }) catch @panic(msg_base);
                 @panic(msg);
             } else {
                 @panic(msg_base);
@@ -201,6 +212,8 @@ fn microzig_main() callconv(.c) noreturn {
 }
 
 test {
+    // Not through `core`: its tests include the heap's, which need the `umm` module.
+    _ = @import("core/usb.zig");
     _ = utilities;
     _ = Allocator;
 }

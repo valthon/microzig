@@ -34,7 +34,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
     const b = dep.builder;
 
     const riscv32_common_dep = b.dependency("microzig/modules/riscv32-common", .{});
-    const pico_sdk = b.lazyDependency("pico-sdk", .{}) orelse return null;
+    const pico_sdk = b.dependencyLazy("pico-sdk", .{}) catch return null;
     const bounded_array_dep = b.dependency("bounded-array", .{});
 
     const hal: microzig.HardwareAbstractionLayer = .{
@@ -360,7 +360,7 @@ fn get_bootrom(b: *std.Build, target: *const microzig.Target, rom: BootROM) std.
     const rom_exe = b.addExecutable(.{
         .name = b.fmt("stage2-{t}", .{rom}),
         .root_module = b.createModule(.{
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .target = b.resolveTargetQuery(zig_target),
         }),
     });

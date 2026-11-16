@@ -22,6 +22,7 @@ pub fn init() void {
 }
 
 test "hal tests" {
+    _ = @import("usb_tests.zig");
     _ = clocks;
     _ = gpio;
     _ = i2c;
