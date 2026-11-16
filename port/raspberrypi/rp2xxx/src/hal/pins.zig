@@ -763,6 +763,9 @@ pub const GlobalConfiguration = struct {
             @compileError(comptimePrint("{} {}", .{ pin_field_count, config_field_count }));
     }
 
+    /// A handle for every configured pin: PWM uses pwm.Pwm, ADC uses adc.Input,
+    /// and all other functions use gpio.Pin. Driving a pin through gpio.Pin.put
+    /// requires the SIO function; obtaining a handle does not change its function.
     pub fn PinsType(self: GlobalConfiguration) type {
         const Attributes = std.lang.Type.Struct.FieldAttributes;
 
@@ -772,14 +775,12 @@ pub const GlobalConfiguration = struct {
         for (@typeInfo(GlobalConfiguration).@"struct".field_names) |field_name| {
             if (@field(self, field_name)) |pin_config| {
                 const name: []const u8 = pin_config.name orelse field_name;
-                const typ: type = if (pin_config.function == .SIO or pin_config.function.is_pio())
-                    gpio.Pin
-                else if (pin_config.function.is_pwm())
+                const typ: type = if (pin_config.function.is_pwm())
                     pwm.Pwm
                 else if (pin_config.function.is_adc())
                     adc.Input
                 else
-                    continue;
+                    gpio.Pin;
 
                 field_names = field_names ++ .{name};
                 field_types = field_types ++ .{typ};
@@ -801,27 +802,25 @@ pub const GlobalConfiguration = struct {
         inline for (@typeInfo(GlobalConfiguration).@"struct".field_names) |field_name| {
             if (@field(self, field_name)) |pin_config| {
                 const cname = pin_config.name orelse field_name;
-                if (@hasField(T, cname)) {
-                    if (comptime pin_config.function == .SIO or pin_config.function.is_pio()) {
-                        @field(ret, cname) = gpio.num(@backingInt(@field(Pin, field_name)));
-                    } else if (comptime pin_config.function.is_pwm()) {
-                        @field(ret, cname) = pwm.Pwm{
-                            .slice_number = pin_config.function.pwm_slice(),
-                            .channel = pin_config.function.pwm_channel(),
-                        };
-                    } else if (comptime pin_config.function.is_adc()) {
-                        @field(ret, cname) = @as(adc.Input, @fromBackingInt(@intCast(switch (pin_config.function) {
-                            .ADC0 => 0,
-                            .ADC1 => 1,
-                            .ADC2 => 2,
-                            .ADC3 => 3,
-                            .ADC4 => 4,
-                            .ADC5 => 5,
-                            .ADC6 => 6,
-                            .ADC7 => 7,
-                            else => unreachable,
-                        })));
-                    }
+                if (comptime pin_config.function.is_pwm()) {
+                    @field(ret, cname) = pwm.Pwm{
+                        .slice_number = pin_config.function.pwm_slice(),
+                        .channel = pin_config.function.pwm_channel(),
+                    };
+                } else if (comptime pin_config.function.is_adc()) {
+                    @field(ret, cname) = @as(adc.Input, @fromBackingInt(@intCast(switch (pin_config.function) {
+                        .ADC0 => 0,
+                        .ADC1 => 1,
+                        .ADC2 => 2,
+                        .ADC3 => 3,
+                        .ADC4 => 4,
+                        .ADC5 => 5,
+                        .ADC6 => 6,
+                        .ADC7 => 7,
+                        else => unreachable,
+                    })));
+                } else {
+                    @field(ret, cname) = gpio.num(@backingInt(@field(Pin, field_name)));
                 }
             }
         }
