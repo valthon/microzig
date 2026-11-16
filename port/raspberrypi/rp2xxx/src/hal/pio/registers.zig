@@ -78,7 +78,12 @@ test "debug clear writes one SM without reading W1C state" {
 
 test "enable writes use hardware SET and CLR aliases" {
     // Aliases share the low 12 address bits (40DS §2.1.2, 50DS §2.1.3).
-    var bank: [4096]u32 align(16384) = @splat(0);
+    // Static, not a local: a 16 KiB-aligned stack frame crashed on Windows.
+    const S = struct {
+        var bank: [4096]u32 align(16384) = @splat(0);
+    };
+    const bank = &S.bank;
+    bank.* = @splat(0);
     const ctrl: *volatile TestCtrl = @ptrCast(&bank[0]);
     const enable: *volatile TestCtrl = @ptrCast(&bank[32]);
     ctrl.raw = 8;
