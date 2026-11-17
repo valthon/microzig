@@ -25,10 +25,25 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: List changed Zig files
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff -z --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" -- '*.zig' > "$RUNNER_TEMP/changed.z"
+          tr '\0' '\n' < "$RUNNER_TEMP/changed.z"
+
+          if [ -s "$RUNNER_TEMP/changed.z" ]; then
+            echo "zig=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Zig
+        if: steps.changed.outputs.zig == 'true'
         uses: mlugg/setup-zig@v2
 
       - name: Build zigimports (pinned)
+        if: steps.changed.outputs.zig == 'true'
         env:
           ZIGIMPORTS_SHA: 2fcea024ff380a2b3a0d18ecc22f1068ef2056be
         run: |
@@ -40,15 +55,8 @@ jobs:
           zig build --release=safe
           ln -s "$PWD"/zig-out/bin/zigimports-* "$RUNNER_TEMP/zigimports-bin"
 
-      - name: List changed Zig files
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          git diff -z --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" -- '*.zig' > "$RUNNER_TEMP/changed.z"
-          tr '\0' '\n' < "$RUNNER_TEMP/changed.z"
-
       - name: Check for unused imports
+        if: steps.changed.outputs.zig == 'true'
         run: |
           if [ ! -s "$RUNNER_TEMP/changed.z" ]; then
             echo "No changed .zig files."
@@ -75,14 +83,30 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: List changed Zig files
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff -z --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" -- '*.zig' > "$RUNNER_TEMP/changed.z"
+          tr '\0' '\n' < "$RUNNER_TEMP/changed.z"
+
+          if [ -s "$RUNNER_TEMP/changed.z" ]; then
+            echo "zig=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Zig
+        if: steps.changed.outputs.zig == 'true'
         uses: mlugg/setup-zig@v2
 
       - name: Build linter
+        if: steps.changed.outputs.zig == 'true'
         working-directory: tools/linter
         run: zig build --release=safe
 
       - name: Run linter on changed Zig files
+        if: steps.changed.outputs.zig == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}

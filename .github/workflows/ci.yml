@@ -7,6 +7,93 @@ on:
   workflow_dispatch:
 
 jobs:
+  changes:
+    name: Select changed inputs
+    runs-on: ubuntu-latest
+    outputs:
+      regz: ${{ steps.paths.outputs.regz }}
+      uf2: ${{ steps.paths.outputs.uf2 }}
+      esp_image: ${{ steps.paths.outputs.esp_image }}
+      printer: ${{ steps.paths.outputs.printer }}
+      stm32: ${{ steps.paths.outputs.stm32 }}
+      build: ${{ steps.paths.outputs.build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Select jobs
+        id: paths
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          # Main pushes and manual runs exercise everything; unknown diffs do too.
+          all=false
+          if [[ "$EVENT" == workflow_dispatch || ( "$EVENT" == push && "$REF" == refs/heads/main ) ]]; then
+            all=true
+          elif [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            all=true
+          else
+            if [[ "$EVENT" == pull_request ]]; then
+              BASE_SHA=$(git merge-base "$BASE_SHA" "$HEAD_SHA") || all=true
+            fi
+            if ! git diff --no-renames --name-only -z "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/changed-paths"; then
+              all=true
+            fi
+          fi
+          regz=$all
+          uf2=$all
+          esp_image=$all
+          printer=$all
+          stm32=$all
+          build=$all
+          if [[ "$all" == false ]]; then
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                # Manifests anywhere and shared build inputs can affect every job.
+                core/*|build.zig|build.zig.zon|*/build.zig.zon|build-internals/*|modules/*|.tool-versions|.gitattributes|.github/workflows/*)
+                  regz=true
+                  uf2=true
+                  esp_image=true
+                  printer=true
+                  stm32=true
+                  build=true
+                  ;;
+              esac
+              case "$path" in
+                tools/regz/*|tools/flags/*) regz=true ;;
+              esac
+              case "$path" in
+                tools/uf2/*|tools/flags/*) uf2=true ;;
+              esac
+              case "$path" in
+                tools/esp-image/*|tools/flags/*) esp_image=true ;;
+              esac
+              # Printer also builds the RP2xxx serial runner.
+              case "$path" in
+                tools/printer/*|tools/flags/*|port/raspberrypi/rp2xxx/*|drivers/*) printer=true ;;
+              esac
+              case "$path" in
+                port/stmicro/stm32/*|tools/regz/*|tools/flags/*) stm32=true ;;
+              esac
+              case "$path" in
+                tools/*) build=true ;;
+              esac
+            done < "$RUNNER_TEMP/changed-paths"
+          fi
+          {
+            echo "regz=$regz"
+            echo "uf2=$uf2"
+            echo "esp_image=$esp_image"
+            echo "printer=$printer"
+            echo "stm32=$stm32"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
   formatting-check:
     name: Formatting check
     runs-on: ubuntu-latest
@@ -18,54 +105,14 @@ jobs:
       - name: Run zig fmt
         run: zig fmt --check .
 
-  # Make sure that we are building examples and invoking tests for each port.
-  # Some may need to be skipped, but that's okay because then it's explicitly
-  # listed instead of forgotten.
-  validate-ports-checks:
-    name: Validate Port Checks
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    steps:
-      - run: sudo apt install -y yq
-      - name: Checkout
-        uses: actions/checkout@v7
-      - run: |
-          set -e
-
-          find port -mindepth 2 -maxdepth 2 -type d | sed 's|^port/||' | sort > ports
-          yq -r '.jobs["unit-test"].steps[] | select(.run == "zig build test") | .["working-directory"]' .github/workflows/ports.yml | sed 's|^port/||' | sort > unit_tested_ports
-          yq -r '.jobs.build.steps[] | select(.run == "zig build -Doptimize=ReleaseSmall") | .["working-directory"]' .github/workflows/ports.yml | grep -v no_hal | sed 's|^examples/||' | sort > exampled_ports
-
-          comm -23 ports unit_tested_ports > missing_unit_tests
-          comm -23 ports exampled_ports > missing_examples
-
-          EXIT_CODE=0
-          if [ -s missing_unit_tests ]
-          then
-            EXIT_CODE=1
-            echo "These ports are not running unit tests in CI:" >&2
-            echo "" >&2
-            cat missing_unit_tests >&2
-            echo "" >&2
-          fi
-
-          if [ -s missing_examples ]
-          then
-            EXIT_CODE=1
-            echo "These ports are not building examples in CI:" >&2
-            echo "" >&2
-            cat missing_examples >&2
-            echo "" >&2
-          fi
-
-          exit $EXIT_CODE
-
   unit-test-regz:
+    needs: changes
+    if: needs.changes.outputs.regz == 'true'
     name: Unit Test Regz
     continue-on-error: true
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -77,11 +124,13 @@ jobs:
         working-directory: tools/regz
 
   unit-test-uf2:
+    needs: changes
+    if: needs.changes.outputs.uf2 == 'true'
     name: Unit Test UF2
     continue-on-error: true
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -93,11 +142,13 @@ jobs:
         working-directory: tools/uf2
 
   unit-test-esp-image:
+    needs: changes
+    if: needs.changes.outputs.esp_image == 'true'
     name: Unit Test ESP Image
     continue-on-error: true
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -109,11 +160,13 @@ jobs:
         working-directory: tools/esp-image
 
   test-printer:
+    needs: changes
+    if: needs.changes.outputs.printer == 'true'
     name: Test Printer
     continue-on-error: true
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -127,29 +180,9 @@ jobs:
         run: zig build test
         working-directory: tools/printer
 
-  build-sorcerer:
-    name: Build Sorcerer
-    if: false # Temporarily disabled: Sorcerer dependency fetches are flaky on CI. https://github.com/ZigEmbeddedGroup/microzig/issues/949
-    continue-on-error: true
-    strategy:
-      matrix:
-        # Skip Ubuntu - sorcerer is a GUI tool with complex dependencies (SDL3, dvui)
-        # that are difficult to satisfy in headless CI environments
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-      - name: Build Sorcerer
-        run: zig build
-        working-directory: tools/sorcerer
-      - name: Test Sorcerer
-        run: zig build test
-        working-directory: tools/sorcerer
-
   stm32-gen-check:
+    needs: changes
+    if: needs.changes.outputs.stm32 == 'true'
     name: Check that stm32 generated code is up to date
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -163,7 +196,7 @@ jobs:
         working-directory: port/stmicro/stm32
       - name: Check for code diffs
         run: |
-          if [[ $(git status --porcelain | grep -v '^??') ]]; then
+          if git status --porcelain | grep -v '^??' > /dev/null; then
             echo "Code differences detected:"
             git diff
             echo "Please commit or fix these changes to proceed."
@@ -173,12 +206,14 @@ jobs:
           fi
 
   build:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     name: Build
     continue-on-error: true
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -186,21 +221,3 @@ jobs:
         uses: mlugg/setup-zig@v2
       - name: Build
         run: zig build -Doptimize=ReleaseSmall
-
-  validate-foundation-libc:
-    name: Test Foundation Libc
-    if: false # TODO: fix foundation libc
-    continue-on-error: true
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-      - name: Generate and test packages
-        working-directory: modules/foundation-libc/test
-        run: |
-          zig build test

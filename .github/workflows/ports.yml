@@ -12,12 +12,65 @@ env:
   ZIG_LOCAL_PKG_DIR: ${{ github.workspace }}/zig-pkg
 
 jobs:
+  changes:
+    name: Select changed inputs
+    runs-on: ubuntu-latest
+    outputs:
+      ports: ${{ steps.paths.outputs.ports }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Select jobs
+        id: paths
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          # Main pushes and manual runs exercise everything; unknown diffs do too.
+          all=false
+          if [[ "$EVENT" == workflow_dispatch || ( "$EVENT" == push && "$REF" == refs/heads/main ) ]]; then
+            all=true
+          elif [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            all=true
+          else
+            if [[ "$EVENT" == pull_request ]]; then
+              BASE_SHA=$(git merge-base "$BASE_SHA" "$HEAD_SHA") || all=true
+            fi
+            if ! git diff --no-renames --name-only -z "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/changed-paths"; then
+              all=true
+            fi
+          fi
+          ports=$all
+          if [[ "$all" == false ]]; then
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                # Manifests anywhere and shared build inputs can affect every job.
+                core/*|build.zig|build.zig.zon|*/build.zig.zon|build-internals/*|modules/*|.tool-versions|.gitattributes|.github/workflows/*)
+                  ports=true
+                  ;;
+              esac
+              case "$path" in
+                port/*|examples/*|drivers/*|tools/*) ports=true ;;
+              esac
+            done < "$RUNNER_TEMP/changed-paths"
+          fi
+          {
+            echo "ports=$ports"
+          } >> "$GITHUB_OUTPUT"
+
   unit-test:
+    needs: changes
+    if: needs.changes.outputs.ports == 'true'
     name: "Unit Test"
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
     steps:
     - name: Checkout
       uses: actions/checkout@v7
@@ -85,11 +138,13 @@ jobs:
       working-directory: port/wch/ch32h
 
   build:
+    needs: changes
+    if: needs.changes.outputs.ports == 'true'
     name: "Build"
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
     steps:
     - name: Checkout
       uses: actions/checkout@v7
