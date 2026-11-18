@@ -445,7 +445,7 @@ const Segment = struct {
             }
 
             const remaining_len = self.size - consume_len;
-            std.mem.copyBackwards(u8, self.data[0..remaining_len], self.data[consume_len..self.size]);
+            @memmove(self.data[0..remaining_len], self.data[consume_len..self.size]);
             if (gpa.resize(self.data, remaining_len)) {
                 self.data.len = remaining_len;
             }
@@ -582,6 +582,43 @@ test "do_segment_merge" {
     try std.testing.expectEqual(segment_list.items[0].addr, 0x42000020);
     try std.testing.expectEqual(segment_list.items[0].size, 0x40);
     try std.testing.expectEqualStrings(segment_list.items[0].data, &(@as([0x20]u8, @splat('a')) ++ @as([0x20]u8, @splat('b'))));
+}
+
+test "Segment.write_to keeps the tail of a segment split into a short first part" {
+    const allocator = std.testing.allocator;
+    var segment: Segment = .{
+        .addr = 0x40380000,
+        .size = 0x20,
+        .data = try allocator.alloc(u8, 0x20),
+    };
+    defer segment.deinit(allocator);
+
+    var expected: [0x20]u8 = undefined;
+    for (&expected, 0..) |*byte, i| byte.* = @intCast(i);
+    @memcpy(segment.data, &expected);
+
+    var segment_data: std.Io.Writer.Allocating = .init(allocator);
+    defer segment_data.deinit();
+    const writer = &segment_data.writer;
+
+    // 0x08 bytes written leave 0x18: the moved tail overlaps where it came from.
+    var checksum: u8 = esp_image.CHECKSUM_XOR_BYTE;
+    try segment.write_to(allocator, writer, 0x08, &checksum);
+
+    try std.testing.expectEqual(0x40380008, segment.addr);
+    try std.testing.expectEqual(0x18, segment.size);
+    try std.testing.expectEqualSlices(u8, expected[0x08..], segment.data[0..segment.size]);
+
+    try segment.write_to(allocator, writer, null, &checksum);
+
+    const out = writer.buffered();
+    try std.testing.expectEqual(0x40380000, std.mem.readInt(u32, out[0..4], .little));
+    try std.testing.expectEqual(0x08, std.mem.readInt(u32, out[4..8], .little));
+    try std.testing.expectEqualSlices(u8, expected[0..0x08], out[8..0x10]);
+    try std.testing.expectEqual(0x40380008, std.mem.readInt(u32, out[0x10..0x14], .little));
+    try std.testing.expectEqual(0x18, std.mem.readInt(u32, out[0x14..0x18], .little));
+    try std.testing.expectEqualSlices(u8, expected[0x08..], out[0x18..0x30]);
+    try std.testing.expectEqual(0x30, out.len);
 }
 
 test "Segment.write_to" {
