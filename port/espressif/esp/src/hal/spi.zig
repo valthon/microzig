@@ -36,8 +36,18 @@ pub const SPI = enum(u2) {
         baud_rate: u32,
         bit_order: BitOrder = .msb_first,
 
+        fn get_clock_source(self: Config) struct { select: u1, frequency: u32 } {
+            // ESP32-C3 TRM v1.4, section 27.11, SPI_CLK_GATE_REG:
+            // MST_CLK_SEL selects PLL_F80M (1) or the undivided XTAL (0).
+            // Only rely on the PLL when the CPU clock config enables it.
+            return switch (self.clock_config.cpu_clk_source) {
+                .pll_clk => .{ .select = 1, .frequency = 80_000_000 },
+                .xtal_clk => .{ .select = 0, .frequency = clocks.xtal_clk_freq },
+            };
+        }
+
         fn validate(self: Config) error{InvalidBaudRate}!void {
-            const source_freq = self.clock_config.apb_clk_freq;
+            const source_freq = self.get_clock_source().frequency;
             const min_divider = 1;
             const max_divider = (std.math.maxInt(u6) + 1) * (std.math.maxInt(u4) + 1);
 
@@ -59,9 +69,9 @@ pub const SPI = enum(u2) {
                 CLK_EQU_SYSCLK: u1,
             };
 
-            const source_freq = self.clock_config.apb_clk_freq;
+            const source_freq = self.get_clock_source().frequency;
 
-            // Use APB directly if target frequency is high enough
+            // Use the selected source directly if target frequency is high enough.
             if (self.baud_rate > ((source_freq / 4) * 3)) {
                 return @bitCast(@as(Reg, .{
                     .CLKCNT_L = 0,
@@ -133,7 +143,7 @@ pub const SPI = enum(u2) {
 
         regs.CLK_GATE.modify(.{
             .MST_CLK_ACTIVE = 1,
-            .MST_CLK_SEL = 1,
+            .MST_CLK_SEL = config.get_clock_source().select,
         });
 
         regs.CTRL.modify(.{
