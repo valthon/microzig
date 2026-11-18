@@ -48,8 +48,12 @@ The main differences between the two chips:
   the rodata first and walks a single region instead of offsetting the two views against each
   other with dummy sections.
 
-## Local changes to the vendored SVDs
+## Register patches
 
-`src/chips/ESP32-C6.svd` is the esp-pacs base SVD with one fix: `DMA.OUT_CONF0_CH%s` (dim 2 at
-offset 0x190) got a `<dimIndex>1,2</dimIndex>`. Without it the array is numbered from zero and
-collides with the explicit `OUT_CONF0_CH0` at offset 0xD0.
+`src/chips/ESP32-C6.svd` is byte-for-byte the upstream
+[esp-pacs base SVD](https://github.com/esp-rs/esp-pacs/blob/main/esp32c6/svd/esp32c6.base.svd),
+SHA256 `b7f76c1779e0154bfb4d94e71344a9abfd71506a20d73cf8a53dd7c60d7b2de0`.
+Its `DMA.OUT_CONF0_CH%s` omits `dimIndex`, so the expanded names CH0/CH1 collide with the
+explicit CH0 at offset 0xD0. `patches/esp32_c6.zon`, wired through `chip.patch_files`, renames
+only the registers at 0x190 and 0x250 to CH1 and CH2 after loading. It leaves addresses, fields,
+and the vendored input unchanged; expected-name checks detect incompatible vendor updates.

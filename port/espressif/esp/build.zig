@@ -166,6 +166,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
             .name = "ESP32-C6",
             .url = "https://www.espressif.com/en/products/socs/esp32-c6",
             .register_definition = .{ .svd = b.path("src/chips/ESP32-C6.svd") },
+            .patch_files = &.{b.path("patches/esp32_c6.zon")},
             .memory_regions = &.{
                 // The instruction and the data view of the flash share one address space on this
                 // chip, both start at 0x42000000.

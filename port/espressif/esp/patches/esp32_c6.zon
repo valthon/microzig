@@ -1,0 +1,17 @@
+// esp-pacs omits dimIndex on DMA.OUT_CONF0_CH%s (dim=2, stride=0xc0).
+// The SVD loader expands it as CH0/CH1, colliding with the real CH0 at 0xd0.
+// C6 TRM v1.2 §4.7–4.8: repair the names at the channel-1/channel-2 offsets.
+.{
+    .{ .rename_register_at_offset = .{
+        .parent = "types.peripherals.DMA",
+        .offset_bytes = 0x250,
+        .expected_name = "OUT_CONF0_CH1",
+        .name = "OUT_CONF0_CH2",
+    } },
+    .{ .rename_register_at_offset = .{
+        .parent = "types.peripherals.DMA",
+        .offset_bytes = 0x190,
+        .expected_name = "OUT_CONF0_CH0",
+        .name = "OUT_CONF0_CH1",
+    } },
+}
