@@ -260,6 +260,14 @@ pub fn set_output_signal(pin: u5, options: struct {
     });
 }
 
+pub fn get_output_routing(pin: u5) u32 {
+    return GPIO.FUNC_OUT_SEL_CFG[pin].raw;
+}
+
+pub fn set_output_routing(pin: u5, raw: u32) void {
+    GPIO.FUNC_OUT_SEL_CFG[pin].write_raw(raw);
+}
+
 pub fn set_output_invert(pin: u5, invert: bool) void {
     GPIO.FUNC_OUT_SEL_CFG[pin].modify(.{ .INV_SEL = @intFromBool(invert) });
 }

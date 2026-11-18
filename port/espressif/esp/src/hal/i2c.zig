@@ -7,8 +7,9 @@ pub const I2C0 = peripherals.I2C0;
 
 const gpio = @import("gpio.zig");
 const time = @import("time.zig");
+const compatibility = @import("compatibility.zig");
 
-// XTAL_CLK is 40 MHz: C3 TRM v1.4 §28.4.1.
+// XTAL_CLK is 40 MHz: C3 TRM v1.4 §28.4.1; C6 TRM v1.2 §29.4.1.
 const SOURCE_CLK_FREQ: u32 = 40_000_000;
 const FILTER_THRESHOLD: u4 = 7;
 
@@ -61,6 +62,21 @@ pub const I2C = struct {
         return self.regs;
     }
 
+    // Both chips have eight 32-bit command registers (C6 TRM v1.2 §29.4.9).
+    // C6 spells the index in every field name; normalize the identical layout.
+    const CommandRegister = microzig.mmio.Mmio(packed struct(u32) {
+        COMMAND: u14 = 0,
+        reserved: u17 = 0,
+        COMMAND_DONE: u1 = 0,
+    });
+
+    fn command_regs(self: I2C) *volatile [8]CommandRegister {
+        return switch (compatibility.chip) {
+            .esp32_c3 => @ptrCast(&self.regs.COMD),
+            .esp32_c6 => @ptrCast(&self.regs.COMD0),
+        };
+    }
+
     /// Connect pins first, then apply. Initialization recovers a connected bus.
     /// HAL initialization and the monotonic system timer must already be running.
     /// A stuck bus is logged; initialization still leaves the controller configured.
@@ -93,7 +109,7 @@ pub const I2C = struct {
             .SCL_FORCE_OUT = 1, // Direct output; the GPIO pad supplies open drain
             .TX_LSB_FIRST = 0, // MSB first for sending
             .RX_LSB_FIRST = 0, // MSB first for receiving
-            .CLK_EN = 1, // Enable clock
+            .CLK_EN = @intFromBool(compatibility.chip == .esp32_c3), // Reserved on C6
         });
 
         // Configure filter
@@ -198,8 +214,8 @@ pub const I2C = struct {
     /// Reset the command list
     fn reset_command_list(self: I2C) void {
         // Reset all command registers
-        for (0..self.get_regs().COMD.len) |i|
-            self.get_regs().COMD[@intCast(i)].write_raw(0);
+        for (0..self.command_regs().len) |i|
+            self.command_regs()[@intCast(i)].write_raw(0);
     }
 
     /// Set the filter threshold in clock cycles
@@ -219,12 +235,34 @@ pub const I2C = struct {
     /// Reads the active APB clock frequency from the clock registers, so custom clock configs
     /// are honoured as well.
     fn apb_clk_freq() u32 {
-        // C3 TRM v1.4 Table 6.2-2: APB follows divided XTAL or is 80 MHz with PLL.
-        const system = peripherals.SYSTEM.SYSCLK_CONF.read();
-        return if (system.SOC_CLK_SEL == 0)
-            SOURCE_CLK_FREQ / (@as(u32, system.PRE_DIV_CNT) + 1)
-        else
-            80_000_000;
+        switch (compatibility.chip) {
+            // C3 TRM v1.4 Table 6.2-2: APB follows divided XTAL or is 80 MHz with PLL.
+            .esp32_c3 => {
+                const system = peripherals.SYSTEM.SYSCLK_CONF.read();
+                return if (system.SOC_CLK_SEL == 0)
+                    SOURCE_CLK_FREQ / (@as(u32, system.PRE_DIV_CNT) + 1)
+                else
+                    80_000_000;
+            },
+            // C6 TRM v1.2 §8.2.4.1, Tables 8.2-1 and 8.2-2: HP_ROOT_CLK is XTAL (40 MHz),
+            // PLL (divided to 160 MHz by hardware) or RC_FAST (17.5 MHz); AHB divides it by
+            // AHB_HS_DIV_NUM + 1 on the PLL and by AHB_LS_DIV_NUM + 1 otherwise, and APB divides
+            // AHB by APB_DIV_NUM + 1. While the automatic reduction of Register 8.64 is enabled
+            // APB may drop to the APB_DECREASE_DIV_NUM divider, so the slower of the two is used.
+            .esp32_c6 => {
+                const PCR = peripherals.PCR;
+                const ahb = PCR.AHB_FREQ_CONF.read();
+                const apb = PCR.APB_FREQ_CONF.read();
+                const root_clk: u32, const ahb_div: u32 = switch (PCR.SYSCLK_CONF.read().SOC_CLK_SEL) {
+                    0 => .{ SOURCE_CLK_FREQ, ahb.AHB_LS_DIV_NUM },
+                    1 => .{ 160_000_000, ahb.AHB_HS_DIV_NUM },
+                    // 3 is reserved; take the slowest source.
+                    else => .{ 17_500_000, ahb.AHB_LS_DIV_NUM },
+                };
+                const apb_div: u32 = @max(apb.APB_DIV_NUM, apb.APB_DECREASE_DIV_NUM);
+                return root_clk / (ahb_div + 1) / (apb_div + 1);
+            },
+        }
     }
 
     /// Sets the frequency of the I2C interface
@@ -235,10 +273,20 @@ pub const I2C = struct {
     fn set_timing(self: I2C, timing: logic.Timing) void {
 
         // Set clock divider
-        self.get_regs().CLK_CONF.modify(.{
-            .SCLK_SEL = 0,
-            .SCLK_DIV_NUM = timing.divider,
-        });
+        switch (compatibility.chip) {
+            .esp32_c3 => self.get_regs().CLK_CONF.modify(.{
+                .SCLK_SEL = 0,
+                .SCLK_DIV_NUM = timing.divider,
+            }),
+            // C6 TRM v1.2 §29.4.1 moves the functional clock to PCR.
+            .esp32_c6 => peripherals.PCR.I2C_SCLK_CONF.modify(.{
+                .I2C_SCLK_SEL = 0,
+                .I2C_SCLK_DIV_NUM = timing.divider,
+                .I2C_SCLK_DIV_A = 0,
+                .I2C_SCLK_DIV_B = 0,
+                .I2C_SCLK_EN = 1,
+            }),
+        }
 
         // Set SCL period
         self.get_regs().SCL_LOW_PERIOD.modify(.{ .SCL_LOW_PERIOD = timing.low });
@@ -274,10 +322,8 @@ pub const I2C = struct {
         const original_timing = try timing_for_frequency(SOURCE_CLK_FREQ, self.frequency);
         const recovery_timing = try timing_for_frequency(SOURCE_CLK_FREQ, 100_000);
         const regs = self.get_regs();
-        const sda_output = &peripherals.GPIO.FUNC_OUT_SEL_CFG[@backingInt(sda)];
-        const scl_output = &peripherals.GPIO.FUNC_OUT_SEL_CFG[@backingInt(scl)];
-        const saved_sda_output = sda_output.read();
-        const saved_scl_output = scl_output.read();
+        const saved_sda_output = sda.get_output_routing();
+        const saved_scl_output = scl.get_output_routing();
         self.reset();
         self.set_timing(recovery_timing);
         defer {
@@ -290,15 +336,16 @@ pub const I2C = struct {
             self.set_timing(original_timing);
             self.clear_interrupts();
             self.update_config();
-            scl_output.write(saved_scl_output);
-            sda_output.write(saved_sda_output);
+            scl.restore_output_routing(saved_scl_output);
+            sda.restore_output_routing(saved_sda_output);
         }
         // Keep SDA released during hardware clocks, independently of FSM state.
-        // GPIO matrix routing and open-drain latches: TRM v1.4 5.5.2/5.5.3.
+        // GPIO matrix routing and open-drain latches: C3 TRM v1.4 5.5.2/5.5.3;
+        // C6 TRM v1.2 7.5.2/7.5.3.
         sda.put(1);
         scl.put(1);
         sda.connect_peripheral_to_output(.{ .signal = .gpio });
-        // C3 TRM v1.4 28.4.4: hardware clocks the slave while
+        // C3 TRM v1.4 28.4.4, C6 TRM v1.2 29.4.4: hardware clocks the slave while
         // the master is idle.
         // UM10204 Rev. 7.0 3.1.16 specifies nine clocks to release stuck SDA.
         regs.SCL_SP_CONF.write(.{
@@ -413,10 +460,10 @@ pub const I2C = struct {
     }
 
     inline fn add_cmd(self: I2C, cmd_start_idx: *usize, cmd: Command) !void {
-        if (cmd_start_idx.* + 1 > self.get_regs().COMD.len)
+        if (cmd_start_idx.* + 1 > self.command_regs().len)
             return Error.CommandNumberExceeded;
 
-        self.get_regs().COMD[cmd_start_idx.*].write(.{
+        self.command_regs()[cmd_start_idx.*].write(.{
             .COMMAND = cmd.to_value(),
             .COMMAND_DONE = 0,
         });
@@ -508,8 +555,8 @@ pub const I2C = struct {
         }
 
         // Verify all commands were executed
-        for (0..self.get_regs().COMD.len) |i| {
-            const cmd = self.get_regs().COMD[i].read();
+        for (0..self.command_regs().len) |i| {
+            const cmd = self.command_regs()[i].read();
             if (cmd.COMMAND != 0 and cmd.COMMAND_DONE == 0) {
                 return Error.ExecutionIncomplete;
             }

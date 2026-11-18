@@ -11,10 +11,10 @@ SVD is copied from https://github.com/esp-rs/esp-pacs
 | ESP32-C3 | `esp32_c3`, `esp32_c3_direct_boot`, `esp32_c3_flashless`    |
 | ESP32-C6 | `esp32_c6`, `esp32_c6_direct_boot`, `esp32_c6_flashless`    |
 
-The esp32c6 port covers the chip bring up (clocks, cache, watchdogs, interrupt controller), gpio,
-the system timer and the usb serial/jtag logger. `hal.i2c`, `hal.spi`, `hal.ledc`, `hal.rtos` and
-`hal.radio` have not been ported to it yet and still speak to esp32c3 registers, so they only
-compile when their chip supports them.
+Both chips share clocks, cache, watchdog disable, interrupts, GPIO/IO MUX, systimer/time,
+efuse/MAC reads and RNG. On the C6, peripheral interrupts are routed by the interrupt matrix
+(INTERRUPT_CORE0) to the CPU-local machine-mode PLIC (`PLIC_MX`), which holds their enable, type,
+priority and threshold; INTPRI is used only for the four CPU software interrupts.
 
 C6 boot modes (ESP32-C6 TRM v1.2 §9.2):
 

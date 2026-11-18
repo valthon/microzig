@@ -5,6 +5,7 @@ const SliceVector = microzig.utilities.SliceVector;
 const clocks = @import("clocks.zig");
 const gpio = @import("gpio.zig");
 const system = @import("system.zig");
+const compatibility = @import("compatibility.zig");
 
 const SPI_Regs = microzig.chip.types.peripherals.SPI2;
 
@@ -132,38 +133,41 @@ pub const SPI = enum(u2) {
             .spi2 = true,
         });
 
-        const regs = self.get_regs();
-
-        regs.CLK_GATE.modify(.{
+        self.modify_register("CLK_GATE", .{
             .CLK_EN = 1,
         });
 
         // this also enables using all 16 words
-        regs.USER.write_raw(0);
+        self.register("USER").write_raw(0);
 
-        regs.CLK_GATE.modify(.{
-            .MST_CLK_ACTIVE = 1,
-            .MST_CLK_SEL = config.get_clock_source().select,
-        });
+        switch (compatibility.chip) {
+            .esp32_c3 => self.modify_register("CLK_GATE", .{
+                .MST_CLK_ACTIVE = 1,
+                .MST_CLK_SEL = config.get_clock_source().select,
+            }),
+            // C6 TRM v1.2 §8.4 PCR_SPI2_CLKM_CONF_REG, §28.5.1.
+            .esp32_c6 => microzig.chip.peripherals.PCR.SPI2_CLKM_CONF.modify(.{
+                .SPI2_CLKM_SEL = config.get_clock_source().select,
+                .SPI2_CLKM_EN = 1,
+            }),
+        }
 
-        regs.CTRL.modify(.{
+        self.modify_register("CTRL", .{
             .Q_POL = 0,
             .D_POL = 0,
             .WP_POL = 0,
         });
 
         // this also disables all cs lines
-        regs.MISC.write_raw(0);
+        self.register("MISC").write_raw(0);
 
-        regs.SLAVE.write_raw(0);
+        self.register("SLAVE").write_raw(0);
 
-        regs.CLOCK.write_raw(config.get_clock_config());
+        self.register("CLOCK").write_raw(config.get_clock_config());
 
-        regs.DMA_INT_CLR.modify(.{
-            .TRANS_DONE_INT_CLR = 1,
-        });
+        self.clear_transfer_done();
 
-        regs.DMA_INT_ENA.modify(.{
+        self.modify_register("DMA_INT_ENA", .{
             .TRANS_DONE_INT_ENA = 1,
         });
 
@@ -359,22 +363,46 @@ pub const SPI = enum(u2) {
         self.transceivev_blocking(&.{write_buffer}, &.{read_buffer});
     }
 
+    // W1C: write only the requested flag, never read-modify-write.
+    fn clear_transfer_done(self: SPI) void {
+        var value = std.mem.zeroes(@TypeOf(self.register("DMA_INT_CLR").read()));
+        @field(value, register_name("TRANS_DONE_INT_CLR")) = 1;
+        self.register("DMA_INT_CLR").write(value);
+    }
+
+    // C6's SVD keeps the SPI_ prefix; select generated names without copying
+    // register definitions or duplicating the transfer implementation.
+    fn register_name(comptime name: []const u8) []const u8 {
+        return if (compatibility.chip == .esp32_c6) "SPI_" ++ name else name;
+    }
+
+    fn register(self: SPI, comptime name: []const u8) *volatile @FieldType(SPI_Regs, register_name(name)) {
+        return &@field(self.get_regs(), register_name(name));
+    }
+
+    fn modify_register(self: SPI, comptime name: []const u8, fields: anytype) void {
+        const reg = self.register(name);
+        var value = reg.read();
+        inline for (@typeInfo(@TypeOf(fields)).@"struct".field_names) |field| {
+            @field(value, register_name(field)) = @field(fields, field);
+        }
+        reg.write(value);
+    }
+
     inline fn get_regs(self: SPI) *volatile SPI_Regs {
         std.debug.assert(@backingInt(self) == 2);
         return microzig.chip.peripherals.SPI2;
     }
 
     fn set_bit_order(self: SPI, bit_order: BitOrder) void {
-        const regs = self.get_regs();
-        regs.CTRL.modify(.{
+        self.modify_register("CTRL", .{
             .RD_BIT_ORDER = @backingInt(bit_order),
             .WR_BIT_ORDER = @backingInt(bit_order),
         });
     }
 
     fn fill_fifo(self: SPI, iter: *SliceVector([]const u8).Iterator, len: usize) void {
-        const regs = self.get_regs();
-        const fifo: *volatile [16]u32 = @ptrCast(&regs.W0);
+        const fifo: *volatile [16]u32 = @ptrCast(self.register("W0"));
 
         var i: usize = 0;
         var word: u32 = 0;
@@ -397,8 +425,7 @@ pub const SPI = enum(u2) {
     }
 
     fn read_fifo(self: SPI, iter: *SliceVector([]u8).Iterator, len: usize) void {
-        const regs = self.get_regs();
-        const fifo: *volatile [16]u32 = @ptrCast(&regs.W0);
+        const fifo: *volatile [16]u32 = @ptrCast(self.register("W0"));
 
         var i: usize = 0;
         while (i < len) : (i += 1) {
@@ -416,9 +443,7 @@ pub const SPI = enum(u2) {
         data_bitlen: u18,
         bit_mode: BitMode,
     ) void {
-        const regs = self.get_regs();
-
-        regs.USER.modify(.{
+        self.modify_register("USER", .{
             .DOUTDIN = @intFromBool(write and read),
             .SIO = @intFromBool(bit_mode == .single_one_wire),
 
@@ -432,7 +457,7 @@ pub const SPI = enum(u2) {
             .FWRITE_QUAD = @intFromBool(bit_mode == .quad),
         });
 
-        regs.CTRL.modify(.{
+        self.modify_register("CTRL", .{
             .FCMD_DUAL = @intFromBool(bit_mode == .dual),
             .FCMD_QUAD = @intFromBool(bit_mode == .quad),
             .FADDR_DUAL = @intFromBool(bit_mode == .dual),
@@ -441,33 +466,28 @@ pub const SPI = enum(u2) {
             .FREAD_QUAD = @intFromBool(bit_mode == .quad),
         });
 
-        regs.MS_DLEN.write(.{
-            .MS_DATA_BITLEN = @intCast(data_bitlen - 1),
-        });
+        self.register("MS_DLEN").write_raw(@intCast(data_bitlen - 1));
 
-        regs.DMA_INT_CLR.modify(.{
-            .TRANS_DONE_INT_CLR = 1,
-        });
+        self.clear_transfer_done();
 
-        regs.DMA_CONF.modify(.{
+        self.modify_register("DMA_CONF", .{
             .RX_AFIFO_RST = 1,
             .BUF_AFIFO_RST = 1,
             .DMA_AFIFO_RST = 1,
         });
 
-        regs.CMD.modify(.{
+        self.modify_register("CMD", .{
             .UPDATE = 1,
         });
 
-        while (regs.CMD.read().UPDATE == 1) {}
+        while (@field(self.register("CMD").read(), register_name("UPDATE")) == 1) {}
 
-        regs.CMD.modify(.{
+        self.modify_register("CMD", .{
             .USR = 1,
         });
     }
 
     fn wait_for_transfer_blocking(self: SPI) void {
-        const regs = self.get_regs();
-        while (regs.DMA_INT_RAW.read().TRANS_DONE_INT_RAW != 1) {}
+        while (@field(self.register("DMA_INT_RAW").read(), register_name("TRANS_DONE_INT_RAW")) != 1) {}
     }
 };

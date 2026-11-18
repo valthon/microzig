@@ -113,6 +113,18 @@ pub const Pin = enum(u5) {
         });
     }
 
+    /// Raw GPIO matrix output routing (FUNC_OUT_SEL_CFG) of a pad, saved by code that borrows
+    /// the pad as a GPIO and restores the peripheral routing afterwards.
+    pub const OutputRouting = struct { raw: u32 };
+
+    pub fn get_output_routing(self: Pin) OutputRouting {
+        return .{ .raw = chip_specific.get_output_routing(@backingInt(self)) };
+    }
+
+    pub fn restore_output_routing(self: Pin, routing: OutputRouting) void {
+        chip_specific.set_output_routing(@backingInt(self), routing.raw);
+    }
+
     pub const ConnectToInputOptions = struct {
         signal: InputSignal,
         invert: bool = false,

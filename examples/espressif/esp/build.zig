@@ -22,15 +22,15 @@ pub fn build(b: *std.Build) void {
         .{ .name = "i2c_bus_scan", .file = "src/i2c_bus_scan.zig" },
         .{ .name = "i2c_temp", .file = "src/i2c_temp.zig" },
         .{ .name = "i2c_display_sh1106", .file = "src/i2c_display_sh1106.zig" },
-        .{ .name = "i2c_display_ssd1306_c3_oled_042", .file = "src/i2c_display_ssd1306_c3_oled_042.zig" },
-        .{ .name = "selftest_ledc_fade", .file = "src/selftest_ledc_fade.zig" },
+        .{ .chips = &.{.esp32_c3}, .name = "i2c_display_ssd1306_c3_oled_042", .file = "src/i2c_display_ssd1306_c3_oled_042.zig" },
+        .{ .name = "selftest_ledc_fade", .file = "src/selftest_ledc_fade.zig", .chips = &.{.esp32_c3} },
         .{ .name = "ledc_pwm_servo", .file = "src/ledc_pwm_servo.zig" },
         .{ .name = "stepper_driver", .file = "src/stepper_driver.zig" },
         .{ .name = "stepper_driver_dumb", .file = "src/stepper_driver_dumb.zig" },
         .{ .name = "systimer", .file = "src/systimer.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .name = "ws2812_blinky", .file = "src/ws2812_blinky.zig" },
-        .{ .name = "rtos", .file = "src/rtos.zig" },
-        .{ .name = "tcp_server", .file = "src/tcp_server.zig", .features = .{
+        .{ .chips = &.{.esp32_c3}, .name = "rtos", .file = "src/rtos.zig" },
+        .{ .chips = &.{.esp32_c3}, .name = "tcp_server", .file = "src/tcp_server.zig", .features = .{
             .flashless = false,
             .lwip = true,
         } },
@@ -196,6 +196,6 @@ const Example = struct {
     name: []const u8,
     file: []const u8,
     features: Features = .{},
-    /// Chips this example builds for. Most of the hal is not ported to the esp32c6 yet.
-    chips: []const Chip = &.{.esp32_c3},
+    /// Chips whose peripherals and board assumptions this example supports.
+    chips: []const Chip = &.{ .esp32_c3, .esp32_c6 },
 };
