@@ -121,6 +121,7 @@ test {
     _ = rtos;
     _ = radio;
     _ = @import("hal/gpio_encoding.zig");
+    _ = @import("hal/i2c_logic.zig");
     _ = @import("interrupt-encoding");
 }
 
