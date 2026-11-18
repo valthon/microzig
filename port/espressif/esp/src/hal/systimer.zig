@@ -33,6 +33,14 @@ pub const Unit = enum(u1) {
             .systimer = true,
         });
 
+        if (@import("compatibility.zig").chip == .esp32_c6) {
+            // C6 TRM v1.2 §13.3: XTAL / 2.5 gives 16 MHz.
+            microzig.chip.peripherals.PCR.SYSTIMER_FUNC_CLK_CONF.modify(.{
+                .SYSTIMER_FUNC_CLK_SEL = 0,
+                .SYSTIMER_FUNC_CLK_EN = 1,
+            });
+        }
+
         switch (config) {
             .disabled => switch (self) {
                 .unit0 => SYSTIMER.CONF.modify(.{

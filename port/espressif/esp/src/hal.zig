@@ -74,20 +74,19 @@ pub fn init_sequence(clock_cfg: clocks.Config) void {
 }
 
 fn disable_watchdogs() void {
-    const peripherals = microzig.chip.peripherals;
-    const TIMG0 = peripherals.TIMG0;
-
-    const dogfood = 0x50D83AA1;
-    const super_dogfood = 0x8F1D312A;
-
-    // Feed and disable watchdog 0
-    TIMG0.WDTWPROTECT.raw = dogfood;
-    TIMG0.WDTCONFIG0.raw = 0;
-    TIMG0.WDTWPROTECT.raw = 0;
-
     switch (compatibility.chip) {
         .esp32_c3 => {
+            const peripherals = microzig.chip.peripherals;
+            const TIMG0 = peripherals.TIMG0;
             const RTC_CNTL = peripherals.RTC_CNTL;
+
+            const dogfood = 0x50D83AA1;
+            const super_dogfood = 0x8F1D312A;
+
+            // Feed and disable watchdog 0
+            TIMG0.WDTWPROTECT.raw = dogfood;
+            TIMG0.WDTCONFIG0.raw = 0;
+            TIMG0.WDTWPROTECT.raw = 0;
 
             // Feed and disable rtc watchdog
             RTC_CNTL.WDTWPROTECT.raw = dogfood;
@@ -102,18 +101,32 @@ fn disable_watchdogs() void {
         // The esp32c6 moved the rtc watchdogs into the low power domain and has a second timer
         // group whose watchdog the rom bootloader may have armed as well.
         .esp32_c6 => {
+            const peripherals = microzig.chip.peripherals;
+            const TIMG0 = peripherals.TIMG0;
             const TIMG1 = peripherals.TIMG1;
             const LP_WDT = peripherals.LP_WDT;
 
+            const dogfood = 0x50D83AA1;
+
+            TIMG0.WDTWPROTECT.raw = dogfood;
+            TIMG0.WDTCONFIG0.raw = 0;
+            // C6 TRM v1.2 §14.6, TIMG_WDTCONFIG0_REG: latch the change.
+            TIMG0.WDTCONFIG0.modify(.{ .WDT_CONF_UPDATE_EN = 1 });
+            TIMG0.WDTWPROTECT.raw = 0;
+
             TIMG1.WDTWPROTECT.raw = dogfood;
             TIMG1.WDTCONFIG0.raw = 0;
+            // C6 TRM v1.2 §14.6, TIMG_WDTCONFIG0_REG: latch the change.
+            TIMG1.WDTCONFIG0.modify(.{ .WDT_CONF_UPDATE_EN = 1 });
             TIMG1.WDTWPROTECT.raw = 0;
 
             LP_WDT.WPROTECT.raw = dogfood;
             LP_WDT.CONFIG0.raw = 0;
             LP_WDT.WPROTECT.raw = 0;
 
-            LP_WDT.SWD_WPROTECT.raw = super_dogfood;
+            // C6 TRM v1.2 §15.6, register 15.9: unlike C3, SWD uses
+            // the same unlock key as the other watchdogs.
+            LP_WDT.SWD_WPROTECT.raw = dogfood;
             LP_WDT.SWD_CONFIG.modify(.{ .SWD_DISABLE = 1 });
             LP_WDT.SWD_WPROTECT.raw = 0;
         },

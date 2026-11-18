@@ -60,7 +60,9 @@ pub const Config = struct {
     /// Initializes a clock config for this cpu frequency.
     pub fn init(cpu_clk_freq: u32) clocks.Error!Config {
         const cpu_clk_source: CpuClockSource = if (cpu_clk_freq <= xtal_clk_freq and cpu_clk_freq != 0) blk: {
-            const div: u10 = @intCast(xtal_clk_freq / cpu_clk_freq);
+            const quotient = xtal_clk_freq / cpu_clk_freq;
+            if (quotient > 32) return error.InvalidCpuClockFrequency;
+            const div: u10 = @intCast(quotient);
             const real_freq: u32 = (xtal_clk_freq + div / 2) / div;
 
             if (real_freq != cpu_clk_freq) {
@@ -130,12 +132,22 @@ pub const Config = struct {
             },
         }
 
+        // C6 TRM v1.2 §8.2.4.1: APB follows AHB without automatic reduction.
+        PCR.APB_FREQ_CONF.modify(.{ .APB_DIV_NUM = 0, .APB_DECREASE_DIV_NUM = 0 });
         rom_cpu_frequency_update(config.cpu_clk_freq);
     }
 };
 
 fn switch_to_pll(cpu_freq: CpuClockSource.PllClock.CpuFreq) void {
     const div = cpu_freq.divider();
+
+    // C6 TRM v1.2 §8.2.4.1, Table 8.2-2: CPU must be an integer multiple of
+    // AHB, and AHB must not exceed 40 MHz. Set AHB before changing the CPU:
+    // all supported PLL CPU frequencies are multiples of 40 MHz. On XTAL
+    // these HS dividers are inactive until the source switch.
+    PCR.AHB_FREQ_CONF.modify(.{
+        .AHB_HS_DIV_NUM = (12 / 3) - 1,
+    });
 
     // High speed divider option: 1, 2, 4 (register value 0, 1, 3), applied on top of the fixed
     // divide by three from the pll to the high speed root clock. 120 MHz cannot be reached with a
@@ -145,26 +157,36 @@ fn switch_to_pll(cpu_freq: CpuClockSource.PllClock.CpuFreq) void {
         .CPU_HS_120M_FORCE = @intFromBool(div == 4),
     });
 
-    // Pin the ahb clock at 480 / 12 = 40 MHz so that the apb clock does not depend on the
-    // selected cpu frequency.
-    PCR.AHB_FREQ_CONF.modify(.{
-        .AHB_HS_DIV_NUM = (12 / 3) - 1,
-    });
-
     PCR.SYSCLK_CONF.modify(.{
         .SOC_CLK_SEL = 1,
     });
 }
 
 fn switch_to_xtal(div: u10) void {
+    const old_div = @as(u10, PCR.CPU_FREQ_CONF.read().CPU_LS_DIV_NUM) + 1;
+    // C6 TRM v1.2 §8.2.4.1, Table 8.2-2: keep CPU/AHB integral at every
+    // write. Increase CPU first when speeding up; decrease AHB first when
+    // slowing down. The LS dividers are inactive on PLL, so both can be
+    // prepared before switching the source, including PLL -> divided XTAL.
+    // ESP-IDF components/esp_hw_support/port/esp32c6/rtc_clk.c,
+    // rtc_clk_cpu_freq_to_xtal (7101770dc6db): AHB, CPU, then source. That
+    // order also needs the CPU-first case for an active XTAL speed increase.
+    if (div < old_div) {
+        PCR.CPU_FREQ_CONF.modify(.{
+            .CPU_LS_DIV_NUM = @as(u8, @intCast(div - 1)),
+        });
+    }
+
     // Low speed divider option: 1, 2, 4, 8, 16, 32 (register value is the divider minus one).
     PCR.AHB_FREQ_CONF.modify(.{
         .AHB_LS_DIV_NUM = @as(u8, @intCast(div - 1)),
     });
 
-    PCR.CPU_FREQ_CONF.modify(.{
-        .CPU_LS_DIV_NUM = @as(u8, @intCast(div - 1)),
-    });
+    if (div >= old_div) {
+        PCR.CPU_FREQ_CONF.modify(.{
+            .CPU_LS_DIV_NUM = @as(u8, @intCast(div - 1)),
+        });
+    }
 
     // Switch clock source
     PCR.SYSCLK_CONF.modify(.{

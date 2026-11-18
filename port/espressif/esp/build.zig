@@ -362,6 +362,16 @@ pub fn build(b: *std.Build) void {
     cpu_without_hal.root_module.addImport("esp-cpu", cpu_module);
     test_step.dependOn(&b.addRunArtifact(cpu_without_hal).step);
 
+    // The C6 CLINT/peripheral interrupt split is pure data and testable on the host.
+    const c6_interrupt_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cpus/esp_riscv/esp32_c6.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(c6_interrupt_tests).step);
+
     const cat_exe = b.addExecutable(.{
         .name = "cat",
         .root_module = b.createModule(.{

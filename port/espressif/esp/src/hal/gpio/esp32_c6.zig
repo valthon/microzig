@@ -164,6 +164,7 @@ pub const OutputSignal = enum(u8) {
     gpio = 128,
 };
 
+/// C6 TRM v1.2 §7.16.2, IO_MUX_GPIOn_REG: 0/1/2/3 select 5/10/20/40 mA.
 /// The esp32c6 maps every drive strength straight onto its register value, there are no pads
 /// with a swapped 10 mA / 20 mA setting like on the esp32c3.
 pub fn drive_strength_value(pin: u5, strength: DriveStrength) u2 {

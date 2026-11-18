@@ -35,6 +35,9 @@ pub const Exception = enum(u5) {
     MachineEnvCall = 0xb,
 };
 
+/// Trap IDs shared with the vector table. On C6, IDs 3, 4 and 7 are
+/// local CLINT interrupts and cannot be mapped or enabled through this
+/// peripheral-interrupt API (C6 TRM v1.2 §1.6.2).
 pub const Interrupt = @import("interrupt-encoding").Interrupt;
 
 pub const InterruptHandler = union(enum) {
@@ -68,7 +71,9 @@ pub const interrupt = struct {
         return chip_specific.cpu_int_enable().* & (@as(u32, 1) << @backingInt(int)) != 0;
     }
 
+    /// Panics on C6 CLINT IDs, including in ReleaseSmall.
     pub fn enable(int: Interrupt) void {
+        require_peripheral_interrupt(int);
         chip_specific.cpu_int_enable().* |= @as(u32, 1) << @backingInt(int);
     }
 
@@ -85,7 +90,7 @@ pub const interrupt = struct {
     /// NOTE: Pending state of an unclaimed (not executing) edge type interrupt can be flushed,
     /// if required, by first disabling it and only then call clearing it.
     pub fn clear_pending(int: Interrupt) void {
-        // C3 TRM §1.5.2; C6 TRM §1.4.3: pulse the clear bit.
+        // C3 TRM §1.5.2; C6 TRM §1.6.2: pulse the clear bit.
         chip_specific.cpu_int_clear().* = @as(u32, 1) << @backingInt(int);
         chip_specific.cpu_int_clear().* = 0;
     }
@@ -141,8 +146,17 @@ pub const interrupt = struct {
     /// Peripheral interrupt sources of this chip that can be routed to a cpu interrupt.
     pub const Source = chip_specific.Source;
 
+    /// Panics when mapping to a C6 CLINT ID; null still unmaps a source.
     pub fn map(source: Source, maybe_int: ?Interrupt) void {
+        if (maybe_int) |int| require_peripheral_interrupt(int);
         chip_specific.source_map(source).* = if (maybe_int) |int| @backingInt(int) else 0;
+    }
+
+    fn require_peripheral_interrupt(int: Interrupt) void {
+        if (cpu_config.chip == .esp32_c6) {
+            if (!chip_specific.is_peripheral_interrupt(@backingInt(int)))
+                @panic("ESP32-C6 CPU interrupt IDs 3, 4 and 7 are CLINT interrupts, not peripheral interrupts");
+        }
     }
 
     pub fn get_mapped_interrupt(source: Source) ?Interrupt {
@@ -251,6 +265,11 @@ pub fn export_startup_logic() void {
 
 /// Gets interrupts into a known state after the bootloader.
 fn init_interrupts() void {
+    if (cpu_config.chip == .esp32_c6) {
+        chip_specific.init_interrupt_matrix();
+        fence();
+    }
+
     // unmap all sources
     for (std.enums.values(interrupt.Source)) |source| {
         interrupt.map(source, null);
@@ -268,6 +287,13 @@ fn init_interrupts() void {
         .mode = .vectored,
         .base = @intCast(@intFromPtr(&_vector_table) >> 2),
     });
+
+    if (cpu_config.chip == .esp32_c6) {
+        // C6 TRM v1.2 §1.5.2, §1.6.2: route external interrupts to M mode
+        // and unmask them at the core. Keep local CLINT IDs 0, 3, 4, 7 masked.
+        csr.Csr(0x303, u32).write_raw(0); // mideleg
+        csr.Csr(0x304, u32).write_raw(chip_specific.peripheral_interrupt_mask); // mie
+    }
 
     if (interrupt_stack_options.enable) {
         csr.mscratch.write_raw(0);

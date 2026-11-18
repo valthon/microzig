@@ -1,13 +1,40 @@
 //! Interrupt matrix and cpu interrupt controller of the esp32c6.
 //!
 //! Unlike the esp32c3 these are two separate peripherals: INTERRUPT_CORE0 routes a peripheral
-//! source to one of the cpu interrupts and reports which sources are pending, while INTPRI owns
+//! source to one of the cpu interrupts and reports which sources are pending, while PLIC_MX owns
 //! the enable, type, priority and threshold state of the cpu interrupts themselves.
+//! C6 TRM v1.2 §§1.6, 10.5.2 describe the legacy INTPRI bank instead; ESP-IDF
+//! v5.3 soc/esp32c6/include/soc/interrupt_reg.h explicitly selects PLIC for C6.
 
 const microzig = @import("microzig");
 
 const INTERRUPT_CORE0 = microzig.chip.peripherals.INTERRUPT_CORE0;
-const INTPRI = microzig.chip.peripherals.INTPRI;
+const PLIC_MX = microzig.chip.peripherals.PLIC_MX;
+
+pub fn init_interrupt_matrix() void {
+    // C6 TRM v1.2 §8.5.1, PCR_INTMTX_CONF_REG: the matrix has its own
+    // clock gate and reset. Establish both before programming routes rather
+    // than depending on the state left by the ROM/download loader.
+    microzig.chip.peripherals.PCR.INTMTX_CONF.modify(.{
+        .INTMTX_CLK_EN = 1,
+        .INTMTX_RST_EN = 0,
+    });
+}
+
+/// C6 TRM v1.2 §1.6.2: IDs 0, 3, 4 and 7 belong to local CLINT,
+/// not the peripheral interrupt matrix. This also defines startup's mie mask.
+pub const peripheral_interrupt_mask: u32 = 0xffff_ff66;
+
+pub fn is_peripheral_interrupt(id: u5) bool {
+    return peripheral_interrupt_mask & (@as(u32, 1) << id) != 0;
+}
+
+test "C6 matrix interrupts exclude all four CLINT IDs" {
+    const testing = @import("std").testing;
+    for ([_]u5{ 0, 3, 4, 7 }) |id| try testing.expect(!is_peripheral_interrupt(id));
+    for ([_]u5{ 1, 2, 5, 6 }) |id| try testing.expect(is_peripheral_interrupt(id));
+    for (8..32) |id| try testing.expect(is_peripheral_interrupt(@intCast(id)));
+}
 
 /// Peripheral interrupt sources that can be routed to one of the cpu interrupts.
 pub const Source = enum(u7) {
@@ -107,27 +134,27 @@ pub fn source_map(source: Source) *volatile u32 {
 }
 
 pub fn cpu_int_enable() *volatile u32 {
-    return @ptrCast(&INTPRI.CPU_INT_ENABLE);
+    return @ptrCast(&PLIC_MX.MXINT_ENABLE);
 }
 
 pub fn cpu_int_type() *volatile u32 {
-    return @ptrCast(&INTPRI.CPU_INT_TYPE);
+    return @ptrCast(&PLIC_MX.MXINT_TYPE);
 }
 
 pub fn cpu_int_clear() *volatile u32 {
-    return @ptrCast(&INTPRI.CPU_INT_CLEAR);
+    return @ptrCast(&PLIC_MX.MXINT_CLEAR);
 }
 
 pub fn cpu_int_eip_status() *volatile u32 {
-    return @ptrCast(&INTPRI.CPU_INT_EIP_STATUS);
+    return @ptrCast(&PLIC_MX.EMIP_STATUS);
 }
 
 pub fn cpu_int_thresh() *volatile u32 {
-    return @ptrCast(&INTPRI.CPU_INT_THRESH);
+    return @ptrCast(&PLIC_MX.MXINT_THRESH);
 }
 
 /// Priority registers of the 32 cpu interrupts, laid out consecutively.
 pub fn cpu_int_pri(int: u5) *volatile u32 {
-    const base: *volatile [32]u32 = @ptrCast(&INTPRI.CPU_INT_PRI_0);
+    const base: *volatile [32]u32 = @ptrCast(&PLIC_MX.MXINT0_PRI);
     return &base[int];
 }

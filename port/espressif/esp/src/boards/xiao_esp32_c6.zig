@@ -2,7 +2,10 @@
 //!
 //! https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/
 //!
-//! The pin map matches the one in the arduino-esp32 variant for this board:
+//! Pin Map and Hardware overview above specify the pad and RF-switch assignments.
+//! Seeed schematic sheet 04 ESP32 C6 shows X1=40MHz and 3V3–R25–D4–GPIO15:
+//! https://files.seeedstudio.com/wiki/SeeedStudio-XIAO-ESP32C6/XIAO_ESP32_C6_v1.0_SCH_260114.pdf
+//! The pin map also matches the arduino-esp32 variant for this board:
 //! https://github.com/espressif/arduino-esp32/blob/master/variants/XIAO_ESP32C6/pins_arduino.h
 
 const std = @import("std");
