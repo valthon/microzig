@@ -38,6 +38,14 @@ pub const Patch = union(enum) {
         of: []const u8,
         to: ?[]const u8,
     },
+    /// Rename one expanded register without changing its fields or address.
+    /// Offset lookup can disambiguate duplicate names in a vendor description.
+    rename_register_at_offset: struct {
+        parent: []const u8,
+        offset_bytes: u64,
+        expected_name: []const u8,
+        name: []const u8,
+    },
     add_interrupt: struct {
         device_name: []const u8,
         idx: i32,
