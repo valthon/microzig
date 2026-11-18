@@ -62,9 +62,8 @@ SECTIONS
     . += 16;
   } > IROM
 
-  .ram.text :
+  .ram.text : ALIGN(16)
   {
-    . = ALIGN(16);
     KEEP(*(.ram_text))
     KEEP(*(.ram_vectors))
 
@@ -72,9 +71,8 @@ SECTIONS
      * and offset done here (NOLOAD) */
   } > IRAM
 
-  .ram.text.wifi :
+  .ram.text.wifi : ALIGN(16)
   {
-    . = ALIGN(16);
     *( .wifi0iram  .wifi0iram.*)
     *( .wifirxiram  .wifirxiram.*)
     *( .wifislprxiram  .wifislprxiram.*)
@@ -85,9 +83,8 @@ SECTIONS
     *( .coexiram.* )
   } > IRAM
 
-  .data :
+  .data : ALIGN(16)
   {
-    . = ALIGN(16);
     microzig_data_start = .;
     *(.sdata*)
     *(.data*)
@@ -95,9 +92,8 @@ SECTIONS
     microzig_data_end = .;
   } > IRAM
 
-  .data.wifi :
+  .data.wifi : ALIGN(16)
   {
-    . = ALIGN(16);
     *(.dram1*)
   } > IRAM
 
