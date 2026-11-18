@@ -372,6 +372,15 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(c6_interrupt_tests).step);
 
+    const gdma_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/gdma.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(gdma_tests).step);
+
     const cat_exe = b.addExecutable(.{
         .name = "cat",
         .root_module = b.createModule(.{
