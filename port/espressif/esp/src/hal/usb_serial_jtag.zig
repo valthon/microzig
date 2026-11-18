@@ -1,8 +1,10 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const microzig = @import("microzig");
+// Both generated chip maps call this USB_DEVICE. EP1/EP1_CONF are described
+// in C6 TRM v1.2 §32.7, registers 32.1/32.2 (FIFO protocol: §32.3.2).
 const USB_SERIAL_JTAG = microzig.chip.peripherals.USB_DEVICE;
 const time = @import("time.zig");
+const Deadline = microzig.drivers.time.Deadline;
 
 /// Returns `false` if data can be sent.
 pub fn tx_fifo_full() bool {
@@ -12,7 +14,7 @@ pub fn tx_fifo_full() bool {
 /// Call this after you are done writing data. After `tx_fifo_full()` returns false
 /// you can start sending more data.
 pub fn tx_fifo_flush() void {
-    USB_SERIAL_JTAG.EP1_CONF.modify(.{ .WR_DONE = 1 });
+    USB_SERIAL_JTAG.EP1_CONF.write(.{ .WR_DONE = 1 });
 }
 
 /// Writes one byte to the fifo.
@@ -22,87 +24,106 @@ pub fn tx_fifo_write(byte: u8) void {
     });
 }
 
-/// USB Serial JTAG logger. To use this, add `.logFn = logger.log` to your
-/// `microzig_options`.
-pub const logger = struct {
-    var timed_out: bool = false;
-    var buffer: [64]u8 = undefined;
-    var writer = std.Io.Writer{
-        .buffer = &buffer,
-        .vtable = &.{
-            .drain = logger.drain,
-        },
-    };
+/// Returns true while the OUT endpoint contains unread bytes.
+/// C3 TRM v1.4 §30.3.2; C6 TRM v1.2 §32.3.2: identical EP1 FIFO protocol.
+pub fn rx_fifo_available() bool {
+    return USB_SERIAL_JTAG.EP1_CONF.read().SERIAL_OUT_EP_DATA_AVAIL != 0;
+}
+
+/// Caller must first check rx_fifo_available(). Reading consumes one byte.
+pub fn rx_fifo_read() u8 {
+    return USB_SERIAL_JTAG.EP1.read().RDWR_BYTE;
+}
+
+/// Reads up to buffer.len bytes without waiting. Returns zero when no data is ready.
+/// RX must have a single consumer; do not also read the FIFO from an interrupt.
+pub fn read(buffer: []u8) usize {
+    var n: usize = 0;
+    while (n < buffer.len and rx_fifo_available()) : (n += 1) {
+        buffer[n] = rx_fifo_read();
+    }
+    return n;
+}
+
+/// Waits for at least one byte, then returns the currently available data.
+/// An empty buffer returns immediately. Uses one deadline for the entire wait.
+pub fn read_blocking(buffer: []u8, deadline: Deadline) error{Timeout}!usize {
+    if (buffer.len == 0) return 0;
+    while (true) {
+        const n = read(buffer);
+        if (n != 0) return n;
+        if (deadline.is_reached_by(time.get_time_since_boot())) return error.Timeout;
+    }
+}
+
+fn wait_for_tx(deadline: Deadline) error{Timeout}!void {
+    while (tx_fifo_full()) {
+        if (deadline.is_reached_by(time.get_time_since_boot())) return error.Timeout;
+    }
+}
+
+/// Success means the host consumed every flushed packet, including the final one.
+/// Timeout indicates a host that is absent, closed, or not reading (C3 TRM v1.4 §30.4; C6 TRM v1.2 §32.3.2).
+/// A timeout can follow partial delivery; retrying the whole slice may duplicate data.
+/// Serialize TX callers, including the logger. The deadline covers the whole write.
+pub fn write_blocking(data: []const u8, deadline: Deadline) error{Timeout}!usize {
+    if (data.len == 0) return 0;
+    try wait_for_tx(deadline);
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const packet = data[offset..][0..@min(64, data.len - offset)];
+        for (packet) |byte| tx_fifo_write(byte);
+        // The 64th byte flushes automatically (C3 TRM v1.4 §30.3.2; C6 TRM v1.2 §32.3.2).
+        if (packet.len < 64) tx_fifo_flush();
+        try wait_for_tx(deadline);
+        offset += packet.len;
+    }
+    return data.len;
+}
+
+/// Buffered writer with bounded host-consumption waits. Inspect err after WriteFailed.
+/// Each drain gets one timeout; no failed bytes are retained for a later message.
+pub const Writer = struct {
+    interface: std.Io.Writer,
+    timeout: microzig.drivers.time.Duration = .from_ms(100),
+    err: ?error{Timeout} = null,
+
+    pub fn init(buffer: []u8) Writer {
+        return .{ .interface = .{ .buffer = buffer, .vtable = &.{ .drain = drain } } };
+    }
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        // bytes from buffer are not included in count.
-        w.end -= write_blocking(w.buffer[0..w.end]) catch |err| switch (err) {
-            error.Timeout => {
-                logger.timed_out = true;
-                return error.WriteFailed;
-            },
+        const self: *Writer = @alignCast(@fieldParentPtr("interface", w));
+        const deadline = Deadline.init_relative(time.get_time_since_boot(), self.timeout);
+        self.err = null;
+        const buffered = w.buffer[0..w.end];
+        w.end = 0;
+        _ = write_blocking(buffered, deadline) catch |err| {
+            self.err = err;
+            return error.WriteFailed;
         };
-        assert(w.end == 0);
-
         var n: usize = 0;
-        for (0..data.len - 1) |i| {
-            n += write_blocking(data[i]) catch |err| switch (err) {
-                error.Timeout => {
-                    logger.timed_out = true;
-                    return error.WriteFailed;
-                },
+        for (data[0 .. data.len - 1]) |bytes| {
+            n += write_blocking(bytes, deadline) catch |err| {
+                self.err = err;
+                return error.WriteFailed;
             };
         }
-
-        for (0..splat) |_|
-            n += write_blocking(data[data.len - 1]) catch |err| switch (err) {
-                error.Timeout => {
-                    logger.timed_out = true;
-                    return error.WriteFailed;
-                },
+        for (0..splat) |_| {
+            n += write_blocking(data[data.len - 1], deadline) catch |err| {
+                self.err = err;
+                return error.WriteFailed;
             };
-
+        }
         return n;
     }
+};
 
-    fn write_blocking(data: []const u8) !usize {
-        const cs = microzig.interrupt.enter_critical_section();
-        defer cs.leave();
-
-        if (tx_fifo_full()) {
-            if (timed_out) {
-                return error.Timeout;
-            }
-
-            try wait_for_flush();
-        } else {
-            timed_out = false;
-        }
-
-        for (data) |byte| {
-            if (tx_fifo_full()) {
-                tx_fifo_flush();
-                try wait_for_flush();
-            }
-
-            tx_fifo_write(byte);
-        }
-
-        tx_fifo_flush();
-
-        return data.len;
-    }
-
-    fn wait_for_flush() error{Timeout}!void {
-        var timeout: usize = 50_000;
-        while (tx_fifo_full()) {
-            if (timeout == 0) {
-                timed_out = true;
-                return error.Timeout;
-            }
-            timeout -= 1;
-        }
-    }
+/// USB Serial JTAG logger. Use `.logFn = logger.log` in std_options.
+/// Failed lines are discarded; subsequent calls retry even after a host timeout.
+pub const logger = struct {
+    var buffer: [64]u8 = undefined;
+    var writer = Writer.init(&buffer);
 
     pub fn log(
         comptime level: std.log.Level,
@@ -116,11 +137,19 @@ pub const logger = struct {
             else => " (" ++ @tagName(scope) ++ "): ",
         };
 
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+
         const current_time = time.get_time_since_boot();
         const seconds = current_time.to_us() / std.time.us_per_s;
         const microseconds = current_time.to_us() % std.time.us_per_s;
 
-        writer.print(prefix ++ format ++ "\r\n", .{ seconds, microseconds } ++ args) catch {};
-        writer.flush() catch {};
+        writer.interface.print(prefix ++ format ++ "\r\n", .{ seconds, microseconds } ++ args) catch {
+            writer.interface.end = 0;
+            return;
+        };
+        writer.interface.flush() catch {
+            writer.interface.end = 0;
+        };
     }
 };
