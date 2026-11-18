@@ -217,6 +217,16 @@ fn func_out_sel(pin: u5) *volatile FuncOutSel {
     return reg(FuncOutSel, &GPIO.FUNC0_OUT_SEL_CFG, pin);
 }
 
+// C6 TRM v1.2 §§7.7.1–7.7.2: GPIO0–7 bypass the HP IO MUX and
+// GPIO matrix while their LP_AON_GPIO_MUX_SEL bit is set.
+fn select_hp_mux(pin: u5) void {
+    if (pin >= 8) return;
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    const mux = peripherals.LP_AON.GPIO_MUX.read();
+    peripherals.LP_AON.GPIO_MUX.modify(.{ .SEL = mux.SEL & ~(@as(u8, 1) << @as(u3, @intCast(pin))) });
+}
+
 pub fn set_mux(pin: u5, options: struct {
     pull_down: bool,
     pull_up: bool,
@@ -225,6 +235,7 @@ pub fn set_mux(pin: u5, options: struct {
     function: u3,
     input_filter_enable: bool,
 }) void {
+    select_hp_mux(pin);
     io_mux(pin).modify(.{
         .SLP_SEL = 0,
         .FUN_WPD = @intFromBool(options.pull_down),
@@ -268,6 +279,7 @@ pub fn set_open_drain(pin: u5, open_drain: bool) void {
 // Preserve inversion and output-enable selection, as Pin.apply did before
 // the chip split. Complete peripheral routing is configured separately.
 pub fn select_gpio_output(pin: u5) void {
+    select_hp_mux(pin);
     func_out_sel(pin).modify(.{ .FUNC_OUT_SEL = @backingInt(OutputSignal.gpio) });
 }
 
@@ -277,6 +289,7 @@ pub fn set_output_signal(pin: u5, options: struct {
     output_enable_signal_controlled_by_peripheral: bool = false,
     invert_output_enable_signal: bool = false,
 }) void {
+    select_hp_mux(pin);
     func_out_sel(pin).write(.{
         .FUNC_OUT_SEL = options.signal,
         .FUNC_OEN_SEL = @intFromBool(!options.output_enable_signal_controlled_by_peripheral),
@@ -291,6 +304,7 @@ pub fn get_output_routing(pin: u5) u32 {
 }
 
 pub fn set_output_routing(pin: u5, raw: u32) void {
+    select_hp_mux(pin);
     func_out_sel(pin).write_raw(raw);
 }
 
@@ -299,6 +313,7 @@ pub fn set_output_invert(pin: u5, invert: bool) void {
 }
 
 pub fn set_input_signal(signal: u8, pin: u5, invert: bool) void {
+    select_hp_mux(pin);
     func_in_sel(signal).write(.{
         .FUNC0_IN_SEL = pin,
         .FUNC0_IN_INV_SEL = @intFromBool(invert),

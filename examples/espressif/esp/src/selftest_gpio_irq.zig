@@ -162,7 +162,30 @@ fn status_clear_check() Result {
     return .{ .name = "status_clear", .expected = 1, .actual = @intFromBool(passed), .passed = passed };
 }
 
+fn lp_mux_check() Result {
+    // Simulate preceding LP/analog firmware without relying on a chip reset.
+    // C6 TRM v1.2 §§7.7.1–7.7.3; §12.10, Register 12.59.
+    const mux = &microzig.chip.peripherals.LP_AON.GPIO_MUX;
+    const mask = @as(u8, 1) << @backingInt(pin);
+    pin.set_interrupt_enabled(false);
+    pin.set_interrupt_type(.disabled);
+    const original = mux.read().SEL;
+    mux.modify(.{ .SEL = original | mask });
+    const seeded = mux.read().SEL == original | mask;
+    pin.put(0);
+    pin.apply(.{ .input_enable = true, .output_enable = true });
+    const reclaimed = mux.read().SEL == original & ~mask;
+    const high = drive(1);
+    const low = drive(0);
+    const passed = seeded and reclaimed and high and low;
+    return .{ .name = "lp_mux_reclaim", .expected = 1, .actual = @intFromBool(passed), .passed = passed };
+}
+
 pub fn main() void {
+    const mux_results = if (hal.compatibility.chip == .esp32_c6)
+        [_]Result{lp_mux_check()}
+    else
+        [_]Result{};
     pin.put(0);
     pin.apply(.{ .input_enable = true, .output_enable = true });
     pin.connect_peripheral_to_output(.{ .signal = .gpio });
@@ -174,7 +197,7 @@ pub fn main() void {
     irq.map(.gpio, .interrupt1);
     irq.enable_interrupts();
 
-    const results = [_]Result{
+    const results = mux_results ++ [_]Result{
         edge_check("rising", .rising_edge, 7),
         edge_check("falling", .falling_edge, 7),
         edge_check("any_edge", .any_edge, 14),
