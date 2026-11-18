@@ -7,9 +7,11 @@
   [Seeed Studio XIAO ESP32C6](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/)
   Blinks the user led through the board definition and logs over the USB-C connector.
 
-Most examples are esp32c3 only for now. `blinky`, `custom_clock_config`, `gpio_input` and
-`systimer` also build for the esp32c6; the pin numbers in them are the ones of the C3 kit, so pick
-the pads of your own board. On a Seeed XIAO ESP32C6 the user led sits on GPIO15 and the usb
+Most examples build for both the esp32c3 and the esp32c6; the `chips` field of each entry in
+[build.zig](build.zig) lists its targets. `rtos`, `tcp_server`, `i2c_display_ssd1306_c3_oled_042`,
+`selftest_ledc_fade` and the `selftest_sleep` stages are esp32c3 only, and `selftest_c6_core` and
+`selftest_c6_ledc` are esp32c6 only. The pin numbers in the examples are the ones of the C3 kit, so
+pick the pads of your own board. On a Seeed XIAO ESP32C6 the user led sits on GPIO15 and the usb
 serial/jtag port is the USB-C connector itself.
 
 ## How to flash the image onto the device

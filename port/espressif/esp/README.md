@@ -16,6 +16,95 @@ efuse/MAC reads and RNG. On the C6, peripheral interrupts are routed by the inte
 (INTERRUPT_CORE0) to the CPU-local machine-mode PLIC (`PLIC_MX`), which holds their enable, type,
 priority and threshold; INTPRI is used only for the four CPU software interrupts.
 
+## Drivers
+
+Hardware results are from RAM images on an ESP32-C3 rev v0.4 and a Super Mini ESP32-C6FH4 rev
+v0.2, as `passed/checks` of the named self-test in `examples/espressif/esp`.
+
+| Driver (`hal.*`)                              | C3  | C6  | Self-test                                          | C3 result | C6 result |
+| --------------------------------------------- | --- | --- | -------------------------------------------------- | --------- | --------- |
+| `uart` (UART0/1)                              | yes | yes | `selftest_uart`                                    | 5/5       | 5/5       |
+| `twai` (CAN)                                  | yes | yes | `selftest_twai`                                    | 10/10     | 20/20     |
+| `rmt` (polling TX/RX)                         | yes | yes | `selftest_rmt`                                     | 3/3       | 3/3       |
+| `timer`, `wdt` (timer groups, watchdogs)      | yes | yes | `selftest_timers`                                  | 6/6       | 6/6       |
+| `usb_serial_jtag` (logging, RX, confirmed TX) | yes | yes | `selftest_usj`                                     | 9/9       | 9/9       |
+| `gpio` pin interrupts                         | yes | yes | `selftest_gpio_irq`                                | 8/8       | 9/9       |
+| `flash` (erase, write, read)                  | yes | yes | `selftest_flash`                                   | 5/5       | 5/5       |
+| `adc` (ADC1), `temperature`                   | yes | yes | `selftest_adc`                                     | 10/10     | 10/10     |
+| `ledc` PWM and fades (C6: single-range gamma) | yes | yes | `selftest_ledc_fade` (C3), `selftest_c6_ledc` (C6) | 4/4       | 7/7       |
+| `i2c` master                                  | yes | yes | none                                               | see below | built     |
+| `spi` master (SPI2), GDMA channel 0 transfers | yes | yes | `selftest_spi_dma`                                 | 8/8       | 8/8       |
+| `clocks.sleep` light sleep                    | yes | no  | `selftest_sleep_s*`                                | see below | n/a       |
+| `radio`, `rtos`                               | yes | no  | none                                               |           | n/a       |
+
+C3-only modules produce an explicit compile error on the C6. The C3 I2C master ran on hardware
+through the `i2c_display_ssd1306_c3_oled_042` example. The C6 LEDC blocking fade helper takes a
+timeout in microseconds.
+
+### C3 light sleep and USB-Serial-JTAG
+
+`hal.clocks.sleep.enter_light_sleep` keeps the CPU, SRAM, XTAL and PLL powered and wakes on an RTC
+timer deadline or a GPIO level. USB-Serial-JTAG cannot run during this sleep: its APB and 48 MHz
+PHY clocks are gated (C3 TRM v1.4 §30.4), and with D+ still pulled up the host never sees a detach,
+so the endpoints stay dead after wake. `Config` selects how USB is handled:
+
+- default: entry with the USB pads enabled fails with `error.UsbSerialJtagActive`;
+- `allow_usb_loss = true`: sleep anyway, with no recovery attempt;
+- `usb_policy = .disconnect_and_reenumerate`: release the D+ pull-up for the sleep (pull override
+  with D+ pulled down, pads disabled, held 10 ms; C3 TRM v1.4 Table 5.12-1 USB note and §30.6
+  register 30.2), re-attach after wake with the steps of Espressif's
+  [Using USB-Serial-JTAG pins as normal GPIO](https://docs.espressif.com/projects/esp-iot-solution/en/latest/usb/usb_overview/usb_serial_jtag.html)
+  (pad enable, D+ pull-down off, D+ pull-up on) folded into one CONF0 write, then restore the saved
+  CONF0, and report in `Diagnostics.usb_bus_reset` whether the host reset the bus within
+  `Config.usb_reattach.bus_reset_timeout` (one second by default). That wait runs only if a host
+  counts as attached: a bus reset is pending, or the caller-owned history in
+  `Config.usb_reattach.attachment` (a `*usb_serial_jtag.Attachment`) records that the last wait saw
+  a reset, or else the SOF frame index advances while it is sampled for up to 3 ms before the
+  detach; the sampling is skipped when either of the first two holds. Pass the same `Attachment` to
+  every sleep: back-to-back sleeps, with the host still re-enumerating, then keep their wait, and an
+  unplugged host costs one timeout. Without it (`null`, the default) only the SOF sample and a
+  pending reset count: back-to-back sleeps keep their wait only while the bus reset stays latched in
+  `INT_RAW`, and once an application USB interrupt handler clears `USB_BUS_RESET`, or one sleep
+  skips its wait, every later one skips. With no host counted, or with the pads disabled by the
+  application (left untouched), the wait is skipped and the field stays null. The host must reopen
+  its port. `usb_serial_jtag.reconnect()` does the same without sleeping.
+
+Limitation of `.disconnect_and_reenumerate`: the first sleep after power-up, or after the host
+attaches, counts no host that is still in its attach debounce (no SOF, no pending reset, empty
+history), so it neither waits nor records a result, and sleeping again right away can keep the host
+from ever resetting the bus. Before sleeping back-to-back, call
+`usb_serial_jtag.wait_for_host(timeout, &attachment)` with the same `Attachment`: it returns true
+once the SOF frame index advances or a bus reset is pending (C3 TRM v1.4 §30.6 registers 30.8 and
+30.16) and records the host, so the next sleep waits for its bus reset; it returns false on timeout,
+and at once with the pads disabled.
+
+Measured on the C3 rev v0.4 with a Windows host, ten back-to-back 200 ms sleeps per case, firmware
+without a USB interrupt handler, after `wait_for_host`: with an `Attachment`, and `USB_BUS_RESET`
+cleared after each sleep as an application handler would, 10/10 waited and saw a bus reset; without
+one, run first and with nothing clearing the reset, 10/10; without one and cleared after each sleep,
+0/10 (every wait skipped); without one and not cleared, run right after that, 0/10. After power-up
+by plugging into the PC, `wait_for_host` with an `Attachment` saw the host after about 57 ms and the
+ten sleeps that followed all saw a bus reset; after an RTC watchdog reset with the PC attached it
+saw the host after 67 us, and again 10/10. In those two runs the `Attachment` was passed and nothing
+cleared `USB_BUS_RESET`, so both rules counted the host: they show that the sleeps after
+`wait_for_host` keep their wait, not which rule kept it (the four cases above separate the two). An
+earlier version of this series without `wait_for_host`, right after power-up, skipped all ten waits.
+
+Observed with a Windows host: IN bytes the device sent right after re-enumeration, before the host
+reopened the port, did not reach the host application; the cause is not established. The s6
+self-test therefore lets the host speak first: after each re-enumeration the host reopens the
+port and sends `USJ?` 1.5 s later; the device then sends `USJ nonce=<8 hex digits>` (again each
+second until consumed) and passes `cdc_in` only when the host answers `ACK <same digits>`.
+
+`selftest_sleep_s1` to `selftest_sleep_s6` stage the C3 sleep checks (`selftest_sleep` is s4); the
+file header documents each stage and the GPIO beacon. Results on the C3 rev v0.4: s1 3/3; s4 passes
+every check except `cdc_in`, which fails by design without the reconnect policy; s6 (`wait_for_host`
+with the test's `Attachment`, then reconnect without sleep and a 100 ms and a 500 ms sleep, each
+checked for a bus reset, the nonce echoed back and the OUT string): 12/12 with a Windows host,
+`wait_for_host` true after 3 us. Light sleep has not run on the C6.
+
+## ESP32-C6 boot modes and clocks
+
 C6 boot modes (ESP32-C6 TRM v1.2 §9.2):
 
 - `esp32_c6`: ROM-loadable Espressif image, chip ID 13, normally flashed at offset zero.
