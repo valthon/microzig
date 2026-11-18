@@ -23,6 +23,7 @@ pub const spi = @import("hal/spi.zig");
 pub const system = @import("hal/system.zig");
 pub const systimer = @import("hal/systimer.zig");
 pub const time = @import("hal/time.zig");
+pub const twai = @import("hal/twai.zig");
 pub const uart = @import("hal/uart.zig");
 pub const usb_serial_jtag = @import("hal/usb_serial_jtag.zig");
 
@@ -156,6 +157,7 @@ fn str(comptime l: usize, comptime s: []const u8) [l]u8 {
 }
 
 test {
+    _ = twai;
     _ = rtos;
     _ = radio;
     _ = @import("hal/gpio_encoding.zig");
