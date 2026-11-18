@@ -16,6 +16,7 @@ pub const ledc = switch (compatibility.chip) {
     .esp32_c6 => @import("hal/ledc/esp32_c6.zig"),
 };
 pub const radio = @import("hal/radio.zig");
+pub const rmt = @import("hal/rmt.zig");
 pub const rng = @import("hal/rng.zig");
 pub const rom = @import("hal/rom.zig");
 pub const rtos = @import("hal/rtos.zig");
@@ -158,6 +159,7 @@ fn str(comptime l: usize, comptime s: []const u8) [l]u8 {
 
 test {
     _ = twai;
+    _ = rmt;
     _ = rtos;
     _ = radio;
     _ = @import("hal/gpio_encoding.zig");

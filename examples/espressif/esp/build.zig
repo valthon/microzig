@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "stepper_driver", .file = "src/stepper_driver.zig" },
         .{ .name = "stepper_driver_dumb", .file = "src/stepper_driver_dumb.zig" },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_uart", .file = "src/selftest_uart.zig" },
+        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_rmt", .file = "src/selftest_rmt.zig" },
         .{ .name = "systimer", .file = "src/systimer.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_twai", .file = "src/selftest_twai.zig" },
         .{ .name = "ws2812_blinky", .file = "src/ws2812_blinky.zig" },
