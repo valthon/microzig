@@ -12,31 +12,7 @@ const peripherals = microzig.chip.peripherals;
 const IO_MUX = peripherals.IO_MUX;
 const GPIO = peripherals.GPIO;
 
-pub const DriveStrength = enum {
-    @"5mA",
-    @"10mA",
-    @"20mA",
-    @"40mA",
-
-    /// Get the appropriate value of DriveStrength based on the pin number.
-    /// See section 5.15.2 (IO MUX Registers) of the Technical Reference Manual
-    fn to_value(strength: DriveStrength, pin: Pin) u2 {
-        return switch (@backingInt(pin)) {
-            2, 3, 5, 18, 19 => switch (strength) {
-                .@"5mA" => 0,
-                .@"10mA" => 2,
-                .@"20mA" => 1,
-                .@"40mA" => 3,
-            },
-            else => switch (strength) {
-                .@"5mA" => 0,
-                .@"10mA" => 1,
-                .@"20mA" => 2,
-                .@"40mA" => 3,
-            },
-        };
-    }
-};
+pub const DriveStrength = @import("gpio_encoding.zig").DriveStrength;
 
 /// Alternative pin functions
 pub const AlternateFunction = enum(u2) {
@@ -108,6 +84,13 @@ pub const InputSignal = enum(u8) {
     sig_in_func_98 = 98,
     sig_in_func_99 = 99,
     sig_in_func_100 = 100,
+
+    /// Change inversion for this peripheral input without changing its pin routing.
+    pub fn set_input_invert(self: InputSignal, invert: bool) void {
+        GPIO.FUNC_IN_SEL_CFG[@backingInt(self)].modify(.{
+            .IN_INV_SEL = @intFromBool(invert),
+        });
+    }
 
     pub const always_low: InputSignal = .cpu_gpio3;
     pub const always_high: InputSignal = .cpu_gpio2;
@@ -267,7 +250,7 @@ pub const Pin = enum(u5) {
             .SLP_SEL = 0,
             .FUN_WPD = @intFromBool(config.pull == .down),
             .FUN_WPU = @intFromBool(config.pull == .up),
-            .FUN_DRV = @backingInt(config.drive_strength),
+            .FUN_DRV = config.drive_strength.to_value(@backingInt(self)),
             .FUN_IE = @intFromBool(config.input_enable),
             .MCU_SEL = @backingInt(AlternateFunction.function1),
             .FILTER_EN = @intFromBool(config.input_filter_enable),
@@ -327,7 +310,7 @@ pub const Pin = enum(u5) {
     }
 
     pub fn set_output_invert(self: Pin, invert: bool) void {
-        GPIO.FUNC_OUT_SEL_CFG[@backingInt(self)].write(.{
+        GPIO.FUNC_OUT_SEL_CFG[@backingInt(self)].modify(.{
             .INV_SEL = @intFromBool(invert),
         });
     }
@@ -338,14 +321,8 @@ pub const Pin = enum(u5) {
         });
     }
 
-    pub fn set_input_invert(self: Pin, invert: bool) void {
-        GPIO.FUNC_IN_SEL_CFG[@backingInt(self)].write(.{
-            .IN_INV_SEL = @intFromBool(invert),
-        });
-    }
-
     pub fn set_input_filter_enabled(self: Pin, enable: bool) void {
-        GPIO.FUNC_IN_SEL_CFG[@backingInt(self)].write(.{
+        IO_MUX.GPIO[@backingInt(self)].modify(.{
             .FILTER_EN = @intFromBool(enable),
         });
     }
@@ -359,7 +336,7 @@ pub const Pin = enum(u5) {
 
     pub fn set_drive_strength(self: Pin, drive_strength: DriveStrength) void {
         IO_MUX.GPIO[@backingInt(self)].modify(.{
-            .FUN_DRV = @backingInt(drive_strength),
+            .FUN_DRV = drive_strength.to_value(@backingInt(self)),
         });
     }
 

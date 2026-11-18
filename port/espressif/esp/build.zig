@@ -28,6 +28,10 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
         .abi = .eabi,
     };
 
+    const interrupt_encoding = b.createModule(.{
+        .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
+    });
+
     const riscv32_common_dep = b.dependency("microzig/modules/riscv32-common", .{});
     const riscv32_common_mod = riscv32_common_dep.module("riscv32-common");
 
@@ -58,6 +62,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                     .name = "riscv32-common",
                     .module = riscv32_common_mod,
                 },
+                .{ .name = "interrupt-encoding", .module = interrupt_encoding },
             }) catch @panic("OOM"),
         },
         .chip = .{
@@ -75,6 +80,10 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
         .hal = .{
             .root_source_file = b.path("src/hal.zig"),
             .imports = b.allocator.dupe(std.Build.Module.Import, &.{
+                .{
+                    .name = "interrupt-encoding",
+                    .module = interrupt_encoding,
+                },
                 .{
                     .name = "esp_image",
                     .module = esp_image_mod,
@@ -116,6 +125,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                             .name = "riscv32-common",
                             .module = riscv32_common_mod,
                         },
+                        .{ .name = "interrupt-encoding", .module = interrupt_encoding },
                     }) catch @panic("OOM"),
                 },
                 .linker_script = .{
@@ -163,9 +173,39 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    unit_tests.root_module.addImport("interrupt-encoding", b.createModule(.{
+        .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
+    }));
     const unit_tests_run = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run platform agnostic unit tests");
     test_step.dependOn(&unit_tests_run.step);
+
+    // Tests in a separate imported module need their own test artifact.
+    const interrupt_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(interrupt_tests).step);
+
+    const cpu_without_hal = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/cpu_without_hal_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const cpu_module = b.createModule(.{
+        .root_source_file = b.path("src/cpus/esp_riscv.zig"),
+    });
+    cpu_module.addImport("microzig", cpu_without_hal.root_module);
+    cpu_module.addImport("interrupt-encoding", b.createModule(.{
+        .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
+    }));
+    cpu_without_hal.root_module.addImport("esp-cpu", cpu_module);
+    test_step.dependOn(&b.addRunArtifact(cpu_without_hal).step);
 
     const cat_exe = b.addExecutable(.{
         .name = "cat",

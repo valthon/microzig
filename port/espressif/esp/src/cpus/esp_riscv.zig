@@ -28,39 +28,7 @@ pub const Exception = enum(u5) {
     MachineEnvCall = 0xb,
 };
 
-pub const Interrupt = enum(u5) {
-    interrupt1 = 1,
-    interrupt2 = 2,
-    interrupt3 = 3,
-    interrupt4 = 4,
-    interrupt5 = 5,
-    interrupt6 = 6,
-    interrupt7 = 7,
-    interrupt8 = 8,
-    interrupt9 = 9,
-    interrupt10 = 10,
-    interrupt11 = 11,
-    interrupt12 = 12,
-    interrupt13 = 13,
-    interrupt14 = 14,
-    interrupt15 = 15,
-    interrupt16 = 16,
-    interrupt17 = 17,
-    interrupt18 = 18,
-    interrupt19 = 19,
-    interrupt20 = 20,
-    interrupt21 = 21,
-    interrupt22 = 22,
-    interrupt23 = 23,
-    interrupt24 = 24,
-    interrupt25 = 25,
-    interrupt26 = 26,
-    interrupt27 = 27,
-    interrupt28 = 28,
-    interrupt29 = 29,
-    interrupt30 = 30,
-    interrupt31 = 31,
-};
+pub const Interrupt = @import("interrupt-encoding").Interrupt;
 
 pub const InterruptHandler = union(enum) {
     /// No state is saved. Do everything yourself. Interrupts are disabled
@@ -112,7 +80,9 @@ pub const interrupt = struct {
     /// NOTE: Pending state of an unclaimed (not executing) edge type interrupt can be flushed,
     /// if required, by first disabling it and only then call clearing it.
     pub fn clear_pending(int: Interrupt) void {
-        INTERRUPT_CORE0.CPU_INT_CLEAR.raw |= @as(u32, 1) << @backingInt(int);
+        // TRM section 1.5.2 requires a set-then-clear pulse.
+        INTERRUPT_CORE0.CPU_INT_CLEAR.write(.{ .CPU_INT_CLEAR = @as(u32, 1) << @backingInt(int) });
+        INTERRUPT_CORE0.CPU_INT_CLEAR.write(.{ .CPU_INT_CLEAR = 0 });
     }
 
     pub const Priority = enum(u4) {
@@ -151,10 +121,7 @@ pub const interrupt = struct {
         return @fromBackingInt(INTERRUPT_CORE0.CPU_INT_THRESH.read().CPU_INT_THRESH);
     }
 
-    pub const Type = enum(u1) {
-        level = 0,
-        edge = 1,
-    };
+    pub const Type = @import("interrupt-encoding").Type;
 
     pub fn set_type(int: Interrupt, typ: Type) void {
         const num = @backingInt(int);
@@ -165,8 +132,7 @@ pub const interrupt = struct {
     }
 
     pub fn get_type(int: Interrupt) Type {
-        const num = @backingInt(int);
-        return @fromBackingInt(@truncate(INTERRUPT_CORE0.CPU_INT_TYPE.raw & (@as(u32, 1) << num) >> num));
+        return @import("interrupt-encoding").type_from_bits(INTERRUPT_CORE0.CPU_INT_TYPE.raw, int);
     }
 
     pub const Source = enum(u6) {
@@ -239,12 +205,7 @@ pub const interrupt = struct {
     }
 
     pub fn get_mapped_interrupt(source: Source) ?Interrupt {
-        const source_raw: u4 = @truncate(get_source_map_register_for(source).*);
-        if (source_raw != 0) {
-            return @fromBackingInt(source_raw);
-        } else {
-            return null;
-        }
+        return @import("interrupt-encoding").interrupt_from_map_bits(get_source_map_register_for(source).*);
     }
 
     fn get_source_map_register_for(source: Source) *volatile u32 {
