@@ -240,6 +240,12 @@ pub fn set_open_drain(pin: u5, open_drain: bool) void {
     GPIO.PIN[pin].modify(.{ .PIN_PAD_DRIVER = @intFromBool(open_drain) });
 }
 
+// Preserve inversion and output-enable selection, as Pin.apply did before
+// the chip split. Complete peripheral routing is configured separately.
+pub fn select_gpio_output(pin: u5) void {
+    GPIO.FUNC_OUT_SEL_CFG[pin].modify(.{ .OUT_SEL = @backingInt(OutputSignal.gpio) });
+}
+
 pub fn set_output_signal(pin: u5, options: struct {
     signal: u8,
     invert: bool = false,

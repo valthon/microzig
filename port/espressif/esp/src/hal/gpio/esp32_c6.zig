@@ -10,7 +10,6 @@
 
 const std = @import("std");
 const microzig = @import("microzig");
-const mmio = microzig.mmio;
 const peripherals = microzig.chip.peripherals;
 const IO_MUX = peripherals.IO_MUX;
 const GPIO = peripherals.GPIO;
@@ -74,6 +73,11 @@ pub const InputSignal = enum(u8) {
     sig_in_func_98 = 98,
     sig_in_func_99 = 99,
     sig_in_func_100 = 100,
+
+    /// Changes inversion by peripheral signal index, preserving its pad routing.
+    pub fn set_input_invert(self: InputSignal, invert: bool) void {
+        set_input_signal_invert(@backingInt(self), invert);
+    }
 
     pub const always_low: InputSignal = .const_low;
     pub const always_high: InputSignal = .const_high;
@@ -185,48 +189,12 @@ pub fn assert_usb_disabled(pin: u5) void {
     }
 }
 
-const IoMux = mmio.Mmio(packed struct(u32) {
-    MCU_OE: u1,
-    SLP_SEL: u1,
-    MCU_WPD: u1,
-    MCU_WPU: u1,
-    MCU_IE: u1,
-    MCU_DRV: u2,
-    FUN_WPD: u1,
-    FUN_WPU: u1,
-    FUN_IE: u1,
-    FUN_DRV: u2,
-    MCU_SEL: u3,
-    FILTER_EN: u1,
-    padding: u16,
-});
-
-const PinCfg = mmio.Mmio(packed struct(u32) {
-    SYNC2_BYPASS: u2,
-    PAD_DRIVER: u1,
-    SYNC1_BYPASS: u2,
-    reserved5: u2,
-    INT_TYPE: u3,
-    WAKEUP_ENABLE: u1,
-    CONFIG: u2,
-    INT_ENA: u5,
-    padding: u14,
-});
-
-const FuncInSel = mmio.Mmio(packed struct(u32) {
-    IN_SEL: u6,
-    IN_INV_SEL: u1,
-    SEL: u1,
-    padding: u24,
-});
-
-const FuncOutSel = mmio.Mmio(packed struct(u32) {
-    OUT_SEL: u9,
-    INV_SEL: u1,
-    OEN_SEL: u1,
-    OEN_INV_SEL: u1,
-    padding: u20,
-});
+// All pad blocks have a four-byte stride. Reuse the first generated type
+// for each block instead of redeclaring its bit positions (TRM §7.16).
+const IoMux = @TypeOf(IO_MUX.GPIO0);
+const PinCfg = @TypeOf(GPIO.PIN0);
+const FuncInSel = @TypeOf(GPIO.FUNC0_IN_SEL_CFG);
+const FuncOutSel = @TypeOf(GPIO.FUNC0_OUT_SEL_CFG);
 
 fn reg(comptime T: type, first: anytype, index: usize) *volatile T {
     return @ptrFromInt(@intFromPtr(first) + @sizeOf(u32) * index);
@@ -294,6 +262,12 @@ pub fn set_open_drain(pin: u5, open_drain: bool) void {
     pin_cfg(pin).modify(.{ .PAD_DRIVER = @intFromBool(open_drain) });
 }
 
+// Preserve inversion and output-enable selection, as Pin.apply did before
+// the chip split. Complete peripheral routing is configured separately.
+pub fn select_gpio_output(pin: u5) void {
+    func_out_sel(pin).modify(.{ .FUNC_OUT_SEL = @backingInt(OutputSignal.gpio) });
+}
+
 pub fn set_output_signal(pin: u5, options: struct {
     signal: u8,
     invert: bool = false,
@@ -301,29 +275,29 @@ pub fn set_output_signal(pin: u5, options: struct {
     invert_output_enable_signal: bool = false,
 }) void {
     func_out_sel(pin).write(.{
-        .OUT_SEL = options.signal,
-        .OEN_SEL = @intFromBool(!options.output_enable_signal_controlled_by_peripheral),
-        .INV_SEL = @intFromBool(options.invert),
-        .OEN_INV_SEL = @intFromBool(options.invert_output_enable_signal),
+        .FUNC_OUT_SEL = options.signal,
+        .FUNC_OEN_SEL = @intFromBool(!options.output_enable_signal_controlled_by_peripheral),
+        .FUNC_OUT_INV_SEL = @intFromBool(options.invert),
+        .FUNC_OEN_INV_SEL = @intFromBool(options.invert_output_enable_signal),
         .padding = 0,
     });
 }
 
 pub fn set_output_invert(pin: u5, invert: bool) void {
-    func_out_sel(pin).modify(.{ .INV_SEL = @intFromBool(invert) });
+    func_out_sel(pin).modify(.{ .FUNC_OUT_INV_SEL = @intFromBool(invert) });
 }
 
 pub fn set_input_signal(signal: u8, pin: u5, invert: bool) void {
     func_in_sel(signal).write(.{
-        .IN_SEL = pin,
-        .IN_INV_SEL = @intFromBool(invert),
-        .SEL = 1,
+        .FUNC0_IN_SEL = pin,
+        .FUNC0_IN_INV_SEL = @intFromBool(invert),
+        .SIG0_IN_SEL = 1,
         .padding = 0,
     });
 }
 
 pub fn set_input_signal_invert(signal: u8, invert: bool) void {
-    func_in_sel(signal).modify(.{ .IN_INV_SEL = @intFromBool(invert) });
+    func_in_sel(signal).modify(.{ .FUNC0_IN_INV_SEL = @intFromBool(invert) });
 }
 
 pub fn set_output_enabled(pin: u5, enable: bool) void {
@@ -343,4 +317,13 @@ pub fn put(pin: u5, level: u1) void {
 
 pub fn read(pin: u5) u1 {
     return @intCast((GPIO.IN.raw >> pin) & 1);
+}
+
+test "drive strength encoding for every C6 GPIO" {
+    for (0..pin_count) |n| {
+        const strengths = .{ .@"5mA", .@"10mA", .@"20mA", .@"40mA" };
+        inline for (strengths, 0..) |strength, value| {
+            try std.testing.expectEqual(@as(u2, value), drive_strength_value(@intCast(n), strength));
+        }
+    }
 }

@@ -79,9 +79,7 @@ pub const Pin = enum(u5) {
 
         const n = @backingInt(self);
 
-        chip_specific.set_output_signal(n, .{
-            .signal = @backingInt(OutputSignal.gpio),
-        });
+        chip_specific.select_gpio_output(n);
 
         chip_specific.set_mux(n, .{
             .pull_down = config.pull == .down,
@@ -137,12 +135,6 @@ pub const Pin = enum(u5) {
 
     pub fn set_input_enabled(self: Pin, enable: bool) void {
         chip_specific.set_input_enabled(@backingInt(self), enable);
-    }
-
-    /// Inverts the signal a peripheral reads from this pin.
-    pub fn set_input_invert(self: Pin, signal: InputSignal, invert: bool) void {
-        _ = self;
-        chip_specific.set_input_signal_invert(@backingInt(signal), invert);
     }
 
     pub fn set_input_filter_enabled(self: Pin, enable: bool) void {

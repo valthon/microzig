@@ -26,8 +26,7 @@ pub const usb_serial_jtag = @import("hal/usb_serial_jtag.zig");
 comptime {
     if (!builtin.is_test) {
         // Keep otherwise unused register accessors in firmware compile coverage.
-        if (compatibility.chip == .esp32_c3)
-            @export(&compile_check_accessors, .{ .name = "esp_compile_check_accessors" });
+        @export(&compile_check_accessors, .{ .name = "esp_compile_check_accessors" });
 
         // export atomic intrinsics
         _ = @import("hal/atomic.zig");
@@ -144,6 +143,7 @@ test {
     _ = rtos;
     _ = radio;
     _ = @import("hal/gpio_encoding.zig");
+    _ = @import("hal/gpio/esp32_c6.zig");
     _ = @import("hal/i2c_logic.zig");
     _ = @import("interrupt-encoding");
 }
@@ -151,7 +151,7 @@ test {
 // Never called: exporting forces body analysis for the real chip register types.
 // A host test cannot validate these MMIO layouts or RISC-V interrupt accessors.
 fn compile_check_accessors(index: u32) callconv(.c) void {
-    const pin = gpio.num(@intCast(index % 22));
+    const pin = gpio.num(@intCast(index % gpio.pin_count));
     const unit_index: u1 = @truncate(index);
     const int: microzig.cpu.Interrupt = @fromBackingInt(@as(u5, @intCast(index % 31 + 1)));
     systimer.unit(unit_index).write(0);
