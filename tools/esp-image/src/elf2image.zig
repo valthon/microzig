@@ -164,9 +164,7 @@ pub fn main(init: std.process.Init) !void {
     // accidentally on esp32c3 because of the memory map (DROM comes before
     // IROM).
 
-    // TODO: maybe also check if sections overlap
-
-    // merge segments
+    // merge segments, then pad each to a multiple of 4
     try do_segment_merge(gpa, &flash_segments);
     try do_segment_merge(gpa, &ram_segments);
 
@@ -269,19 +267,27 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+/// Merges address-sorted segments on their real lengths, then pads each to a
+/// multiple of 4: the bootloader rejects any other length. A segment starting
+/// at or before the previous one's padded end is merged, with any gap
+/// zero-filled, so no padded segment overlaps the next and abutting segments
+/// cost no extra segment header. Overlapping input is an error.
 fn do_segment_merge(gpa: std.mem.Allocator, segment_list: *std.ArrayList(Segment)) !void {
     if (segment_list.items.len >= 2) {
         var i: usize = segment_list.items.len - 1;
         while (i > 0) : (i -= 1) {
             const seg_a = &segment_list.items[i - 1];
             const seg_b = segment_list.items[i];
-            if (seg_a.addr + seg_a.size == seg_b.addr) {
+            const end = seg_a.addr + seg_a.size;
+            if (seg_b.addr < end) return error.OverlappingSegments;
+            if (seg_b.addr <= seg_a.addr + std.mem.alignForward(usize, seg_a.size, 4)) {
                 try seg_a.merge(gpa, seg_b);
                 seg_b.deinit(gpa);
                 _ = segment_list.orderedRemove(i);
             }
         }
     }
+    for (segment_list.items) |*segment| try segment.pad_to_word(gpa);
 }
 
 pub const chips: std.enums.EnumMap(esp_image.ChipId, Chip) = .init(.{
@@ -361,11 +367,11 @@ const Segment = struct {
     pub fn init(gpa: std.mem.Allocator, segment_info: SegmentInfo, elf_file_reader: *std.Io.File.Reader) !Segment {
         try elf_file_reader.seekTo(segment_info.file_offset);
 
-        const data = try gpa.alloc(u8, segment_info.size + segment_info.size % 4);
+        // Real length: do_segment_merge pads after merging.
+        const data = try gpa.alloc(u8, segment_info.size);
         errdefer gpa.free(data);
 
-        try elf_file_reader.interface.readSliceAll(data[0..segment_info.size]);
-        @memset(data[segment_info.size..], 0);
+        try elf_file_reader.interface.readSliceAll(data);
 
         return .{
             .addr = segment_info.addr,
@@ -406,12 +412,24 @@ const Segment = struct {
         return @intCast(pad_len);
     }
 
+    /// Appends `other`, which starts at or after this segment's end; the
+    /// gap between them is zero-filled.
     pub fn merge(self: *Segment, gpa: std.mem.Allocator, other: Segment) !void {
-        std.debug.assert(self.addr + self.size == other.addr);
+        std.debug.assert(self.addr + self.size <= other.addr);
 
-        const new_size = self.size + other.size;
+        const offset = other.addr - self.addr;
+        const new_size = offset + other.size;
         self.data = try gpa.realloc(self.data, new_size);
-        @memcpy(self.data[self.size..], other.data[0..other.size]);
+        @memset(self.data[self.size..offset], 0);
+        @memcpy(self.data[offset..], other.data[0..other.size]);
+        self.size = new_size;
+    }
+
+    /// The bootloader rejects a segment whose length is not a multiple of 4.
+    pub fn pad_to_word(self: *Segment, gpa: std.mem.Allocator) !void {
+        const new_size = std.mem.alignForward(usize, self.size, 4);
+        self.data = try gpa.realloc(self.data, new_size);
+        @memset(self.data[self.size..], 0);
         self.size = new_size;
     }
 
@@ -437,6 +455,89 @@ const Segment = struct {
         }
     }
 };
+
+fn test_segment(allocator: std.mem.Allocator, addr: usize, bytes: []const u8) !Segment {
+    return .{ .addr = addr, .size = bytes.len, .data = try allocator.dupe(u8, bytes) };
+}
+
+test "do_segment_merge pads each segment to a multiple of 4" {
+    const allocator = std.testing.allocator;
+
+    // A length of 1 modulo 4 is the case `size + size % 4` left unaligned.
+    for ([_]struct { bytes: []const u8, padded: []const u8 }{
+        .{ .bytes = "abcd", .padded = "abcd" },
+        .{ .bytes = "abcde", .padded = "abcde\x00\x00\x00" },
+        .{ .bytes = "abcdef", .padded = "abcdef\x00\x00" },
+        .{ .bytes = "abcdefg", .padded = "abcdefg\x00" },
+    }) |case| {
+        var segment_list: std.ArrayList(Segment) = .empty;
+        defer segment_list.deinit(allocator);
+        defer for (segment_list.items) |segment| segment.deinit(allocator);
+
+        try segment_list.append(allocator, try test_segment(allocator, 0x3fc80000, case.bytes));
+        try do_segment_merge(allocator, &segment_list);
+
+        try std.testing.expectEqual(1, segment_list.items.len);
+        try std.testing.expectEqual(case.padded.len, segment_list.items[0].size);
+        try std.testing.expectEqualStrings(case.padded, segment_list.items[0].data);
+    }
+}
+
+test "do_segment_merge joins a segment that starts at or before the previous one's padded end" {
+    const allocator = std.testing.allocator;
+
+    // Padding "abcde" to 8 bytes first would overlap a segment 1 or 2 bytes
+    // after it; a segment 3 bytes after it starts exactly at the padded end.
+    for ([_]struct { gap: usize, merged: []const u8 }{
+        .{ .gap = 0, .merged = "abcdefgh" },
+        .{ .gap = 1, .merged = "abcde\x00fghi\x00\x00" },
+        .{ .gap = 2, .merged = "abcde\x00\x00fghi\x00" },
+        .{ .gap = 3, .merged = "abcde\x00\x00\x00fghi" },
+    }) |case| {
+        var segment_list: std.ArrayList(Segment) = .empty;
+        defer segment_list.deinit(allocator);
+        defer for (segment_list.items) |segment| segment.deinit(allocator);
+
+        try segment_list.append(allocator, try test_segment(allocator, 0x40380000, "abcde"));
+        try segment_list.append(allocator, try test_segment(allocator, 0x40380005 + case.gap, if (case.gap == 0) "fgh" else "fghi"));
+        try do_segment_merge(allocator, &segment_list);
+
+        try std.testing.expectEqual(1, segment_list.items.len);
+        try std.testing.expectEqual(0x40380000, segment_list.items[0].addr);
+        try std.testing.expectEqualStrings(case.merged, segment_list.items[0].data);
+    }
+}
+
+test "do_segment_merge keeps a segment that starts beyond the previous one's padded end" {
+    const allocator = std.testing.allocator;
+
+    // 0x40380009 is one byte past the padded end 0x40380008.
+    for ([_]usize{ 0x40380009, 0x4038000c }) |addr| {
+        var segment_list: std.ArrayList(Segment) = .empty;
+        defer segment_list.deinit(allocator);
+        defer for (segment_list.items) |segment| segment.deinit(allocator);
+
+        try segment_list.append(allocator, try test_segment(allocator, 0x40380000, "abcde"));
+        try segment_list.append(allocator, try test_segment(allocator, addr, "fghi"));
+        try do_segment_merge(allocator, &segment_list);
+
+        try std.testing.expectEqual(2, segment_list.items.len);
+        try std.testing.expectEqualStrings("abcde\x00\x00\x00", segment_list.items[0].data);
+        try std.testing.expectEqual(addr, segment_list.items[1].addr);
+    }
+}
+
+test "do_segment_merge rejects overlapping segments" {
+    const allocator = std.testing.allocator;
+
+    var segment_list: std.ArrayList(Segment) = .empty;
+    defer segment_list.deinit(allocator);
+    defer for (segment_list.items) |segment| segment.deinit(allocator);
+
+    try segment_list.append(allocator, try test_segment(allocator, 0x40380000, "abcdefgh"));
+    try segment_list.append(allocator, try test_segment(allocator, 0x40380004, "ijkl"));
+    try std.testing.expectError(error.OverlappingSegments, do_segment_merge(allocator, &segment_list));
+}
 
 test "Segment.get_padding_len" {
     var allocator = std.testing.allocator;
