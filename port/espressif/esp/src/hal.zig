@@ -179,3 +179,7 @@ fn compile_check_accessors(index: u32) callconv(.c) void {
     std.mem.doNotOptimizeAway(microzig.cpu.interrupt.get_type(int));
     std.mem.doNotOptimizeAway(microzig.cpu.interrupt.get_mapped_interrupt(.i2c_ext0));
 }
+
+test {
+    _ = @import("hal/uart/timing.zig");
+}
