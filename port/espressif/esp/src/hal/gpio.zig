@@ -30,6 +30,7 @@ pub const AlternateFunction = enum(u3) {
 
 /// Interrupt events
 pub const Event = enum(u3) {
+    disabled = 0,
     rising_edge = 1,
     falling_edge = 2,
     any_edge = 3,
@@ -163,6 +164,31 @@ pub const Pin = enum(u5) {
 
     pub fn set_open_drain(self: Pin, open_drain: bool) void {
         chip_specific.set_open_drain(@backingInt(self), open_drain);
+    }
+
+    /// Select the trigger independently of CPU interrupt delivery. Enable the
+    /// input buffer first. Route `.gpio` with `microzig.cpu.interrupt.map` to
+    /// a level-type CPU interrupt and install its handler in microzig_options.
+    pub fn set_interrupt_type(self: Pin, event: Event) void {
+        chip_specific.set_interrupt_type(@backingInt(self), @backingInt(event));
+    }
+
+    /// Enable maskable CPU delivery for this pin, preserving its trigger type.
+    /// Does not clear latched status. Disable and clear before reconfiguring
+    /// if old events must be discarded.
+    pub fn set_interrupt_enabled(self: Pin, enable: bool) void {
+        chip_specific.set_interrupt_enabled(@backingInt(self), enable);
+    }
+
+    /// Raw latched status, independent of CPU delivery enable.
+    pub fn interrupt_status(self: Pin) bool {
+        return chip_specific.interrupt_status(@backingInt(self));
+    }
+
+    /// Clear only this pin's latched status (write-one-to-clear). A level
+    /// trigger must be deasserted or disabled before clearing to avoid reentry.
+    pub fn clear_interrupt(self: Pin) void {
+        chip_specific.clear_interrupt(@backingInt(self));
     }
 
     pub fn put(self: Pin, level: u1) void {

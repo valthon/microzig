@@ -260,6 +260,8 @@ pub fn set_input_filter_enabled(pin: u5, enable: bool) void {
 }
 
 pub fn set_open_drain(pin: u5, open_drain: bool) void {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
     pin_cfg(pin).modify(.{ .PAD_DRIVER = @intFromBool(open_drain) });
 }
 
@@ -335,4 +337,29 @@ test "drive strength encoding for every C6 GPIO" {
             try std.testing.expectEqual(@as(u2, value), drive_strength_value(@intCast(n), strength));
         }
     }
+}
+
+// C6 TRM §7.16.1: PINn selects the trigger and maskable CPU route;
+// STATUS_W1TC clears only the written pins. Serialize PINn read-modify-writes
+// with set_open_drain, which shares this register with interrupt handlers.
+pub fn set_interrupt_type(pin: u5, event: u3) void {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    pin_cfg(pin).modify(.{ .INT_TYPE = event });
+}
+
+pub fn set_interrupt_enabled(pin: u5, enable: bool) void {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    // INT_ENA bit 0 is the maskable route; leave the NMI route untouched.
+    const old = pin_cfg(pin).read().INT_ENA;
+    pin_cfg(pin).modify(.{ .INT_ENA = (old & ~@as(u5, 1)) | @as(u5, @intFromBool(enable)) });
+}
+
+pub fn interrupt_status(pin: u5) bool {
+    return (GPIO.STATUS.read().INTERRUPT & (@as(RegMask, 1) << pin)) != 0;
+}
+
+pub fn clear_interrupt(pin: u5) void {
+    GPIO.STATUS_W1TC.write(.{ .STATUS_W1TC = @as(RegMask, 1) << pin });
 }
