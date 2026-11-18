@@ -149,6 +149,7 @@ test {
     _ = temperature;
     _ = rtos;
     _ = radio;
+    _ = usb_serial_jtag;
     _ = @import("hal/gpio_encoding.zig");
     _ = @import("hal/gpio/esp32_c6.zig");
     _ = @import("hal/i2c_logic.zig");

@@ -1,5 +1,7 @@
 const compatibility = @import("compatibility.zig");
 
+pub const sleep = @import("sleep.zig");
+
 /// Clock config init error.
 pub const Error = error{
     InvalidCpuClockFrequency,
