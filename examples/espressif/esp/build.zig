@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
 
     const examples: []const Example = &.{
         .{ .name = "selftest_gpio_irq", .file = "src/selftest_gpio_irq.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
+        .{ .name = "selftest_spi_dma", .file = "src/selftest_spi_dma.zig" },
         .{ .name = "selftest_c6_ledc", .file = "src/selftest_c6_ledc.zig", .chips = &.{.esp32_c6} },
         .{ .name = "selftest_c6_core", .file = "src/selftest_c6_core.zig", .chips = &.{.esp32_c6} },
         .{ .name = "blinky", .file = "src/blinky.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },

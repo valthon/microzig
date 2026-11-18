@@ -1,6 +1,9 @@
 const std = @import("std");
 const microzig = @import("microzig");
 const SliceVector = microzig.utilities.SliceVector;
+pub const gdma = @import("gdma.zig");
+const time = @import("time.zig");
+const mtime = microzig.drivers.time;
 
 const clocks = @import("clocks.zig");
 const gpio = @import("gpio.zig");
@@ -330,7 +333,7 @@ pub const SPI = enum(u2) {
     ) void {
         const write_vec: SliceVector([]const u8) = .init(write_buffer_vec);
         var write_iter = write_vec.iterator();
-        const read_vec: SliceVector([]const u8) = .init(read_buffer_vec);
+        const read_vec: SliceVector([]u8) = .init(read_buffer_vec);
         var read_iter = read_vec.iterator();
 
         var remaining = write_vec.size();
@@ -361,6 +364,92 @@ pub const SPI = enum(u2) {
         read_buffer: []u8,
     ) void {
         self.transceivev_blocking(&.{write_buffer}, &.{read_buffer});
+    }
+
+    pub const DmaBuffers = struct {
+        tx: ?[]const u8 = null,
+        rx: ?[]u8 = null,
+        tx_descriptors: []gdma.Descriptor = &.{},
+        rx_descriptors: []gdma.Descriptor = &.{},
+    };
+
+    pub const DmaError = gdma.Error || error{ InvalidLength, OverlappingMemory, Timeout, Busy, SpiFault, ShortRead };
+
+    /// Single 1-bit transaction, at most 32768 bytes (C3 §27.5.6.1,
+    /// §27.5.8.3–4; C6 §28.5.6.1, §28.5.8.3–4). TX/RX lengths must match
+    /// for full duplex. A null direction selects a half-duplex read or write.
+    /// Own SPI2 and GDMA channel 0 exclusively for this call; initialize GDMA
+    /// once with gdma.init(). All buffers/descriptors must be disjoint SRAM.
+    /// No buffer access survives return, including timeout. On a hardware error
+    /// SPI2 is reset: call apply() again before using either the CPU or DMA API.
+    pub fn transfer_dma_blocking(self: SPI, buffers: DmaBuffers, timeout: mtime.Duration) DmaError!void {
+        const tx = buffers.tx;
+        const rx = buffers.rx;
+        const len = if (tx) |b| b.len else if (rx) |b| b.len else return error.InvalidLength;
+        if (len == 0 or len > 32768) return error.InvalidLength;
+        if (rx) |b| if (b.len != len) return error.InvalidLength;
+        if (@field(self.register("CMD").read(), register_name("USR")) != 0) return error.Busy;
+        const count = gdma.descriptor_count(len);
+        if ((tx != null and buffers.tx_descriptors.len < count) or
+            (rx != null and buffers.rx_descriptors.len < count)) return error.InsufficientDescriptors;
+        const regions = [_][]const u8{
+            if (tx) |b| b else &.{},
+            if (rx) |b| b else &.{},
+            if (tx != null) std.mem.sliceAsBytes(buffers.tx_descriptors[0..count]) else &.{},
+            if (rx != null) std.mem.sliceAsBytes(buffers.rx_descriptors[0..count]) else &.{},
+        };
+        for (regions, 0..) |a, i| {
+            for (regions[i + 1 ..]) |b| {
+                if (a.len != 0 and b.len != 0 and
+                    @intFromPtr(a.ptr) < @intFromPtr(b.ptr) + b.len and
+                    @intFromPtr(b.ptr) < @intFromPtr(a.ptr) + a.len) return error.OverlappingMemory;
+            }
+        }
+        const out: []gdma.Descriptor = if (tx) |b| try gdma.prepare(buffers.tx_descriptors, b, .tx) else &.{};
+        const input: []gdma.Descriptor = if (rx) |b| try gdma.prepare(buffers.rx_descriptors, b, .rx) else &.{};
+        const deadline = mtime.Deadline.init_relative(time.get_time_since_boot(), timeout);
+        if (compatibility.chip == .esp32_c6) {
+            // C6 TRM v1.2 §16.3.1–2, §16.4, Table 18.4-5: SPI2 is
+            // GDMA master 16. Its reset mode is REE2, whose SRAM reads are
+            // denied by default and return zero (§16.5), including descriptor
+            // fetches. Use TEE for this trusted DMA client of the machine-mode
+            // HAL; leave the other masters and APM region policy untouched.
+            microzig.chip.peripherals.TEE.M16_MODE_CTRL.modify(.{ .M16_MODE = 0 });
+        }
+        gdma.reset();
+        defer gdma.reset();
+        errdefer system.peripheral_reset(.{ .spi2 = true });
+        defer self.modify_register("DMA_CONF", .{ .DMA_TX_ENA = 0, .DMA_RX_ENA = 0 });
+        self.configure_transfer(tx != null, rx != null, @intCast(len * 8), .single_two_wires);
+        self.clear_transfer_done();
+        self.modify_register("DMA_CONF", .{
+            .DMA_TX_ENA = @intFromBool(tx != null),
+            .DMA_RX_ENA = @intFromBool(rx != null),
+            .RX_EOF_EN = 0,
+            .DMA_SLV_SEG_TRANS_EN = 0,
+            .RX_AFIFO_RST = 1,
+            .BUF_AFIFO_RST = 1,
+            .DMA_AFIFO_RST = 1,
+        });
+        if (rx != null) gdma.start(.rx, 0, input);
+        if (tx != null) gdma.start(.tx, 0, out);
+        self.modify_register("CMD", .{ .UPDATE = 1 });
+        while (@field(self.register("CMD").read(), register_name("UPDATE")) != 0) {
+            if (deadline.is_reached_by(time.get_time_since_boot())) return error.Timeout;
+        }
+        self.modify_register("CMD", .{ .USR = 1 });
+        while (true) {
+            const raw = self.register("DMA_INT_RAW").read();
+            if (@field(raw, register_name("DMA_INFIFO_FULL_ERR_INT_RAW")) != 0 or
+                @field(raw, register_name("DMA_OUTFIFO_EMPTY_ERR_INT_RAW")) != 0 or
+                @field(raw, register_name("MST_RX_AFIFO_WFULL_ERR_INT_RAW")) != 0 or
+                @field(raw, register_name("MST_TX_AFIFO_REMPTY_ERR_INT_RAW")) != 0) return error.SpiFault;
+            const dma_done = try gdma.completed(tx != null, rx != null);
+            if (dma_done and @field(raw, register_name("TRANS_DONE_INT_RAW")) != 0 and
+                @field(self.register("CMD").read(), register_name("USR")) == 0) break;
+            if (deadline.is_reached_by(time.get_time_since_boot())) return error.Timeout;
+        }
+        if (rx != null and !gdma.received(input, len)) return error.ShortRead;
     }
 
     // W1C: write only the requested flag, never read-modify-write.
@@ -436,11 +525,11 @@ pub const SPI = enum(u2) {
         }
     }
 
-    fn start_transfer_generic(
+    fn configure_transfer(
         self: SPI,
         write: bool,
         read: bool,
-        data_bitlen: u18,
+        data_bitlen: u19,
         bit_mode: BitMode,
     ) void {
         self.modify_register("USER", .{
@@ -467,7 +556,10 @@ pub const SPI = enum(u2) {
         });
 
         self.register("MS_DLEN").write_raw(@intCast(data_bitlen - 1));
+    }
 
+    fn start_transfer_generic(self: SPI, write: bool, read: bool, data_bitlen: u18, bit_mode: BitMode) void {
+        self.configure_transfer(write, read, data_bitlen, bit_mode);
         self.clear_transfer_done();
 
         self.modify_register("DMA_CONF", .{
