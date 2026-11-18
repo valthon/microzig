@@ -6,6 +6,11 @@ const pwm_pin = esp.gpio.num(0);
 const ledc_timer = esp.ledc.timer(0);
 const ledc_channel = esp.ledc.channel(0);
 
+const ledc_clock: esp.ledc.ClockSource = switch (esp.compatibility.chip) {
+    .esp32_c3 => .apb_clk,
+    .esp32_c6 => .pll_f80m_clk,
+};
+
 const PWM_FREQ_HZ = 50;
 const PWM_PERIOD_MS = 1000 / PWM_FREQ_HZ;
 const PWM_PRECISION_BITS = 14;
@@ -28,12 +33,12 @@ pub fn main() !void {
     pwm_pin.apply(.{ .output_enable = true });
     ledc_channel.connect_pin(pwm_pin);
 
-    esp.ledc.apply(.apb_clk);
+    esp.ledc.apply(ledc_clock);
     ledc_timer.apply(.{
         .clock_config = esp.clock_config,
         .frequency = 50,
         .precision = 14,
-    }, .apb_clk);
+    }, ledc_clock);
 
     ledc_channel.apply(.{
         .timer = ledc_timer,

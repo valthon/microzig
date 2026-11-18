@@ -54,6 +54,15 @@ that MAC check. Clock measurements are relative to the common crystal; they do n
 absolute accuracy. It runs once, waits 1500 ms, then repeats saved `SELFTEST c6_core` results and a
 `DONE pass=... fail=...` line every second through USB-serial-JTAG.
 
+The additional `selftest_c6_ledc` example samples a 1 kHz PWM through GPIO0, checks 25% and 75%
+duty cycles and their active-duty readbacks, measures both XTAL and PLL_F80M clock paths, and
+verifies a gamma fade reaches its expected final duty. It also needs no wiring. Fixed-duty updates
+use a zero-scale gamma range with DUTY_START and PARA_UP, rather than leaving the duty engine
+stopped (TRM §35.3.4.1 and §35.5, registers 35.1–35.2).
+
+Evidence: on the Super Mini ESP32-C6FH4 rev v0.2, from RAM, `selftest_c6_core` passed 85/85 and
+`selftest_c6_ledc` passed 7/7.
+
 ## Chip specific code
 
 Most of the hal is shared. Where a peripheral differs between chips, the module either switches on
