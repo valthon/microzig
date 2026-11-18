@@ -15,3 +15,11 @@ pub const chip: Chip = blk: {
         @compileError(std.fmt.comptimePrint("Unsupported chip for ESP HAL: \"{s}\"", .{microzig.config.chip_name}));
     }
 };
+
+/// Fails compilation when a HAL module that only drives ESP32-C3 registers is used on another
+/// chip, instead of failing later on a missing or differently laid out register.
+pub fn require_esp32_c3(comptime module: []const u8) void {
+    if (@import("builtin").is_test) return;
+    if (chip != .esp32_c3)
+        @compileError(module ++ " drives ESP32-C3 registers only and is not ported to " ++ @tagName(chip));
+}

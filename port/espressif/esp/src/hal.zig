@@ -5,6 +5,7 @@ pub const esp_image = @import("esp_image");
 const microzig = @import("microzig");
 
 pub const cache = @import("hal/cache.zig");
+pub const adc = @import("hal/adc.zig");
 pub const clocks = @import("hal/clocks.zig");
 pub const compatibility = @import("hal/compatibility.zig");
 pub const drivers = @import("hal/drivers.zig");
@@ -28,6 +29,7 @@ pub const timer = @import("hal/timer.zig");
 pub const wdt = @import("hal/wdt.zig");
 pub const time = @import("hal/time.zig");
 pub const twai = @import("hal/twai.zig");
+pub const temperature = @import("hal/temperature.zig");
 pub const uart = @import("hal/uart.zig");
 pub const usb_serial_jtag = @import("hal/usb_serial_jtag.zig");
 
@@ -142,6 +144,9 @@ test {
     _ = twai;
     _ = rmt;
     _ = flash;
+    _ = adc;
+    _ = efuse;
+    _ = temperature;
     _ = rtos;
     _ = radio;
     _ = @import("hal/gpio_encoding.zig");

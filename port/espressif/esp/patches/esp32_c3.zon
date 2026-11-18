@@ -1,0 +1,33 @@
+// ESP-IDF v5.3.1 (Apache-2.0):
+// components/soc/esp32c3/include/soc/regi2c_defs.h gives the addresses/bits;
+// components/hal/esp32c3/include/hal/regi2c_ctrl_ll.h,
+// regi2c_ctrl_ll_i2c_saradc_enable clears SAR_FORCE_PD and sets SAR_FORCE_PU.
+// These analog-I2C control registers are absent from the supplied C3 SVD
+// and the ESP32-C3 TRM v1.4 register descriptions. Leave BBPLL and all
+// other analog controls untouched when enabling SAR register access.
+.{
+    .{ .add_peripheral = .{
+        .device_name = "ESP32-C3",
+        .name = "I2C_ANA_MST",
+        .description = "Analog I2C master control (ESP-IDF v5.3.1 regi2c_defs.h)",
+        .base_address = 0x6000e000,
+        .registers = .{
+            .{
+                .name = "ANA_CONFIG",
+                .offset_bytes = 0x44,
+                .size_bits = 32,
+                .fields = .{
+                    .{ .name = "SAR_FORCE_PD", .offset_bits = 18, .size_bits = 1 },
+                },
+            },
+            .{
+                .name = "ANA_CONFIG2",
+                .offset_bytes = 0x48,
+                .size_bits = 32,
+                .fields = .{
+                    .{ .name = "SAR_FORCE_PU", .offset_bits = 16, .size_bits = 1 },
+                },
+            },
+        },
+    } },
+}

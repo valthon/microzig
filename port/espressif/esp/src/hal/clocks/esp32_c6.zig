@@ -202,7 +202,7 @@ fn rom_cpu_frequency_update(freq: u32) void {
 ///
 /// NOTE: unlike the esp32c3 the analog side of the pll is not configured here. The esp32c6 rom
 /// does not export the regi2c helpers, the analog registers have to be driven through the
-/// LP_I2C_ANA_MST peripheral instead. The rom bootloader already calibrates the pll to 480 MHz
+/// HP I2C_ANA_MST peripheral instead (see `../analog/esp32_c6.zig`). The rom bootloader already calibrates the pll to 480 MHz
 /// before it hands over control, so re-running that calibration is only needed once this hal
 /// starts powering the pll down again.
 fn bbpll_enable() void {

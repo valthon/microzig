@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "systimer", .file = "src/systimer.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_twai", .file = "src/selftest_twai.zig" },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_flash", .file = "src/selftest_flash.zig" },
+        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_adc", .file = "src/selftest_adc.zig" },
         .{ .name = "ws2812_blinky", .file = "src/ws2812_blinky.zig" },
         .{ .chips = &.{.esp32_c3}, .name = "rtos", .file = "src/rtos.zig" },
         .{ .chips = &.{.esp32_c3}, .name = "tcp_server", .file = "src/tcp_server.zig", .features = .{

@@ -99,6 +99,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
             .name = "ESP32-C3",
             .url = "https://www.espressif.com/en/products/socs/esp32-c3",
             .register_definition = .{ .svd = b.path("src/chips/ESP32-C3.svd") },
+            .patch_files = &.{b.path("patches/esp32_c3.zon")},
             .memory_regions = &.{
                 .{ .name = "IROM", .offset = 0x4200_0000, .length = 0x0080_0000, .access = .rx },
                 .{ .name = "DROM", .offset = 0x3C00_0000, .length = 0x0080_0000, .access = .r },
