@@ -3,6 +3,26 @@ const Allocator = std.mem.Allocator;
 const Arch = @import("arch.zig").Arch;
 
 pub const Type = struct {
+    pub const Access = enum { read_write, read_only, write_only, write_once, read_write_once };
+
+    pub const Field = struct {
+        name: []const u8,
+        description: ?[]const u8 = null,
+        offset_bits: u8,
+        size_bits: u8,
+        access: ?Access = null,
+    };
+
+    pub const Register = struct {
+        name: []const u8,
+        description: ?[]const u8 = null,
+        offset_bytes: u64,
+        size_bits: u8,
+        access: Access = .read_write,
+        reset_value: ?u64 = null,
+        fields: []const Field = &.{},
+    };
+
     pub const EnumField = struct {
         name: []const u8,
         description: ?[]const u8 = null,
@@ -18,6 +38,16 @@ pub const Type = struct {
 };
 
 pub const Patch = union(enum) {
+    /// Add a peripheral type and an instance on one existing device. Register
+    /// offsets are relative to base_address; field offsets are relative to the
+    /// register. Existing peripherals cannot be replaced by this operation.
+    add_peripheral: struct {
+        device_name: []const u8,
+        name: []const u8,
+        description: ?[]const u8 = null,
+        base_address: u64,
+        registers: []const Type.Register,
+    },
     override_arch: struct {
         device_name: []const u8,
         arch: Arch,
