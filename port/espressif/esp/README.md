@@ -16,6 +16,10 @@ the system timer and the usb serial/jtag logger. `hal.i2c`, `hal.spi`, `hal.ledc
 `hal.radio` have not been ported to it yet and still speak to esp32c3 registers, so they only
 compile when their chip supports them.
 
+RNG reads enable the asynchronous RC_FAST path and are serialized below 1 MHz. On C6, an active
+SAR ADC or radio ADC is required for true randomness (TRM §26.3–26.4). The HAL does not enable an
+ADC implicitly; without ADC entropy its output is pseudo-random and unsuitable for cryptography.
+
 ## Boards
 
 | Board                                                                       | Target                              |
