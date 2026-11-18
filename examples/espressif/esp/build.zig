@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "i2c_temp", .file = "src/i2c_temp.zig" },
         .{ .name = "i2c_display_sh1106", .file = "src/i2c_display_sh1106.zig" },
         .{ .name = "i2c_display_ssd1306_c3_oled_042", .file = "src/i2c_display_ssd1306_c3_oled_042.zig" },
+        .{ .name = "selftest_ledc_fade", .file = "src/selftest_ledc_fade.zig" },
         .{ .name = "ledc_pwm_servo", .file = "src/ledc_pwm_servo.zig" },
         .{ .name = "stepper_driver", .file = "src/stepper_driver.zig" },
         .{ .name = "stepper_driver_dumb", .file = "src/stepper_driver_dumb.zig" },
