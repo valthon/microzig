@@ -15,6 +15,13 @@ pub fn build(b: *std.Build) void {
     const examples: []const Example = &.{
         .{ .name = "selftest_gpio_irq", .file = "src/selftest_gpio_irq.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .name = "selftest_spi_dma", .file = "src/selftest_spi_dma.zig" },
+        .{ .name = "selftest_sleep_s1", .file = "src/selftest_sleep.zig", .sleep_stage = 1, .chips = &.{.esp32_c3} },
+        .{ .name = "selftest_sleep_s2", .file = "src/selftest_sleep.zig", .sleep_stage = 2, .chips = &.{.esp32_c3} },
+        .{ .name = "selftest_sleep_s3", .file = "src/selftest_sleep.zig", .sleep_stage = 3, .chips = &.{.esp32_c3} },
+        .{ .name = "selftest_sleep_s4", .file = "src/selftest_sleep.zig", .sleep_stage = 4, .chips = &.{.esp32_c3} },
+        .{ .name = "selftest_sleep_s5", .file = "src/selftest_sleep.zig", .sleep_stage = 5, .chips = &.{.esp32_c3} },
+        .{ .name = "selftest_sleep_s6", .file = "src/selftest_sleep.zig", .sleep_stage = 6, .chips = &.{.esp32_c3} },
+        .{ .name = "selftest_sleep", .file = "src/selftest_sleep.zig", .sleep_stage = 4, .chips = &.{.esp32_c3} },
         .{ .name = "selftest_c6_ledc", .file = "src/selftest_c6_ledc.zig", .chips = &.{.esp32_c6} },
         .{ .name = "selftest_c6_core", .file = "src/selftest_c6_core.zig", .chips = &.{.esp32_c6} },
         .{ .name = "blinky", .file = "src/blinky.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
@@ -80,6 +87,12 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .root_source_file = b.path(example.file),
             });
+
+            if (example.sleep_stage) |stage| {
+                const options = b.addOptions();
+                options.addOption(u8, "stage", stage);
+                fw.exe.root_module.addOptions("sleep_test_options", options);
+            }
 
             if (example.features.lwip) {
                 const target = b.resolveTargetQuery(fw.target.zig_target);
@@ -205,6 +218,7 @@ const Example = struct {
     name: []const u8,
     file: []const u8,
     features: Features = .{},
+    sleep_stage: ?u8 = null,
     /// Chips whose peripherals and board assumptions this example supports.
     chips: []const Chip = &.{ .esp32_c3, .esp32_c6 },
 };
