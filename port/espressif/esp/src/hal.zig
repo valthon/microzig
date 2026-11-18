@@ -9,6 +9,7 @@ pub const clocks = @import("hal/clocks.zig");
 pub const compatibility = @import("hal/compatibility.zig");
 pub const drivers = @import("hal/drivers.zig");
 pub const efuse = @import("hal/efuse.zig");
+pub const flash = @import("hal/flash.zig");
 pub const gpio = @import("hal/gpio.zig");
 pub const i2c = @import("hal/i2c.zig");
 pub const ledc = switch (compatibility.chip) {
@@ -140,6 +141,7 @@ fn str(comptime l: usize, comptime s: []const u8) [l]u8 {
 test {
     _ = twai;
     _ = rmt;
+    _ = flash;
     _ = rtos;
     _ = radio;
     _ = @import("hal/gpio_encoding.zig");
