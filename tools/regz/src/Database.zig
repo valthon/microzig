@@ -2115,6 +2115,82 @@ pub fn apply_patch(db: *Database, zon_text: [:0]const u8, arena: std.mem.Allocat
 
     for (patches) |patch| {
         switch (patch) {
+            .add_peripheral => |peripheral| {
+                const device_id = try db.get_device_id_by_name(peripheral.device_name) orelse
+                    return error.DeviceNotFound;
+                if (try db.get_peripheral_by_name(peripheral.name) != null)
+                    return error.PeripheralAlreadyExists;
+                const instances = try db.get_device_peripherals(arena, device_id);
+                for (instances) |instance| {
+                    if (std.mem.eql(u8, instance.name, peripheral.name))
+                        return error.PeripheralAlreadyExists;
+                }
+                // Validate the whole description before changing the database.
+                if (peripheral.name.len == 0) return error.InvalidPeripheral;
+                for (peripheral.registers, 0..) |register, i| {
+                    switch (register.size_bits) {
+                        8, 16, 32, 64 => {},
+                        else => return error.InvalidRegister,
+                    }
+                    if (register.name.len == 0) return error.InvalidRegister;
+                    const end = std.math.add(u64, register.offset_bytes, register.size_bits / 8) catch
+                        return error.InvalidRegister;
+                    _ = std.math.add(u64, peripheral.base_address, end) catch return error.InvalidRegister;
+                    if (register.reset_value) |value| {
+                        if (register.size_bits < 64 and value >> @as(u6, @intCast(register.size_bits)) != 0)
+                            return error.InvalidRegister;
+                    }
+                    for (peripheral.registers[0..i]) |previous| {
+                        if (std.mem.eql(u8, previous.name, register.name)) return error.DuplicateRegister;
+                        if (register.offset_bytes < previous.offset_bytes + previous.size_bits / 8 and previous.offset_bytes < end)
+                            return error.OverlappingRegisters;
+                    }
+                    for (register.fields, 0..) |field, j| {
+                        const field_end = @as(u16, field.offset_bits) + field.size_bits;
+                        if (field.name.len == 0 or field.size_bits == 0 or field_end > register.size_bits)
+                            return error.InvalidField;
+                        for (register.fields[0..j]) |previous| {
+                            if (std.mem.eql(u8, previous.name, field.name)) return error.DuplicateField;
+                            if (field.offset_bits < @as(u16, previous.offset_bits) + previous.size_bits and previous.offset_bits < field_end)
+                                return error.OverlappingFields;
+                        }
+                    }
+                }
+                const peripheral_id = try db.create_peripheral(.{
+                    .name = peripheral.name,
+                    .description = peripheral.description,
+                });
+                const parent = try db.get_peripheral_struct(peripheral_id);
+                for (peripheral.registers) |register| {
+                    const register_id = try db.create_register(parent, .{
+                        .name = register.name,
+                        .description = register.description,
+                        .offset_bytes = register.offset_bytes,
+                        .size_bits = register.size_bits,
+                        .access = switch (register.access) {
+                            inline else => |access| @field(Access, @tagName(access)),
+                        },
+                        .reset_value = register.reset_value,
+                    });
+                    for (register.fields) |field| {
+                        try db.add_register_field(register_id, .{
+                            .name = field.name,
+                            .description = field.description,
+                            .offset_bits = field.offset_bits,
+                            .size_bits = field.size_bits,
+                            .access = if (field.access) |field_access| switch (field_access) {
+                                inline else => |access| @field(Access, @tagName(access)),
+                            } else null,
+                        });
+                    }
+                }
+                _ = try db.create_device_peripheral(device_id, .{
+                    .struct_id = parent,
+                    .name = peripheral.name,
+                    .description = peripheral.description,
+                    .offset_bytes = peripheral.base_address,
+                });
+            },
             .override_arch => |override_arch| {
                 const device_id = try db.get_device_id_by_name(override_arch.device_name) orelse {
                     return error.DeviceNotFound;
@@ -2174,6 +2250,24 @@ pub fn apply_patch(db: *Database, zon_text: [:0]const u8, arena: std.mem.Allocat
                 try db.set_register_field_enum_id(register_id, field_name, enum_id);
                 try db.cleanup_unused_enums();
             },
+            .rename_register_at_offset => |rename| {
+                const parent = try db.get_struct_ref(rename.parent);
+                const matches = try db.all(struct { id: RegisterID, name: []const u8 },
+                    \\SELECT r.id, r.name
+                    \\FROM registers AS r
+                    \\JOIN struct_registers AS sr ON sr.register_id = r.id
+                    \\WHERE sr.struct_id = ? AND r.offset_bytes = ?
+                , arena, .{ @backingInt(parent), rename.offset_bytes });
+                if (matches.len == 0) return error.MissingEntity;
+                if (matches.len != 1) return error.AmbiguousRegister;
+                if (!std.mem.eql(u8, matches[0].name, rename.expected_name))
+                    return error.RegisterNameMismatch;
+
+                try db.conn.exec("UPDATE registers SET name = ? WHERE id = ?", .{
+                    rename.name,
+                    @backingInt(matches[0].id),
+                });
+            },
             .add_interrupt => |add_interrupt| {
                 const device_id = try db.get_device_id_by_name(add_interrupt.device_name) orelse {
                     return error.DeviceNotFound;
@@ -2216,8 +2310,177 @@ pub fn apply_patch(db: *Database, zon_text: [:0]const u8, arena: std.mem.Allocat
 
 pub const ToZigOptions = gen.ToZigOptions;
 
+test "add_peripheral creates an instance and typed registers and composes with rename" {
+    var db = try Database.create(std.testing.allocator);
+    defer db.destroy();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const target = try db.create_device(.{ .name = "TARGET", .arch = .unknown });
+    const other = try db.create_device(.{ .name = "OTHER", .arch = .unknown });
+    const patch_zon: [:0]const u8 =
+        \\.{ .{ .add_peripheral = .{
+        \\    .device_name = "TARGET", .name = "ANALOG", .base_address = 0x6000e000,
+        \\    .description = "Analog I2C control",
+        \\    .registers = .{
+        \\        .{ .name = "CONF", .offset_bytes = 0x44, .size_bits = 32, .reset_value = 0x40000,
+        \\           .fields = .{ .{ .name = "PD", .offset_bits = 18, .size_bits = 1 } } },
+        \\        .{ .name = "STATUS", .offset_bytes = 0x48, .size_bits = 32, .access = .read_only,
+        \\           .fields = .{ .{ .name = "VALUE", .offset_bits = 0, .size_bits = 8, .access = .read_only } } },
+        \\    },
+        \\} } }
+    ;
+    try db.apply_patch(patch_zon, allocator);
+    const instances = try db.get_device_peripherals(allocator, target);
+    try std.testing.expectEqual(@as(usize, 1), instances.len);
+    try std.testing.expectEqualStrings("ANALOG", instances[0].name);
+    try std.testing.expectEqual(@as(u64, 0x6000e000), instances[0].offset_bytes);
+    try std.testing.expectEqual(@as(usize, 0), (try db.get_device_peripherals(allocator, other)).len);
+    const parent = instances[0].struct_id;
+    const conf = try db.get_register_by_name(allocator, parent, "CONF");
+    try std.testing.expectEqual(@as(u64, 0x44), conf.offset_bytes);
+    try std.testing.expectEqual(@as(u64, 32), conf.size_bits);
+    try std.testing.expectEqual(@as(?u64, 0x40000), conf.reset_value);
+    const fields = try db.get_register_fields(allocator, conf.id, .{});
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("PD", fields[0].name);
+    try std.testing.expectEqual(@as(u8, 18), fields[0].offset_bits);
+    try std.testing.expectEqual(@as(u8, 1), fields[0].size_bits);
+    const status = try db.get_register_by_name(allocator, parent, "STATUS");
+    try std.testing.expectEqual(Access.read_only, status.access);
+    const status_fields = try db.get_register_fields(allocator, status.id, .{});
+    try std.testing.expectEqual(@as(?Access, .read_only), status_fields[0].access);
+    try db.apply_patch(
+        \\.{ .{ .rename_register_at_offset = .{
+        \\    .parent = "types.peripherals.ANALOG", .offset_bytes = 0x44,
+        \\    .expected_name = "CONF", .name = "CONTROL",
+        \\} } }
+    , allocator);
+    try std.testing.expectEqual(conf.id, (try db.get_register_by_name(allocator, parent, "CONTROL")).id);
+    try std.testing.expectError(error.PeripheralAlreadyExists, db.apply_patch(patch_zon, allocator));
+    try std.testing.expectEqual(@as(usize, 1), (try db.get_device_peripherals(allocator, target)).len);
+}
+
+test "add_peripheral rejects missing devices and invalid register fields before mutation" {
+    var db = try Database.create(std.testing.allocator);
+    defer db.destroy();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const target = try db.create_device(.{ .name = "TARGET", .arch = .unknown });
+    try std.testing.expectError(error.DeviceNotFound, db.apply_patch(
+        \\.{ .{ .add_peripheral = .{ .device_name = "MISSING", .name = "NEW", .base_address = 0, .registers = .{} } } }
+    , allocator));
+    const cases = .{
+        .{ error.InvalidRegister, ".{ .name = \"R\", .offset_bytes = 0, .size_bits = 0 }" },
+        .{ error.InvalidRegister, ".{ .name = \"R\", .offset_bytes = 0xffffffffffffffff, .size_bits = 32 }" },
+        .{ error.InvalidRegister, ".{ .name = \"R\", .offset_bytes = 0, .size_bits = 8, .reset_value = 256 }" },
+        .{ error.InvalidField, ".{ .name = \"R\", .offset_bytes = 0, .size_bits = 32, .fields = .{ .{ .name = \"F\", .offset_bits = 31, .size_bits = 2 } } }" },
+        .{ error.OverlappingFields, ".{ .name = \"R\", .offset_bytes = 0, .size_bits = 32, .fields = .{ .{ .name = \"F\", .offset_bits = 0, .size_bits = 2 }, .{ .name = \"G\", .offset_bits = 1, .size_bits = 1 } } }" },
+        .{ error.DuplicateField, ".{ .name = \"R\", .offset_bytes = 0, .size_bits = 32, .fields = .{ .{ .name = \"F\", .offset_bits = 0, .size_bits = 1 }, .{ .name = \"F\", .offset_bits = 1, .size_bits = 1 } } }" },
+        .{ error.OverlappingRegisters, ".{ .name = \"R\", .offset_bytes = 0, .size_bits = 32 }, .{ .name = \"S\", .offset_bytes = 2, .size_bits = 32 }" },
+        .{ error.DuplicateRegister, ".{ .name = \"R\", .offset_bytes = 0, .size_bits = 32 }, .{ .name = \"R\", .offset_bytes = 4, .size_bits = 32 }" },
+    };
+    inline for (cases) |case| {
+        const patch_zon = ".{ .{ .add_peripheral = .{ .device_name = \"TARGET\", .name = \"NEW\", .base_address = 0, .registers = .{ " ++ case[1] ++ " } } } }";
+        try std.testing.expectError(case[0], db.apply_patch(patch_zon, allocator));
+        try std.testing.expect(try db.get_peripheral_by_name("NEW") == null);
+        try std.testing.expectEqual(@as(usize, 0), (try db.get_device_peripherals(allocator, target)).len);
+    }
+}
+
 pub fn to_zig(db: *Database, io: std.Io, output_dir: std.Io.Dir, opts: ToZigOptions) !void {
     try gen.to_zig(db, io, output_dir, opts);
+}
+
+test "rename_register_at_offset disambiguates expanded names and preserves registers" {
+    var db = try Database.create(std.testing.allocator);
+    defer db.destroy();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    const dma = try db.get_peripheral_struct(try db.create_peripheral(.{ .name = "DMA" }));
+    const other = try db.get_peripheral_struct(try db.create_peripheral(.{ .name = "OTHER" }));
+    const channel0 = try db.create_register(dma, .{
+        .name = "OUT_CONF0_CH0",
+        .offset_bytes = 0xd0,
+        .size_bits = 32,
+    });
+    const channel1 = try db.create_register(dma, .{
+        .name = "OUT_CONF0_CH0",
+        .offset_bytes = 0x190,
+        .size_bits = 32,
+        .description = "Channel 1 configuration",
+        .reset_value = 8,
+    });
+    try db.add_register_field(channel1, .{ .name = "RESET", .offset_bits = 0, .size_bits = 1 });
+    const channel2 = try db.create_register(dma, .{
+        .name = "OUT_CONF0_CH1",
+        .offset_bytes = 0x250,
+        .size_bits = 32,
+    });
+    const unrelated = try db.create_register(other, .{
+        .name = "OUT_CONF0_CH0",
+        .offset_bytes = 0x190,
+        .size_bits = 32,
+    });
+
+    try db.apply_patch(
+        \\.{
+        \\    .{ .rename_register_at_offset = .{
+        \\        .parent = "types.peripherals.DMA", .offset_bytes = 0x250,
+        \\        .expected_name = "OUT_CONF0_CH1", .name = "OUT_CONF0_CH2",
+        \\    } },
+        \\    .{ .rename_register_at_offset = .{
+        \\        .parent = "types.peripherals.DMA", .offset_bytes = 0x190,
+        \\        .expected_name = "OUT_CONF0_CH0", .name = "OUT_CONF0_CH1",
+        \\    } },
+        \\}
+    , gpa);
+
+    try std.testing.expectEqual(channel0, (try db.get_register_by_name(gpa, dma, "OUT_CONF0_CH0")).id);
+    const renamed = try db.get_register_by_name(gpa, dma, "OUT_CONF0_CH1");
+    try std.testing.expectEqual(channel1, renamed.id);
+    try std.testing.expectEqual(@as(u64, 0x190), renamed.offset_bytes);
+    try std.testing.expectEqual(@as(u64, 32), renamed.size_bits);
+    try std.testing.expectEqual(@as(?u64, 8), renamed.reset_value);
+    try std.testing.expectEqualStrings("Channel 1 configuration", renamed.description.?);
+    const fields = try db.get_register_fields(gpa, renamed.id, .{});
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("RESET", fields[0].name);
+    try std.testing.expectEqual(channel2, (try db.get_register_by_name(gpa, dma, "OUT_CONF0_CH2")).id);
+    try std.testing.expectEqual(unrelated, (try db.get_register_by_name(gpa, other, "OUT_CONF0_CH0")).id);
+}
+
+test "rename_register_at_offset rejects missing ambiguous and unexpected targets" {
+    var db = try Database.create(std.testing.allocator);
+    defer db.destroy();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const parent = try db.get_peripheral_struct(try db.create_peripheral(.{ .name = "PERIPH" }));
+    const original = try db.create_register(parent, .{ .name = "REG", .offset_bytes = 4, .size_bits = 32 });
+    const patch_zon: [:0]const u8 =
+        \\.{ .{ .rename_register_at_offset = .{
+        \\    .parent = "types.peripherals.PERIPH", .offset_bytes = 0,
+        \\    .expected_name = "REG", .name = "RENAMED",
+        \\} } }
+    ;
+    try std.testing.expectError(error.MissingEntity, db.apply_patch(patch_zon, gpa));
+
+    try std.testing.expectError(error.RegisterNameMismatch, db.apply_patch(
+        \\.{ .{ .rename_register_at_offset = .{
+        \\    .parent = "types.peripherals.PERIPH", .offset_bytes = 4,
+        \\    .expected_name = "OLD_VENDOR_NAME", .name = "RENAMED",
+        \\} } }
+    , gpa));
+    try std.testing.expectEqual(original, (try db.get_register_by_name(gpa, parent, "REG")).id);
+
+    _ = try db.create_register(parent, .{ .name = "ALIAS_A", .offset_bytes = 0, .size_bits = 32 });
+    _ = try db.create_register(parent, .{ .name = "ALIAS_B", .offset_bytes = 0, .size_bits = 32 });
+    try std.testing.expectError(error.AmbiguousRegister, db.apply_patch(patch_zon, gpa));
+    try std.testing.expectEqual(original, (try db.get_register_by_name(gpa, parent, "REG")).id);
 }
 
 test "all" {

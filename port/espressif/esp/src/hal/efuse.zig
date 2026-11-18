@@ -14,13 +14,12 @@ pub fn read_mac() [6]u8 {
 pub fn read(comptime what: Item) @Int(.unsigned, what.bit_length) {
     const OutputType = @Int(.unsigned, what.bit_length);
 
-    const block_byte_offsets = [_]u8{ 0x2C, 0x44, 0x5C };
-    if (what.block >= block_byte_offsets.len) @compileError("invalid block");
+    if (what.block > 2) @compileError("invalid block");
 
     const start_word = what.bit_offset / 32;
     const start_bit_offset_in_word = what.bit_offset % 32;
 
-    const end_bit = what.bit_offset + what.bit_length - 1;
+    const end_bit = @as(usize, what.bit_offset) + what.bit_length - 1;
     const end_word = end_bit / 32;
     const end_bit_offset_in_word = end_bit % 32;
 
@@ -28,9 +27,13 @@ pub fn read(comptime what: Item) @Int(.unsigned, what.bit_length) {
     comptime var current_bit = 0;
 
     inline for (start_word..end_word + 1) |word| {
-        const word_offset = block_byte_offsets[what.block] + word * 4;
-
-        var value = @as(*volatile u32, @ptrFromInt(@intFromPtr(EFUSE) + word_offset)).*;
+        const name = comptime switch (what.block) {
+            0 => if (word == 0) "RD_WR_DIS" else std.fmt.comptimePrint("RD_REPEAT_DATA{d}", .{word - 1}),
+            1 => std.fmt.comptimePrint("RD_MAC_SPI_SYS_{d}", .{word}),
+            2 => std.fmt.comptimePrint("RD_SYS_PART1_DATA{d}", .{word}),
+            else => unreachable,
+        };
+        var value: u32 = @bitCast(@field(EFUSE, name).read());
 
         comptime var increment = 32;
         comptime var pre_shift = 0;
@@ -107,7 +110,8 @@ pub const items = struct {
     };
 
     pub const blk_version_major: Item = .{
-        .block = 1,
+        // ESP-IDF v5.3.1 esp_efuse_table.csv: BLK_VERSION_MAJOR is in BLOCK2.
+        .block = 2,
         .bit_offset = 128,
         .bit_length = 2,
     };
@@ -158,3 +162,44 @@ pub const items = struct {
         },
     };
 };
+
+pub const AdcCalibration = struct {
+    init_code: u12,
+    reference_code: u12,
+    reference_mv: u16,
+};
+
+/// Only encoding version 1 (BLOCK2 major = 1) is supported. Other versions,
+/// including unburnt eFuses, return null. Zero payload fields are valid in v1.
+/// Arithmetic from ESP-IDF v5.3.1 esp_efuse_rtc_calib.c:
+/// esp_efuse_rtc_calib_get_ver/get_init_code/get_cal_voltage (Apache-2.0).
+pub fn read_adc1_calibration() ?[4]AdcCalibration {
+    if (read(items.blk_version_major) != 1) return null;
+    var result: [4]AdcCalibration = undefined;
+    inline for (0..4) |atten| {
+        result[atten] = decode_adc_calibration(
+            read(items.adc1_init_code[atten]),
+            read(items.adc1_cal_voltage[atten]),
+            .{ 400, 550, 750, 1370 }[atten],
+        );
+    }
+    return result;
+}
+
+fn decode_adc_calibration(init_code: u10, voltage_code: u10, reference_mv: u16) AdcCalibration {
+    const magnitude: u12 = voltage_code & 0x1ff;
+    return .{
+        .init_code = 1000 + @as(u12, init_code),
+        .reference_code = if (voltage_code & 0x200 != 0) 2000 - magnitude else 2000 + magnitude,
+        .reference_mv = reference_mv,
+    };
+}
+
+test "ADC v1 sign magnitude voltage and init code boundaries" {
+    const expect = std.testing.expectEqual;
+    try expect(@as(u12, 1000), decode_adc_calibration(0, 0, 400).init_code);
+    try expect(@as(u12, 2023), decode_adc_calibration(1023, 0, 400).init_code);
+    try expect(@as(u12, 2000), decode_adc_calibration(0, 0x200, 400).reference_code);
+    try expect(@as(u12, 2511), decode_adc_calibration(0, 0x1ff, 400).reference_code);
+    try expect(@as(u12, 1489), decode_adc_calibration(0, 0x3ff, 400).reference_code);
+}

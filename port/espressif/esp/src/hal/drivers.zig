@@ -193,17 +193,7 @@ pub const I2C_Device = struct {
         write_chunks: []const []const u8,
         read_chunks: []const []u8,
     ) I2CError!void {
-        // TODO: When writev_then_readv_blocking is implemented in the HAL, use that.
-        // NOTE: Since we are making two calls with the same timeout, we are effectively doubling
-        // the timeout here.
-        dev.bus.writev_blocking(address, write_chunks, dev.timeout) catch |err| return switch (err) {
-            error.FifoExceeded => I2CError.UnknownAbort,
-            error.ArbitrationLost => I2CError.UnknownAbort,
-            error.ExecutionIncomplete => I2CError.UnknownAbort,
-            error.CommandNumberExceeded => I2CError.UnknownAbort,
-            else => |e| e,
-        };
-        dev.bus.readv_blocking(address, read_chunks, dev.timeout) catch |err| return switch (err) {
+        dev.bus.writev_then_readv_blocking(address, write_chunks, read_chunks, dev.timeout) catch |err| return switch (err) {
             error.FifoExceeded => I2CError.UnknownAbort,
             error.ArbitrationLost => I2CError.UnknownAbort,
             error.ExecutionIncomplete => I2CError.UnknownAbort,
@@ -465,4 +455,9 @@ pub fn clock_device() ClockDevice {
         .ptr = undefined,
         .vtable = &S.vtable,
     };
+}
+
+comptime {
+    _ = hal.i2c.I2C.write_then_read_blocking;
+    _ = hal.i2c.I2C.writev_then_readv_blocking;
 }

@@ -119,7 +119,7 @@ pub fn free(ptr: ?*anyopaque) callconv(.c) void {
 
     const buf_ptr: [*]u8 = @ptrFromInt(@intFromPtr(ptr) - 8);
     const buf_len: *usize = @ptrCast(@alignCast(buf_ptr));
-    gpa.rawFree(buf_ptr[0 .. @sizeOf(usize) + buf_len.*], .@"8", @returnAddress());
+    gpa.rawFree(buf_ptr[0 .. 8 + buf_len.*], .@"8", @returnAddress());
 }
 
 pub fn puts(ptr: ?*anyopaque) callconv(.c) void {
@@ -479,7 +479,7 @@ pub fn queue_create(capacity: u32, item_len: u32) callconv(.c) ?*anyopaque {
         break :blk .{ 3, 8 };
     };
 
-    const buf: []u8 = gpa.alloc(u8, new_cap * item_len) catch {
+    const buf: []u8 = gpa.alloc(u8, new_cap * new_item_len) catch {
         log.warn("failed to allocate queue buffer", .{});
         return null;
     };

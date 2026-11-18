@@ -29,6 +29,8 @@ pub const Options = struct {
 var refcount: std.atomic.Value(usize) = .init(0);
 
 pub fn init(gpa: Allocator) Allocator.Error!void {
+    if (@import("compatibility.zig").chip == .esp32_c6)
+        @compileError("hal.radio is only supported on ESP32-C3");
     // TODO: check that clock frequency is higher or equal to 80mhz
 
     const radio_interrupt = microzig.options.hal.radio.interrupt;

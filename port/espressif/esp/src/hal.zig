@@ -5,26 +5,39 @@ pub const esp_image = @import("esp_image");
 const microzig = @import("microzig");
 
 pub const cache = @import("hal/cache.zig");
+pub const adc = @import("hal/adc.zig");
 pub const clocks = @import("hal/clocks.zig");
 pub const compatibility = @import("hal/compatibility.zig");
 pub const drivers = @import("hal/drivers.zig");
 pub const efuse = @import("hal/efuse.zig");
+pub const flash = @import("hal/flash.zig");
 pub const gpio = @import("hal/gpio.zig");
 pub const i2c = @import("hal/i2c.zig");
-pub const ledc = @import("hal/ledc.zig");
+pub const ledc = switch (compatibility.chip) {
+    .esp32_c3 => @import("hal/ledc.zig"),
+    .esp32_c6 => @import("hal/ledc/esp32_c6.zig"),
+};
 pub const radio = @import("hal/radio.zig");
+pub const rmt = @import("hal/rmt.zig");
 pub const rng = @import("hal/rng.zig");
 pub const rom = @import("hal/rom.zig");
 pub const rtos = @import("hal/rtos.zig");
 pub const spi = @import("hal/spi.zig");
 pub const system = @import("hal/system.zig");
 pub const systimer = @import("hal/systimer.zig");
+pub const timer = @import("hal/timer.zig");
+pub const wdt = @import("hal/wdt.zig");
 pub const time = @import("hal/time.zig");
+pub const twai = @import("hal/twai.zig");
+pub const temperature = @import("hal/temperature.zig");
 pub const uart = @import("hal/uart.zig");
 pub const usb_serial_jtag = @import("hal/usb_serial_jtag.zig");
 
 comptime {
     if (!builtin.is_test) {
+        // Keep otherwise unused register accessors in firmware compile coverage.
+        @export(&compile_check_accessors, .{ .name = "esp_compile_check_accessors" });
+
         // export atomic intrinsics
         _ = @import("hal/atomic.zig");
 
@@ -57,7 +70,6 @@ pub fn init() void {
 pub fn init_sequence(clock_cfg: clocks.Config) void {
     cache.init();
 
-    // TODO: disable watchdogs in a more elegant way (with a hal).
     disable_watchdogs();
 
     clock_cfg.apply();
@@ -70,29 +82,43 @@ pub fn init_sequence(clock_cfg: clocks.Config) void {
         rtos.init();
 }
 
-// NOTE: might be esp32c3 specific only + temporary until timers hal.
 fn disable_watchdogs() void {
-    const peripherals = microzig.chip.peripherals;
-    const TIMG0 = peripherals.TIMG0;
-    const RTC_CNTL = peripherals.RTC_CNTL;
+    switch (compatibility.chip) {
+        .esp32_c3 => wdt.disable_at_boot(),
+        // `hal.wdt` drives the esp32c3 register layout only. The esp32c6 moved the rtc watchdogs
+        // into the low power domain and has a second timer group whose watchdog the rom
+        // bootloader may have armed as well.
+        .esp32_c6 => {
+            const peripherals = microzig.chip.peripherals;
+            const TIMG0 = peripherals.TIMG0;
+            const TIMG1 = peripherals.TIMG1;
+            const LP_WDT = peripherals.LP_WDT;
 
-    const dogfood = 0x50D83AA1;
-    const super_dogfood = 0x8F1D312A;
+            const dogfood = 0x50D83AA1;
 
-    // Feed and disable watchdog 0
-    TIMG0.WDTWPROTECT.raw = dogfood;
-    TIMG0.WDTCONFIG0.raw = 0;
-    TIMG0.WDTWPROTECT.raw = 0;
+            TIMG0.WDTWPROTECT.raw = dogfood;
+            TIMG0.WDTCONFIG0.raw = 0;
+            // C6 TRM v1.2 §14.6, TIMG_WDTCONFIG0_REG: latch the change.
+            TIMG0.WDTCONFIG0.modify(.{ .WDT_CONF_UPDATE_EN = 1 });
+            TIMG0.WDTWPROTECT.raw = 0;
 
-    // Feed and disable rtc watchdog
-    RTC_CNTL.WDTWPROTECT.raw = dogfood;
-    RTC_CNTL.WDTCONFIG0.raw = 0;
-    RTC_CNTL.WDTWPROTECT.raw = 0;
+            TIMG1.WDTWPROTECT.raw = dogfood;
+            TIMG1.WDTCONFIG0.raw = 0;
+            // C6 TRM v1.2 §14.6, TIMG_WDTCONFIG0_REG: latch the change.
+            TIMG1.WDTCONFIG0.modify(.{ .WDT_CONF_UPDATE_EN = 1 });
+            TIMG1.WDTWPROTECT.raw = 0;
 
-    // Feed and disable rtc super watchdog
-    RTC_CNTL.SWD_WPROTECT.raw = super_dogfood;
-    RTC_CNTL.SWD_CONF.modify(.{ .SWD_DISABLE = 1 });
-    RTC_CNTL.SWD_WPROTECT.raw = 0;
+            LP_WDT.WPROTECT.raw = dogfood;
+            LP_WDT.CONFIG0.raw = 0;
+            LP_WDT.WPROTECT.raw = 0;
+
+            // C6 TRM v1.2 §15.6, register 15.9: unlike C3, SWD uses
+            // the same unlock key as the other watchdogs.
+            LP_WDT.SWD_WPROTECT.raw = dogfood;
+            LP_WDT.SWD_CONFIG.modify(.{ .SWD_DISABLE = 1 });
+            LP_WDT.SWD_WPROTECT.raw = 0;
+        },
+    }
 }
 
 // Don't change the name of this export, it is checked by espflash tool. Only
@@ -115,6 +141,37 @@ fn str(comptime l: usize, comptime s: []const u8) [l]u8 {
 }
 
 test {
+    _ = twai;
+    _ = rmt;
+    _ = flash;
+    _ = adc;
+    _ = efuse;
+    _ = temperature;
     _ = rtos;
     _ = radio;
+    _ = usb_serial_jtag;
+    _ = @import("hal/gpio_encoding.zig");
+    _ = @import("hal/gpio/esp32_c6.zig");
+    _ = @import("hal/i2c_logic.zig");
+    _ = @import("interrupt-encoding");
+}
+
+// Never called: exporting forces body analysis for the real chip register types.
+// A host test cannot validate these MMIO layouts or RISC-V interrupt accessors.
+fn compile_check_accessors(index: u32) callconv(.c) void {
+    const pin = gpio.num(@intCast(index % gpio.pin_count));
+    const unit_index: u1 = @truncate(index);
+    const int: microzig.cpu.Interrupt = @fromBackingInt(@as(u5, @intCast(index % 31 + 1)));
+    systimer.unit(unit_index).write(0);
+    pin.set_drive_strength(.@"10mA");
+    pin.set_input_filter_enabled(false);
+    gpio.InputSignal.i2cext0_sda.set_input_invert(false);
+    pin.set_output_invert(false);
+    microzig.cpu.interrupt.clear_pending(int);
+    std.mem.doNotOptimizeAway(microzig.cpu.interrupt.get_type(int));
+    std.mem.doNotOptimizeAway(microzig.cpu.interrupt.get_mapped_interrupt(.i2c_ext0));
+}
+
+test {
+    _ = @import("hal/uart/timing.zig");
 }

@@ -82,10 +82,11 @@ pub const Config = struct {
 
     /// Initializes a clock config from a cpu clock source.
     pub fn init_from_cpu_clock_source(cpu_clk_source: CpuClockSource) Config {
+        // ESP32-C3 TRM v1.4, Table 6.2-2: both PLL frequencies support 80/160 MHz.
         const cpu_clk_freq: u32 = switch (cpu_clk_source) {
             .pll_clk => |pll_clk| switch (pll_clk.cpu_freq) {
                 .@"80mhz" => 80_000_000,
-                .@"160mhz" => 80_000_000,
+                .@"160mhz" => 160_000_000,
             },
             .xtal_clk => |div| xtal_clk_freq / div,
         };

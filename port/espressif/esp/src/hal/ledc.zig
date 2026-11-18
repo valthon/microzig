@@ -30,11 +30,11 @@ pub fn get_clock_source() ClockSource {
     return @fromBackingInt(LEDC.CONF.read().APB_CLK_SEL);
 }
 
-pub fn timer(num: u4) Timer {
+pub fn timer(num: u2) Timer {
     return @fromBackingInt(num);
 }
 
-pub fn channel(num: u4) Channel {
+pub fn channel(num: u2) Channel {
     return @fromBackingInt(num);
 }
 
@@ -219,9 +219,9 @@ pub const Channel = enum(u2) {
     pub fn is_duty_fade_done(chan: Channel) bool {
         return switch (chan) {
             .channel0 => LEDC.INT_RAW.read().DUTY_CHNG_END_LSCH0_INT_RAW == 1,
-            .channel1 => LEDC.INT_RAW.read().DUTY_CHNG_END_LSCH0_INT_RAW == 1,
-            .channel2 => LEDC.INT_RAW.read().DUTY_CHNG_END_LSCH0_INT_RAW == 1,
-            .channel3 => LEDC.INT_RAW.read().DUTY_CHNG_END_LSCH0_INT_RAW == 1,
+            .channel1 => LEDC.INT_RAW.read().DUTY_CHNG_END_LSCH1_INT_RAW == 1,
+            .channel2 => LEDC.INT_RAW.read().DUTY_CHNG_END_LSCH2_INT_RAW == 1,
+            .channel3 => LEDC.INT_RAW.read().DUTY_CHNG_END_LSCH3_INT_RAW == 1,
         };
     }
 

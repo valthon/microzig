@@ -1,0 +1,121 @@
+// esp-pacs omits dimIndex on DMA.OUT_CONF0_CH%s (dim=2, stride=0xc0).
+// The SVD loader expands it as CH0/CH1, colliding with the real CH0 at 0xd0.
+// C6 TRM v1.2 §4.7–4.8: repair the names at the channel-1/channel-2 offsets.
+.{
+    // C6 TRM v1.2 §§1.6, 10.5.2 and the SVD describe the legacy INTPRI.
+    // ESP-IDF v5.3 soc/esp32c6/include/soc/interrupt_reg.h explicitly selects
+    // PLIC instead. reg_base.h and plic_reg.h define this missing CPU-local bank:
+    // https://github.com/espressif/esp-idf/blob/v5.3/components/soc/esp32c6/include/soc/plic_reg.h
+    // https://github.com/espressif/esp-idf/blob/v5.3/components/soc/esp32c6/include/soc/reg_base.h
+    .{ .add_peripheral = .{
+        .device_name = "ESP32-C6",
+        .name = "PLIC_MX",
+        .description = "Machine-mode PLIC interrupt controller (ESP-IDF v5.3)",
+        .base_address = 0x20001000,
+        .registers = .{
+            .{ .name = "MXINT_ENABLE", .offset_bytes = 0x0, .size_bits = 32, .fields = .{.{ .name = "ENABLE", .offset_bits = 0, .size_bits = 32 }} },
+            .{ .name = "MXINT_TYPE", .offset_bytes = 0x4, .size_bits = 32, .fields = .{.{ .name = "TYPE", .offset_bits = 0, .size_bits = 32 }} },
+            .{ .name = "MXINT_CLEAR", .offset_bytes = 0x8, .size_bits = 32, .fields = .{.{ .name = "CLEAR", .offset_bits = 0, .size_bits = 32 }} },
+            .{ .name = "EMIP_STATUS", .offset_bytes = 0xc, .size_bits = 32, .access = .read_only, .fields = .{.{ .name = "PENDING", .offset_bits = 0, .size_bits = 32 }} },
+            .{ .name = "MXINT0_PRI", .offset_bytes = 0x10, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT1_PRI", .offset_bytes = 0x14, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT2_PRI", .offset_bytes = 0x18, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT3_PRI", .offset_bytes = 0x1c, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT4_PRI", .offset_bytes = 0x20, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT5_PRI", .offset_bytes = 0x24, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT6_PRI", .offset_bytes = 0x28, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT7_PRI", .offset_bytes = 0x2c, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT8_PRI", .offset_bytes = 0x30, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT9_PRI", .offset_bytes = 0x34, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT10_PRI", .offset_bytes = 0x38, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT11_PRI", .offset_bytes = 0x3c, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT12_PRI", .offset_bytes = 0x40, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT13_PRI", .offset_bytes = 0x44, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT14_PRI", .offset_bytes = 0x48, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT15_PRI", .offset_bytes = 0x4c, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT16_PRI", .offset_bytes = 0x50, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT17_PRI", .offset_bytes = 0x54, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT18_PRI", .offset_bytes = 0x58, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT19_PRI", .offset_bytes = 0x5c, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT20_PRI", .offset_bytes = 0x60, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT21_PRI", .offset_bytes = 0x64, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT22_PRI", .offset_bytes = 0x68, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT23_PRI", .offset_bytes = 0x6c, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT24_PRI", .offset_bytes = 0x70, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT25_PRI", .offset_bytes = 0x74, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT26_PRI", .offset_bytes = 0x78, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT27_PRI", .offset_bytes = 0x7c, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT28_PRI", .offset_bytes = 0x80, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT29_PRI", .offset_bytes = 0x84, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT30_PRI", .offset_bytes = 0x88, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT31_PRI", .offset_bytes = 0x8c, .size_bits = 32, .fields = .{.{ .name = "PRIORITY", .offset_bits = 0, .size_bits = 4 }} },
+            .{ .name = "MXINT_THRESH", .offset_bytes = 0x90, .size_bits = 32, .fields = .{.{ .name = "THRESHOLD", .offset_bits = 0, .size_bits = 8 }} },
+        },
+    } },
+    .{ .rename_register_at_offset = .{
+        .parent = "types.peripherals.DMA",
+        .offset_bytes = 0x250,
+        .expected_name = "OUT_CONF0_CH1",
+        .name = "OUT_CONF0_CH2",
+    } },
+    .{ .rename_register_at_offset = .{
+        .parent = "types.peripherals.DMA",
+        .offset_bytes = 0x190,
+        .expected_name = "OUT_CONF0_CH0",
+        .name = "OUT_CONF0_CH1",
+    } },
+    // HP analog-I2C master, absent from esp-pacs (LP_I2C_ANA_MST is a
+    // different peripheral). C6 TRM v1.2 §39.2/§39.3 describes SAR/TSENS,
+    // but does not document this internal bus. Addresses and command fields:
+    // ESP-IDF v5.4 (Apache-2.0), soc/esp32c6/register/soc/i2c_ana_mst_reg.h,
+    // soc/esp32c6/include/soc/regi2c_defs.h and
+    // esp_rom/patches/esp_rom_hp_regi2c_esp32c6.c.
+    .{ .add_peripheral = .{
+        .device_name = "ESP32-C6",
+        .name = "I2C_ANA_MST",
+        .description = "HP analog I2C master (ESP-IDF v5.4)",
+        .base_address = 0x600af800,
+        .registers = .{
+            .{
+                .name = "I2C0_CTRL",
+                .offset_bytes = 0x0,
+                .size_bits = 32,
+                .fields = .{
+                    .{ .name = "SLAVE_ID", .offset_bits = 0, .size_bits = 8 },
+                    .{ .name = "REGISTER", .offset_bits = 8, .size_bits = 8 },
+                    .{ .name = "DATA", .offset_bits = 16, .size_bits = 8 },
+                    .{ .name = "WRITE", .offset_bits = 24, .size_bits = 1 },
+                    .{ .name = "BUSY", .offset_bits = 25, .size_bits = 1 },
+                },
+            },
+            .{
+                .name = "I2C1_CTRL",
+                .offset_bytes = 0x4,
+                .size_bits = 32,
+                .fields = .{
+                    .{ .name = "SLAVE_ID", .offset_bits = 0, .size_bits = 8 },
+                    .{ .name = "REGISTER", .offset_bits = 8, .size_bits = 8 },
+                    .{ .name = "DATA", .offset_bits = 16, .size_bits = 8 },
+                    .{ .name = "WRITE", .offset_bits = 24, .size_bits = 1 },
+                    .{ .name = "BUSY", .offset_bits = 25, .size_bits = 1 },
+                },
+            },
+            .{
+                .name = "ANA_CONF1",
+                .offset_bytes = 0x1c,
+                .size_bits = 32,
+                .fields = .{
+                    .{ .name = "READ_MASK", .offset_bits = 0, .size_bits = 24 },
+                },
+            },
+            .{
+                .name = "ANA_CONF2",
+                .offset_bytes = 0x20,
+                .size_bits = 32,
+                .fields = .{
+                    .{ .name = "SAR_MST_SEL", .offset_bits = 11, .size_bits = 1 },
+                },
+            },
+        },
+    } },
+}

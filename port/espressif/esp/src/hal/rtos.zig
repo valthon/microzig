@@ -125,6 +125,8 @@ pub const RTOS_State = struct {
 /// Automatically called inside hal startup sequence if it the rtos is enabled
 /// in hal options.
 pub fn init() void {
+    if (@import("compatibility.zig").chip == .esp32_c6)
+        @compileError("hal.rtos is only supported on ESP32-C3");
     comptime {
         if (!microzig.options.cpu.interrupt_stack.enable)
             @compileError("rtos requires the interrupt stack cpu option to be enabled");

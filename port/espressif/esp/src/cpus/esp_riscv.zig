@@ -4,6 +4,13 @@ const microzig = @import("microzig");
 const cpu_config = @import("cpu-config");
 const riscv32_common = @import("riscv32-common");
 
+/// Interrupt matrix and cpu interrupt controller registers, which are laid out differently
+/// from chip to chip even though the cpu itself is the same.
+const chip_specific = switch (cpu_config.chip) {
+    .esp32_c3 => @import("esp_riscv/esp32_c3.zig"),
+    .esp32_c6 => @import("esp_riscv/esp32_c6.zig"),
+};
+
 const interrupt_stack_options = microzig.options.cpu.interrupt_stack;
 
 pub const CPU_Options = struct {
@@ -28,39 +35,10 @@ pub const Exception = enum(u5) {
     MachineEnvCall = 0xb,
 };
 
-pub const Interrupt = enum(u5) {
-    interrupt1 = 1,
-    interrupt2 = 2,
-    interrupt3 = 3,
-    interrupt4 = 4,
-    interrupt5 = 5,
-    interrupt6 = 6,
-    interrupt7 = 7,
-    interrupt8 = 8,
-    interrupt9 = 9,
-    interrupt10 = 10,
-    interrupt11 = 11,
-    interrupt12 = 12,
-    interrupt13 = 13,
-    interrupt14 = 14,
-    interrupt15 = 15,
-    interrupt16 = 16,
-    interrupt17 = 17,
-    interrupt18 = 18,
-    interrupt19 = 19,
-    interrupt20 = 20,
-    interrupt21 = 21,
-    interrupt22 = 22,
-    interrupt23 = 23,
-    interrupt24 = 24,
-    interrupt25 = 25,
-    interrupt26 = 26,
-    interrupt27 = 27,
-    interrupt28 = 28,
-    interrupt29 = 29,
-    interrupt30 = 30,
-    interrupt31 = 31,
-};
+/// Trap IDs shared with the vector table. On C6, IDs 3, 4 and 7 are
+/// local CLINT interrupts and cannot be mapped or enabled through this
+/// peripheral-interrupt API (C6 TRM v1.2 §1.6.2).
+pub const Interrupt = @import("interrupt-encoding").Interrupt;
 
 pub const InterruptHandler = union(enum) {
     /// No state is saved. Do everything yourself. Interrupts are disabled
@@ -89,30 +67,32 @@ pub const interrupt = struct {
         fence();
     }
 
-    const INTERRUPT_CORE0 = microzig.chip.peripherals.INTERRUPT_CORE0;
-
     pub fn is_enabled(int: Interrupt) bool {
-        return INTERRUPT_CORE0.CPU_INT_ENABLE.raw & (@as(u32, 1) << @backingInt(int)) != 0;
+        return chip_specific.cpu_int_enable().* & (@as(u32, 1) << @backingInt(int)) != 0;
     }
 
+    /// Panics on C6 CLINT IDs, including in ReleaseSmall.
     pub fn enable(int: Interrupt) void {
-        INTERRUPT_CORE0.CPU_INT_ENABLE.raw |= @as(u32, 1) << @backingInt(int);
+        require_peripheral_interrupt(int);
+        chip_specific.cpu_int_enable().* |= @as(u32, 1) << @backingInt(int);
     }
 
     pub fn disable(int: Interrupt) void {
-        INTERRUPT_CORE0.CPU_INT_ENABLE.raw &= ~(@as(u32, 1) << @backingInt(int));
+        chip_specific.cpu_int_enable().* &= ~(@as(u32, 1) << @backingInt(int));
     }
 
     /// Checks if a given interrupt is pending.
     pub fn is_pending(int: Interrupt) bool {
-        return INTERRUPT_CORE0.CPU_INT_EIP_STATUS.raw & (@as(u32, 1) << @backingInt(int)) != 0;
+        return chip_specific.cpu_int_eip_status().* & (@as(u32, 1) << @backingInt(int)) != 0;
     }
 
     /// Clears the pending state of claimed (executing) edge-type interrupt only.
     /// NOTE: Pending state of an unclaimed (not executing) edge type interrupt can be flushed,
     /// if required, by first disabling it and only then call clearing it.
     pub fn clear_pending(int: Interrupt) void {
-        INTERRUPT_CORE0.CPU_INT_CLEAR.raw |= @as(u32, 1) << @backingInt(int);
+        // C3 TRM §1.5.2; C6 TRM §1.6.2: pulse the clear bit.
+        chip_specific.cpu_int_clear().* = @as(u32, 1) << @backingInt(int);
+        chip_specific.cpu_int_clear().* = 0;
     }
 
     pub const Priority = enum(u4) {
@@ -135,136 +115,63 @@ pub const interrupt = struct {
     }
 
     fn get_priority_register_for(int: Interrupt) *volatile u32 {
-        const base: [*]volatile u32 = @ptrCast(&INTERRUPT_CORE0.CPU_INT_PRI_0);
-        return &base[@backingInt(int)];
+        std.debug.assert(@backingInt(int) != 0);
+        return chip_specific.cpu_int_pri(@backingInt(int));
     }
 
     /// Set threshold for interrupt assertion. Only when the interrupt priority is equal to or
     /// higher than this threshold, the cpu will respond to this interrupt.
     pub fn set_priority_threshold(priority: Priority) void {
-        INTERRUPT_CORE0.CPU_INT_THRESH.write(.{
-            .CPU_INT_THRESH = @backingInt(priority),
-        });
+        chip_specific.cpu_int_thresh().* = @backingInt(priority);
     }
 
     pub fn get_priority_threshold() Priority {
-        return @fromBackingInt(INTERRUPT_CORE0.CPU_INT_THRESH.read().CPU_INT_THRESH);
+        return @fromBackingInt(@truncate(chip_specific.cpu_int_thresh().*));
     }
 
-    pub const Type = enum(u1) {
-        level = 0,
-        edge = 1,
-    };
+    pub const Type = @import("interrupt-encoding").Type;
 
     pub fn set_type(int: Interrupt, typ: Type) void {
         const num = @backingInt(int);
         switch (typ) {
-            .level => INTERRUPT_CORE0.CPU_INT_TYPE.raw &= ~(@as(u32, 1) << num),
-            .edge => INTERRUPT_CORE0.CPU_INT_TYPE.raw |= @as(u32, 1) << num,
+            .level => chip_specific.cpu_int_type().* &= ~(@as(u32, 1) << num),
+            .edge => chip_specific.cpu_int_type().* |= @as(u32, 1) << num,
         }
     }
 
     pub fn get_type(int: Interrupt) Type {
-        const num = @backingInt(int);
-        return @fromBackingInt(@truncate(INTERRUPT_CORE0.CPU_INT_TYPE.raw & (@as(u32, 1) << num) >> num));
+        return @import("interrupt-encoding").type_from_bits(chip_specific.cpu_int_type().*, int);
     }
 
-    pub const Source = enum(u6) {
-        wifi_mac = 0,
-        wifi_mac_nmi = 1,
-        wifi_pwr = 2,
-        wifi_bb = 3,
-        bt_mac = 4,
-        bt_bb = 5,
-        bt_bb_nmi = 6,
-        rwbt = 7,
-        rwble = 8,
-        rwbt_nmi = 9,
-        rwble_nmi = 10,
-        i2c_master = 11,
-        slc0 = 12,
-        slc1 = 13,
-        apb_ctrl = 14,
-        uhci0 = 15,
-        gpio = 16,
-        gpio_nmi = 17,
-        spi1 = 18,
-        spi2 = 19,
-        i2s0 = 20,
-        uart0 = 21,
-        uart1 = 22,
-        ledc = 23,
-        efuse = 24,
-        twai0 = 25,
-        usb_device = 26,
-        rtc_core = 27,
-        rmt = 28,
-        i2c_ext0 = 29,
-        timer1 = 30,
-        timer2 = 31,
-        tg0_t0_level = 32,
-        tg0_wdt_level = 33,
-        tg1_t0_level = 34,
-        tg1_wdt_level = 35,
-        cache_ia = 36,
-        systimer_target0 = 37,
-        systimer_target1 = 38,
-        systimer_target2 = 39,
-        spi_mem_reject_cache = 40,
-        icache_preload0 = 41,
-        icache_sync0 = 42,
-        apb_adc = 43,
-        dma_ch0 = 44,
-        dma_ch1 = 45,
-        dma_ch2 = 46,
-        rsa = 47,
-        aes = 48,
-        sha = 49,
-        from_cpu_intr0 = 50,
-        from_cpu_intr1 = 51,
-        from_cpu_intr2 = 52,
-        from_cpu_intr3 = 53,
-        assist_debug = 54,
-        dma_apbperi_pms = 55,
-        core0_iram0_pms = 56,
-        core0_dram0_pms = 57,
-        core0_pif_pms = 58,
-        core0_pif_pms_size = 59,
-        bak_pms_violate = 60,
-        cache_core0_acs = 61,
-    };
+    /// Peripheral interrupt sources of this chip that can be routed to a cpu interrupt.
+    pub const Source = chip_specific.Source;
 
+    /// Panics when mapping to a C6 CLINT ID; null still unmaps a source.
     pub fn map(source: Source, maybe_int: ?Interrupt) void {
-        get_source_map_register_for(source).* = if (maybe_int) |int| @backingInt(int) else 0;
+        if (maybe_int) |int| require_peripheral_interrupt(int);
+        chip_specific.source_map(source).* = if (maybe_int) |int| @backingInt(int) else 0;
+    }
+
+    fn require_peripheral_interrupt(int: Interrupt) void {
+        if (cpu_config.chip == .esp32_c6) {
+            if (!chip_specific.is_peripheral_interrupt(@backingInt(int)))
+                @panic("ESP32-C6 CPU interrupt IDs 3, 4 and 7 are CLINT interrupts, not peripheral interrupts");
+        }
     }
 
     pub fn get_mapped_interrupt(source: Source) ?Interrupt {
-        const source_raw: u4 = @truncate(get_source_map_register_for(source).*);
-        if (source_raw != 0) {
-            return @fromBackingInt(source_raw);
-        } else {
-            return null;
-        }
-    }
-
-    fn get_source_map_register_for(source: Source) *volatile u32 {
-        // using MAC_INTR_MAP here as it's the first map register.
-        const base: usize = @intFromPtr(&INTERRUPT_CORE0.MAC_INTR_MAP);
-        return @ptrFromInt(base + @sizeOf(u32) * @as(usize, @backingInt(source)));
+        return @import("interrupt-encoding").interrupt_from_map_bits(chip_specific.source_map(source).*);
     }
 
     pub const Status = struct {
-        reg: u61,
+        reg: chip_specific.SourceStatus,
 
         pub fn init() Status {
-            return .{
-                .reg = INTERRUPT_CORE0.INTR_STATUS_REG_0.raw |
-                    (@as(u61, INTERRUPT_CORE0.INTR_STATUS_REG_1.raw) << 32),
-            };
+            return .{ .reg = chip_specific.source_status() };
         }
 
         pub fn is_set(status: Status, source: Source) bool {
-            return status.reg & (@as(u61, 1) << @backingInt(source)) != 0;
+            return status.reg & (@as(chip_specific.SourceStatus, 1) << @backingInt(source)) != 0;
         }
     };
 
@@ -358,6 +265,11 @@ pub fn export_startup_logic() void {
 
 /// Gets interrupts into a known state after the bootloader.
 fn init_interrupts() void {
+    if (cpu_config.chip == .esp32_c6) {
+        chip_specific.init_interrupt_matrix();
+        fence();
+    }
+
     // unmap all sources
     for (std.enums.values(interrupt.Source)) |source| {
         interrupt.map(source, null);
@@ -375,6 +287,13 @@ fn init_interrupts() void {
         .mode = .vectored,
         .base = @intCast(@intFromPtr(&_vector_table) >> 2),
     });
+
+    if (cpu_config.chip == .esp32_c6) {
+        // C6 TRM v1.2 §1.5.2, §1.6.2: route external interrupts to M mode
+        // and unmask them at the core. Keep local CLINT IDs 0, 3, 4, 7 masked.
+        csr.Csr(0x303, u32).write_raw(0); // mideleg
+        csr.Csr(0x304, u32).write_raw(chip_specific.peripheral_interrupt_mask); // mie
+    }
 
     if (interrupt_stack_options.enable) {
         csr.mscratch.write_raw(0);
