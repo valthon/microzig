@@ -23,6 +23,8 @@ pub const rtos = @import("hal/rtos.zig");
 pub const spi = @import("hal/spi.zig");
 pub const system = @import("hal/system.zig");
 pub const systimer = @import("hal/systimer.zig");
+pub const timer = @import("hal/timer.zig");
+pub const wdt = @import("hal/wdt.zig");
 pub const time = @import("hal/time.zig");
 pub const twai = @import("hal/twai.zig");
 pub const uart = @import("hal/uart.zig");
@@ -65,7 +67,6 @@ pub fn init() void {
 pub fn init_sequence(clock_cfg: clocks.Config) void {
     cache.init();
 
-    // TODO: disable watchdogs in a more elegant way (with a hal).
     disable_watchdogs();
 
     clock_cfg.apply();
@@ -80,31 +81,10 @@ pub fn init_sequence(clock_cfg: clocks.Config) void {
 
 fn disable_watchdogs() void {
     switch (compatibility.chip) {
-        .esp32_c3 => {
-            const peripherals = microzig.chip.peripherals;
-            const TIMG0 = peripherals.TIMG0;
-            const RTC_CNTL = peripherals.RTC_CNTL;
-
-            const dogfood = 0x50D83AA1;
-            const super_dogfood = 0x8F1D312A;
-
-            // Feed and disable watchdog 0
-            TIMG0.WDTWPROTECT.raw = dogfood;
-            TIMG0.WDTCONFIG0.raw = 0;
-            TIMG0.WDTWPROTECT.raw = 0;
-
-            // Feed and disable rtc watchdog
-            RTC_CNTL.WDTWPROTECT.raw = dogfood;
-            RTC_CNTL.WDTCONFIG0.raw = 0;
-            RTC_CNTL.WDTWPROTECT.raw = 0;
-
-            // Feed and disable rtc super watchdog
-            RTC_CNTL.SWD_WPROTECT.raw = super_dogfood;
-            RTC_CNTL.SWD_CONF.modify(.{ .SWD_DISABLE = 1 });
-            RTC_CNTL.SWD_WPROTECT.raw = 0;
-        },
-        // The esp32c6 moved the rtc watchdogs into the low power domain and has a second timer
-        // group whose watchdog the rom bootloader may have armed as well.
+        .esp32_c3 => wdt.disable_at_boot(),
+        // `hal.wdt` drives the esp32c3 register layout only. The esp32c6 moved the rtc watchdogs
+        // into the low power domain and has a second timer group whose watchdog the rom
+        // bootloader may have armed as well.
         .esp32_c6 => {
             const peripherals = microzig.chip.peripherals;
             const TIMG0 = peripherals.TIMG0;
