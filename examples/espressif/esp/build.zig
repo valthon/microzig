@@ -8,6 +8,9 @@ const MicroBuild = microzig.MicroBuild(.{
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const maybe_example = b.option([]const u8, "example", "only build matching examples");
+    const expected_mac_text = b.option([]const u8, "expected_mac", "selftest_c6_core: the board's efuse MAC (aa:bb:cc:dd:ee:ff); unset reports SKIP");
+    const expected_mac: ?u48 = if (expected_mac_text) |text| parse_mac(text) orelse
+        std.process.fatal("-Dexpected_mac={s}: expected six hex bytes separated by ':'", .{text}) else null;
 
     const mz_dep = b.dependency("microzig", .{});
     const mb = MicroBuild.init(b, mz_dep) orelse return;
@@ -23,7 +26,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "selftest_sleep_s6", .file = "src/selftest_sleep.zig", .sleep_stage = 6, .chips = &.{.esp32_c3} },
         .{ .name = "selftest_sleep", .file = "src/selftest_sleep.zig", .sleep_stage = 4, .chips = &.{.esp32_c3} },
         .{ .name = "selftest_c6_ledc", .file = "src/selftest_c6_ledc.zig", .chips = &.{.esp32_c6} },
-        .{ .name = "selftest_c6_core", .file = "src/selftest_c6_core.zig", .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_c6_core", .file = "src/selftest_c6_core.zig", .chips = &.{.esp32_c6}, .mac_option = true },
         .{ .name = "blinky", .file = "src/blinky.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .name = "custom_clock_config", .file = "src/custom_clock_config.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .name = "gpio_input", .file = "src/gpio_input.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
@@ -92,6 +95,12 @@ pub fn build(b: *std.Build) void {
                 const options = b.addOptions();
                 options.addOption(u8, "stage", stage);
                 fw.exe.root_module.addOptions("sleep_test_options", options);
+            }
+
+            if (example.mac_option) {
+                const options = b.addOptions();
+                options.addOption(?u48, "expected_mac", expected_mac);
+                fw.exe.root_module.addOptions("c6_core_options", options);
             }
 
             if (example.features.lwip) {
@@ -219,6 +228,22 @@ const Example = struct {
     file: []const u8,
     features: Features = .{},
     sleep_stage: ?u8 = null,
+    /// Receives `-Dexpected_mac` as module `c6_core_options`.
+    mac_option: bool = false,
     /// Chips whose peripherals and board assumptions this example supports.
     chips: []const Chip = &.{ .esp32_c3, .esp32_c6 },
 };
+
+fn parse_mac(text: []const u8) ?u48 {
+    var it = std.mem.splitScalar(u8, text, ':');
+    var value: u48 = 0;
+    var count: usize = 0;
+    while (it.next()) |part| : (count += 1) {
+        if (count == 6 or part.len != 2) return null;
+        for (part) |char| {
+            if (!std.ascii.isHex(char)) return null;
+        }
+        value = (value << 8) | (std.fmt.parseInt(u8, part, 16) catch return null);
+    }
+    return if (count == 6) value else null;
+}

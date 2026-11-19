@@ -60,6 +60,9 @@ pub fn assert(expr: bool, opts: AssertOptions) void {
 /// The microzig default panic handler. Will disable interrupts and loop endlessly.
 pub const panic = std.debug.FullPanic(struct {
     pub fn panic_fn(message: []const u8, first_trace_address: ?usize) noreturn {
+        // A port may need to abandon an interrupted logger before fatal output.
+        // This hook must mask interrupts and must only be used on fatal paths.
+        if (@hasDecl(cpu, "prepare_panic")) cpu.prepare_panic();
         std.log.err("panic: {s}", .{message});
 
         var trace_index: usize = 0;

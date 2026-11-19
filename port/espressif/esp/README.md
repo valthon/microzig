@@ -26,8 +26,8 @@ v0.2, as `passed/checks` of the named self-test in `examples/espressif/esp`.
 | `uart` (UART0/1)                              | yes | yes | `selftest_uart`                                    | 5/5       | 5/5       |
 | `twai` (CAN)                                  | yes | yes | `selftest_twai`                                    | 10/10     | 20/20     |
 | `rmt` (polling TX/RX)                         | yes | yes | `selftest_rmt`                                     | 3/3       | 3/3       |
-| `timer`, `wdt` (timer groups, watchdogs)      | yes | yes | `selftest_timers`                                  | 6/6       | 6/6       |
-| `usb_serial_jtag` (logging, RX, confirmed TX) | yes | yes | `selftest_usj`                                     | 9/9       | 9/9       |
+| `timer`, `wdt` (timer groups, watchdogs)      | yes | yes | `selftest_timers`                                  | built only (prior 6/6) | built only (prior 6/6) |
+| `usb_serial_jtag` (logging, RX, confirmed TX) | yes | yes | `selftest_usj`                                     | built only (prior 9/9) | built only (prior 9/9) |
 | `gpio` pin interrupts                         | yes | yes | `selftest_gpio_irq`                                | 8/8       | 9/9       |
 | `flash` (erase, write, read)                  | yes | yes | `selftest_flash`                                   | 5/5       | 5/5       |
 | `adc` (ADC1), `temperature`                   | yes | yes | `selftest_adc`                                     | 10/10     | 10/10     |
@@ -40,6 +40,47 @@ v0.2, as `passed/checks` of the named self-test in `examples/espressif/esp`.
 C3-only modules produce an explicit compile error on the C6. The C3 I2C master ran on hardware
 through the `i2c_display_ssd1306_c3_oled_042` example. The C6 LEDC blocking fade helper takes a
 timeout in microseconds.
+
+The USB Serial/JTAG logger waits for the host with the caller's interrupt
+state: it masks interrupts only to claim the writer and update its counters,
+never while waiting. Each writer drain (64 bytes) waits at most 2 ms for the
+host. Callers with interrupts masked and ordinary interrupt
+handlers (identified by a nonzero priority threshold) share one 2 ms deadline
+per line, plus formatting and FIFO writes. A line that starts while another
+is being written (from an interrupt handler or a preempting task) is dropped
+rather than interleaved. Once stalled, the logger drops lines immediately
+until the FIFO is writable. The next written line reports **at most N** lost
+or truncated lines **since the last confirmed report**. This saturating count
+is an upper bound: committed packets, including reports, can arrive after a
+timeout. Fatal panic/trap handling masks interrupts and takes over an abandoned
+writer before logging; the old owner never resumes. Delivery remains best
+effort. `write_blocking` confirms host consumption, but its caller must quiesce
+logging first; masking interrupts cannot exclude a preempted logger owner.
+The same limitation applies throughout `Disconnect.begin`/`finish`.
+This logger is host-tested; on hardware it ran on a XIAO ESP32-C6 (rev v0.1),
+2026-11-19, with `selftest_wifi_lifecycle` (logger: same code as this tree):
+10 of 10 watchdog boots with the port opened 40 s late gave USB output, each
+starting with an `at most 25 lines` report. The 9/9 USB counts are from an
+earlier logger. Radio evidence is documented in "BLE bench examples" and "IEEE 802.15.4 raw MAC (C6)".
+
+On an ESP32-C6, SERIAL_IN_EP_DATA_FREE can read 0 at boot with nothing
+committed: IN_EP1_ST (C6 TRM v1.2 register 32.19) idle and the host's IN
+tokens NAKed, so a writer that only waits for DATA_FREE never sends again.
+No TRM text describes this state; the cause is not known. On a C6 booted by
+the RTC watchdog it read 0 before `hal.init` in 30 of 68 boots, and one
+WR_DONE let the host read the buffer and set DATA_FREE again. Repeating
+WR_DONE on a flushed packet the host had not read changed neither the
+delivered log nor its order (C6, 24 runs). The driver therefore writes
+WR_DONE when a wait times out, on every line dropped while stalled, and once
+before the first write after boot. A host that reads the buffer between the
+DATA_FREE read and WR_DONE receives a zero-length packet, which CDC ACM
+ignores. The boot-time release is included in the tested XIAO logger above
+(same code as this tree).
+
+Timer-group clock enable clears MWDT flash-boot mode only when releasing a
+group held in reset, inside a critical section. Calls on an active group do
+not unlock, relock or update the watchdog. The prior timer hardware counts
+predate this change; current evidence is **built only**.
 
 ### C3 light sleep and USB-Serial-JTAG
 
@@ -138,8 +179,11 @@ Build the no-wiring core self-test from `examples/espressif/esp` with
 It checks the 16 MHz systimer against the HP CPU cycle counter, measures the CPU frequency after
 each of the 81 ordered transitions between the nine supported frequencies (1.25 MHz to 160 MHz)
 with 1% tolerance, exercises GPIO0's output/input path and systimer LOAD_HI,
-and compares efuse MAC against the attached board's `98:88:e0:7e:fc:74`. Another board should fail
-that MAC check. Clock measurements are relative to the common crystal; they do not establish its
+and checks the efuse MAC. With `-Dexpected_mac=aa:bb:cc:dd:ee:ff` (the board's MAC, e.g.
+`98:88:e0:7e:fc:74` for the Super Mini) the MAC must match, so another board fails that case.
+Without the option the MAC is reported as `SKIP` and excluded from both pass
+and fail counts (84 checks instead of 85). Octets must be two hex digits; signs
+are rejected. Clock measurements are relative to the common crystal; they do not establish its
 absolute accuracy. It runs once, waits 1500 ms, then repeats saved `SELFTEST c6_core` results and a
 `DONE pass=... fail=...` line every second through USB-serial-JTAG.
 
@@ -149,8 +193,11 @@ verifies a gamma fade reaches its expected final duty. It also needs no wiring. 
 use a zero-scale gamma range with DUTY_START and PARA_UP, rather than leaving the duty engine
 stopped (TRM §35.3.4.1 and §35.5, registers 35.1–35.2).
 
-Evidence: on the Super Mini ESP32-C6FH4 rev v0.2, from RAM, `selftest_c6_core` passed 85/85 and
-`selftest_c6_ledc` passed 7/7.
+Current core self-test reporting is **built only**. Historical results below
+predate the SKIP change. Evidence: on the Super Mini ESP32-C6FH4 rev v0.2, from RAM, `selftest_c6_core` passed 85/85 and
+`selftest_c6_ledc` passed 7/7. `selftest_c6_core` also passed 85/85 from RAM on the Super Mini and
+on a XIAO ESP32-C6 rev v0.1, each with `-Dexpected_mac` set to its own MAC and without the option;
+the Super Mini built with the XIAO's MAC failed only the `mac` case (84/85).
 
 ## Chip specific code
 

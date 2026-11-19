@@ -5,6 +5,7 @@ const microzig = @import("microzig");
 const USB_SERIAL_JTAG = microzig.chip.peripherals.USB_DEVICE;
 const time = @import("time.zig");
 const Deadline = microzig.drivers.time.Deadline;
+const log_state = @import("usb_serial_jtag/state.zig");
 
 /// Destructive C3 reconnect experiment: discards pending CDC/JTAG transfers and
 /// interrupt configuration. Serialize against all USB users, including logging.
@@ -151,8 +152,14 @@ test "without an Attachment only a SOF or a pending bus reset counts" {
     try std.testing.expect(!host_present(null, false, false));
 }
 
-/// C3 soft detach state. Serialize the entire begin/finish interval against all
-/// USB users (including logging); pending CDC/JTAG transfers may be lost.
+/// C3/C6 soft detach state. C6 TRM v1.2 §32.7 CONF0 (register 32.3),
+/// FRAM_NUM (32.17), INT_RAW/INT_CLR (32.12/32.15) have the same pad,
+/// pull-override, SOF and bus-reset fields used below. Preserve C6's additional
+/// USB_JTAG_BRIDGE_EN bit along with all caller interrupt enables.
+/// Serialize the entire begin/finish interval against all
+/// USB users; pending CDC/JTAG transfers may be lost. Masking interrupts alone
+/// does not exclude a preempted logger owner. Quiesce logging and other TX
+/// users before begin(), and keep them quiescent through finish().
 /// Requires running PLL/APB clocks (C3 TRM v1.4 §30.4) and SYSTIMER unit 0.
 pub const Disconnect = struct {
     conf0: @TypeOf(USB_SERIAL_JTAG.CONF0.read()),
@@ -173,7 +180,6 @@ pub const Disconnect = struct {
     /// that suspended the bus counts as absent unless the history holds, and
     /// a host still in its attach debounce counts as absent (see Attachment).
     pub fn begin(options: ReattachOptions) Disconnect {
-        @import("compatibility.zig").require_esp32_c3("USB soft reconnect");
         const cs = microzig.interrupt.enter_critical_section();
         defer cs.leave();
         var saved: Disconnect = .{
@@ -271,9 +277,9 @@ pub const Disconnect = struct {
 /// .disconnect_and_reenumerate: a host still in its attach debounce sends
 /// neither (see Attachment). A reset already cleared by the caller's USB
 /// interrupt handler is not seen; the SOF check still is. Interrupts stay
-/// enabled; requires active USB clocks and SYSTIMER unit 0.
+/// enabled; requires active USB clocks and SYSTIMER unit 0. C6 register
+/// references: TRM v1.2 §32.7 registers 32.3, 32.12, 32.17.
 pub fn wait_for_host(timeout: microzig.drivers.time.Duration, attachment: ?*Attachment) bool {
-    @import("compatibility.zig").require_esp32_c3("USB host wait");
     if (USB_SERIAL_JTAG.CONF0.read().USB_PAD_ENABLE == 0) return false;
     const frame = USB_SERIAL_JTAG.FRAM_NUM.read().SOF_FRAME_INDEX;
     const deadline = Deadline.init_relative(time.get_time_since_boot(), timeout);
@@ -346,18 +352,59 @@ pub fn read_blocking(buffer: []u8, deadline: Deadline) error{Timeout}!usize {
     }
 }
 
-fn wait_for_tx(deadline: Deadline) error{Timeout}!void {
-    while (tx_fifo_full()) {
-        if (deadline.is_reached_by(time.get_time_since_boot())) return error.Timeout;
+const TxWait = struct {
+    deadline: Deadline,
+    pub fn full(_: *TxWait) bool {
+        return tx_fifo_full();
     }
+    pub fn expired(self: *TxWait) bool {
+        return self.deadline.is_reached_by(time.get_time_since_boot());
+    }
+    pub fn release_stuck(_: *TxWait) void {
+        release_stuck_tx();
+    }
+};
+
+fn wait_for_tx(deadline: Deadline) error{Timeout}!void {
+    var wait: TxWait = .{ .deadline = deadline };
+    try log_state.wait_for_tx(&wait);
+}
+
+/// Re-commits the IN buffer (WR_DONE) while SERIAL_IN_EP_DATA_FREE reads 0.
+/// DATA_FREE stays 0 after a flush "until data in UART TX FIFO is read by the
+/// USB Host" (C6 TRM v1.2 §32.7 register 32.2; C3 TRM v1.4 register 30.6).
+/// No TRM text describes a DATA_FREE that stays 0 with nothing committed;
+/// the cause and this remedy are empirical (C6 bench observations, see the
+/// port README). Callers write it only after reading DATA_FREE as 0. If the
+/// host reads the buffer between that read and this write, WR_DONE commits
+/// an empty buffer and a zero-length packet goes out, which CDC ACM hosts
+/// ignore. Our writers flush every packet they write, so it never commits a
+/// partial packet of ours.
+fn release_stuck_tx() void {
+    tx_fifo_flush();
+}
+
+var boot_tx_checked = false;
+
+/// Before the first write after boot, release an IN buffer that was already
+/// stuck at boot (see release_stuck_tx), so that write is not lost to it.
+fn release_stuck_tx_at_boot() void {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    if (boot_tx_checked) return;
+    boot_tx_checked = true;
+    if (tx_fifo_full()) release_stuck_tx();
 }
 
 /// Success means the host consumed every flushed packet, including the final one.
 /// Timeout indicates a host that is absent, closed, or not reading (C3 TRM v1.4 §30.4; C6 TRM v1.2 §32.3.2).
 /// A timeout can follow partial delivery; retrying the whole slice may duplicate data.
-/// Serialize TX callers, including the logger. The deadline covers the whole write.
+/// A timed-out wait re-commits the IN buffer for the host (release_stuck_tx).
+/// Serialize TX callers. Masking interrupts does not exclude a preempted logger:
+/// quiesce logging before using this API. The deadline covers the whole write.
 pub fn write_blocking(data: []const u8, deadline: Deadline) error{Timeout}!usize {
     if (data.len == 0) return 0;
+    release_stuck_tx_at_boot();
     try wait_for_tx(deadline);
     var offset: usize = 0;
     while (offset < data.len) {
@@ -372,10 +419,13 @@ pub fn write_blocking(data: []const u8, deadline: Deadline) error{Timeout}!usize
 }
 
 /// Buffered writer with bounded host-consumption waits. Inspect err after WriteFailed.
-/// Each drain gets one timeout; no failed bytes are retained for a later message.
+/// Each drain gets one timeout, or the shared `deadline` when set; no failed
+/// bytes are retained for a later message.
 pub const Writer = struct {
     interface: std.Io.Writer,
     timeout: microzig.drivers.time.Duration = .from_ms(100),
+    /// When set, every drain uses this deadline instead of `timeout`.
+    deadline: ?Deadline = null,
     err: ?error{Timeout} = null,
 
     pub fn init(buffer: []u8) Writer {
@@ -384,7 +434,7 @@ pub const Writer = struct {
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Writer = @alignCast(@fieldParentPtr("interface", w));
-        const deadline = Deadline.init_relative(time.get_time_since_boot(), self.timeout);
+        const deadline = self.deadline orelse Deadline.init_relative(time.get_time_since_boot(), self.timeout);
         self.err = null;
         const buffered = w.buffer[0..w.end];
         w.end = 0;
@@ -410,10 +460,46 @@ pub const Writer = struct {
 };
 
 /// USB Serial JTAG logger. Use `.logFn = logger.log` in std_options.
-/// Failed lines are discarded; subsequent calls retry even after a host timeout.
+/// Waits for the host run with the caller's interrupt state: the logger masks
+/// interrupts only to claim the writer and to update its counters, never
+/// while waiting. Each drain waits at most 2 ms. A caller that already has
+/// interrupts masked, or is in a nested interrupt handler, gets one
+/// 2 ms deadline for the whole line instead, so it masks at most 2 ms per
+/// line plus formatting and FIFO writes.
+/// A line that starts while another is being written (from an interrupt
+/// handler or a preempting task) is dropped, not interleaved. A stalled host
+/// drops subsequent lines without waiting. Every dropped or possibly
+/// truncated line is counted conservatively. The next written line reports
+/// at most N lost lines since the last confirmed report: committed packets
+/// can arrive after a timeout, including the report itself.
+/// Fatal panic/trap handling takes over the writer with interrupts masked.
+/// This is best-effort logging (including error/panic text), not confirmed TX;
+/// use write_blocking with caller serialization for delivery confirmation.
 pub const logger = struct {
     var buffer: [64]u8 = undefined;
     var writer = Writer.init(&buffer);
+    // All state accesses are guarded by critical sections, or owned by the
+    // context that claimed the writer (host_stalled).
+    var state: log_state.State = .{};
+
+    /// Called only on a fatal path that never returns to the interrupted owner.
+    pub fn prepare_panic() void {
+        microzig.cpu.interrupt.disable_interrupts();
+        state.takeover(&writer.interface.end);
+    }
+
+    fn count_dropped() void {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        state.count_dropped();
+    }
+
+    /// Owner only: discards the line and counts it.
+    fn drop_line() void {
+        writer.interface.end = 0;
+        state.host_stalled = true;
+        count_dropped();
+    }
 
     pub fn log(
         comptime level: std.log.Level,
@@ -427,19 +513,64 @@ pub const logger = struct {
             else => " (" ++ @tagName(scope) ++ "): ",
         };
 
-        const cs = microzig.interrupt.enter_critical_section();
-        defer cs.leave();
+        const masked_by_caller = !microzig.interrupt.globally_enabled() or
+            microzig.cpu.interrupt.get_priority_threshold() != .zero;
+        const unreported = claim: {
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            break :claim state.claim() orelse return;
+        };
+        defer {
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            state.release();
+        }
+
+        release_stuck_tx_at_boot();
+        // A reading host frees a packet slot within one 1 ms USB frame
+        // (measured on C3 and C6 under Windows: at most 154 us per packet,
+        // 326 us per line); 50 us dropped most lines while the host read.
+        writer.timeout = .from_ms(2);
+        writer.deadline = if (masked_by_caller)
+            Deadline.init_relative(time.get_time_since_boot(), writer.timeout)
+        else
+            null;
+
+        if (state.host_stalled and tx_fifo_full()) {
+            // No wait runs here: release a stuck buffer on every dropped
+            // line, not only on the timeout that began the stall.
+            release_stuck_tx();
+            drop_line();
+            return;
+        }
+        if (unreported != 0) {
+            // A timed-out line may have left a delivered fragment. Terminate
+            // it before reporting loss and attempting the next complete line.
+            writer.interface.print("\r\n[usb logger: lost at most {d} lines since last confirmed report]\r\n", .{unreported}) catch {
+                drop_line();
+                return;
+            };
+            writer.interface.flush() catch {
+                drop_line();
+                return;
+            };
+            // Lines dropped by other contexts meanwhile stay counted.
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            state.confirm_report(unreported);
+        }
+        state.host_stalled = false;
 
         const current_time = time.get_time_since_boot();
         const seconds = current_time.to_us() / std.time.us_per_s;
         const microseconds = current_time.to_us() % std.time.us_per_s;
 
         writer.interface.print(prefix ++ format ++ "\r\n", .{ seconds, microseconds } ++ args) catch {
-            writer.interface.end = 0;
+            drop_line();
             return;
         };
         writer.interface.flush() catch {
-            writer.interface.end = 0;
+            drop_line();
         };
     }
 };

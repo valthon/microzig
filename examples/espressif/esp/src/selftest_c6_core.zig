@@ -4,6 +4,7 @@ const microzig = @import("microzig");
 const hal = microzig.hal;
 const csr = microzig.cpu.csr;
 const SYSTIMER = microzig.chip.peripherals.SYSTIMER;
+const expected_mac = @import("c6_core_options").expected_mac;
 
 pub const panic = microzig.panic;
 pub const std_options = microzig.std_options(.{
@@ -21,6 +22,7 @@ const Result = struct {
     expected: u64,
     actual: u64,
     pass: bool,
+    skip: bool = false,
 };
 
 fn within_percent(actual: u64, expected: u64) bool {
@@ -169,7 +171,7 @@ pub fn main() void {
     const mac = hal.efuse.read_mac();
     var mac_value: u48 = 0;
     for (mac) |byte| mac_value = (mac_value << 8) | byte;
-    results[transitions.len + 2] = .{ .name = "mac", .expected = 0x9888e07efc74, .actual = mac_value, .pass = mac_value == 0x9888e07efc74 };
+    results[transitions.len + 2] = .{ .name = "mac", .expected = expected_mac orelse 0, .actual = mac_value, .pass = if (expected_mac) |want| mac_value == want else false, .skip = expected_mac == null };
     const load_index = transitions.len + 3;
     results[load_index] = .{ .name = "systimer_load_hi", .expected = 1, .actual = @intFromBool(load_hi()), .pass = false };
     results[load_index].pass = results[load_index].actual == 1;
@@ -181,16 +183,22 @@ pub fn main() void {
     hal.rom.delay_us(1_500_000);
     while (true) {
         var passed: usize = 0;
+        var skipped: usize = 0;
         for (results) |result| {
-            const verdict: []const u8 = if (result.pass) "PASS" else "FAIL";
-            if (result.pass) passed += 1;
+            const verdict: []const u8 = if (result.skip) "SKIP" else if (result.pass) "PASS" else "FAIL";
+            if (result.skip) skipped += 1 else if (result.pass) passed += 1;
             if (std.mem.eql(u8, result.name, "mac")) {
-                std.log.info("SELFTEST c6_core mac: {s} expected=98:88:e0:7e:fc:74 actual={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ verdict, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] });
+                if (expected_mac) |want| {
+                    const w: [6]u8 = @bitCast(@byteSwap(want));
+                    std.log.info("SELFTEST c6_core mac: {s} expected={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} actual={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ verdict, w[0], w[1], w[2], w[3], w[4], w[5], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] });
+                } else {
+                    std.log.info("SELFTEST c6_core mac: {s} expected_mac=unset actual={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ verdict, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] });
+                }
             } else {
                 std.log.info("SELFTEST c6_core {s}: {s} expected={} actual={}", .{ result.name, verdict, result.expected, result.actual });
             }
         }
-        std.log.info("SELFTEST c6_core DONE pass={} fail={}", .{ passed, results.len - passed });
+        std.log.info("SELFTEST c6_core DONE pass={} fail={}", .{ passed, results.len - passed - skipped });
         hal.rom.delay_us(1_000_000);
     }
 }
