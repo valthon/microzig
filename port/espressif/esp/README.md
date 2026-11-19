@@ -111,6 +111,27 @@ group held in reset, inside a critical section. Calls on an active group do
 not unlock, relock or update the watchdog. The prior timer hardware counts
 predate this change; current evidence is **built only**.
 
+### Crypto accelerators
+
+| Crypto driver | Chips | Limits | Evidence |
+| --- | --- | --- | --- |
+| `sha` | C3, C6 | SHA-1/224/256; CPU, no DMA; synchronous whole-message API, exclusive against DS/HMAC; TRM §23.4.2.1 | built only; `selftest_sha` compares empty, abc, padding boundaries and multi-block input with std.crypto |
+| `aes` | C3, C6 | AES-128/256 CPU ECB, software CBC/OFB/CTR/CFB8/CFB128 chaining; whole blocks except CFB8, no padding/authentication/DMA, exclusive against DS; TRM §§19.4–19.5 | built; host `aes/cfb128_vectors.zig` tests pin CFB128 to `std.crypto`; `selftest_aes` SP 800-38A encrypt/decrypt vectors; current vectors built and host unit-tested; no C3/C6 hardware run of these vectors |
+| `rsa` | C3, C6 | Raw integer operations: modular exponent/multiply 32–3072 bits, multiply 32–1536 bits; odd modulus, caller supplies R², little-endian u32 limbs, bounded polling, exclusive against DS; TRM §§22.3.1–22.3.4 | built only; `selftest_rsa` compares with std.crypto.ff and wide integer multiplication |
+| `ecc` | C6 only (compile-time gate) | P-192/P-256 affine point verification and verified multiplication; big-endian fixed-size coordinates/scalars, nonzero scalar below group order; no ECDSA/ECDH protocol or Jacobian API; TRM §§20.3.2–20.7 | built only; `selftest_ecc` compares with std.crypto P256 and ff P-192 doubling, including invalid inputs |
+
+AES CFB128 uses the forward block transform for encryption and decryption, with
+ciphertext feedback. This matches ESP-IDF's `esp_aes_crypt_cfb128` CPU path in
+`components/mbedtls/port/aes/esp_aes.c`; the HAL block sequence is in
+`components/esp_hal_security/aes_hal.c` (formerly `components/hal/aes_hal.c`).
+ESP32-C6 TRM v1.2 §19.3 Table 19.3-2 selects the block transform; §§19.4.2–19.4.3
+specify little-endian CPU words, DMA disabled, TRIGGER=1, and STATE=0 before
+reading TEXT_OUT. §19.5's BLOCK_MODE selection applies to DMA operations.
+The shared answers come from [NIST SP 800-38A](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38a.pdf)
+F.3.13–F.3.14 (AES-128) and F.3.17–F.3.18 (AES-256); F.3.15–F.3.16 are AES-192.
+Run the host regression with `zig test src/hal/aes/cfb128_vectors.zig` from this
+port directory. Firmware FAIL lines include expected/actual hex and driver errors.
+
 C6 startup follows ESP-IDF v6.0.2 `bootloader_init_mem`: it disables the HP_APM,
 LP_APM0 and LP_APM access-path filters and puts all implemented HP masters and the
 LP CPU in TEE mode (C6 TRM v1.2 §§16.3.1, 16.3.2.3, 16.4). This covers Wi-Fi M4

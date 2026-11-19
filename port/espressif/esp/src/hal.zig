@@ -188,3 +188,11 @@ pub const pcnt = @import("hal/pcnt.zig");
 pub const etm = @import("hal/etm.zig");
 
 pub const mcpwm = @import("hal/mcpwm.zig");
+
+pub const sha = @import("hal/sha.zig");
+
+pub const aes = @import("hal/aes.zig");
+
+pub const rsa = @import("hal/rsa.zig");
+
+pub const ecc = @import("hal/ecc.zig");
