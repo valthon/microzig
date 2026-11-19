@@ -2,6 +2,27 @@
 // The SVD loader expands it as CH0/CH1, colliding with the real CH0 at 0xd0.
 // C6 TRM v1.2 §4.7–4.8: repair the names at the channel-1/channel-2 offsets.
 .{
+    // Opcodes from ESP-IDF v5.5.1 hal/ieee802154_common_ll.h (Apache-2.0).
+    // The public C6 TRM does not document the radio MAC command interface.
+    .{ .add_enum_and_apply = .{
+        .parent = "types.peripherals.IEEE802154",
+        .@"enum" = .{
+            .name = "Opcode",
+            .bitsize = 8,
+            .fields = .{
+                .{ .name = "tx_start", .value = 0x41 },
+                .{ .name = "rx_start", .value = 0x42 },
+                .{ .name = "cca_tx_start", .value = 0x43 },
+                .{ .name = "ed_start", .value = 0x44 },
+                .{ .name = "stop", .value = 0x45 },
+                .{ .name = "timer0_start", .value = 0x4c },
+                .{ .name = "timer0_stop", .value = 0x4d },
+                .{ .name = "timer1_start", .value = 0x4e },
+                .{ .name = "timer1_stop", .value = 0x4f },
+            },
+        },
+        .apply_to = .{"types.peripherals.IEEE802154.COMMAND.OPCODE"},
+    } },
     // C6 TRM v1.2 §§1.6, 10.5.2 and the SVD describe the legacy INTPRI.
     // ESP-IDF v5.3 soc/esp32c6/include/soc/interrupt_reg.h explicitly selects
     // PLIC instead. reg_base.h and plic_reg.h define this missing CPU-local bank:

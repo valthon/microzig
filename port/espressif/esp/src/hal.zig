@@ -179,6 +179,8 @@ fn compile_check_accessors(index: u32) callconv(.c) void {
 
 test {
     _ = @import("hal/uart/timing.zig");
+    _ = @import("hal/radio/ieee802154_frame.zig");
+    _ = @import("hal/radio/ieee802154_rx.zig");
 }
 
 pub const sigma_delta = @import("hal/sigma_delta.zig");

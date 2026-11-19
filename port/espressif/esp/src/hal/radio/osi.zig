@@ -946,10 +946,11 @@ fn clocks_phy_set_enabled_c3(enable: bool) void {
     APB_CTRL.WIFI_CLK_EN.write(.{ .WIFI_CLK_EN = wifi_clk_en });
 }
 
-// ESP-IDF phy_init.c / phy_common.c lifecycle.
+// ESP-IDF phy_init.c / phy_common.c lifecycle. The selected protocol is
+// exclusive for this image; Wi-Fi retains its adapter enable/disable calls.
 // These OS adapter entry points and the timer callback run in task context.
 const phy = struct {
-    const is_wifi = true;
+    const is_wifi = microzig.options.hal.radio.protocol == .wifi;
     extern fn phy_init_param_set(param: u8) void;
     extern fn phy_wifi_enable_set(enabled: u8) void;
     extern fn phy_bbpll_en_usb(enabled: bool) void;

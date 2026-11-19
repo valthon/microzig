@@ -48,6 +48,8 @@ pub const Controller = struct {
                 @compileError("BLE controller is supported only on ESP32-C6");
             if (!microzig.options.hal.radio.ble)
                 @compileError("select hal.radio.ble=true for exclusive BLE mode");
+            if (microzig.options.hal.radio.protocol != .wifi)
+                @compileError("BLE and IEEE 802.15.4 cannot run simultaneously: no RF coexistence scheduler");
             microzig.cpu.interrupt.expect_handler(.interrupt29, interrupt_handler);
         }
         // C6 TRM §8.2.4.1: PLL root / 3, no extra HS divider or

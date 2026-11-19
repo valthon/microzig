@@ -18,10 +18,14 @@ pub const bluetooth = @import("radio/bluetooth.zig");
 const osi = @import("radio/osi.zig");
 const timer = @import("radio/timer.zig");
 pub const wifi = @import("radio/wifi.zig");
+pub const ieee802154 = if (compatibility.chip == .esp32_c6) @import("radio/ieee802154.zig") else void;
 
 const log = std.log.scoped(.esp_radio);
 
 pub const Options = struct {
+    /// The port has no RF coexistence scheduler. Select one protocol per image;
+    /// `.ieee802154` also excludes `ble`.
+    protocol: enum { wifi, ieee802154 } = .wifi,
     interrupt: microzig.cpu.Interrupt = .interrupt30,
     /// Exclusive C6 BLE mode. Wi-Fi initialization is rejected at compile time.
     ble: bool = false,

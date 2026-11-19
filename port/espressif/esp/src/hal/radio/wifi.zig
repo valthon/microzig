@@ -18,7 +18,7 @@ pub const Options = struct {
     on_packet_transmitted: ?*const fn (interface: Interface, data: []const u8, status: bool) void = null,
 };
 
-const InitError = radio.InitError || PowerSaveError;
+const InitError = radio.InitError || PowerSaveError || error{UnsupportedRadioProtocol};
 
 pub const InitConfig = struct {
     /// Power save mode. Only `.none` is supported on the ESP32-C6.
@@ -149,6 +149,8 @@ pub fn init(gpa: std.mem.Allocator, config: InitConfig) InitError!void {
     if (comptime microzig.options.hal.radio.ble)
         @compileError("Wi-Fi and BLE cannot run simultaneously: hal.radio.ble selects exclusive BLE mode");
     comptime export_symbols();
+
+    if (microzig.options.hal.radio.protocol != .wifi) return error.UnsupportedRadioProtocol;
 
     if (compatibility.chip == .esp32_c6 and config.power_save_mode != .none)
         return error.PowerSaveUnsupported;

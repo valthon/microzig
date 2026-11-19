@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     const expected_mac_text = b.option([]const u8, "expected_mac", "selftest_c6_core: the board's efuse MAC (aa:bb:cc:dd:ee:ff); unset reports SKIP");
     const ble_scan_seconds = b.option(u32, "ble_scan_seconds", "BLE observer scan duration (1..3600 seconds)") orelse 10;
     if (ble_scan_seconds == 0 or ble_scan_seconds > 3600) @panic("ble_scan_seconds must be in 1..3600");
-    const antenna = b.option(Antenna, "antenna", "Antenna the XIAO ESP32C6 builds of the BLE examples select (default internal)") orelse .internal;
+    const antenna = b.option(Antenna, "antenna", "Antenna the XIAO ESP32C6 builds of the BLE and 802.15.4 examples select (default internal)") orelse .internal;
     const ble_peer_name = b.option([]const u8, "ble_peer_name", "BLE central peer advertised name") orelse "H2-PEER";
     if (ble_peer_name.len == 0 or ble_peer_name.len > 31) @panic("ble_peer_name must be 1..31 bytes");
     const softap_ssid = b.option([]const u8, "softap_ssid", "SoftAP SSID (1..32 bytes)") orelse "microzig-softap";
@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
 
     const examples: []const Example = &.{
         .{ .name = "compile_wifi", .file = "src/compile_wifi.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
+        .{ .name = "selftest_ieee802154", .file = "src/selftest_ieee802154.zig", .chips = &.{.esp32_c6}, .antenna_option = true, .features = .{ .image_boot_only = true } },
         .{ .name = "softap", .file = "src/softap.zig", .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
         .{ .name = "selftest_i2s", .file = "src/selftest_i2s.zig" },
         .{ .name = "selftest_parl_io", .file = "src/selftest_parl_io.zig", .chips = &.{.esp32_c6} },
@@ -118,6 +119,14 @@ pub fn build(b: *std.Build) void {
         .{ .name = "ble_scan", .file = "src/ble_scan.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
         .{ .name = "ble_peripheral", .file = "src/ble_peripheral.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
         .{ .name = "ble_central", .file = "src/ble_central.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
+        // The radio self-test again, for the XIAO's rf switch (see its main).
+        .{
+            .name = "selftest_ieee802154",
+            .file = "src/selftest_ieee802154.zig",
+            .prefix = "xiao_esp32_c6",
+            .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6,
+            .antenna_option = true,
+        },
     };
 
     for (examples) |example| {

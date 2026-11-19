@@ -161,6 +161,28 @@ var bb_clock_refs: u32 = 0;
 var phy_clock_refs: u32 = 0;
 var analog_clock_owned = false;
 var slowclk_period: u32 = 0;
+var ieee802154_clocks_owned = false;
+
+/// ESP-IDF v5.5.1 modem_clock.c IEEE802154_CLOCK_DEPS: MAC/APB, shared
+/// BT BB, ETM and coexistence. radio_init already maps ZB to ACTIVE only.
+/// The radio protocol option excludes Wi-Fi; no BLE clock owner exists here.
+pub fn ieee802154_clocks_set_enabled(enabled: bool) void {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    ieee802154_clocks_owned = enabled;
+    const en = @intFromBool(enabled);
+    MODEM_SYSCON.CLK_CONF.modify(.{ .CLK_ZB_APB_EN = en, .CLK_ZB_MAC_EN = en, .CLK_ETM_EN = en });
+    MODEM_SYSCON.CLK_CONF1.modify(.{ .CLK_BT_APB_EN = en, .CLK_BT_EN = en });
+    MODEM_LPCON.CLK_CONF.modify(.{ .CLK_COEX_EN = en });
+}
+
+/// IDF modem_clock_module_mac_reset(PERIPH_IEEE802154_MODULE).
+pub fn ieee802154_mac_reset() void {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    MODEM_SYSCON.MODEM_RST_CONF.modify(.{ .RST_ZBMAC = 1 });
+    MODEM_SYSCON.MODEM_RST_CONF.modify(.{ .RST_ZBMAC = 0 });
+}
 
 pub fn wifi_set_inited(inited: bool) void {
     const cs = microzig.interrupt.enter_critical_section();
@@ -197,7 +219,8 @@ pub fn calibration_clocks_set_enabled(enabled: bool) void {
     defer cs.leave();
     bb_clocks_set_enabled(enabled);
     // IDF PHY_CALIBRATION_BT_I154_CLOCK_DEPS also opens the shared BT BB.
-    const en = @intFromBool(enabled);
+    // Retain the shared BB when an 802.15.4 owner survives calibration.
+    const en = @intFromBool(enabled or ieee802154_clocks_owned);
     MODEM_SYSCON.CLK_CONF1.modify(.{ .CLK_BT_APB_EN = en, .CLK_BT_EN = en });
 }
 
