@@ -23,6 +23,8 @@ const log = std.log.scoped(.esp_radio);
 
 pub const Options = struct {
     interrupt: microzig.cpu.Interrupt = .interrupt30,
+    /// Exclusive C6 BLE mode. Wi-Fi initialization is rejected at compile time.
+    ble: bool = false,
     wifi: wifi.Options = .{},
 };
 
@@ -82,7 +84,7 @@ pub fn init(gpa: Allocator) InitError!void {
         .Debug => c.WIFI_LOG_VERBOSE,
         else => c.WIFI_LOG_NONE,
     };
-    wifi.c_err(c.esp_wifi_internal_set_log_level(internal_wifi_log_level)) catch {
+    if (!microzig.options.hal.radio.ble) wifi.c_err(c.esp_wifi_internal_set_log_level(internal_wifi_log_level)) catch {
         log.warn("failed to set wifi internal log level", .{});
     };
 }

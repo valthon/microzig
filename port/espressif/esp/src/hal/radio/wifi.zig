@@ -146,6 +146,8 @@ pub const InitConfig = struct {
 };
 
 pub fn init(gpa: std.mem.Allocator, config: InitConfig) InitError!void {
+    if (comptime microzig.options.hal.radio.ble)
+        @compileError("Wi-Fi and BLE cannot run simultaneously: hal.radio.ble selects exclusive BLE mode");
     comptime export_symbols();
 
     if (compatibility.chip == .esp32_c6 and config.power_save_mode != .none)

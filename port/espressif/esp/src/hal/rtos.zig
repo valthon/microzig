@@ -1059,7 +1059,7 @@ pub const Semaphore = struct {
         const cs = enter_critical_section();
         defer cs.leave();
 
-        sem.give_impl(&hptw);
+        sem.give_impl(hptw);
     }
 
     fn give_impl(sem: *Semaphore, hptw: *bool) void {

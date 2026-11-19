@@ -340,6 +340,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run platform agnostic unit tests");
     test_step.dependOn(&unit_tests_run.step);
 
+    const ble_host_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/radio/ble/host.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(ble_host_tests).step);
+
     // Tests in a separate imported module need their own test artifact.
     const interrupt_tests = b.addTest(.{
         .root_module = b.createModule(.{

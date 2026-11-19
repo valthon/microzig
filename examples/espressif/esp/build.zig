@@ -19,6 +19,11 @@ pub fn build(b: *std.Build) void {
     if (wifi_password.len == 0 and !std.mem.eql(u8, wifi_auth, "none"))
         std.process.fatal("-Dwifi_auth={s} needs -Dwifi_password", .{wifi_auth});
     const expected_mac_text = b.option([]const u8, "expected_mac", "selftest_c6_core: the board's efuse MAC (aa:bb:cc:dd:ee:ff); unset reports SKIP");
+    const ble_scan_seconds = b.option(u32, "ble_scan_seconds", "BLE observer scan duration (1..3600 seconds)") orelse 10;
+    if (ble_scan_seconds == 0 or ble_scan_seconds > 3600) @panic("ble_scan_seconds must be in 1..3600");
+    const antenna = b.option(Antenna, "antenna", "Antenna the XIAO ESP32C6 builds of the BLE examples select (default internal)") orelse .internal;
+    const ble_peer_name = b.option([]const u8, "ble_peer_name", "BLE central peer advertised name") orelse "H2-PEER";
+    if (ble_peer_name.len == 0 or ble_peer_name.len > 31) @panic("ble_peer_name must be 1..31 bytes");
     const softap_ssid = b.option([]const u8, "softap_ssid", "SoftAP SSID (1..32 bytes)") orelse "microzig-softap";
     const softap_password = b.option([]const u8, "softap_password", "SoftAP WPA2 passphrase (8..63 printable ASCII bytes)") orelse "microzig-demo";
     if (softap_ssid.len == 0 or softap_ssid.len > 32)
@@ -96,6 +101,10 @@ pub fn build(b: *std.Build) void {
             .flashless = false,
             .lwip = true,
         } },
+        .{ .name = "selftest_ble_hci", .file = "src/selftest_ble_hci.zig", .chips = &.{.esp32_c6}, .features = .{ .image_boot_only = true } },
+        .{ .name = "ble_scan", .file = "src/ble_scan.zig", .chips = &.{.esp32_c6}, .ble_options = true, .features = .{ .image_boot_only = true } },
+        .{ .name = "ble_peripheral", .file = "src/ble_peripheral.zig", .chips = &.{.esp32_c6}, .ble_options = true, .features = .{ .image_boot_only = true } },
+        .{ .name = "ble_central", .file = "src/ble_central.zig", .chips = &.{.esp32_c6}, .ble_options = true, .features = .{ .image_boot_only = true } },
     };
 
     const board_examples: []const BoardExample = &.{
@@ -105,6 +114,10 @@ pub fn build(b: *std.Build) void {
             .prefix = "xiao_esp32_c6",
             .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6,
         },
+        // The radio examples again, for the XIAO's rf switch (see ble_bench.run).
+        .{ .name = "ble_scan", .file = "src/ble_scan.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
+        .{ .name = "ble_peripheral", .file = "src/ble_peripheral.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
+        .{ .name = "ble_central", .file = "src/ble_central.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
     };
 
     for (examples) |example| {
@@ -152,6 +165,8 @@ pub fn build(b: *std.Build) void {
                 options.addOption(?u48, "expected_mac", expected_mac);
                 fw.exe.root_module.addOptions("c6_core_options", options);
             }
+            if (example.ble_options) add_ble_options(b, fw, ble_scan_seconds, ble_peer_name);
+            if (example.ble_options or example.antenna_option) add_antenna_option(b, fw, antenna);
 
             if (example.wifi_options) {
                 const options = b.addOptions();
@@ -213,6 +228,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .root_source_file = b.path(example.file),
         });
+        if (example.ble_options) add_ble_options(b, fw, ble_scan_seconds, ble_peer_name);
+        if (example.ble_options or example.antenna_option) add_antenna_option(b, fw, antenna);
 
         mb.install_firmware(fw, .{});
         mb.install_firmware(fw, .{ .format = .elf });
@@ -226,6 +243,11 @@ const BoardExample = struct {
     /// Prefixed to the installed firmware name.
     prefix: []const u8,
     target: *const microzig.Target,
+    /// Receives `-Dble_scan_seconds` and `-Dble_peer_name` as module `ble_options`,
+    /// and `-Dantenna` as module `antenna_options`.
+    ble_options: bool = false,
+    /// Receives `-Dantenna` as module `antenna_options`.
+    antenna_option: bool = false,
 };
 
 const TargetEnum = enum {
@@ -298,9 +320,29 @@ const Example = struct {
     mac_option: bool = false,
     /// Receives station credentials as module `wifi_options`.
     wifi_options: bool = false,
+    /// Receives BLE options as `ble_options` and `-Dantenna` as `antenna_options`.
+    ble_options: bool = false,
+    /// Receives `-Dantenna` as module `antenna_options`.
+    antenna_option: bool = false,
     /// Chips whose peripherals and board assumptions this example supports.
     chips: []const Chip = &.{ .esp32_c3, .esp32_c6 },
 };
+
+fn add_ble_options(b: *std.Build, fw: *MicroBuild.Firmware, scan_seconds: u32, peer_name: []const u8) void {
+    const options = b.addOptions();
+    options.addOption(u32, "scan_seconds", scan_seconds);
+    options.addOption([]const u8, "peer_name", peer_name);
+    fw.exe.root_module.addOptions("ble_options", options);
+}
+
+/// Mirrors the XIAO ESP32C6 board's `antenna.Selection`.
+const Antenna = enum { internal, external };
+
+fn add_antenna_option(b: *std.Build, fw: *MicroBuild.Firmware, antenna: Antenna) void {
+    const options = b.addOptions();
+    options.addOption(Antenna, "antenna", antenna);
+    fw.exe.root_module.addOptions("antenna_options", options);
+}
 
 fn parse_mac(text: []const u8) ?u48 {
     var it = std.mem.splitScalar(u8, text, ':');

@@ -440,3 +440,230 @@ Its `DMA.OUT_CONF0_CH%s` omits `dimIndex`, so the expanded names CH0/CH1 collide
 explicit CH0 at offset 0xD0. `patches/esp32_c6.zon`, wired through `chip.patch_files`, renames
 only the registers at 0x190 and 0x250 to CH1 and CH2 after loading. It leaves addresses, fields,
 and the vendored input unchanged; expected-name checks detect incompatible vendor updates.
+
+## ESP32-C6 BLE controller and HCI
+
+`hal.radio.bluetooth.Controller.start(allocator)` ports the controller-only
+lifecycle from **ESP-IDF v5.5.1**, `components/bt/controller/esp32c6/{bt,ble}.c`,
+with NPL backed by `hal.rtos`. It uses the existing pinned `esp-wifi-sys`
+revision `7623c8d746b55cd8d9f7473359069aef381b7d3b` (`libble_app.a`, `libbtbb.a`
+and `libphy.a`). Its configuration ABI is `0x20250606`; v6.0.2 is incompatible.
+The existing Wi-Fi ROM script is retained. No BLE ROM overrides are added.
+
+Select `hal.radio.ble = true`, enable the RTOS and interrupt stack, and register
+`bluetooth.interrupt_handler` on interrupt 29, plus the existing radio and RTOS
+handlers. This mode rejects `wifi.init` at compile time: simultaneous Wi-Fi/BLE
+is unsupported. Wi-Fi's default configuration and PHY lifecycle are unchanged.
+Use a 160 MHz PLL CPU / 40 MHz crystal and C6 image-boot target. Startup
+rejects other CPU clocks. MicroZig defaults to 80 MHz; these examples explicitly
+apply a compile-time `hal.clocks.Config.init_comptime(160_000_000)` through their
+`init` override.
+
+The controller and allocator must stay at stable addresses for the whole boot.
+The controller is a singleton with one connection. There is no shutdown/restart
+API; a failed startup requires reboot. Controller tasks, NPL objects and PHY
+tracking use the supplied allocator for this boot lifetime. NPL callouts use
+millisecond resolution; modem sleep and pairing/secure-connections crypto are
+disabled. This does not implement SMP or bonding.
+
+`send_command` takes an HCI command header and parameters; `send_acl` takes the
+ACL header and payload. Neither includes an H4 packet-type byte. Both copy their
+input into controller-owned buffers. `receive(timeout_ms)` returns an owned
+packet copy from a 16-packet queue; the C callback releases the controller buffer
+immediately. Queue overflow is latched and reported as `ReceiveOverflow`, never
+silently dropped. Commands and ACL traffic must obey HCI credits in the host.
+Transport calls and receive have a single host owner; packet callbacks never log
+or block. Buffers support 255-byte ACL payloads and full-length HCI events.
+
+`selftest_ble_hci` needs no peer or wiring. It checks HCI Reset, Read Local Version,
+Read BD_ADDR and LE Read Buffer Size, including completion status and response
+length. Output starts after 1.5 seconds and repeats `SELFTEST ble_hci DONE
+pass=N fail=M` every three seconds. Evidence: see the per-build counts under
+"BLE bench examples" below.
+
+## Minimal Zig BLE host
+
+`bluetooth.host.Host.init(controller.transport())` owns all host state and
+allocates nothing. `initialize()` resets HCI, enables the event masks, and
+obtains ACL buffer credits. HCI commands and ATT requests are serialized with
+two-second procedure deadlines. Longer named-peer scan/connection deadlines
+are caller supplied. Number Of Completed Packets replenishes outbound ACL
+credits; incoming ACL fragments are reassembled before fixed-channel dispatch.
+One task owns the host, including callbacks. Do not reenter the host from its
+advertiser callback. A protocol, transport, overflow or procedure error aborts
+the application session; reboot before attempting another session.
+
+The observer supports active legacy LE scanning (including scan responses),
+public/random addresses, RSSI and complete/short local names from AD structures.
+`advertise(name)` exposes GAP Device Name plus service FFF0: FFF1 is a mutable
+0–20-byte value with read/write/write-command properties; FFF2 notifies a
+little-endian 32-bit counter once a second when its CCCD is enabled. Call
+`poll()` and `tick()` regularly. Disconnect clears the subscription and counter;
+call `resume_advertising()` to accept another peer. CCCD state is per connection,
+not persisted.
+
+The central actively scans for an exact advertised name, connects, discovers
+FFF0 and its FFF1/FFF2 declarations and FFF2's CCCD, then offers `read`, `write`
+and `subscribe`. It does not assume peer handles. Discovery supports 16-bit
+service/characteristic UUIDs and skips unrelated 128-bit UUID entries. The
+host uses ATT MTU 23, one connection and one ATT bearer; values longer than 20
+bytes, queued/reliable writes, dynamic L2CAP channels, extended advertising,
+privacy/resolving lists, pairing/SMP, encryption and bonding are unsupported.
+Pairing requests receive Pairing Not Supported. Connection-parameter update
+requests on LE signaling are rejected, retaining the negotiated interval.
+Notification payloads and counts are available in the host state.
+
+Evidence: desktop unit tests of HCI status and credit handling, multi-report
+AD parsing, fragmented ATT responses, discovery with non-default handles,
+notifications, server permissions, CCCD validation and write commands; the
+on-board runs are listed per build under "BLE bench examples" below.
+
+### BLE bench examples
+
+From `examples/espressif/esp`, with the pinned Zig toolchain:
+
+```sh
+zig build -Doptimize=ReleaseSmall -Dexample=selftest_ble_hci
+zig build -Doptimize=ReleaseSmall -Dexample=ble_scan -Dble_scan_seconds=10
+zig build -Doptimize=ReleaseSmall -Dexample=ble_peripheral
+zig build -Doptimize=ReleaseSmall -Dexample=ble_central -Dble_peer_name=H2-PEER
+```
+
+Each command builds the C6 image-boot target, installed as
+`esp32_c6_<example>.bin` and `.elf` under `zig-out/firmware`. `ble_scan`,
+`ble_peripheral` and `ble_central` also build for the XIAO ESP32C6 board as
+`xiao_esp32_c6_ble_scan`, `xiao_esp32_c6_ble_peripheral` and
+`xiao_esp32_c6_ble_central` (same commands). On a XIAO use those board
+builds: they power the rf switch in front of the antenna (GPIO3 low, GPIO14
+selects the antenna; `boards/xiao_esp32_c6.zig`). `-Dantenna=external` selects
+the U.FL connector instead of the ceramic antenna (default `internal`). They use USB Serial
+JTAG logging, interrupt 29 for BLE, 30 for shared radio, 31 for RTOS, an 8 KiB
+interrupt stack, 32 RTOS priorities with time slicing, and a 160 KiB explicit
+controller heap. No GPIO wiring is needed. Run one role at a time.
+
+* `ble_scan` actively scans for N seconds (default 10, range 1–3600), printing
+  address, address type, RSSI and AD name for each report. Non-printable name
+  bytes become dots. Its count is advertising reports, including duplicates,
+  rather than distinct devices. It stops scanning and repeats its summary.
+* `ble_peripheral` advertises **MZ-C6**, serves FFF0, and stays running across
+  connections. Its self-test marks setup, the first accepted connection, CCCD
+  subscription and first notification; then repeats DONE while continuing to
+  serve. The notification counter is per connection and encoded little-endian.
+* `ble_central` targets **H2-PEER** by default. `-Dble_peer_name` can select the
+  Zephyr peer's configured name. It allows 15 seconds each for scanning and
+  connecting, discovers handles, reads FFF1, writes and verifies `MZ-C6`, sends
+  and verifies a write command `MZ-C6-WNR`, subscribes to FFF2, requires two
+  notifications within six seconds, unsubscribes, and disconnects. It leaves
+  `MZ-C6-WNR` in the peer's FFF1 value. Each step prints
+  `SELFTEST ble_central <step>: PASS|FAIL`; failures include HCI/ATT status.
+
+The three role examples start a reporter before controller initialization. It
+prints RUNNING or DONE after 1.5 seconds, then every three seconds, so opening
+USB late still shows status. Completed tests print `SELFTEST <suite> DONE
+pass=N fail=M`; no peer or a failed operation is a FAIL, not a successful empty
+central run. A peripheral continues waiting for a peer without marking the
+connection tests passed. The peer-free HCI test delays 1.5 seconds before its
+checks and repeats DONE every three seconds.
+
+Evidence on two C6 boards, a XIAO ESP32-C6 (rev v0.1) and a Super Mini
+ESP32-C6FH4 (rev v0.2), against an ESP32-H2 NimBLE peer and a XIAO nRF52840
+Zephyr peer. "Generic" is the `esp32_c6_*` chip build, "board" the
+`xiao_esp32_c6_*` build (on the XIAO, only the board build powers the rf
+switch). All runs below are dated 2026-11-19. A count is runs that printed `DONE`
+with `fail=0`. The 0 dBm builds use the initial TX-power setting; the +9 dBm
+builds use IDF v5.5.1's default (`BT_CONTROLLER_INIT_CONFIG_DEFAULT`).
+"Initial" and "diagnostic" distinguish the recorded +9 dBm run sets.
+Every committed build below ran on an earlier version. Since the 0 dBm runs,
+TX power, controller interrupt/protocol guards, antenna selection/reporting,
+logger and LP_FAST startup changed. Since the initial +9 dBm runs, the same
+items except TX power changed. Since the diagnostic +9 dBm runs, logger and
+LP_FAST startup changed. The changes since are built only / unit-tested.
+Rows marked "an uncommitted build" have no verified equivalence to this tree.
+
+XIAO ESP32-C6, all at 0 dBm:
+
+| Example | Build (source) | Peer | Result |
+| --- | --- | --- | --- |
+| `selftest_ble_hci` | generic, an uncommitted build, two different images | none | debug image c6e74a305fa93b30: 4/4, 1 run; earlier a50cb04be3d6b298: `ControllerFailed` at init (0 pass, 1 fail), 1 run |
+| `ble_scan` | generic, 0 dBm initial | advertisers incl. the H2/nRF | 4/4 checks, 2 of 2 runs |
+| `ble_scan` | board, 0 dBm board | advertisers incl. the H2/nRF | 4/4 checks, 1 of 1 run |
+| `ble_peripheral` | generic, 0 dBm initial | H2 central | 6/6, 1 of 1 run |
+| `ble_peripheral` | generic, 0 dBm initial | nRF central | 6/6, 1 of 1 run |
+| `ble_peripheral` | board, 0 dBm board | H2 central | 6/6, 1 of 1 run |
+| `ble_central` | generic, 0 dBm initial | H2 peripheral | 13/13, 1 of 1 run |
+| `ble_central` | generic, 0 dBm initial | nRF peripheral | 13/13 in 1 of 5 runs |
+| `ble_central` | generic, an uncommitted build | nRF peripheral | 13/13 in 7 of 13 runs |
+| `ble_central` | board, an uncommitted build | nRF peripheral | 13/13 in 8 of 8 runs |
+
+Every failed central run against the nRF stopped at `discover` with
+`Disconnected`. The first four failures came from a build that predates the
+reason field; every later failure shows `disconnect_reason=3e`, Connection
+Failed to be Established. The
+current board build of `ble_central` has no committed-build hardware
+evidence against the nRF. The central's nRF reliability with the generic build is a known
+failure, not a pass.
+
+Super Mini ESP32-C6FH4, generic build:
+
+| Example | Build (source), TX power | Peer | Result |
+| --- | --- | --- | --- |
+| `selftest_ble_hci` | initial, 0 dBm | none | 4/4 checks, 1 run |
+| `ble_scan` | initial, 0 dBm | advertisers incl. the H2/nRF | 4/4 checks, 1 run |
+| `ble_central` | initial, 0 dBm | nRF, all advertising channels | 13/13 in 7 of 12 runs |
+| `ble_central` | initial, 0 dBm | nRF on channel 37 / 38 / 39 only | 4 of 4 / 4 of 10 / 4 of 4 runs |
+| `ble_central` | an uncommitted build with +9 dBm | nRF on channel 38 only | 9 of 10 runs |
+| `ble_central` | initial, +9 dBm | nRF, all advertising channels | 6 of 6 runs |
+| `ble_central` | initial, 0 dBm | H2 | 1 of 6 runs |
+| `ble_central` | initial, +9 dBm | H2 | 1 of 6 runs |
+| `ble_central` | an uncommitted build, image 055cb9e63773dc83, 0 dBm (riram set) | H2 | 3 of 6 runs |
+| `ble_central` | an uncommitted build, image d062a24e16611a44, +9 dBm (rp9 set) | H2 | 3 of 6 runs |
+| `ble_peripheral` | initial, 0 dBm | H2 central / nRF central | 6/6 in one C6 log; separate H2 run/connection not confirmed by that C6 evidence |
+| `ble_peripheral` | initial, +9 dBm | H2 central / nRF central | 1 of 1 / 0 of 2 runs |
+| `selftest_ble_hci` | diagnostic, +9 dBm | none | 4/4 checks, 1 run |
+| `ble_scan` | diagnostic, +9 dBm | 10 advertisers incl. the H2 | 4/4 checks, 1 run |
+| `ble_peripheral` | diagnostic, +9 dBm | H2 central / nRF central | 1 of 1 / 0 of 1 run |
+| `ble_central` | diagnostic, +9 dBm | nRF, all advertising channels | 8 of 11 runs |
+| `ble_central` | diagnostic, +9 dBm | H2 | 6 of 10 runs |
+
+In the diagnostic +9 dBm run set, `ble_scan` counted 219 reports in 10 s, 83 of them from the H2
+at a median of -36 dBm. In the `ble_peripheral` run with the nRF as central,
+the nRF's first connect ended with 0x3e, so its GATT sequence found no link;
+its scripted reconnect only reads, and the C6 stopped at 4/6 (connection
+passed, no subscription). Of the three
+failed central runs against the nRF, two ended in `discover` with 0x3e (in one
+the nRF never received the CONNECT_IND, in the other it did) and one in
+`discover: FAIL Timeout` with the link still up on both sides; that timeout
+did not recur in the other ten runs. In every failed central run against the
+H2, the H2 logged no connection and the C6 reported 0x3e.
+
+At 0 dBm the nRF received the Super Mini's adverts at a median of -75 dBm,
+against -65 dBm at +9 dBm. In each failed channel-38 run at 0 dBm the nRF
+never accepted the CONNECT_IND, which is sent only once.
+
+Open, not passes:
+
+* `ble_central` against the H2 passed 1 of 6 on each committed build
+  (initial 0 dBm and initial +9 dBm), with no H2 connection and C6
+  reason 0x3e in their failed runs. Two uncommitted builds
+  each passed 3 of 6: image 055cb9e63773dc83 at 0 dBm (riram set), and
+  d062a24e16611a44 at +9 dBm (rp9 set). The latter's run rp9-1 connected
+  but failed command readback with an ATT timeout, rather than 0x3e.
+  A single nRF-central/H2-peripheral control set (`hw6-ble-ctrl-nrf2h2-nrf.log`)
+  passed 6 of 10 (failed 4 of 10); the cause is not yet located on either side.
+* With the diagnostic +9 dBm build `ble_central` against the H2 passed 6 of 10; in every
+  failed run the H2 logged no connection and the C6 reported 0x3e. A second
+  nRF-central/H2-peripheral control failed 3 of 10, so the cause is not located
+  on the C6 side.
+* With the Super Mini as peripheral, the nRF formed a link in 3 of 10 repeated
+  connects at 0 dBm and 2 of 10 at +9 dBm; every other attempt ended with
+  0x3e. Cause unknown.
+  With the diagnostic +9 dBm build, two sets of
+  10 gave 1 and 8, and the H2 as central 10 of 10. Every other attempt ended
+  with 0x3e, a rate that varies between sets far more than between builds; the
+  nRF-to-H2 control above fails at a similar rate. Setting the controller's LP
+  timer divider to 4 on chip revisions above v0.0, as IDF's bt.c does with
+  `SOC_BLE_USE_WIFI_PWR_CLK_WORKAROUND`, gave 7 and 8 of 10 in sets run
+  alternately with the 1 and 8 above (uncommitted experiment): no measurable
+  difference. The driver keeps divider 399.
+* The +9 dBm default has run only on the Super Mini; the XIAO results above
+  predate it.
