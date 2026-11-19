@@ -33,13 +33,33 @@ v0.2, as `passed/checks` of the named self-test in `examples/espressif/esp`.
 | `adc` (ADC1), `temperature`                   | yes | yes | `selftest_adc`                                     | 10/10     | 10/10     |
 | `ledc` PWM and fades (C6: single-range gamma) | yes | yes | `selftest_ledc_fade` (C3), `selftest_c6_ledc` (C6) | 4/4       | 7/7       |
 | `i2c` master                                  | yes | yes | none                                               | see below | built     |
+| `i2s` (Philips stereo 16/32-bit; master TX/RX, shared duplex clocks; integer PLL160M dividers; aligned frames ≤4092 bytes, 4088 for 32-bit; owns I2S0 and DMA pair) | yes | yes | `selftest_i2s`, pads 4/5/6, no wiring; EOF probe: RX_EOF_NUM counts bytes (TRM 30.10 says bits) | built only (prior 7/7) | built only (prior 7/7) |
+| `parl_io` (1/2/4/8-bit; XTAL master TX, external-clock RX, optional valid; aligned 4..65532-byte frames; owns peripheral and DMA pair) | no | yes | `selftest_parl_io`, valid/software-enable loops, ordered byte comparisons, pads 0–7/10/11, no wiring | n/a | built only (prior 16/16) |
+| `dedicated_gpio` (8 CPU signals; exclusive pad/signal ownership, CSR set/clear/read) | yes | yes | `selftest_dedicated_gpio`, pad 4, no wiring | 9/9 | 8/8 |
+| `gdma` channel pairs 0–2, SRAM memory copy | yes | yes | `selftest_gdma`; exclusive channels, disjoint SRAM/descriptors, bounded wait | built only (prior 15/15) | built only (prior 16/16) |
 | `spi` master (SPI2), GDMA channel 0 transfers | yes | yes | `selftest_spi_dma`                                 | 8/8       | 8/8       |
 | `clocks.sleep` light sleep                    | yes | no  | `selftest_sleep_s*`                                | see below | n/a       |
 | `radio`, `rtos`                               | yes | no  | none                                               |           | n/a       |
+| `sigma_delta` (4 channels, signed density, divider 1–256) | yes | yes | `selftest_sigma_delta` | built only | built only |
+| `pcnt` (4 units, channel 0, signed 16-bit, polling watchpoints, 10-bit filter) | no | yes | `selftest_pcnt` | n/a | built only |
+| `etm` (50 routes; 8 GPIO event/task groups, no interrupt allocation) | no | yes | `selftest_etm` | n/a | built only |
+| `mcpwm` (timer/operator 0, A/B complementary, count-up, symmetric dead time; owns group) | no | yes | `selftest_mcpwm` | n/a | built only |
 
 C3-only modules produce an explicit compile error on the C6. The C3 I2C master ran on hardware
 through the `i2c_display_ssd1306_c3_oled_042` example. The C6 LEDC blocking fade helper takes a
 timeout in microseconds.
+
+GDMA `copy()` on C3 reserves peripheral selector 6 (AES) for pair 0, 7 (SHA)
+for pair 1, or 8 (ADC) for pair 2 during the call. Concurrent drivers/channels
+must not use the selected peripheral's GDMA selector. C6 uses Dummy selectors
+1/4/5. Prior C3 tests observed descriptor errors with reserved selectors;
+that is a hardware observation, not a specified guarantee (C3 Table 2.4-1).
+The reservation documentation is **built only**; prior counts predate it.
+
+I2S diagnostic `rx_eof_num` is a byte count, matching ESP-IDF and the prior
+hardware EOF probe. Its bounds require that many RX bytes and duplex TX
+bytes, without the obsolete sample-count alternative. The bounds change is
+**built only**; prior 7/7 counts predate it.
 
 The USB Serial/JTAG logger waits for the host with the caller's interrupt
 state: it masks interrupts only to claim the writer and update its counters,
@@ -77,10 +97,25 @@ DATA_FREE read and WR_DONE receives a zero-length packet, which CDC ACM
 ignores. The boot-time release is included in the tested XIAO logger above
 (same code as this tree).
 
+PARL_IO stretches every TX setup clock to factor 65535 before gating it low.
+At a 40 MHz XTAL, allow about 2 ms of setup plus frame time in `timeout_us`;
+shorter deadlines can expire before transmission. The low check and gating
+write exclude interrupts; phase waits do not. `ClockGateFailed` reports a
+pad still high after gating. Mid-count divider changes are a hardware
+observation from the prior 16/16 tests at divider 40, not a TRM guarantee
+(C6 §38.5.1 gives a maximum factor of 65535). The interrupt-safe gating
+change is **built only**; those counts predate it.
+
 Timer-group clock enable clears MWDT flash-boot mode only when releasing a
 group held in reset, inside a critical section. Calls on an active group do
 not unlock, relock or update the watchdog. The prior timer hardware counts
 predate this change; current evidence is **built only**.
+
+C6 startup follows ESP-IDF v6.0.2 `bootloader_init_mem`: it disables the HP_APM,
+LP_APM0 and LP_APM access-path filters and puts all implemented HP masters and the
+LP CPU in TEE mode (C6 TRM v1.2 §§16.3.1, 16.3.2.3, 16.4). This covers Wi-Fi M4
+and SPI/GDMA M16; drivers no longer change their modes. Region permissions stay
+unchanged.
 
 ### C3 light sleep and USB-Serial-JTAG
 

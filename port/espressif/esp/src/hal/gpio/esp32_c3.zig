@@ -83,6 +83,11 @@ pub const InputSignal = enum(u8) {
 };
 
 pub const OutputSignal = enum(u8) {
+    sigma_delta0 = 55,
+    sigma_delta1 = 56,
+    sigma_delta2 = 57,
+    sigma_delta3 = 58,
+
     spiq = 0,
     spid = 1,
     spihd = 2,

@@ -11,7 +11,11 @@ pub const compatibility = @import("hal/compatibility.zig");
 pub const drivers = @import("hal/drivers.zig");
 pub const efuse = @import("hal/efuse.zig");
 pub const flash = @import("hal/flash.zig");
+pub const parl_io = if (compatibility.chip == .esp32_c6) @import("hal/parl_io.zig") else void;
+pub const dedicated_gpio = @import("hal/dedicated_gpio.zig");
+pub const gdma = @import("hal/gdma.zig");
 pub const gpio = @import("hal/gpio.zig");
+pub const i2s = @import("hal/i2s.zig");
 pub const i2c = @import("hal/i2c.zig");
 pub const ledc = switch (compatibility.chip) {
     .esp32_c3 => @import("hal/ledc.zig"),
@@ -176,3 +180,11 @@ fn compile_check_accessors(index: u32) callconv(.c) void {
 test {
     _ = @import("hal/uart/timing.zig");
 }
+
+pub const sigma_delta = @import("hal/sigma_delta.zig");
+
+pub const pcnt = @import("hal/pcnt.zig");
+
+pub const etm = @import("hal/etm.zig");
+
+pub const mcpwm = @import("hal/mcpwm.zig");

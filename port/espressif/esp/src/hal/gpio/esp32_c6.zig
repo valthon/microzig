@@ -25,6 +25,11 @@ pub const PinMask = u31;
 const RegMask = u32;
 
 pub const InputSignal = enum(u8) {
+    pcnt_unit0_channel0 = 101,
+    pcnt_unit1_channel0 = 105,
+    pcnt_unit2_channel0 = 109,
+    pcnt_unit3_channel0 = 113,
+
     u0rxd = 6,
     u0cts = 7,
     u0dsr = 8,
@@ -56,12 +61,24 @@ pub const InputSignal = enum(u8) {
     /// Tied to a constant zero by the gpio matrix.
     const_low = 60,
 
+    parl_data0 = 47,
+    parl_data1 = 48,
+    parl_data2 = 49,
+    parl_data3 = 50,
+    parl_data4 = 51,
+    parl_data5 = 52,
+    parl_data6 = 53,
+    parl_data7 = 54,
+    parl_data15 = 62,
+
     fspiclk = 63,
     fspiq = 64,
     fspid = 65,
     fspihd = 66,
     fspiwp = 67,
     fspics0 = 68,
+
+    parl_rx_clk = 69,
 
     rmt_sig0 = 71,
     rmt_sig1 = 72,
@@ -84,6 +101,13 @@ pub const InputSignal = enum(u8) {
 };
 
 pub const OutputSignal = enum(u8) {
+    mcpwm0_a = 87,
+    mcpwm0_b = 88,
+    sigma_delta0 = 83,
+    sigma_delta1 = 84,
+    sigma_delta2 = 85,
+    sigma_delta3 = 86,
+
     ledc_ls_sig0 = 0,
     ledc_ls_sig1 = 1,
     ledc_ls_sig2 = 2,
@@ -121,6 +145,16 @@ pub const OutputSignal = enum(u8) {
 
     i2cext0_scl = 45,
     i2cext0_sda = 46,
+
+    parl_data0 = 47,
+    parl_data1 = 48,
+    parl_data2 = 49,
+    parl_data3 = 50,
+    parl_data4 = 51,
+    parl_data5 = 52,
+    parl_data6 = 53,
+    parl_data7 = 54,
+    parl_data15 = 62,
 
     fspiclk = 63,
     fspiq = 64,
@@ -162,6 +196,8 @@ pub const OutputSignal = enum(u8) {
     clk_out3 = 125,
 
     gpio = 128,
+    /// C6 TRM table 7.11-1: PARL TX clock is matrix signal 70.
+    pub const parl_tx_clk: @This() = .fspics2;
 };
 
 /// C6 TRM v1.2 §7.16.2, IO_MUX_GPIOn_REG: 0/1/2/3 select 5/10/20/40 mA.

@@ -16,6 +16,14 @@ pub fn build(b: *std.Build) void {
     const mb = MicroBuild.init(b, mz_dep) orelse return;
 
     const examples: []const Example = &.{
+        .{ .name = "selftest_i2s", .file = "src/selftest_i2s.zig" },
+        .{ .name = "selftest_parl_io", .file = "src/selftest_parl_io.zig", .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_dedicated_gpio", .file = "src/selftest_dedicated_gpio.zig" },
+        .{ .name = "selftest_gdma", .file = "src/selftest_gdma.zig" },
+        .{ .name = "selftest_mcpwm", .file = "src/selftest_mcpwm.zig", .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_etm", .file = "src/selftest_etm.zig", .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_pcnt", .file = "src/selftest_pcnt.zig", .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_sigma_delta", .file = "src/selftest_sigma_delta.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .name = "selftest_gpio_irq", .file = "src/selftest_gpio_irq.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .name = "selftest_spi_dma", .file = "src/selftest_spi_dma.zig" },
         .{ .name = "selftest_sleep_s1", .file = "src/selftest_sleep.zig", .sleep_stage = 1, .chips = &.{.esp32_c3} },

@@ -408,14 +408,6 @@ pub const SPI = enum(u2) {
         const out: []gdma.Descriptor = if (tx) |b| try gdma.prepare(buffers.tx_descriptors, b, .tx) else &.{};
         const input: []gdma.Descriptor = if (rx) |b| try gdma.prepare(buffers.rx_descriptors, b, .rx) else &.{};
         const deadline = mtime.Deadline.init_relative(time.get_time_since_boot(), timeout);
-        if (compatibility.chip == .esp32_c6) {
-            // C6 TRM v1.2 §16.3.1–2, §16.4, Table 18.4-5: SPI2 is
-            // GDMA master 16. Its reset mode is REE2, whose SRAM reads are
-            // denied by default and return zero (§16.5), including descriptor
-            // fetches. Use TEE for this trusted DMA client of the machine-mode
-            // HAL; leave the other masters and APM region policy untouched.
-            microzig.chip.peripherals.TEE.M16_MODE_CTRL.modify(.{ .M16_MODE = 0 });
-        }
         gdma.reset();
         defer gdma.reset();
         errdefer system.peripheral_reset(.{ .spi2 = true });
