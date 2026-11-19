@@ -64,12 +64,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
     const esp_wifi_sys_dep = b.lazyDependency("esp-wifi-sys", .{}) orelse return null;
     const esp_wifi_driver_mod = make_esp_wifi_driver_module(b, esp_wifi_sys_dep, "esp32c3", esp32_c3_zig_target);
 
-    // esp-wifi-sys ships blobs and headers for the esp32c6 as well, but translating them needs a
-    // wider libc shim than the one in `src/hal/radio/libc_dummy_include`. Until `hal.radio` is
-    // ported to that chip its hal gets a stub that only fails if something reaches for it.
-    const unsupported_wifi_driver_mod = b.createModule(.{
-        .root_source_file = b.path("src/hal/radio/unsupported.zig"),
-    });
+    const esp32_c6_wifi_driver_mod = make_esp_wifi_driver_module(b, esp_wifi_sys_dep, "esp32c6", esp32_c6_zig_target);
 
     const chip_esp32_c3: microzig.Target = .{
         .dep = dep,
@@ -193,7 +188,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                 },
                 .{
                     .name = "esp-wifi-driver",
-                    .module = unsupported_wifi_driver_mod,
+                    .module = esp32_c6_wifi_driver_mod,
                 },
             }) catch @panic("OOM"),
         },
@@ -205,6 +200,9 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                 &.{
                     b.path("ld/esp32_c6/image_boot_sections.ld"),
                     b.path("ld/esp32_c6/rom_functions.ld"),
+                    b.path("ld/esp32_c6/esp32c6.rom.libc.ld"),
+                    b.path("ld/esp32_c6/esp32c6.rom.libc-suboptimal_for_misaligned_mem.ld"),
+                    b.path("ld/esp32_c6/radio_rom_functions.ld"),
                 },
             ),
         },
@@ -284,6 +282,9 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                         &.{
                             b.path("ld/esp32_c6/direct_boot_sections.ld"),
                             b.path("ld/esp32_c6/rom_functions.ld"),
+                            b.path("ld/esp32_c6/esp32c6.rom.libc.ld"),
+                            b.path("ld/esp32_c6/esp32c6.rom.libc-suboptimal_for_misaligned_mem.ld"),
+                            b.path("ld/esp32_c6/radio_rom_functions.ld"),
                         },
                     ),
                 },
@@ -298,6 +299,9 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                         &.{
                             b.path("ld/esp32_c6/flashless_sections.ld"),
                             b.path("ld/esp32_c6/rom_functions.ld"),
+                            b.path("ld/esp32_c6/esp32c6.rom.libc.ld"),
+                            b.path("ld/esp32_c6/esp32c6.rom.libc-suboptimal_for_misaligned_mem.ld"),
+                            b.path("ld/esp32_c6/radio_rom_functions.ld"),
                         },
                     ),
                 },
@@ -433,10 +437,10 @@ fn make_esp_wifi_driver_module(
     chip_name: []const u8,
     target_query: std.Target.Query,
 ) *std.Build.Module {
-    const esp32_c3_resolved_zig_target = b.resolveTargetQuery(target_query);
+    const radio_resolved_zig_target = b.resolveTargetQuery(target_query);
     const translate_c = b.addTranslateC(.{
         .root_source_file = esp_wifi_sys_dep.path("c/include/include.h"),
-        .target = esp32_c3_resolved_zig_target,
+        .target = radio_resolved_zig_target,
         .optimize = .Debug,
         .link_libc = false,
     });
@@ -452,9 +456,10 @@ fn make_esp_wifi_driver_module(
     const mod = translate_c.createModule();
     mod.addLibraryPath(esp_wifi_sys_dep.path(b.fmt("esp-wifi-sys-{s}/libs", .{chip_name})));
 
+    mod.linkSystemLibrary(if (std.mem.eql(u8, chip_name, "esp32c6")) "ble_app" else "btdm_app", .{});
+
     inline for (&.{
         "btbb",
-        "btdm_app",
         "coexist",
         "core",
         "espnow",

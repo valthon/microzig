@@ -8,6 +8,16 @@ const MicroBuild = microzig.MicroBuild(.{
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const maybe_example = b.option([]const u8, "example", "only build matching examples");
+    const wifi_ssid = b.option([]const u8, "wifi_ssid", "Wi-Fi station SSID for tcp_server and selftest_wifi_lifecycle") orelse "SSID";
+    const wifi_password = b.option([]const u8, "wifi_password", "Wi-Fi station passphrase for tcp_server and selftest_wifi_lifecycle") orelse "";
+    // Names of hal.radio.wifi.AuthMethod; the station joins no AP weaker than this.
+    const wifi_auth = b.option([]const u8, "wifi_auth", "Weakest AP auth the station accepts, a hal.radio.wifi.AuthMethod name (default: wpa2_personal with a passphrase, none without)") orelse
+        if (wifi_password.len != 0) "wpa2_personal" else "none";
+    // tcp_server (also imported by selftest_wifi_lifecycle) validates this
+    // with std.meta.stringToEnum(AuthMethod, ...). Keep the enum as the only
+    // source of accepted names instead of maintaining a second list here.
+    if (wifi_password.len == 0 and !std.mem.eql(u8, wifi_auth, "none"))
+        std.process.fatal("-Dwifi_auth={s} needs -Dwifi_password", .{wifi_auth});
     const expected_mac_text = b.option([]const u8, "expected_mac", "selftest_c6_core: the board's efuse MAC (aa:bb:cc:dd:ee:ff); unset reports SKIP");
     const expected_mac: ?u48 = if (expected_mac_text) |text| parse_mac(text) orelse
         std.process.fatal("-Dexpected_mac={s}: expected six hex bytes separated by ':'", .{text}) else null;
@@ -16,6 +26,7 @@ pub fn build(b: *std.Build) void {
     const mb = MicroBuild.init(b, mz_dep) orelse return;
 
     const examples: []const Example = &.{
+        .{ .name = "compile_wifi", .file = "src/compile_wifi.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_i2s", .file = "src/selftest_i2s.zig" },
         .{ .name = "selftest_parl_io", .file = "src/selftest_parl_io.zig", .chips = &.{.esp32_c6} },
         .{ .name = "selftest_dedicated_gpio", .file = "src/selftest_dedicated_gpio.zig" },
@@ -60,8 +71,12 @@ pub fn build(b: *std.Build) void {
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_flash", .file = "src/selftest_flash.zig" },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_adc", .file = "src/selftest_adc.zig" },
         .{ .name = "ws2812_blinky", .file = "src/ws2812_blinky.zig" },
-        .{ .chips = &.{.esp32_c3}, .name = "rtos", .file = "src/rtos.zig" },
-        .{ .chips = &.{.esp32_c3}, .name = "tcp_server", .file = "src/tcp_server.zig", .features = .{
+        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "rtos", .file = "src/rtos.zig" },
+        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_wifi_lifecycle", .file = "src/selftest_wifi_lifecycle.zig", .wifi_options = true, .features = .{
+            .flashless = false,
+            .lwip = true,
+        } },
+        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "tcp_server", .file = "src/tcp_server.zig", .wifi_options = true, .features = .{
             .flashless = false,
             .lwip = true,
         } },
@@ -83,6 +98,13 @@ pub fn build(b: *std.Build) void {
                 continue;
 
         for (std.enums.values(TargetEnum)) |target_enum| {
+            if (example.features.image_boot_only and target_enum != .esp32_c3 and target_enum != .esp32_c6)
+                continue;
+            // C6 lwIP images need flash capacity for the Wi-Fi blobs and TCP/IP stack;
+            // build the image-boot target, excluding direct-boot and RAM-only variants.
+            if (example.features.lwip and target_enum.chip() == .esp32_c6 and target_enum != .esp32_c6)
+                continue;
+
             if (!example.features.flashless and std.mem.containsAtLeast(u8, @tagName(target_enum), 1, "flashless"))
                 continue;
 
@@ -113,6 +135,14 @@ pub fn build(b: *std.Build) void {
                 const options = b.addOptions();
                 options.addOption(?u48, "expected_mac", expected_mac);
                 fw.exe.root_module.addOptions("c6_core_options", options);
+            }
+
+            if (example.wifi_options) {
+                const options = b.addOptions();
+                options.addOption([]const u8, "ssid", wifi_ssid);
+                options.addOption([]const u8, "password", wifi_password);
+                options.addOption([]const u8, "auth", wifi_auth);
+                fw.exe.root_module.addOptions("wifi_options", options);
             }
 
             if (example.features.lwip) {
@@ -233,6 +263,7 @@ const TargetDescription = struct {
 const Example = struct {
     const Features = packed struct {
         flashless: bool = true,
+        image_boot_only: bool = false,
         lwip: bool = false,
     };
 
@@ -242,6 +273,8 @@ const Example = struct {
     sleep_stage: ?u8 = null,
     /// Receives `-Dexpected_mac` as module `c6_core_options`.
     mac_option: bool = false,
+    /// Receives station credentials as module `wifi_options`.
+    wifi_options: bool = false,
     /// Chips whose peripherals and board assumptions this example supports.
     chips: []const Chip = &.{ .esp32_c3, .esp32_c6 },
 };

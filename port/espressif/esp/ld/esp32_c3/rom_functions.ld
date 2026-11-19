@@ -2256,6 +2256,6 @@ PROVIDE( strcmp = 0x4000036c );
 PROVIDE( strchr = 0x400003e0 );
 PROVIDE( strlcpy = 0x400003f0 );
 PROVIDE( strstr = 0x40000378 );
-PROVIDE( strcasecmp = 0x400003d0 );
+/* strcasecmp is in IDF v6.0.2 rom.newlib, not rom.libc; supplied by the OS adapter. */
 
 PROVIDE( memchr = 0x400003c8 );

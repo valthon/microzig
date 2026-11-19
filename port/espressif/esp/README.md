@@ -39,11 +39,12 @@ v0.2, as `passed/checks` of the named self-test in `examples/espressif/esp`.
 | `gdma` channel pairs 0–2, SRAM memory copy | yes | yes | `selftest_gdma`; exclusive channels, disjoint SRAM/descriptors, bounded wait | built only (prior 15/15) | built only (prior 16/16) |
 | `spi` master (SPI2), GDMA channel 0 transfers | yes | yes | `selftest_spi_dma`                                 | 8/8       | 8/8       |
 | `clocks.sleep` light sleep                    | yes | no  | `selftest_sleep_s*`                                | see below | n/a       |
-| `radio`, `rtos`                               | yes | no  | none                                               |           | n/a       |
 | `sigma_delta` (4 channels, signed density, divider 1–256) | yes | yes | `selftest_sigma_delta` | built only | built only |
 | `pcnt` (4 units, channel 0, signed 16-bit, polling watchpoints, 10-bit filter) | no | yes | `selftest_pcnt` | n/a | built only |
 | `etm` (50 routes; 8 GPIO event/task groups, no interrupt allocation) | no | yes | `selftest_etm` | n/a | built only |
 | `mcpwm` (timer/operator 0, A/B complementary, count-up, symmetric dead time; owns group) | no | yes | `selftest_mcpwm` | n/a | built only |
+| `radio` (Wi-Fi station)                       | yes | yes | `tcp_server` (image boot)                          | TCP echo  | TCP echo  |
+| `rtos`                                        | yes | yes | `rtos`                                             | built     | 5/5 items |
 
 C3-only modules produce an explicit compile error on the C6. The C3 I2C master ran on hardware
 through the `i2c_display_ssd1306_c3_oled_042` example. The C6 LEDC blocking fade helper takes a
@@ -111,6 +112,17 @@ group held in reset, inside a critical section. Calls on an active group do
 not unlock, relock or update the watchdog. The prior timer hardware counts
 predate this change; current evidence is **built only**.
 
+The lifecycle test counts TCP bind/listen as an eighth check, publishing
+success only after it completes. Setup, reporter-spawn and TCP setup failures
+repeat from the main task, even when no reporter could be allocated. The
+allocator and registered netif remain in that task's owning frame throughout
+failure reporting, since lwIP still references them. The reporter's default
+4096-byte stack shares the Wi-Fi/lwIP allocator, which uses the linker-defined
+heap region minus a 16 KiB stack reserve (`core/src/allocator.zig`, `heap` and
+`init_with_heap`). The heap is not fixed at 16 KiB.
+Lifecycle evidence is under "Wi-Fi station and RTOS"; NVS evidence is under
+"NVS board self-test".
+
 ### Crypto accelerators
 
 | Crypto driver | Chips | Limits | Evidence |
@@ -132,11 +144,103 @@ F.3.13–F.3.14 (AES-128) and F.3.17–F.3.18 (AES-256); F.3.15–F.3.16 are AES
 Run the host regression with `zig test src/hal/aes/cfb128_vectors.zig` from this
 port directory. Firmware FAIL lines include expected/actual hex and driver errors.
 
+### Wi-Fi station and RTOS
+
+The optional TX-done callback is built only (host cross-compilation in `compile_wifi` for C3/C6); it has not been run on hardware.
+
+C6 `tcp_server` is built for the image-boot target. Set station credentials at build time
+with `-Dwifi_ssid='bench-ap' -Dwifi_password='example-passphrase'`; these options also apply to
+`selftest_wifi_lifecycle`. For example, from `examples/espressif/esp`:
+
+```sh
+zig build -Doptimize=ReleaseSmall -Dexample=tcp_server -Dwifi_ssid='bench-ap' -Dwifi_password='example-passphrase'
+zig build -Doptimize=ReleaseSmall -Dexample=selftest_wifi_lifecycle -Dwifi_ssid='bench-ap' -Dwifi_password='example-passphrase'
+```
+
+Defaults remain SSID `SSID` and an empty password. `-Dwifi_auth` sets the weakest AP
+authentication the station accepts, as a `hal.radio.wifi.AuthMethod` name; it defaults to
+`wpa2_personal` when a passphrase is given and `none` without one, so a station with a
+passphrase is configured to reject an open AP of the same name. This authentication
+policy is **built only**: the evidence logs show build rejections for an invalid auth
+name and a missing passphrase, with no open-AP rejection run. A non-`none` value without a
+passphrase is a build error. Credentials are embedded in the firmware; the examples do not
+log them. The scan logs neighbouring APs' SSIDs, which they broadcast. `-D` values are
+also kept in the shell's history and in the build cache (`.zig-cache`), so use a test
+network's credentials or clear both. The standalone SoftAP example is described below.
+For other build options, see "SoftAP (C3 and C6)", "BLE bench examples"
+and "Boards and hardware validation".
+On both boards the server scanned, associated with a WPA2 hotspot, got a DHCP
+lease and echoed a TCP message on port 3333 (image boot behind the ESP-IDF v6.0.2 bootloader).
+The C6 `rtos` RAM image received all five queue items, then returned `error.Timeout` as written.
+C3 Wi-Fi examples remain in the build.
+`selftest_wifi_lifecycle` shares `tcp_server.zig`'s build-time station credentials and
+TCP echo server. With the test hotspot present it starts, connects, waits through a PLL
+tracking period, stops, starts and connects again, then switches the running STA to AP_STA
+and waits for AP start and STA connectivity. C6 additionally checks MAC/APB/BB/FE clocks
+remain enabled after stop. It logs `SELFTEST wifi_lifecycle <case>: PASS|FAIL` and
+`SELFTEST wifi_lifecycle DONE pass=N fail=M` (success repeated every 3 s; failure
+repeated every second from the main task, since USB output before the host
+reopens the port is lost); DHCP is the seventh case and TCP bind/listen on
+port 3333 is the eighth. State and DHCP waits time out after 30 seconds. The AP is
+open with SSID `microzig-lifecycle`; the example has no AP network interface or DHCP server.
+This self-test is built for C3 and C6 image boot (also C3 direct boot); the C6 rev v0.2 run is
+still to do.
+
+C3 rev v0.4, image boot, as a station on a Pico 2 W MicroPython AP (WPA2, channel 6,
+CYW43 DHCP server), 2026-11-19:
+- `tcp_server`: DHCP lease 192.168.4.16; the AP listed the C3's MAC as a station; the AP's
+  first TCP connection after each boot echoed 10/10 lines on port 3333 in 8 of 8 boots.
+- `selftest_wifi_lifecycle`: `DONE pass=8 fail=0` in 3 of 3 boots.
+
+A diagnostic build without static RX management buffers (`rx_mgmt_buf_type`, the IDF
+default) failed that first connection in 8 of 8 boots: the C3's ARP requests got no 802.11
+ACK from about 20 s after boot and Wi-Fi TX later returned `WifiOther`. A diagnostic build with static RX management buffers
+passed 4 of 5 boots.
+
+XIAO ESP32-C6 (rev v0.1), `esp32_c6` image boot, 2026-11-19, same AP: `tcp_server` got a
+lease and the AP's first TCP connection after each boot echoed 10/10 lines in 8 of 8 boots;
+`selftest_wifi_lifecycle` `DONE pass=8 fail=0` in 3 of 3 boots. C6 rev v0.2 was not run.
+This ran on an earlier version; Wi-Fi protocol/inactivity argument types and the
+optional TX-done callback changed since; the changes since are built only.
+
+#### Wi-Fi initialization and limits
+
+Only `.none` power save is supported on C6; modem/light sleep retention is not implemented.
+Wi-Fi initialization returns `CpuClockNotPll` unless the hardware CPU source is PLL
+(C6 TRM v1.2 §8.2.4.4), including when a custom HAL initialization selects clocks. Radio initialization restores MODEM_APB
+access after `system.init` and configures the modem clock maps in the existing analog module.
+Both PHYs keep the USB PLL enabled during calibration, calibrate fully once per boot/reset,
+and use a task mutex and reference count for calibration/wakeup and final RF close. Calibration
+allows interrupts, matching IDF's PHY access lock. Both run PLL tracking every second and on
+enable when a tracking period elapsed. The pinned `esp-wifi-sys` C3/C6 blobs do not
+export `phy_wait_freq_hw_hop_done`, so the IDF v6.0.2 hop-wait call is unavailable.
+Every enable/disable updates the blob's Wi-Fi enabled flag, including an unbalanced disable,
+which is tolerated. Calibration data is not stored in NVS.
+C6 clocks follow IDF v6.0.2 reference/inited semantics: MAC/APB/BB/44M stay enabled while
+Wi-Fi is initialized, including stop and STA-to-AP_STA changes; coexistence follows references.
+Calibration temporarily owns APB/BB/44M clocks too. FE clocks are never disabled. The analog
+I2C clock retains the SAR helpers' ownership after `analog.enable()`, so a later PHY stop
+does not require re-enabling analog helpers. Concurrent PHY/SAR register access is unsupported.
+C6 radio initialization measures its RC_SLOW source against XTAL using TIMG0 calibration
+(C6 TRM v1.2 §14.3.6, registers 14.18–14.20), writes the resulting Q19 period to STORE1 and
+keeps its own copy for Wi-Fi. It never trusts a retained value from another application;
+calibration timeout returns `SlowClockCalibrationTimeout`. These lifecycle changes are built only.
 C6 startup follows ESP-IDF v6.0.2 `bootloader_init_mem`: it disables the HP_APM,
 LP_APM0 and LP_APM access-path filters and puts all implemented HP masters and the
 LP CPU in TEE mode (C6 TRM v1.2 §§16.3.1, 16.3.2.3, 16.4). This covers Wi-Fi M4
 and SPI/GDMA M16; drivers no longer change their modes. Region permissions stay
-unchanged.
+unchanged. Modem ICG maps follow IDF v6.0.2 `initial_gating_mode`, with BT and
+IEEE802154 enabled in ACTIVE only. These startup changes are built only. The Wi-Fi blobs take `vsnprintf` from
+libprintf.a: the ROM's printf and stdio functions need a newlib syscall table that MicroZig does
+not install. C6 links the unmodified IDF v6.0.2 `rom.libc` and
+`rom.libc-suboptimal_for_misaligned_mem` scripts, excluding `rom.newlib` and
+`rom.newlib-normal`. C3 maps only memory/string primitives and `abs` from libc,
+with no reent-dependent libc bindings. The OS adapter uses an ASCII
+comparison for `strcasecmp`. This linker split is built only.
+The C6 radio ROM bindings follow ESP-IDF v6.0.2, including its disabled node-search
+bindings so the matching blob supplies them. Both chips use the IDF 64-bit seconds
+layout for the supplicant clock. These type/layout checks are built only.
+Do not use the SAR analog helpers concurrently with the radio PHY.
 
 ### C3 light sleep and USB-Serial-JTAG
 

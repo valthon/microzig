@@ -8,6 +8,7 @@ const time = microzig.drivers.time;
 
 const radio = @import("../radio.zig");
 const osi = @import("osi.zig");
+const compatibility = @import("../compatibility.zig");
 
 const log = std.log.scoped(.esp_radio_wifi);
 
@@ -17,10 +18,10 @@ pub const Options = struct {
     on_packet_transmitted: ?*const fn (interface: Interface, data: []const u8, status: bool) void = null,
 };
 
-const InitError = std.mem.Allocator.Error || InternalError;
+const InitError = radio.InitError || PowerSaveError;
 
 pub const InitConfig = struct {
-    /// Power save mode.
+    /// Power save mode. Only `.none` is supported on the ESP32-C6.
     power_save_mode: PowerSaveMode = .none,
 
     /// Country info. If .auto the country info of the AP to which the station
@@ -147,6 +148,9 @@ pub const InitConfig = struct {
 pub fn init(gpa: std.mem.Allocator, config: InitConfig) InitError!void {
     comptime export_symbols();
 
+    if (compatibility.chip == .esp32_c6 and config.power_save_mode != .none)
+        return error.PowerSaveUnsupported;
+
     try radio.init(gpa);
 
     {
@@ -181,12 +185,14 @@ pub fn init(gpa: std.mem.Allocator, config: InitConfig) InitError!void {
     }
 
     try set_power_save_mode(config.power_save_mode);
+    if (compatibility.chip == .esp32_c6) @import("../analog/esp32_c6.zig").wifi_set_inited(true);
 }
 
 pub fn deinit() void {
     _ = c.esp_wifi_stop();
     _ = c.esp_wifi_deinit_internal();
     _ = c.esp_supplicant_deinit();
+    if (compatibility.chip == .esp32_c6) @import("../analog/esp32_c6.zig").wifi_set_inited(false);
 
     radio.deinit();
 }
@@ -373,7 +379,13 @@ pub const PowerSaveMode = enum(u32) {
     max = c.WIFI_PS_MAX_MODEM,
 };
 
-pub fn set_power_save_mode(mode: PowerSaveMode) InternalError!void {
+pub const PowerSaveError = InternalError || error{
+    /// Modem sleep needs the sleep retention hooks, which aren't ported on the ESP32-C6.
+    PowerSaveUnsupported,
+};
+
+pub fn set_power_save_mode(mode: PowerSaveMode) PowerSaveError!void {
+    if (compatibility.chip == .esp32_c6 and mode != .none) return error.PowerSaveUnsupported;
     try c_err(c.esp_wifi_set_ps(@backingInt(mode)));
 }
 
@@ -397,7 +409,7 @@ pub const Protocol = enum(u8) {
     P802D11BGNAX = c.WIFI_PROTOCOL_11B | c.WIFI_PROTOCOL_11G | c.WIFI_PROTOCOL_11N | c.WIFI_PROTOCOL_11AX,
 };
 
-pub fn set_protocol(protocols: []const Config.AccessPoint.Protocol) InternalError!void {
+pub fn set_protocol(protocols: []const Protocol) InternalError!void {
     var combined: u8 = 0;
     for (protocols) |protocol| {
         combined |= @backingInt(protocol);
@@ -421,7 +433,7 @@ pub fn set_protocol(protocols: []const Config.AccessPoint.Protocol) InternalErro
 /// 2. For SoftAP, if the softAP doesn't receive any data from the connected
 /// STA during inactive time, the softAP will force deauth the STA. Default is
 /// 300s. Must be at least 10s.
-pub fn set_inactive_time(interface: Interface, inactive_time: u32) InternalError!void {
+pub fn set_inactive_time(interface: Interface, inactive_time: u16) InternalError!void {
     try c_err(c.esp_wifi_set_inactive_time(
         @backingInt(interface),
         inactive_time,
@@ -760,8 +772,10 @@ fn tx_done_cb(
 ) callconv(.c) void {
     log.debug("tx_done_cb", .{});
 
-    if (wifi_options.on_packet_transmitted) |on_packet_transmitted|
-        on_packet_transmitted(@backingInt(iface_idx), data_ptr[0..data_len], status);
+    if (wifi_options.on_packet_transmitted) |on_packet_transmitted| {
+        const interface = std.enums.fromInt(Interface, iface_idx) orelse return;
+        on_packet_transmitted(interface, data_ptr[0..data_len.*], status);
+    }
 }
 
 fn recv_cb_ap(buf: ?*anyopaque, len: u16, eb: ?*anyopaque) callconv(.c) c.esp_err_t {
@@ -954,7 +968,9 @@ var init_config: c.wifi_init_config_t = .{
     .tx_buf_type = c.CONFIG_ESP_WIFI_TX_BUFFER_TYPE,
     .static_tx_buf_num = 0, // overwritten by init
     .dynamic_tx_buf_num = 32, // overwritten by init
-    .rx_mgmt_buf_type = c.CONFIG_ESP_WIFI_STATIC_RX_MGMT_BUFFER,
+    // IDF WIFI_INIT_CONFIG_DEFAULT: 0 = static, 1 = dynamic. The STATIC_RX_MGMT_BUFFER
+    // choice flag is 1 when static is selected, which would request dynamic buffers.
+    .rx_mgmt_buf_type = c.CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUF,
     .rx_mgmt_buf_num = c.CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF,
     .cache_tx_buf_num = c.WIFI_CACHE_TX_BUFFER_NUM,
     .csi_enable = 0, // TODO: WiFi channel state information enable flag.
@@ -985,126 +1001,135 @@ const wifi_enable_enterprise: u64 = 1 << 7;
 
 var g_wifi_feature_caps: u64 = wifi_enable_wpa3_sae | wifi_enable_enterprise;
 
-var g_wifi_osi_funcs: c.wifi_osi_funcs_t = .{
-    ._version = c.ESP_WIFI_OS_ADAPTER_VERSION,
-    ._env_is_chip = osi.env_is_chip,
-    ._set_intr = osi.set_intr,
-    ._clear_intr = osi.clear_intr,
-    ._set_isr = osi.set_isr,
-    ._ints_on = osi.ints_on,
-    ._ints_off = osi.ints_off,
-    ._is_from_isr = osi.is_from_isr,
-    ._spin_lock_create = osi.spin_lock_create,
-    ._spin_lock_delete = osi.spin_lock_delete,
-    ._wifi_int_disable = osi.wifi_int_disable,
-    ._wifi_int_restore = osi.wifi_int_restore,
-    ._task_yield_from_isr = osi.task_yield_from_isr,
-    ._semphr_create = osi.semphr_create,
-    ._semphr_delete = osi.semphr_delete,
-    ._semphr_take = osi.semphr_take,
-    ._semphr_give = osi.semphr_give,
-    ._wifi_thread_semphr_get = osi.wifi_thread_semphr_get,
-    ._mutex_create = osi.mutex_create,
-    ._recursive_mutex_create = osi.recursive_mutex_create,
-    ._mutex_delete = osi.mutex_delete,
-    ._mutex_lock = osi.mutex_lock,
-    ._mutex_unlock = osi.mutex_unlock,
-    ._queue_create = osi.queue_create,
-    ._queue_delete = osi.queue_delete,
-    ._queue_send = osi.queue_send,
-    ._queue_send_from_isr = osi.queue_send_from_isr,
-    ._queue_send_to_back = @ptrCast(&osi.queue_send_to_back),
-    ._queue_send_to_front = @ptrCast(&osi.queue_send_to_front),
-    ._queue_recv = osi.queue_recv,
-    ._queue_msg_waiting = osi.queue_msg_waiting,
-    ._event_group_create = @ptrCast(&osi.event_group_create),
-    ._event_group_delete = @ptrCast(&osi.event_group_delete),
-    ._event_group_set_bits = @ptrCast(&osi.event_group_set_bits),
-    ._event_group_clear_bits = @ptrCast(&osi.event_group_clear_bits),
-    ._event_group_wait_bits = @ptrCast(&osi.event_group_wait_bits),
-    ._task_create_pinned_to_core = osi.task_create_pinned_to_core,
-    ._task_create = osi.task_create,
-    ._task_delete = osi.task_delete,
-    ._task_delay = osi.task_delay,
-    ._task_ms_to_tick = osi.task_ms_to_tick,
-    ._task_get_current_task = osi.task_get_current_task,
-    ._task_get_max_priority = osi.task_get_max_priority,
-    ._malloc = osi.malloc,
-    ._free = osi.free,
-    ._event_post = osi.esp_event_post,
-    ._get_free_heap_size = @ptrCast(&osi.get_free_heap_size),
-    ._rand = osi.rand,
-    ._dport_access_stall_other_cpu_start_wrap = osi.dport_access_stall_other_cpu_start_wrap,
-    ._dport_access_stall_other_cpu_end_wrap = osi.dport_access_stall_other_cpu_end_wrap,
-    ._wifi_apb80m_request = osi.wifi_apb80m_request,
-    ._wifi_apb80m_release = osi.wifi_apb80m_release,
-    ._phy_disable = osi.phy_disable,
-    ._phy_enable = osi.phy_enable,
-    ._phy_update_country_info = osi.phy_update_country_info,
-    ._read_mac = osi.read_mac,
-    ._timer_arm = osi.timer_arm,
-    ._timer_disarm = osi.timer_disarm,
-    ._timer_done = osi.timer_done,
-    ._timer_setfn = osi.timer_setfn,
-    ._timer_arm_us = osi.timer_arm_us,
-    ._wifi_reset_mac = osi.wifi_reset_mac,
-    ._wifi_clock_enable = osi.wifi_clock_enable,
-    ._wifi_clock_disable = osi.wifi_clock_disable,
-    ._wifi_rtc_enable_iso = @ptrCast(&osi.wifi_rtc_enable_iso),
-    ._wifi_rtc_disable_iso = @ptrCast(&osi.wifi_rtc_disable_iso),
-    ._esp_timer_get_time = osi.esp_timer_get_time,
-    ._nvs_set_i8 = @ptrCast(&osi.nvs_set_i8),
-    ._nvs_get_i8 = @ptrCast(&osi.nvs_get_i8),
-    ._nvs_set_u8 = @ptrCast(&osi.nvs_set_u8),
-    ._nvs_get_u8 = @ptrCast(&osi.nvs_get_u8),
-    ._nvs_set_u16 = @ptrCast(&osi.nvs_set_u16),
-    ._nvs_get_u16 = @ptrCast(&osi.nvs_get_u16),
-    ._nvs_open = @ptrCast(&osi.nvs_open),
-    ._nvs_close = @ptrCast(&osi.nvs_close),
-    ._nvs_commit = @ptrCast(&osi.nvs_commit),
-    ._nvs_set_blob = @ptrCast(&osi.nvs_set_blob),
-    ._nvs_get_blob = @ptrCast(&osi.nvs_get_blob),
-    ._nvs_erase_key = @ptrCast(&osi.nvs_erase_key),
-    ._get_random = osi.get_random,
-    ._get_time = @ptrCast(&osi.get_time),
-    ._random = &osi.random,
-    ._slowclk_cal_get = osi.slowclk_cal_get,
-    ._log_write = osi.log_write,
-    ._log_writev = osi.log_writev,
-    ._log_timestamp = osi.log_timestamp,
-    ._malloc_internal = osi.malloc_internal,
-    ._realloc_internal = @ptrCast(&osi.realloc_internal),
-    ._calloc_internal = osi.calloc_internal,
-    ._zalloc_internal = osi.zalloc_internal,
-    ._wifi_malloc = osi.wifi_malloc,
-    ._wifi_realloc = @ptrCast(&osi.wifi_realloc),
-    ._wifi_calloc = osi.wifi_calloc,
-    ._wifi_zalloc = osi.wifi_zalloc,
-    ._wifi_create_queue = osi.wifi_create_queue,
-    ._wifi_delete_queue = osi.wifi_delete_queue,
-    ._coex_init = osi.coex_init,
-    ._coex_deinit = osi.coex_deinit,
-    ._coex_enable = osi.coex_enable,
-    ._coex_disable = osi.coex_disable,
-    ._coex_status_get = osi.coex_status_get,
-    ._coex_condition_set = @ptrCast(&osi.coex_condition_set),
-    ._coex_wifi_request = osi.coex_wifi_request,
-    ._coex_wifi_release = osi.coex_wifi_release,
-    ._coex_wifi_channel_set = osi.coex_wifi_channel_set,
-    ._coex_event_duration_get = osi.coex_event_duration_get,
-    ._coex_pti_get = osi.coex_pti_get,
-    ._coex_schm_status_bit_clear = osi.coex_schm_status_bit_clear,
-    ._coex_schm_status_bit_set = osi.coex_schm_status_bit_set,
-    ._coex_schm_interval_set = osi.coex_schm_interval_set,
-    ._coex_schm_interval_get = osi.coex_schm_interval_get,
-    ._coex_schm_curr_period_get = osi.coex_schm_curr_period_get,
-    ._coex_schm_curr_phase_get = osi.coex_schm_curr_phase_get,
-    ._coex_schm_process_restart = osi.coex_schm_process_restart,
-    ._coex_schm_register_cb = osi.coex_schm_register_cb,
-    ._coex_register_start_cb = osi.coex_register_start_cb,
-    ._coex_schm_flexible_period_set = osi.coex_schm_flexible_period_set,
-    ._coex_schm_flexible_period_get = osi.coex_schm_flexible_period_get,
-    ._magic = @bitCast(c.ESP_WIFI_OS_ADAPTER_MAGIC),
+var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
+    var f: c.wifi_osi_funcs_t = .{
+        ._version = c.ESP_WIFI_OS_ADAPTER_VERSION,
+        ._env_is_chip = osi.env_is_chip,
+        ._set_intr = osi.set_intr,
+        ._clear_intr = osi.clear_intr,
+        ._set_isr = osi.set_isr,
+        ._ints_on = osi.ints_on,
+        ._ints_off = osi.ints_off,
+        ._is_from_isr = osi.is_from_isr,
+        ._spin_lock_create = osi.spin_lock_create,
+        ._spin_lock_delete = osi.spin_lock_delete,
+        ._wifi_int_disable = osi.wifi_int_disable,
+        ._wifi_int_restore = osi.wifi_int_restore,
+        ._task_yield_from_isr = osi.task_yield_from_isr,
+        ._semphr_create = osi.semphr_create,
+        ._semphr_delete = osi.semphr_delete,
+        ._semphr_take = osi.semphr_take,
+        ._semphr_give = osi.semphr_give,
+        ._wifi_thread_semphr_get = osi.wifi_thread_semphr_get,
+        ._mutex_create = osi.mutex_create,
+        ._recursive_mutex_create = osi.recursive_mutex_create,
+        ._mutex_delete = osi.mutex_delete,
+        ._mutex_lock = osi.mutex_lock,
+        ._mutex_unlock = osi.mutex_unlock,
+        ._queue_create = osi.queue_create,
+        ._queue_delete = osi.queue_delete,
+        ._queue_send = osi.queue_send,
+        ._queue_send_from_isr = osi.queue_send_from_isr,
+        ._queue_send_to_back = osi.queue_send_to_back,
+        ._queue_send_to_front = osi.queue_send_to_front,
+        ._queue_recv = osi.queue_recv,
+        ._queue_msg_waiting = osi.queue_msg_waiting,
+        ._event_group_create = @ptrCast(&osi.event_group_create),
+        ._event_group_delete = @ptrCast(&osi.event_group_delete),
+        ._event_group_set_bits = @ptrCast(&osi.event_group_set_bits),
+        ._event_group_clear_bits = @ptrCast(&osi.event_group_clear_bits),
+        ._event_group_wait_bits = @ptrCast(&osi.event_group_wait_bits),
+        ._task_create_pinned_to_core = osi.task_create_pinned_to_core,
+        ._task_create = osi.task_create,
+        ._task_delete = osi.task_delete,
+        ._task_delay = osi.task_delay,
+        ._task_ms_to_tick = osi.task_ms_to_tick,
+        ._task_get_current_task = osi.task_get_current_task,
+        ._task_get_max_priority = osi.task_get_max_priority,
+        ._malloc = osi.malloc,
+        ._free = osi.free,
+        ._event_post = osi.esp_event_post,
+        ._get_free_heap_size = @ptrCast(&osi.get_free_heap_size),
+        ._rand = osi.rand,
+        ._dport_access_stall_other_cpu_start_wrap = osi.dport_access_stall_other_cpu_start_wrap,
+        ._dport_access_stall_other_cpu_end_wrap = osi.dport_access_stall_other_cpu_end_wrap,
+        ._wifi_apb80m_request = osi.wifi_apb80m_request,
+        ._wifi_apb80m_release = osi.wifi_apb80m_release,
+        ._phy_disable = osi.phy_disable,
+        ._phy_enable = osi.phy_enable,
+        ._phy_update_country_info = osi.phy_update_country_info,
+        ._read_mac = osi.read_mac,
+        ._timer_arm = osi.timer_arm,
+        ._timer_disarm = osi.timer_disarm,
+        ._timer_done = osi.timer_done,
+        ._timer_setfn = osi.timer_setfn,
+        ._timer_arm_us = osi.timer_arm_us,
+        ._wifi_reset_mac = osi.wifi_reset_mac,
+        ._wifi_clock_enable = osi.wifi_clock_enable,
+        ._wifi_clock_disable = osi.wifi_clock_disable,
+        ._wifi_rtc_enable_iso = @ptrCast(&osi.wifi_rtc_enable_iso),
+        ._wifi_rtc_disable_iso = @ptrCast(&osi.wifi_rtc_disable_iso),
+        ._esp_timer_get_time = osi.esp_timer_get_time,
+        ._nvs_set_i8 = @ptrCast(&osi.nvs_set_i8),
+        ._nvs_get_i8 = @ptrCast(&osi.nvs_get_i8),
+        ._nvs_set_u8 = @ptrCast(&osi.nvs_set_u8),
+        ._nvs_get_u8 = @ptrCast(&osi.nvs_get_u8),
+        ._nvs_set_u16 = @ptrCast(&osi.nvs_set_u16),
+        ._nvs_get_u16 = @ptrCast(&osi.nvs_get_u16),
+        ._nvs_open = @ptrCast(&osi.nvs_open),
+        ._nvs_close = @ptrCast(&osi.nvs_close),
+        ._nvs_commit = @ptrCast(&osi.nvs_commit),
+        ._nvs_set_blob = @ptrCast(&osi.nvs_set_blob),
+        ._nvs_get_blob = @ptrCast(&osi.nvs_get_blob),
+        ._nvs_erase_key = @ptrCast(&osi.nvs_erase_key),
+        ._get_random = osi.get_random,
+        ._get_time = osi.get_time,
+        ._random = &osi.random,
+        ._slowclk_cal_get = osi.slowclk_cal_get,
+        ._log_write = osi.log_write,
+        ._log_writev = osi.log_writev,
+        ._log_timestamp = osi.log_timestamp,
+        ._malloc_internal = osi.malloc_internal,
+        ._realloc_internal = osi.realloc_internal,
+        ._calloc_internal = osi.calloc_internal,
+        ._zalloc_internal = osi.zalloc_internal,
+        ._wifi_malloc = osi.wifi_malloc,
+        ._wifi_realloc = osi.wifi_realloc,
+        ._wifi_calloc = osi.wifi_calloc,
+        ._wifi_zalloc = osi.wifi_zalloc,
+        ._wifi_create_queue = osi.wifi_create_queue,
+        ._wifi_delete_queue = osi.wifi_delete_queue,
+        ._coex_init = osi.coex_init,
+        ._coex_deinit = osi.coex_deinit,
+        ._coex_enable = osi.coex_enable,
+        ._coex_disable = osi.coex_disable,
+        ._coex_status_get = osi.coex_status_get,
+        ._coex_condition_set = @ptrCast(&osi.coex_condition_set),
+        ._coex_wifi_request = osi.coex_wifi_request,
+        ._coex_wifi_release = osi.coex_wifi_release,
+        ._coex_wifi_channel_set = osi.coex_wifi_channel_set,
+        ._coex_event_duration_get = osi.coex_event_duration_get,
+        ._coex_pti_get = osi.coex_pti_get,
+        ._coex_schm_status_bit_clear = osi.coex_schm_status_bit_clear,
+        ._coex_schm_status_bit_set = osi.coex_schm_status_bit_set,
+        ._coex_schm_interval_set = osi.coex_schm_interval_set,
+        ._coex_schm_interval_get = osi.coex_schm_interval_get,
+        ._coex_schm_curr_period_get = osi.coex_schm_curr_period_get,
+        ._coex_schm_curr_phase_get = osi.coex_schm_curr_phase_get,
+        ._coex_schm_process_restart = osi.coex_schm_process_restart,
+        ._coex_schm_register_cb = osi.coex_schm_register_cb,
+        ._coex_register_start_cb = osi.coex_register_start_cb,
+        ._coex_schm_flexible_period_set = osi.coex_schm_flexible_period_set,
+        ._coex_schm_flexible_period_get = osi.coex_schm_flexible_period_get,
+        ._magic = @bitCast(c.ESP_WIFI_OS_ADAPTER_MAGIC),
+    };
+    // ESP32-C6 only: modem sleep retention hooks. Sleep isn't supported, so these must not be
+    // called; stubs instead of null so a call shows up in the log instead of jumping to 0.
+    if (@hasField(c.wifi_osi_funcs_t, "_regdma_link_set_write_wait_content")) {
+        f._regdma_link_set_write_wait_content = osi.regdma_link_set_write_wait_content;
+        f._sleep_retention_find_link_by_id = osi.sleep_retention_find_link_by_id;
+    }
+    break :osi_funcs f;
 };
 
 pub const InternalError = error{
