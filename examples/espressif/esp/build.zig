@@ -75,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "selftest_rsa", .file = "src/selftest_rsa.zig" },
         .{ .name = "selftest_aes", .file = "src/selftest_aes.zig" },
         .{ .name = "selftest_sha", .file = "src/selftest_sha.zig" },
+        .{ .name = "selftest_nvs", .file = "src/selftest_nvs.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_mcpwm", .file = "src/selftest_mcpwm.zig", .chips = &.{.esp32_c6} },
         .{ .name = "selftest_etm", .file = "src/selftest_etm.zig", .chips = &.{.esp32_c6} },
         .{ .name = "selftest_pcnt", .file = "src/selftest_pcnt.zig", .chips = &.{.esp32_c6} },

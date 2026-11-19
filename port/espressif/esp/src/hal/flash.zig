@@ -114,6 +114,25 @@ pub const Flash = struct {
         try result(impl.transaction(.erase, offset, &unused, 0));
     }
 
+    /// A bounded data region outside boot metadata and all copies of the
+    /// running image. Unlike the raw API, this permits NVS below an IDF app.
+    /// The partition-table layer must additionally check partition overlaps.
+    pub fn data_region(self: Flash, offset: u32, size: u32) Error!DataRegion {
+        const entry = @intFromPtr(&_start);
+        const image: ImageRange = if (microzig.config.ram_image)
+            .{ .start = 0, .end = 0 }
+        else if (entry == 0x4200_0008)
+            .{ .start = 0, .end = self.protected_end }
+        else
+            try esp_image_range(self, @intCast(entry));
+        try validate_data_region(self.size, image, offset, size);
+        var device = self;
+        // The region's range was checked against the actual image interval;
+        // its methods enforce that bound on every operation.
+        device.allow_running_image = true;
+        return .{ .device = device, .offset = offset, .size = size };
+    }
+
     fn check_range(self: Flash, offset: u32, len: usize, modifying: bool) Error!void {
         if (offset > self.size or len > self.size - offset) return error.OutOfBounds;
         if (offset % 4 != 0 or len % 4 != 0) return error.Unaligned;
@@ -142,12 +161,54 @@ pub const Flash = struct {
     }
 };
 
+/// Partition-relative flash I/O. Obtain through Flash.data_region.
+pub const DataRegion = struct {
+    device: Flash,
+    offset: u32,
+    size: u32,
+
+    pub fn read(self: DataRegion, offset: u32, dest: []u8) Error!void {
+        try self.check_range(offset, dest.len);
+        try self.device.read(self.offset + offset, dest);
+    }
+
+    pub fn write(self: DataRegion, offset: u32, bytes: []const u8) Error!void {
+        try self.check_range(offset, bytes.len);
+        try self.device.write(self.offset + offset, bytes);
+    }
+
+    pub fn erase_sector(self: DataRegion, offset: u32) Error!void {
+        try self.check_range(offset, sector_size);
+        try self.device.erase_sector(self.offset + offset);
+    }
+
+    fn check_range(self: DataRegion, offset: u32, len: usize) Error!void {
+        if (offset > self.size or len > self.size - offset) return error.OutOfBounds;
+    }
+};
+
+const ImageRange = struct { start: u32, end: u32 };
+
+fn validate_data_region(size: u32, image: ImageRange, offset: u32, len: u32) Error!void {
+    if (offset > size or len == 0 or len > size - offset) return error.OutOfBounds;
+    if (offset % sector_size != 0 or len % sector_size != 0) return error.Unaligned;
+    // Reserve the default IDF bootloader and partition-table sectors.
+    if (offset < 0x9000 or (offset < image.end and offset + len > image.start)) return error.RunningImage;
+}
+
 // The reader is either the device or a byte-backed image in host tests.
 fn esp_image_end(self: anytype, entry: u32) Error!u32 {
+    return (try esp_image_range(self, entry)).end;
+}
+
+fn esp_image_range(self: anytype, entry: u32) Error!ImageRange {
     // ESP images can contain RAM segments after the mapped segments. Scan
     // sector-aligned image headers and protect ALL images with our entry
     // point (conservative for OTA copies), including checksum and digest.
     // Layout: tools/esp-image/src/elf2image.zig, ImageHeader and write_to.
+    const unknown: ImageRange = .{ .start = 0, .end = self.size };
+    if (self.size < 24) return unknown;
+    var start: u32 = self.size;
     var end: u32 = 0;
     var base: u32 = 0;
     while (base <= self.size - 24) : (base += sector_size) {
@@ -157,20 +218,21 @@ fn esp_image_end(self: anytype, entry: u32) Error!u32 {
             std.mem.readInt(u32, header[4..8], .little) != entry) continue;
         var cursor = base + 24;
         for (0..header[1]) |_| {
-            if (cursor > self.size - 8) return self.size;
+            if (cursor > self.size - 8) return unknown;
             var segment: [8]u8 = undefined;
             try self.read(cursor, &segment);
             const len = std.mem.readInt(u32, segment[4..8], .little);
-            if (len % 4 != 0 or len > self.size - cursor - 8) return self.size;
+            if (len % 4 != 0 or len > self.size - cursor - 8) return unknown;
             cursor += 8 + len;
         }
         // Checksum is the last byte of the next 16-byte boundary.
         const trailer_end = (@as(u64, cursor) + 16) & ~@as(u64, 15);
         const image_limit = trailer_end + @as(u64, if (header[23] != 0) 32 else 0);
-        if (image_limit > self.size) return self.size;
+        if (image_limit > self.size) return unknown;
+        start = @min(start, base);
         end = @max(end, @as(u32, @intCast(image_limit)));
     }
-    return if (end == 0) self.size else end;
+    return if (end == 0) unknown else .{ .start = start, .end = end };
 }
 
 fn detected_size(id: u32, configured: u32) Error!u32 {
@@ -298,4 +360,19 @@ test "image guard covers trailing RAM segments, digests and OTA copies; unknown 
     try std.testing.expectEqual(@as(u32, sector_size + 272), try esp_image_end(&image, entry));
     std.mem.writeInt(u32, image.bytes[sector_size + 100 ..][0..4], 0xfffffff0, .little);
     try std.testing.expectEqual(image.size, try esp_image_end(&image, entry));
+}
+
+test "bounded data regions allow NVS below app and reject image and boot overlap" {
+    const image: ImageRange = .{ .start = 0x10000, .end = 0x22000 };
+    try validate_data_region(0x400000, image, 0x9000, 0x6000);
+    try validate_data_region(0x400000, image, 0x22000, 0x1000);
+    try std.testing.expectError(error.RunningImage, validate_data_region(0x400000, image, 0xf000, 0x2000));
+    try std.testing.expectError(error.RunningImage, validate_data_region(0x400000, image, 0x8000, 0x1000));
+    try std.testing.expectError(error.RunningImage, validate_data_region(0x400000, .{ .start = 0, .end = 0x400000 }, 0x9000, 0x6000));
+    try std.testing.expectError(error.OutOfBounds, validate_data_region(0x400000, image, 0xfffff000, 0x2000));
+    try std.testing.expectError(error.Unaligned, validate_data_region(0x400000, image, 0x9004, 0x1000));
+    const region: DataRegion = .{ .device = undefined, .offset = 0x9000, .size = 0x6000 };
+    try region.check_range(0x5ffc, 4);
+    try std.testing.expectError(error.OutOfBounds, region.check_range(0x6000, 4));
+    try std.testing.expectError(error.OutOfBounds, region.check_range(0xfffffffc, 8));
 }

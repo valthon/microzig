@@ -12,6 +12,9 @@ pub const clocks = @import("hal/clocks.zig");
 pub const compatibility = @import("hal/compatibility.zig");
 pub const drivers = @import("hal/drivers.zig");
 pub const efuse = @import("hal/efuse.zig");
+pub const nvs_flash = @import("hal/nvs_flash.zig");
+pub const nvs = @import("hal/nvs.zig");
+pub const partition_table = @import("hal/partition_table.zig");
 pub const flash = @import("hal/flash.zig");
 pub const parl_io = if (compatibility.chip == .esp32_c6) @import("hal/parl_io.zig") else void;
 pub const dedicated_gpio = @import("hal/dedicated_gpio.zig");
@@ -177,6 +180,13 @@ fn compile_check_accessors(index: u32) callconv(.c) void {
     microzig.cpu.interrupt.clear_pending(int);
     std.mem.doNotOptimizeAway(microzig.cpu.interrupt.get_type(int));
     std.mem.doNotOptimizeAway(microzig.cpu.interrupt.get_mapped_interrupt(.i2c_ext0));
+    // Compile the partition/flash adapter for each target without executing it.
+    const device: flash.Flash = .{ .size = 0x400000, .protected_end = 0x400000, .allow_running_image = false };
+    const backend = nvs_flash.open(device, "nvs") catch return;
+    var word: [4]u8 = undefined;
+    backend.read(0, &word) catch return;
+    backend.write(0, &word) catch return;
+    backend.erase(0) catch return;
 }
 
 test {

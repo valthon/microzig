@@ -356,6 +356,62 @@ pub fn build(b: *std.Build) void {
     }));
     const unit_tests_run = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run platform agnostic unit tests");
+    const nvs_crash_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/nvs_crash_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const nvs_crash_options = b.addOptions();
+    nvs_crash_options.addOption([]const u8, "dump_path", b.option(
+        []const u8,
+        "nvs-crash-dump",
+        "Absolute path: write every NVS crash image there for src/hal/nvs_testdata/crosscheck_idf.py",
+    ) orelse "");
+    nvs_crash_tests.root_module.addOptions("nvs_crash_options", nvs_crash_options);
+    test_step.dependOn(&b.addRunArtifact(nvs_crash_tests).step);
+    // ESP-IDF's init against this store's on random foreign partitions, for
+    // src/hal/nvs_testdata/init_diff_idf.py; not part of `test`.
+    const nvs_init_diff = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/nvs_init_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const nvs_init_diff_options = b.addOptions();
+    nvs_init_diff_options.addOption([]const u8, "dir", b.option(
+        []const u8,
+        "nvs-init-diff",
+        "Absolute path: the directory src/hal/nvs_testdata/init_diff_idf.py runs in",
+    ) orelse "");
+    nvs_init_diff.root_module.addOptions("nvs_init_diff_options", nvs_init_diff_options);
+    b.step("nvs-init-diff", "Run this NVS store's init for src/hal/nvs_testdata/init_diff_idf.py").dependOn(&b.addRunArtifact(nvs_init_diff).step);
+    const nvs_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/nvs.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(nvs_tests).step);
+    const nvs_format_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/nvs_format.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(nvs_format_tests).step);
+    const partition_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/partition_table.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(partition_tests).step);
     test_step.dependOn(&unit_tests_run.step);
 
     const ble_host_tests = b.addTest(.{

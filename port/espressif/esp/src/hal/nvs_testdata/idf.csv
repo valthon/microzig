@@ -1,0 +1,6 @@
+key,type,encoding,value
+fixture,namespace,,
+unsigned,data,u64,18364758544493064720
+signed,data,i32,-123456
+message,data,string,ESP-IDF fixture
+payload,data,hex2bin,0001027f80feff

@@ -925,6 +925,573 @@ vector 30 and continuation after `mret`. Each self-test waits at least
 1.5 s before reporting, then repeats cases and summary every second.
 These additional paths are **built only**, not run on hardware.
 
+## Partition table
+
+`hal.partition_table.read(device)` reads the ESP-IDF table at `0x8000` without
+modifying flash. `Table.decode` is also usable on host byte images. The whole
+table is checked for magic, flash bounds, partition overlap, duplicate labels,
+and MD5 when present before `find_data(.nvs, "nvs")` returns a partition.
+Limits: default table offset only, at most 95 entries, no decryption. Partition
+flags are retained for callers to enforce. Evidence: built only, unit-tested;
+no board execution. Format reference: ESP-IDF
+`components/partition_table/gen_esp32part.py`.
+
+## NVS format
+
+`hal/nvs_format.zig` implements version 2 headers, entry layout, ROM-compatible
+CRC32, span validation, bitmap iteration and a fixed-size page hash map. Bucket
+collisions require a full key comparison. No allocation or target imports.
+Evidence: built only, unit-tested, including an ESP-IDF-generated page image.
+The fixture `src/hal/nvs_testdata/idf.bin` was generated offline from the CSV
+beside it with ESP-IDF's `components/nvs_flash/nvs_partition_generator/`
+`nvs_partition_gen.py generate <absolute-idf.csv> <absolute-idf.bin> 0x3000
+--version 2` (installed `esp-idf-nvs-partition-gen` 0.1.9). The fixture contains
+one namespace, unsigned/signed integers, a string and a v2 blob chunk/index.
+
+## NVS store
+
+`hal.nvs.Storage(Backend)` provides namespaces, all 8/16/32/64-bit signed and
+unsigned integers, NUL-terminated ESP-IDF strings, v2 chunked blobs, key erase,
+and `Handle.commit()`. Writes are synchronous: successful setters/erase calls
+are already durable, so commit is a barrier and does not group keys atomically.
+Read values with the same type they were written with. Erase first to change a
+key's type. Handles open in ESP-IDF's three modes (`nvs_open_mode_t`):
+`.read_only` rejects changes; `.read_write` (`NVS_READWRITE`) marks a replaced
+or erased value's entries erased, and its bytes stay in flash until its page is
+reclaimed; `.read_write_purge` (`NVS_READWRITE_PURGE`) also overwrites them
+with zeros. Init's repairs always zero, as ESP-IDF's do
+with `Page::DEFAULT_PURGE_AFTER_ERASE`. No Wi-Fi or PHY integration.
+
+Where ESP-IDF v6.0.2 (`nvs_storage.cpp`, `nvs_page.cpp`) answers with a
+generic code or quietly repairs, this store keeps distinct errors and erases
+nothing on a read:
+
+| Situation | ESP-IDF | This store |
+| --- | --- | --- |
+| Key absent; namespace absent when opened read only | `ESP_ERR_NVS_NOT_FOUND` | `NotFound` |
+| Read as another type than stored (integer width or sign, string, blob) | `ESP_ERR_NVS_NOT_FOUND`: `Storage::findItem` skips the page's `ESP_ERR_NVS_TYPE_MISMATCH` | `TypeMismatch` |
+| Write of another type than stored | replaces the old item (`Storage::writeItem` looks the key up as `ItemType::ANY`, `nvs_storage.cpp` 445-461), unless built with `CONFIG_NVS_LEGACY_DUP_KEYS_COMPATIBILITY` (Kconfig default `n`), which keeps both | `TypeMismatch`; erase first |
+| String or blob payload fails its CRC | `ESP_ERR_NVS_NOT_FOUND`, and the item is erased (`Page::readVariableLengthItemData`) | `Corrupt` |
+| Blob index whose chunks are missing or too long | erased at init with its chunks if the chunks do not add up to its size and count (`Storage::eraseMismatchedBlobIndexes`, `nvs_storage.cpp` 90-152, and `Storage::eraseOrphanDataBlobs`); else the read answers `ESP_FAIL` or `ESP_ERR_NVS_INVALID_LENGTH` and erases the blob (`Storage::readMultiPageBlob`) | `Corrupt`, and the index stays, unless its key also has a version 1 blob (see "Init and ESP-IDF's") |
+| String without its terminating NUL, or with an embedded one | the stored bytes | `Corrupt` |
+
+A blob written over a format version 1 blob is not a type change (below). The
+test `type and payload errors stay distinct from NotFound and a read erases
+nothing` pins every row: a read-only open of a missing namespace, each type
+mismatch, a payload CRC failure, chunks missing and chunks longer than the
+index says, a string without its NUL and one with an embedded NUL.
+
+For C3/C6 flash, initialize `hal.flash.Flash`, call
+`hal.nvs_flash.open(device, "nvs")`, then initialize a caller-owned
+`hal.nvs_flash.Store` with that backend and `backend.region.size`. This reads
+and validates the entire table, rejects flags (including encryption/read-only),
+and bounds every access to that named NVS partition. `Flash.data_region` is the
+only flash API extension: the original guard conservatively protects all bytes
+below the running image end, which includes the usual NVS location. The bounded
+API checks the actual image interval (including OTA copies), protects low boot
+metadata through `0x9000`, and retains the raw API's existing default protection.
+Unknown image layouts fail closed. Direct-boot/RAM-boot applications must supply
+a real, disjoint partition table; the self-test uses image boot only.
+
+Limits (what differs from ESP-IDF in damaged or foreign states is listed
+under "Known limits"): unencrypted version 2 pages only; no iteration, no key-type conversion,
+no multi-key atomic transaction. Format version 1 blobs (a single item of type
+`0x41`) that ESP-IDF left in version 2 pages are read, replaced and erased as
+ESP-IDF v6 does (see the `legacy_*` fixtures below), except that init erases one
+whose key also has a blob index that reads, which ESP-IDF can keep (see "Init
+and ESP-IDF's").
+Partitions must have 3–64 sectors (12–256 KiB). One sector stays free for garbage
+collection; replacement blobs temporarily need room for both versions. Strings
+are at most 3999 bytes plus NUL and cannot contain embedded NULs. Names are 1–15
+bytes without NULs. The store allocates nothing, owns a 4 KiB page buffer and a
+page hash index, and must not be copied after handles are opened. Serialize all
+calls in task context; do not use from interrupts. Reinitialize after flash I/O
+errors. Initialization repairs interrupted writes/reclaims, discards invalid
+entries and erases pages with invalid headers; it can write even if the next
+namespace handle will be read-only. Preserve a backup of irreplaceable data.
+Page sequence exhaustion reports `NotEnoughSpace` rather than wrapping.
+
+Evidence: unit-tested, and on hardware as below. Host tests cover all integer widths, namespace
+isolation, commit/reopen/erase, full partition and reclaimed space, multi-page
+blobs, failed replacement preserving the old value, maximum strings, corrupt
+payload CRC, and power loss after each operation in a rollover workload. The
+ESP-IDF fixture is read, modified and reopened through the store. The board
+self-test (below) ran on hardware on an earlier version of this store; the
+changes since are unit-tested only. References: ESP-IDF `components/nvs_flash/src/nvs_types.*`,
+`nvs_page.*` and `nvs_pagemanager.cpp`. Derived code credits
+`totorototo`'s MicroZig implementation in source.
+
+### NVS board self-test
+
+Build `examples/espressif/esp` with `zig build -Doptimize=ReleaseSmall
+-Dexample=selftest_nvs`. Outputs `esp32_c3_selftest_nvs.bin` and
+`esp32_c6_selftest_nvs.bin` (and ELF files); only ESP-IDF image-boot targets are
+registered. No external wiring is required. Use an existing ESP-IDF bootloader
+and partition table at `0x8000` with an unencrypted writable data/NVS partition
+labelled `nvs` (at least 12 KiB). Install the app at the table's app offset with
+the usual image-boot procedure. This example neither installs a table nor
+formats a missing partition; invalid/missing tables report failure before NVS
+writes. Back up existing data before running a flash-write self-test.
+
+The self-test reserves namespace `mz_selftest`; it writes all integer widths,
+a string, a 6000-byte multi-page blob, and 300 counter updates, commits, reopens,
+checks values, erases its test keys, then reopens to verify absence. A final
+`boots_increment` case increments the u32 key `boots`, commits, reopens and reads it back;
+This case checks the increment and same-boot reopen, not persistence across boots.
+`boots` is never erased, so `SELFTEST nvs boots=N` must rise by one on each
+reboot without reflashing (the host compares the two boots). Store initialization may repair pages and garbage
+collection may move other keys **within the named NVS partition**; application,
+bootloader and other partitions are never write targets. Keys in other
+namespaces are preserved. If interrupted, test keys may remain until a successful
+rerun. USB Serial/JTAG logs repeat `SELFTEST nvs <case>: PASS|FAIL` and
+`SELFTEST nvs DONE pass=N fail=M`; the flash operations run once per boot.
+Evidence: the 2026-11-19 run records show `selftest_nvs` ran by image boot
+on an earlier version on a Super Mini ESP32-C6 (rev v0.2), a XIAO ESP32-C6 (rev v0.1) and an ESP32-C3 (rev
+v0.4): 8/8 on each, with `boots=1` after flashing and `boots=2` after a
+watchdog reset. The run records identify an uncommitted build; no equivalence
+to this tree is claimed. That example called the boot-count case `persist`.
+Open modes, blob/reclaim/recovery handling and the `boots_increment` case name
+have changed since; the changes since are built only / unit-tested.
+
+The board workload also runs twice against a simulated minimum 12 KiB partition
+in host tests, with guard pages and an unrelated namespace checked after
+reclaim and erase. This is unit-test evidence, not board execution.
+
+Reclaim persists the victim's `freeing` state before activating the reserve
+page, matching ESP-IDF v6.0.2 `nvs_pagemanager.cpp::requestNewPage`
+(v5.5.1 activates the destination first; see "Known limits"). Host crash tests
+reset between every completed reclaim write/erase (including before and after
+bitmap publication), reopen and check every scalar, string, blob and namespace.
+They also reset during each recovery write/erase and reopen again. The general
+rollover workload tests both resets between operations and partial operations.
+
+Every walk of a page (lookup, hash index, recovery, reclaim) reads it as
+ESP-IDF's `Page::mLoadEntryTable` and `Page::findItem` do: an entry not marked
+written, or marked written with a header `Item::checkHeaderConsistency` rejects,
+is stepped over alone; a consistent string, blob chunk or legacy blob header
+is stepped over with its span, and is an item only if all of its entries are
+marked written; the active page is read up to its first free entry only.
+Interrupted multi-entry items are discarded as whole extents. An item is
+published by one bitmap write from its header to its last entry, and erased
+from its last bitmap word to its first, as ESP-IDF's
+`Page::alterEntryRangeState` does: an interrupted erase leaves the header
+marked written over a partly erased extent, which init then erases whole, so
+neither this store nor ESP-IDF ever reads the payload of an item this store was
+writing or erasing as headers. Once its entries are marked erased, an item
+erased by init's repairs or through a `.read_write_purge` handle is overwritten
+with zeros, as ESP-IDF's `Page::eraseItem` does with `purgeAfterErase` set; a
+`.read_write` handle leaves it marked erased only, as `NVS_READWRITE` does.
+The same holds, per handle, for a value a write replaces and for both items of
+a key with a blob index and a version 1 blob that an erase takes: zeroed
+through a purging handle, only marked through a `.read_write` one (`a write
+replaces through a purging handle by zeroing the old entries, through a
+read_write one by marking them`). In
+either mode a page this store erased from holds the bytes ESP-IDF's erase in
+the same mode would leave (see below). Tests embed a valid encoded replacement key inside
+blob payload, interrupt bitmap publication, erasure and recovery, and verify the
+untouched key stays unchanged across reopen. A published header that is damaged
+is different, see below.
+
+### Exhaustive host crash replay
+
+`zig build test` also runs `nvs_crash_test.zig`, which records every program and
+sector erase in a 638-action workload, then replays its physical-operation
+prefixes from erased flash. It covers all integer types, two namespaces,
+strings, multi-page blobs, overwrites, key erases and five page reclaims. Blob
+payload entries contain CRC-valid encoded replacements for an unrelated key.
+Strings exercise multiple entries but cannot contain these binary headers:
+the string API rejects embedded NUL bytes required by encoded key names.
+
+The workload runs once through `.read_write` and once through
+`.read_write_purge` handles. The purging trace has 2590 program operations (627
+of them the zeroing of erased items, each after its bitmap update) and 5 sector
+erases; the other has 1963 programs, none of them zeroing, and the same 5
+erases. The harness checks **10359 and 17658 crash points**: after every
+completed operation and at every 4-byte program-prefix boundary (including zero
+bytes). NOR programming preserves
+the pre-operation bytes after the torn prefix, including earlier bitmap bits.
+Every case reopens, verifies all completed keys and permits only the old/new
+value of the in-flight key, then writes another key, reopens again and verifies
+that recovery's chosen values remain durable. Sector erase interruptions are
+also covered separately by the older partial-operation tests.
+
+A second replay, `a reset at every word of a write over or an erase of a version
+1 blob leaves the old or the new value`, starts from the `idf_state_legacy_blob`
+partitions (below) and records, in both modes, a write over and an erase of the
+version 1 blob on its active and on its full page, and a write over it on the
+full page once the active page is nearly full of other keys, so that the write
+itself reclaims the version 1 blob's page, copying that item to another page
+and erasing the sector (the test checks both). It checks **819 crash points**
+(307 without purging, 512 with) at the same granularity: every key keeps its
+value, the blob reads old or new, the version 1 item is gone exactly when the
+new value is read, and the choice holds after another write and a reopen.
+
+From the active page's first entry marked empty, ESP-IDF erases and zeroes
+each entry whose first word is programmed, one at a time, until a blank one.
+Recovery here goes on while any byte is programmed, so that the next item is
+written on blank flash, and over the whole extent an unpublished
+variable-length header there claims (its first word holds the span; key, data
+length and CRC need not have reached flash yet, and payload may be blank
+0xff). That extent is erased from its last entry back to its header, so a reset
+in between leaves the header that claims the rest. ESP-IDF reads none of these
+entries either way.
+
+`python3 src/hal/nvs_testdata/crosscheck_idf.py <esp-idf checkout> [zig]`
+(not run by `zig build test`) has the crash replay write every image it checks,
+as the crash left it and once this store had recovered it, with the values
+allowed there (`zig build test -Dnvs-crash-dump=<file>`), and boots unmodified
+ESP-IDF `Storage` on each, compiled for the host as on a target (without the
+host-only `Storage::debugCheck`). ESP-IDF must read every completed key and the
+in-flight key's old or new value, and keep that choice after a second boot and
+after writing another key. Result with ESP-IDF v6.0.2, both replays and both
+modes (10359 + 17658 + 819 points): 28836 crashed and 28836 recovered images,
+no failures; 12 crashed images (6 per mode) are read with ESP-IDF's tail chunk
+loss (below), checked as such and not counted as failures. Evidence: host
+tests only; no board execution.
+
+`python3 src/hal/nvs_testdata/init_diff_idf.py <esp-idf checkout> [--zig zig]
+[--seed 1] [--count 3000] [partition.bin ...]` (not run by `zig build test`)
+covers the states only damage or another writer leaves. Unmodified ESP-IDF
+`Page` code writes `--count` random four-page partitions from `--seed`: blob
+chunks, blob indexes and version 1 blobs of three keys in two namespaces,
+complete or not, short, overlapping, out of order, from any first chunk number,
+some with a damaged payload, between other keys; in some, an integer or a
+string that is the newest page's last item, with older items of its key, of its
+type or another. They lie on one to three pages, in any physical order; in one
+partition in six a page is marked as being freed. Unmodified `Storage` boots
+each twice, the second time on what the first left; a boot is init and then
+four reads of each key. `zig build nvs-init-diff` does the same with this
+store. The script holds a model of ESP-IDF's rules, item by item, with one
+switch for each difference listed under "Init and ESP-IDF's" below. ESP-IDF and
+the store must each match the model exactly at every step: the items each init
+leaves, every read's status and bytes, and the items the reads leave (none
+erased by a read here). A case is counted under the switches it used; one where
+either side departs from the model, or where the two differ and no switch was
+used, is UNEXPLAINED, which fails the run. Not generated: a partly written
+item, a damaged item or page header, a stray entry; a partition without a free
+page, or of another size; two pages being freed, two active pages, two pages
+with one sequence number. Only the blob keys are read; of the other keys, the
+items each init leaves are compared. Given partition files (16384 bytes), it
+boots those instead. Result with ESP-IDF v6.0.2 and the defaults: 3000
+partitions, 931 the same, 0 UNEXPLAINED; seeds 1 to 8 with `--count 10000` also
+leave 0 UNEXPLAINED. Evidence: host only.
+
+### ESP-IDF erased and zero-purged entries
+
+ESP-IDF v6.0.2 erases an item by marking its entries erased and, when purging,
+then overwriting them with zeros (`Page::eraseEntryAndSpan`,
+`Page::purgeEntryRange`). Its repairs purge (`Page::DEFAULT_PURGE_AFTER_ERASE`
+is true); a handle's erases and replacements purge only if it was opened
+`NVS_READWRITE_PURGE` (`nvs_handle_simple.cpp` passes `mPurgeAfterErase`). A
+zeroed header no longer records
+the item's span, and a purge interrupted after its first entry leaves the rest
+of the payload erased but not zeroed. ESP-IDF never parses erased entries:
+`Page::mLoadEntryTable` and `Page::findItem` step over them one at a time.
+Every walk of a page here does the same, so a purge's leftover payload is never
+read as a header. This store purges the same way, in the same cases (init's
+repairs, `.read_write_purge` handles): the bitmap first, then zeros over the
+whole extent in one write, so a reset in between leaves erased entries that are
+never zeroed, which nothing reads. Tests erase keys from purge_fixture.cpp's
+page (below) and from `idf_blob_rewritten.bin` and compare the result byte for
+byte with ESP-IDF's own erase: through a purging handle with `idf_purged_*.bin`
+and `idf_blob_erased.bin`, through a `.read_write` handle with
+`idf_erased_*.bin` (`an erase leaves the page byte for byte as ESP-IDF's erase,
+with and without purging`); ESP-IDF's unpurged pages are also read, kept and
+reclaimed (`ESP-IDF erased but not purged items are read, kept and
+reclaimed`). A programmed entry marked empty is stepped over alone too on
+a full page, where ESP-IDF reads only entries marked written, and reclaim
+copies every item after it; at the active page's first free entry it is
+erased and zeroed, as ESP-IDF does.
+
+### ESP-IDF damaged headers
+
+An entry marked written whose header fails ESP-IDF's
+`Item::checkHeaderConsistency` (CRC, type, span and chunk fields), blank ones
+included, or any entry marked illegal, is a *stray entry*. `Page::mLoadEntryTable`
+(active and full pages) and `Page::findItem` erase and zero a written stray
+entry alone with `Page::eraseEntryAndSpan`, without trusting the span it claims,
+and read on from the next entry, so the damaged item's payload entries are each
+checked as headers and, failing, erased in turn. An illegal entry is erased and
+zeroed only by the active-page load; elsewhere it is stepped over. Every walk
+here steps over a stray entry alone too, and init erases and zeroes the same
+stray entries ESP-IDF's load does (on the active page all of them, on full pages
+the written ones), zeroing before the bitmap update so that an interrupted
+repair is picked up again. Neither this store's writes nor its erases leave a stray
+entry, interrupted or not: a header is complete before its bitmap marks it
+written, and illegal is never written. So damage no longer hides the keys after
+it or makes reclaim refuse the page. As in ESP-IDF, a damaged header's payload
+that happens to be a consistent header is read as an item; only damage leaves
+that state, never this store's writes or erases. Recovery also follows ESP-IDF
+in erasing a published item, on active and full pages, only if its extent is
+not wholly marked written: one whose header ESP-IDF accepts but this store does
+not serve (an integer with a chunk index, say) is kept, not erased.
+
+Twelve one-page fixtures in `src/hal/nvs_testdata/idf_purged_*.bin` were
+written by ESP-IDF's own `Page` code compiled for the host, not by the Zig
+encoder. Starting from `idf.bin`, `purge_fixture.cpp` adds a 100-byte string, a
+96-byte blob (data chunk and index) whose first payload entry is a CRC-valid
+string header spanning the two tail keys after it, and those tail keys. It then
+erases the integer, the string, the blob or all three with `Page::eraseItem` and
+`DEFAULT_PURGE_AFTER_ERASE`, and saves each page active and after
+`Page::markFull`. The `_partial_` pages are the flash contents at the moment the
+string's or blob data's purge had zeroed only its header. Eight
+`idf_erased_*.bin` pages are the same erases with purging off, as through an
+`NVS_READWRITE` handle: the entries marked erased, their bytes kept.
+
+Eight more, `idf_corrupt_*.bin`, start from the same page with the string's
+header damaged after it was written, as a bit flip would: `_crc_` flips a CRC
+bit, `_span_` changes its span from 5 to 4. ESP-IDF's `Page::load` then repairs
+the page; `_repairing_` is the flash at the moment it had erased and zeroed only
+the header, its payload still written, and `_repaired_` the page once it
+returned. The generator checks that ESP-IDF still reads the tail key, no longer
+finds the string, and finishes the interrupted repair with the same bytes.
+
+Five five-page partitions, `idf_blob_*.bin`, come from `blob_fixture.cpp`,
+which drives ESP-IDF's `Storage` and `PageManager` on a blank partition: a key,
+a 9000-byte blob (format version 2: `BLOB_DATA` chunks 0, 1 and 2 on pages 0, 1
+and 2, and a `BLOB_IDX`) and another key (`_written_`); the blob rewritten with
+6000 bytes, chunks 128 and 129 on pages 2 and 3 (`_rewritten_`, the old
+version erased and purged), and the flash just before that rewrite's index was
+written (`_rewriting_`: the old blob intact, the new chunks orphans); then the
+blob erased with purging (`_erased_`), and the flash once
+`Storage::eraseMultiPageBlob` had erased and zeroed only the index
+(`_erasing_`: the chunks orphans). For each partition the generator opens a
+fresh ESP-IDF `Storage` on it and checks both keys and the blob it reads (the
+first blob for `_rewriting_`, none after the erase).
+
+Twenty-one three-page partitions, `idf_state_*.bin`, come from `state_fixture.cpp`,
+each with the `_loaded` partition a fresh ESP-IDF `Storage::init` makes of it.
+Seven are in states interrupted ESP-IDF writes leave: a key's entry written but not yet
+marked (`torn_entry`); a string's header written and marked, its payload
+written but still marked empty (`torn_string`); the same with the page marked
+full afterwards by the generator (`full_partial`); a version 1 blob written
+with `Page::writeItem` between two keys, active and full (`legacy_blob`,
+`legacy_blob_full`); a blob rewritten across pages and reset after the new
+index, with another key then written by `Page::writeItem` so that both indexes
+stay (`two_indexes`); and a blob rewritten on its own page, reset before the new
+index (`tail_chunk`). Init here leaves the first five byte for byte as their
+`_loaded` partition and reads what ESP-IDF read. In `two_indexes` both read the
+blob the index on the oldest page names: lookups go through pages in sequence
+order and take the first match on a page, as `Storage::findItem` and
+`Page::findItem` do. A write over or an erase of that key here first erases the
+index not read and its chunks, which changes no read, so that new chunks reuse
+no live chunk number, and then works on the index read; both are reset after
+every flash operation in both modes (`a write or an erase of a key with two blob
+indexes takes both, reset anywhere`). Chunks the index read also claims are left
+to it (`a write or an erase over two blob indexes that claim the same chunk keeps
+the read one's chunk until its turn, reset anywhere`), and an erase of chunks
+takes every copy of a chunk number, which only damage or another writer leaves,
+so that no copy outlives its index and is read in place of a later write's
+chunk (`two blob indexes, each with its own copy of chunk 0: a write or an
+erase takes both copies`). In `tail_chunk` ESP-IDF reads neither version: the last
+check of `Page::mLoadEntryTable` (`nvs_page.cpp` 814-827) looks the new last
+chunk up with any chunk index and erases the old blob's chunk. This is a
+deliberate difference: this store does not repeat that loss and reads the old
+blob, from ESP-IDF's partition and from its own crash images in the same state
+(the 12 above, 6 per mode). The test `a rewrite's last chunk next to an old chunk keeps the
+old blob, unlike ESP-IDF` pins it.
+
+Fourteen more start from the version 1 blob: eight `idf_state_legacy_*.bin`
+partitions come from ESP-IDF's `Storage` (`write_over_legacy` in
+`state_fixture.cpp`), `index_then_legacy` and five more `legacy_*` ones from
+`Page::writeItem` (described below).
+`Storage::writeItem` looks a blob up by its index, and, finding none, takes
+whatever item the key has; it writes a version 2 blob (chunks from 0) and then
+erases and zeroes that item. `legacy_blob_rewritten` and
+`legacy_blob_full_rewritten` hold the result, on the version 1 blob's active
+page or on the page after its full one; `_rewriting` is the flash once the new
+index was marked written, before that erase, which ESP-IDF's load then
+finishes (on the active page as an earlier item with the same key, on the full
+page by `PageManager::load`'s check of the last item, as init here does).
+`legacy_blob_erased` is the key erased. `legacy_and_index` is the full-page
+`_rewriting` state with another key written after the index, as in
+`two_indexes`, so that both versions stay; `legacy_and_index_erased` is that
+after one `Storage::eraseItem`, and `legacy_and_broken_index` is
+`legacy_and_index` with the index's chunk erased by `Page::eraseItem`, as
+damage would lose it. `index_then_legacy` holds a version 2 blob written by
+`Storage` and then a version 1 blob of its key written by `Page::writeItem`
+after it on the active page. ESP-IDF reads a key's blob index first
+(`Storage::getItemDataSize`, `Storage::readItem`) and the version 1 blob only if
+there is none, and an erase takes the key's first item, here the version 1
+blob on the older page, leaving the index. As with `Page::findItem`
+(`nvs_page.cpp` 1128-1134), a blob lookup here that meets another item of the
+key first on a page finds nothing on that page and goes on to the next (`a blob
+lookup takes a page's first item of the key, as ESP-IDF's Page::findItem does`),
+and of two version 1 blobs of a key on different pages it reads the one on the
+older page (`the first of two version 1 blobs of a key is read, as ESP-IDF's
+Storage::findItem finds it`).
+
+### Init and ESP-IDF's
+
+Init does what ESP-IDF's does, in its order: each page's own repair
+(`Page::load`), the newest page's last item against the older pages
+(`PageManager::load`), the interrupted reclaim, then the blob checks of
+`Storage::init`. Pages are taken oldest first by sequence number, wherever
+they lie, and of two with one number the later one in the partition is the
+newer (`init orders pages by sequence number, the later of two equal ones
+last, as ESP-IDF's PageManager::load does`). The blob cases of `init erases what
+the last write replaced, then finishes a reclaim, then judges blobs, in
+ESP-IDF's order` catch judging blobs before erasing replacements or finishing
+reclaim. Finishing reclaim before erasing replacements is caught by
+`init erases the first older copy of the newest page's last item, as
+ESP-IDF's PageManager::load does`, case `page being freed: 0`.
+Init differs in the eight ways
+listed here, each a class of `init_diff_idf.py` (above), and in no other way
+that script finds.
+
+`PageManager::load`: an item is written before the one it replaces is erased,
+so the newest page's last item erases its older copy: on the first older
+page where an item has its namespace, key and chunk index, that item if it
+has its type too (`Page::findItem` stops at another type). One item at most,
+a blob chunk included (`init erases the first older copy of the newest page's
+last item, as ESP-IDF's PageManager::load does`). A page being freed is left
+out of that search, as ESP-IDF leaves it out.
+
+1. *Tail chunk.* On the active page, ESP-IDF's load erases the first chunk of
+   the key of a last item that is a chunk (`nvs_page.cpp` 814-827), which loses
+   both versions of a blob rewritten on one page and reset before its index.
+   This store keeps the chunk and reads the old blob (`tail_chunk`, above).
+2. *The last index's version 1 blob.* For a last item that is a blob index,
+   ESP-IDF's `PageManager::load` also erases a version 1 blob of its key
+   (`nvs_pagemanager.cpp` 82-91), whether or not the index reads. Here rules
+   3 and 4 decide.
+3. *A version 1 blob beside an index that reads* is erased by init. First,
+   every index of the key that `Storage::eraseMismatchedBlobIndexes` counts
+   incomplete is erased, as ESP-IDF's init does. Then, if the first index
+   left reads (each chunk it names, by the first copy of its number, with a
+   good CRC, adding up to its size), each version 1 blob of the key is
+   erased. ESP-IDF keeps it there and reads the index, until a write or an
+   erase of the key takes only the index and the version 1 value comes back;
+   it reads the version 1 value at once where that item comes first on the
+   index's own page. Only ESP-IDF older than v3.3 wrote version 1 blobs, so
+   one is always older than any index of its key.
+4. *A version 1 blob beside an index that does not read* (a chunk with a bad
+   CRC, or two copies of one chunk number and none of another): init erases
+   every index of the key, and the version 1 value is read. ESP-IDF leaves
+   it to its reads, which fail and erase what they could not read: the chunk
+   with the bad CRC, or the indexes and their chunks.
+5. *A key without a version 1 blob keeps its indexes*, whatever their state,
+   and reads `Corrupt` from one that does not read. ESP-IDF's init erases an
+   incomplete one and its read erases one with a missing or too long chunk.
+   This store's own writes leave no such index, reset
+   anywhere: chunks are written before their index and erased after it.
+6. *Shared start.* Two indexes of a key with one first chunk number: ESP-IDF
+   erases an incomplete one by key and first chunk number, which takes the
+   first index with that number, complete or not. Init here erases the
+   incomplete one, and by rule 5 only beside a version 1 blob. In
+   `legacy_shared_start` both read the same value from other bytes; in other
+   such states the values differ.
+
+7. *Unfinished reclaim.* While a page is being freed and the newest page is
+   active, this store takes the newest page for that reclaim's unfinished
+   copy and skips the `PageManager::load` check above. ESP-IDF runs it,
+   erasing what the newest page's last item replaced on a third page, and
+   then erases the newest page with that item (`nvs_pagemanager.cpp`
+   95-128): both values are lost. No reset in either writer's reclaim
+   leaves that state: until the reclaim's destination is activated the
+   newest page is full, and both run the check; from then on the newest
+   page holds only copies of items on the page being freed, which has no
+   older copy on a third page. The script generates it.
+8. *Reclaim destination.* In that state both erase the newest page and copy
+   the whole page being freed again: this store to the page just erased,
+   ESP-IDF to its first free page, the erased one being its last. The same
+   pages are left, at other places. Both rules are also pinned by a case of
+   `init erases the first older copy of the newest page's last item, as
+   ESP-IDF's PageManager::load does`.
+
+Last, as ESP-IDF's `Storage::eraseOrphanDataBlobs` does, init erases every
+chunk that no index of its key names.
+
+A read erases nothing here (the table under "NVS store"); an ESP-IDF read
+that fails erases what it could not read, which the script counts as a
+ninth class. A blob index whose first chunk number is neither 0 nor 128,
+which no ESP-IDF writer makes, is read and erased like any other; a write
+over it answers `Corrupt` (ESP-IDF: `ESP_FAIL`), since the new blob's chunk
+numbers come from the other half of 0 and 128 (`a blob index from another
+chunk number than 0 or 128 is read and erased, not written over, and costs no
+other item`). A page whose header is damaged is erased at init here; ESP-IDF
+leaves it unerased on its free list.
+
+Completeness is ESP-IDF's: each chunk counts for the first index of its key,
+in page order and then entry order, whose range holds its number (from its
+first chunk number to 127 if that is 0, else to 254), and an index is complete
+with as many chunks as it says, adding up to its size. Each index is judged
+with every index before it still there, and a key's indexes once, however
+many version 1 blobs it has (`init judges a key's blob indexes once, beside
+one or two version 1 blobs, reset anywhere`).
+
+The `Page::writeItem` fixtures pin these rules against ESP-IDF's bytes.
+`legacy_and_index` loads to the bytes of `legacy_and_index_erased` (rule 3).
+`legacy_and_broken_index` and `legacy_two_broken_indexes` (indexes from chunk
+128 and from chunk 0, neither with a chunk) load to ESP-IDF's bytes and read
+the version 1 value. `legacy_complete_and_broken_index` and
+`legacy_broken_then_empty_index` (chunks 0 and 1 and an index of chunk 0, then
+an empty blob's index: both chunks count for the first index, none for the
+second, which is complete) load to ESP-IDF's bytes with the version 1 item
+then erased (their `_v1_erased` partitions) and read the complete index. In
+`legacy_overlapping_indexes` (chunk 0 with its index, then chunk 1 with an
+index of chunks 0 and 1) both chunks count for the first index, so neither is
+complete, though each reads: both go, and the version 1 value is read. In
+`index_then_legacy` the active page's repair erases the earlier of two items
+of a key, whatever their types (`Page::mLoadEntryTable`, `nvs_page.cpp`
+782-811): the index goes and the version 1 value is read.
+
+Tests, beside those named above: `a version 1 blob next to a complete blob
+index of its key is erased at init, unlike ESP-IDF` (also after a reclaim);
+`beside a version 1 blob, init erases the key's indexes if the first does not
+read, and else the version 1 blobs` (rule 4 with a missing chunk and with a
+bad chunk CRC, rule 3 with two version 1 blobs); `init keeps a version 1 blob
+beside an incomplete blob index and erases the index, reset anywhere`; `a blob
+index is complete with its chunk on another page, and init then erases the
+version 1 blob`; `beside a version 1 blob, init erases the indexes ESP-IDF's
+load erases, judged as ESP-IDF judges them` (the fixtures above, one reset
+after each of init's flash operations); `init judges a version 1 blob's index
+by the chunks of its key, namespace and half only`; `init adds a version 1
+blob's chunk sizes beyond 16 bits`; `init credits a chunk to the first blob
+index whose range holds it, to the end of its half, on the active page up to
+its first blank entry`. A write or an erase takes every index and every
+version 1 blob of its key (`a write or an erase of a key with three blob
+indexes takes all three`; `a write or an erase takes every version 1 blob of
+a key, the one read last, reset anywhere`).
+
+Tests check that init leaves each other partition as its `_loaded` one and
+reads what ESP-IDF read (`legacy_complete_and_broken_index`,
+`legacy_broken_then_empty_index` and `legacy_shared_start` as above), that this
+store's own write over and erase of the
+version 1 blob leave ESP-IDF's `_rewritten` and `_erased` bytes (through a
+purging handle, as `Storage` with its default purge), and reset that write and
+that erase after every flash operation, whole or cut short, in both modes: the
+old or the new value is read, and once the new one is, the version 1 item is
+gone.
+
+Regenerate all of them with
+`python3 src/hal/nvs_testdata/generate_fixtures.py <esp-idf checkout> [output-dir]`: it compiles
+unmodified `nvs_page.cpp`, `nvs_types.cpp`, `nvs_item_hash_list.cpp` and the
+Linux ROM CRC (with `nvs_pagemanager.cpp` and `nvs_storage.cpp` for the blob
+and state partitions, the latter without the host-only `Storage::debugCheck`)
+with three host-only header shims, in a temporary directory under
+the port's `.zig-cache`; ESP-IDF is only read. ESP-IDF v6.0.2 with
+g++ 15.2.0 reproduces the committed files byte for byte. `zig build test` needs
+neither: it embeds the pages.
+
+Tests open every fixture as the active and as a full page, check every
+surviving value and the erased keys' absence, and check that recovery wrote
+nothing to the purge fixtures and left each damaged-header fixture byte for byte
+as `_repaired_`, ESP-IDF's own repair. They then reclaim each page into the
+reserve page, check that the fixture's sector was erased, and reopen, write and
+reopen again keeping every live key.
+
+The blob partitions are opened and reopened, and must read what ESP-IDF read:
+both keys, the blob byte for byte (the 6000-byte one from the chunk numbers its
+index starts at, 128) or none, and only the chunks its index names: init drops
+the orphans of the interrupted rewrite and erase, as ESP-IDF's
+`Storage::eraseOrphanDataBlobs` does. The three that hold a blob are then
+filled with live keys until full; in `_rewriting_` and `_rewritten_` that
+reclaims pages holding erased entries beside chunks and copies those chunks
+(`_written_` has no erased entry to reclaim). The blob still reads back after a
+reopen, and is then rewritten by this store and erased, each checked after a
+reopen. Evidence: built only, unit-tested; no board execution.
+
 ## ESP32-C6 BLE controller and HCI
 
 `hal.radio.bluetooth.Controller.start(allocator)` ports the controller-only
@@ -1151,3 +1718,72 @@ Open, not passes:
   difference. The driver keeps divider 399.
 * The +9 dBm default has run only on the Super Mini; the XIAO results above
   predate it.
+
+### Known limits
+
+The target is ESP-IDF v5.5.1. All fixture generation, crash cross-checks and
+init differential runs described above used v6.0.2; none ran against v5.5.1.
+Reading v5.5.1's `nvs_page.cpp`, `nvs_pagemanager.cpp` and `nvs_storage.cpp`
+finds these differences from v6.0.2:
+
+- v5.5.1 never zeroes erased entries; the purge comparisons above apply to
+  v6.0.2 only.
+- `PageManager::requestNewPage` activates the destination before marking the
+  victim freeing. v6.0.2 and this store do the reverse. By source reading,
+  the extra interrupted state (an empty active destination with no freeing
+  victim yet) and the subsequent copy states are handled by init here;
+  this has not been tested against v5.5.1.
+- `Storage::writeItem` searches for an old item of another type by trying
+  the possible types, rather than v6.0.2's `ANY` lookup, with the same result
+  for states either writer leaves.
+
+What the comparison with ESP-IDF v6.0.2 leaves open, each with the writer
+that can leave the state: *own* (this store's writes, reset anywhere),
+*ESP-IDF* (its writes, reset anywhere) or *other* (only another writer or
+damaged flash). Where no test is named, the writer is argued from the write
+order in `nvs.zig` and `nvs_storage.cpp`, not tested.
+
+- This version has not run on a board: every reset test is a host test. *Own.*
+- A blob rewritten on one page and reset before its index reads as the old
+  blob here and is lost when ESP-IDF boots that image (rule 1; 12 images of
+  the crash replay). *Own, ESP-IDF.*
+- After a reset in a reclaim, the page copied to again keeps its sequence
+  number here (`activate`); ESP-IDF gives it the next one. Page order is the
+  same. Not compared: the fuzzer has another free page there. *Own, ESP-IDF.*
+- A page whose header an interrupted sector erase damaged is erased at init;
+  ESP-IDF erases it when it next uses the page. Not compared. *Own, ESP-IDF.*
+- A key without a version 1 blob keeps a blob index that is incomplete or
+  does not read, and reads `Corrupt` until it is written or erased; ESP-IDF's
+  init or read erases it (rule 5). *Other.*
+- A version 1 blob beside a blob index of its key is settled at init: erased
+  if the index reads, else read and the indexes erased. ESP-IDF keeps it or
+  leaves it to its reads (rules 2, 3, 4 and 6). *Other.*
+- A read that fails erases nothing; ESP-IDF's erases what it could not read
+  (the table under "NVS store"). *Other.*
+- With a page being freed and the newest page active, an older copy of the
+  newest page's last item is kept, and the reclaim is copied again to the
+  page it was using, not to the first free one (rules 7 and 8). *Other.*
+- With the newest page full and an older copy on the page being freed,
+  reclaim can copy stale `n=1` after live `n=3`. Both survive the first init,
+  which reads 3, but the next init erases 3 and reads 1; even `set(n,4)` can
+  succeed and then `get(n)` read 1 in the same session. The `page being freed:
+  0` case of `init erases the first older copy…` constructs this state.
+  Neither writer leaves it: replacements are erased before reclaim starts,
+  and an interrupted copy's destination is active, not full. *Other.*
+- An older page still marked active is marked full; ESP-IDF loads it as an
+  active page. Unit-tested here, not compared. *Other.*
+- With two pages being freed, init frees only the first. A later write can
+  succeed, then the next init takes that active destination as an unfinished
+  copy of the second reclaim and erases it, losing the namespace entry and
+  keys (`open` returns `NotFound`). ESP-IDF v5.5.1 does the same by source
+  reading (`nvs_pagemanager.cpp`, `PageManager::load`, lines 96–128);
+  not tested against it. *Other.*
+- A partition with no free page fails init with `NotEnoughSpace` (ESP-IDF:
+  `ESP_ERR_NVS_NO_FREE_PAGES`); the fuzzer's model does not cover it. *Other.*
+- A write over a blob index whose first chunk number is neither 0 nor 128
+  answers `Corrupt`; erase the key first. *Other.*
+- The init fuzzer writes whole items on at most three pages of four (its
+  list is under "Exhaustive host crash replay"). Partly written items and
+  damaged item headers are compared with ESP-IDF by the crash replay's
+  cross-check and the `idf_state_*` and damaged-header fixtures only, two
+  pages with one sequence number by a unit test only.
