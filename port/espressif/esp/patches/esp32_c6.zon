@@ -91,54 +91,71 @@
     // ESP-IDF v5.4 (Apache-2.0), soc/esp32c6/register/soc/i2c_ana_mst_reg.h,
     // soc/esp32c6/include/soc/regi2c_defs.h and
     // esp_rom/patches/esp_rom_hp_regi2c_esp32c6.c.
-    .{ .add_peripheral = .{
-        .device_name = "ESP32-C6",
-        .name = "I2C_ANA_MST",
-        .description = "HP analog I2C master (ESP-IDF v5.4)",
-        .base_address = 0x600af800,
-        .registers = .{
-            .{
-                .name = "I2C0_CTRL",
-                .offset_bytes = 0x0,
-                .size_bits = 32,
-                .fields = .{
-                    .{ .name = "SLAVE_ID", .offset_bits = 0, .size_bits = 8 },
-                    .{ .name = "REGISTER", .offset_bits = 8, .size_bits = 8 },
-                    .{ .name = "DATA", .offset_bits = 16, .size_bits = 8 },
-                    .{ .name = "WRITE", .offset_bits = 24, .size_bits = 1 },
-                    .{ .name = "BUSY", .offset_bits = 25, .size_bits = 1 },
+    .{
+        .add_peripheral = .{
+            .device_name = "ESP32-C6",
+            .name = "I2C_ANA_MST",
+            .description = "HP analog I2C master (ESP-IDF v5.4)",
+            .base_address = 0x600af800,
+            .registers = .{
+                .{
+                    .name = "I2C0_CTRL",
+                    .offset_bytes = 0x0,
+                    .size_bits = 32,
+                    .fields = .{
+                        .{ .name = "SLAVE_ID", .offset_bits = 0, .size_bits = 8 },
+                        .{ .name = "REGISTER", .offset_bits = 8, .size_bits = 8 },
+                        .{ .name = "DATA", .offset_bits = 16, .size_bits = 8 },
+                        .{ .name = "WRITE", .offset_bits = 24, .size_bits = 1 },
+                        .{ .name = "BUSY", .offset_bits = 25, .size_bits = 1 },
+                    },
                 },
-            },
-            .{
-                .name = "I2C1_CTRL",
-                .offset_bytes = 0x4,
-                .size_bits = 32,
-                .fields = .{
-                    .{ .name = "SLAVE_ID", .offset_bits = 0, .size_bits = 8 },
-                    .{ .name = "REGISTER", .offset_bits = 8, .size_bits = 8 },
-                    .{ .name = "DATA", .offset_bits = 16, .size_bits = 8 },
-                    .{ .name = "WRITE", .offset_bits = 24, .size_bits = 1 },
-                    .{ .name = "BUSY", .offset_bits = 25, .size_bits = 1 },
+                .{
+                    .name = "I2C1_CTRL",
+                    .offset_bytes = 0x4,
+                    .size_bits = 32,
+                    .fields = .{
+                        .{ .name = "SLAVE_ID", .offset_bits = 0, .size_bits = 8 },
+                        .{ .name = "REGISTER", .offset_bits = 8, .size_bits = 8 },
+                        .{ .name = "DATA", .offset_bits = 16, .size_bits = 8 },
+                        .{ .name = "WRITE", .offset_bits = 24, .size_bits = 1 },
+                        .{ .name = "BUSY", .offset_bits = 25, .size_bits = 1 },
+                    },
                 },
-            },
-            .{
-                .name = "ANA_CONF1",
-                .offset_bytes = 0x1c,
-                .size_bits = 32,
-                .fields = .{
-                    .{ .name = "READ_MASK", .offset_bits = 0, .size_bits = 24 },
+                // IDF v5.5.1 soc/esp32c6/include/soc/regi2c_defs.h:12–15.
+                // Internal analog calibration control is not described in TRM ch.12.
+                .{
+                    .name = "ANA_CONF0",
+                    .offset_bytes = 0x18,
+                    .size_bits = 32,
+                    .fields = .{
+                        .{ .name = "BBPLL_STOP_FORCE_HIGH", .offset_bits = 2, .size_bits = 1 },
+                        .{ .name = "BBPLL_STOP_FORCE_LOW", .offset_bits = 3, .size_bits = 1 },
+                        .{ .name = "BBPLL_CAL_DONE", .offset_bits = 24, .size_bits = 1, .access = .read_only },
+                    },
                 },
-            },
-            .{
-                .name = "ANA_CONF2",
-                .offset_bytes = 0x20,
-                .size_bits = 32,
-                .fields = .{
-                    .{ .name = "SAR_MST_SEL", .offset_bits = 11, .size_bits = 1 },
+                .{
+                    .name = "ANA_CONF1",
+                    .offset_bytes = 0x1c,
+                    .size_bits = 32,
+                    .fields = .{
+                        .{ .name = "READ_MASK", .offset_bits = 0, .size_bits = 24 },
+                    },
+                },
+                .{
+                    .name = "ANA_CONF2",
+                    .offset_bytes = 0x20,
+                    .size_bits = 32,
+                    .fields = .{
+                        .{ .name = "BBPLL_MST_SEL", .offset_bits = 9, .size_bits = 1 },
+                        .{ .name = "ULP_CAL_MST_SEL", .offset_bits = 10, .size_bits = 1 },
+                        .{ .name = "SAR_MST_SEL", .offset_bits = 11, .size_bits = 1 },
+                        .{ .name = "DIG_REG_MST_SEL", .offset_bits = 12, .size_bits = 1 },
+                    },
                 },
             },
         },
-    } },
+    },
     // TRM ch. 23, register summary: 32-bit CPU windows and bit-0 triggers.
     // Vendor SVD has byte windows and incorrectly describes triggers at bit 1.
     .{ .add_peripheral = .{

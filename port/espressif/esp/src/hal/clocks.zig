@@ -1,6 +1,9 @@
 const compatibility = @import("compatibility.zig");
 
-pub const sleep = @import("sleep.zig");
+pub const sleep = switch (compatibility.chip) {
+    .esp32_c3 => @import("sleep.zig"),
+    .esp32_c6 => @import("sleep_c6.zig"),
+};
 
 /// Clock config init error.
 pub const Error = error{

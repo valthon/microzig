@@ -81,6 +81,15 @@ pub fn build(b: *std.Build) void {
         .{ .name = "selftest_sigma_delta", .file = "src/selftest_sigma_delta.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .name = "selftest_gpio_irq", .file = "src/selftest_gpio_irq.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .name = "selftest_spi_dma", .file = "src/selftest_spi_dma.zig" },
+        .{ .name = "selftest_sleep_c6_regs", .file = "src/selftest_sleep_c6_regs.zig", .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_sleep_c6_s1", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 1, .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_sleep_c6_s2", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 2, .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_sleep_c6_s3", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 3, .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_sleep_c6_s4", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 4, .chips = &.{.esp32_c6}, .lp_image = .sleep },
+        .{ .name = "selftest_sleep_c6_s5", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 5, .chips = &.{.esp32_c6}, .features = .{ .image_boot_only = true } },
+        .{ .name = "selftest_sleep_c6_s6", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 6, .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_sleep_c6_s7", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 7, .chips = &.{.esp32_c6}, .features = .{ .image_boot_only = true } },
+        .{ .name = "selftest_sleep_c6_s8", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 8, .chips = &.{.esp32_c6} },
         .{ .name = "selftest_sleep_s1", .file = "src/selftest_sleep.zig", .sleep_stage = 1, .chips = &.{.esp32_c3} },
         .{ .name = "selftest_sleep_s2", .file = "src/selftest_sleep.zig", .sleep_stage = 2, .chips = &.{.esp32_c3} },
         .{ .name = "selftest_sleep_s3", .file = "src/selftest_sleep.zig", .sleep_stage = 3, .chips = &.{.esp32_c3} },
@@ -180,6 +189,30 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .root_source_file = b.path(example.file),
             });
+
+            if (std.mem.eql(u8, example.name, "selftest_sleep_c6_regs") and target_enum == .esp32_c6) {
+                const host_tests = b.addTest(.{
+                    .root_module = b.createModule(.{
+                        .root_source_file = b.path("tools/sleep_c6_plan_test.zig"),
+                        .target = b.graph.host,
+                    }),
+                });
+                const generated_chip = fw.exe.root_module.import_table.get("microzig").?.import_table.get("chip").?;
+                const host_chip = b.createModule(.{ .root_source_file = generated_chip.root_source_file });
+                host_chip.addImport("microzig", host_tests.root_module);
+                const pmu = b.createModule(.{ .root_source_file = mz_dep.path("port/espressif/esp/src/hal/pmu_c6.zig") });
+                pmu.addImport("microzig", host_tests.root_module);
+                host_tests.root_module.addImport("chip", host_chip);
+                host_tests.root_module.addImport("pmu", pmu);
+                host_tests.root_module.addImport("mmio", b.createModule(.{ .root_source_file = mz_dep.path("core/src/mmio.zig") }));
+                const run_tests = b.addRunArtifact(host_tests);
+                // Both the explicit host-test step and the batch example gate
+                // run these tests, so literal IDF regressions block acceptance.
+                b.step("test-sleep-c6", "Compare C6 PMU plans to literal IDF profiles").dependOn(&run_tests.step);
+                b.getInstallStep().dependOn(&run_tests.step);
+                const check_vectors = b.addSystemCommand(&.{ "python3", "tools/sleep_c6_idf_reference.py", "--check" });
+                b.step("check-sleep-c6-idf", "Regenerate and compare C6 vectors using ESP-IDF v5.5.1").dependOn(&check_vectors.step);
+            }
 
             if (example.lp_image) |image| {
                 fw.exe.root_module.addAnonymousImport("lp_image", .{ .root_source_file = lp_images[@backingInt(image)].get_emitted_bin(.binary) });
@@ -390,4 +423,4 @@ fn parse_mac(text: []const u8) ?u48 {
     return if (count == 6) value else null;
 }
 
-const LpImage = enum { counter, timer, uart, i2c, irq };
+const LpImage = enum { counter, timer, uart, i2c, irq, sleep };

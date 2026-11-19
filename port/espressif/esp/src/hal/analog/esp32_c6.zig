@@ -184,6 +184,15 @@ pub fn ieee802154_mac_reset() void {
     MODEM_SYSCON.MODEM_RST_CONF.modify(.{ .RST_ZBMAC = 0 });
 }
 
+/// Conservative sleep guard: even a stopped but initialized Wi-Fi stack owns
+/// modem state, as does an initialized IEEE 802.15.4 radio. Call with HP interrupts masked through the sleep transaction;
+/// LP firmware must not manipulate radio/analog hardware concurrently.
+pub fn sleep_blocked() bool {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    return wifi_inited or ieee802154_clocks_owned or wifi_clock_refs != 0 or bb_clock_refs != 0 or phy_clock_refs != 0;
+}
+
 pub fn wifi_set_inited(inited: bool) void {
     const cs = microzig.interrupt.enter_critical_section();
     defer cs.leave();

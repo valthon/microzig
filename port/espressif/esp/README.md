@@ -38,7 +38,8 @@ v0.2, as `passed/checks` of the named self-test in `examples/espressif/esp`.
 | `dedicated_gpio` (8 CPU signals; exclusive pad/signal ownership, CSR set/clear/read) | yes | yes | `selftest_dedicated_gpio`, pad 4, no wiring | 9/9 | 8/8 |
 | `gdma` channel pairs 0–2, SRAM memory copy | yes | yes | `selftest_gdma`; exclusive channels, disjoint SRAM/descriptors, bounded wait | built only (prior 15/15) | built only (prior 16/16) |
 | `spi` master (SPI2), GDMA channel 0 transfers | yes | yes | `selftest_spi_dma`                                 | 8/8       | 8/8       |
-| `clocks.sleep` light sleep                    | yes | no  | `selftest_sleep_s*`                                | see below | n/a       |
+| `clocks.sleep` light sleep                    | yes | yes | `selftest_sleep_s*` (C3), `selftest_sleep_c6_s*` (C6) | see below | s1–s4, s6–s8 on XIAO (3 runs each); see "C6 light sleep and deep sleep" |
+| `clocks.sleep` deep sleep                     | no  | yes | `selftest_sleep_c6_s5` (image boot) | n/a | 3/3 on XIAO; see "C6 light sleep and deep sleep" |
 | `sigma_delta` (4 channels, signed density, divider 1–256) | yes | yes | `selftest_sigma_delta` | built only | built only |
 | `pcnt` (4 units, channel 0, signed 16-bit, polling watchpoints, 10-bit filter) | no | yes | `selftest_pcnt` | n/a | built only |
 | `etm` (50 routes; 8 GPIO event/task groups, no interrupt allocation) | no | yes | `selftest_etm` | n/a | built only |
@@ -477,7 +478,259 @@ file header documents each stage and the GPIO beacon. Results on the C3 rev v0.4
 every check except `cdc_in`, which fails by design without the reconnect policy; s6 (`wait_for_host`
 with the test's `Attachment`, then reconnect without sleep and a 100 ms and a 500 ms sleep, each
 checked for a bus reset, the nonce echoed back and the OUT string): 12/12 with a Windows host,
-`wait_for_host` true after 3 us. Light sleep has not run on the C6.
+`wait_for_host` true after 3 us. C6 evidence is recorded below.
+
+### C6 light sleep and deep sleep
+
+`hal.clocks.sleep` selects the C6 PMU implementation; the C3 code is unchanged.
+The reference is **ESP-IDF v5.5.1**, matching the radio blobs. `pmu_c6.zig` cites the
+source file/line for each table group and the TRM v1.2 ch. 12 section documenting its fields.
+The v6.0.2 checkout serves only as a comparison (its optional PVT startup is not imported).
+
+The first validated sleep request initializes all HP ACTIVE/MODEM/SLEEP and LP ACTIVE/SLEEP
+state tables, hands regulator control to PMU through analog `ENIF_*`, then releases the domain
+forces in IDF order. HP memory forced power-up and power masks are preserved: only memory
+no-isolate is cleared (`pmu_init.c:135–167`). Active HP/LP bias follows the eFuse encoding version,
+nonzero code + 2 saturated at 31, otherwise 25/26 (`pmu_param.c:418–466`). Power-on o-code setup
+also follows IDF; parts without a burned code use bounded calibration. PMU initialization persists
+across calls; applications and LP firmware must not overwrite these tables afterwards.
+
+`enter_light_sleep(Config)` retains CPU context, HP SRAM and TOP/peripherals. No peripheral
+retention DMA is available, so TOP/CPU/HP AON power-down flags are clear. The modem domain is
+powered down; Wi-Fi and BT must be off. CPU switches to undivided XTAL before programming sleep,
+and the previous source/dividers and ROM frequency bookkeeping are restored afterwards, including
+rejection/timeout paths (`sleep_modes.c:1011–1014,1154–1162`, `rtc_clk.c:174–180,252–270`).
+HP_SLEEP analog I2C uses isolation/retention **1/1**, with BBPLL and its I2C powered down.
+Wake-up recalibrates the 480 MHz PLL from the 40 MHz XTAL before returning CPU to PLL.
+Default light sleep keeps flash supply, LP peripherals, HP memory, LP oscillators and XTAL.
+`power_down_xtal = true` selects the IDF XTAL-off light profile: RC_FAST stays on in HP_SLEEP,
+then powers down in LP_SLEEP unless `lp_core` wake needs it. Unselected 32 kHz oscillators are
+powered down too; LP peripheral power is retained for light-sleep users. Deep sleep powers down
+XTAL, VDD_SPI, LP peripherals and unused RC_FAST/XTAL32K/RC32K by default, matching IDF v5.5.1
+`sleep_modes.c:1262–1265,2573–2628`. LP SRAM remains retained. `lp_core` wake keeps RC_FAST and LP
+peripherals; the selected LP slow oscillator is always kept (TRM §§12.4.2.3–7).
+Both deep sleep and XTAL-off light sleep return `UnsupportedClock` before regulator handoff or
+USB detachment if `LP_CLKRST.FAST_CLK_SEL` selects XTAL_D2. Change LP_FAST only with LP clients
+quiescent; the sleep HAL never silently changes their clock source.
+
+PMU waits are computed using measured Q13.19 slow/RC_FAST periods and IDF's 450 us minimum sleep,
+154 us analog wait (LP deep: 500 us), 2 us digital supply/up waits, 250 us XTAL and 50 us PLL waits.
+XTAL stabilization uses slow-clock cycles when XTAL is kept and fast-clock cycles when it is powered down (`pmu_sleep.c:209–212`); the reference periods give 37 versus 5000 cycles.
+TIMG0 RTC calibration is exclusively owned during the call; temporary clock gates are restored.
+The unused modem-wakeup wait is derived from IDF's hardware wait and software adjustment;
+there is no modem wake source or RTOS software-overhead compensation. The relative timer target
+is anchored to the API-entry LP-timer snapshot and armed after setup; requested raw ticks are
+not reduced by an estimated wall-clock preparation overhead. The final request/poll/eFuse-IDLE
+wait runs in RAM; light sleep suspends and resumes cache, while deep sleep leaves cache enabled.
+IDLE is controller state **1**, including after rejection (`pmu_sleep.c:359–392`).
+
+Applications must quiesce DMA and peripherals first. The HAL flushes UART output before deep
+sleep, suspends UART transmission for light sleep and resumes it after clock restoration. It
+releases SAR ADC PWDET power ownership during sleep and restores it afterwards. C6 MSPI timing
+synchronization is a no-op in IDF (`clk_utils.c`, `FLASH_CPU_CLK_SRC_BINDED` is S3-only); no
+peripheral retention or ADC monitor profile is installed. Interrupts remain masked through restoration.
+SYSTIMER time is not compensated; `rtc_ticks()` counts LP_SLOW_CLK ticks through sleep (§12.4.3).
+Calibrate that clock before converting ticks to a duration. Internal I2C writes use the ROM form
+without read-back of self-clearing/write-only bits. A genuine PLL calibration timeout restores
+the divider fields, keeps CPU on XTAL, updates ROM frequency bookkeeping and returns an error.
+The modem clock maps are opened temporarily for analog transactions and then restored; permanent
+clock-init map changes were avoided to keep Wi-Fi behavior identical.
+
+Wake sources (TRM Table 12.4-1, with the EXT1 omission below):
+
+- `timer_ticks`: HP wake target 0 of LP_TIMER; the LP firmware's target 1 is left available.
+- `gpio = .{ .pin = 0..7, .level = 0..1 }`, or `ext1 = .{ .pins, .levels }`: any selected LP
+  GPIO at its configured level. Use `hal.lp_io.apply` to configure the LP mux, input and pull
+  before sleeping (§7.7). TRM v1.2 omits EXT1 from Table 12.4-1 and the LP_AON EXT1 field
+  descriptions; the selector/levels and source bit 1 follow IDF v5.5.1
+  `lp_aon_ll_ext1_set_wakeup_pins` and C6 `pmu_bit_defs.h`. Bit 2 is the separate HP GPIO
+  source, not EXT1. The HAL validates LP mux ownership, consumes EXT1 status,
+  and restores the previous EXT1 selection. It does not reconfigure pads. An already asserted
+  source can return `Rejected`; no edge is required. HP-only GPIO wake is not implemented.
+- Light sleep: `uart0`/`uart1` enable the UART edge wake detector. Configure that UART's
+  `SLEEP_CONF2.WK_MODE_SEL=0` and `ACTIVE_THRESHOLD` before entry; threshold+3 rising edges wake
+  the CPU (§27.4.8). Trigger bytes are lost. Other UART wake modes are refused. Transmit in active
+  mode or reset that UART after wake to clear its wake signal before sleeping again (§27.4.8).
+- `lp_core`: LP firmware triggers `PMU.HP_LP_CPU_COMM.LP_TRIGGER_HP` (§3.9.3). A pending LP
+  request is preserved and may reject entry; the caller acknowledges it through
+  `PMU.HP_INT_CLR.SW_INT_CLR` after consuming the event. LP firmware must not concurrently change
+  sleep registers, software RTC snapshots, or analog/radio ownership.
+
+An initialized Wi-Fi stack (including a stopped stack) or any outstanding Wi-Fi/BB/PHY clock
+reference returns `error.RadioActive` before USB or sleep configuration changes. Deinitialize the
+stack and release PHY references first. There is no automatic modem sleep or connected Wi-Fi
+retention. The guard uses the ownership recorded by `hal/analog/esp32_c6.zig` and the OSI PHY
+lifecycle; direct radio-register users must quiesce their hardware themselves.
+
+The C3 USB policy shape applies on C6 too: default refuses enabled pads; `allow_usb_loss` accepts
+endpoint loss; `.disconnect_and_reenumerate` uses the shared `usb_serial_jtag.Attachment`,
+`wait_for_host`, and bounded host-reset wait. The host must reopen after each detach. A bus reset
+alone does not prove CDC traffic. `Diagnostics` captures full C6 wake/reject/raw interrupt bits
+and the optional USB bus-reset result; `Step` emits diagnostic milestones with interrupts masked.
+Trace callbacks must be bounded and must not wait on sleep-gated peripherals.
+
+`enter_deep_sleep(Config)` powers down HP CPU, TOP, modem and HP AON digital domains, retaining LP
+SRAM; LP peripherals are off unless LP-core wake requires them (§12.4.2.4). Success never returns. UART wake is refused. Install an
+**image-boot flash app**; RAM-loaded code cannot survive. No wake stub is installed; ROM reloads
+flash through its reset path. Read `wake_cause()` before requesting another sleep: it returns
+`reset` (including `.deep_sleep`, reset code 5, §8.2.2) and decoded timer/GPIO/UART/LP flags plus
+raw source bits and EXT1 pin status. Boot wake flags are zero for other reset reasons. Reserve LP
+memory explicitly if using it as a reboot counter; HP startup does not initialize LP SRAM (§5.3.2).
+Both entry calls own timer target 0 and PMU sleep/wake/reject flags, and must not share those with
+another sleep manager. Once SLEEP_REQ is written, polling continues until wake or rejection,
+matching IDF; software never disarms the timer while entry may still be pending.
+
+Every sleep transaction installs IDF's one-second RWDT stage-0 `RESET_RTC` safety net around
+hardware entry/exit if no application RWDT is enabled (`sleep_modes.c:1557–1565`). Default policy pauses
+RWDT during sleep and preserves an already enabled application watchdog. `Config.bench_recovery`
+is **off by default**. The C6 sleep self-tests enable it: a timer wake deadline is required, RWDT
+gets the requested ticks plus five seconds (or the explicit bench-only `bench_reset_ticks`
+deadline), both LP_WDT pause-in-sleep and HP_SLEEP's digital watchdog pause are cleared. An active application RWDT returns `WatchdogActive` in bench mode.
+Stage 0 uses action 4, called `RESET_RTC` by IDF and **system reset** by TRM v1.2 §15.2.2.2,
+Table 15.2-1: it resets PMU/RTC as well as HP, so a stalled PMU is reset rather than only the CPU.
+Chip-reset mode remains off: system reset preserves internal memory (§8.1.1), including the LP
+SRAM recovery marker. This is a recovery provision, not hardware evidence that it works.
+A stopped LP slow clock or missing LP dynamic fast clock can defeat this watchdog
+(§15.2.2.2, Register 15.1 reset lengths are in RTC_DYN_FAST_CLK). s7 below tests recovery with
+XTAL kept on and an independent later timer wake; it deliberately avoids testing a hang.
+
+Before attempting sleep, run **`selftest_sleep_c6_regs`** (no wiring, never sleeps). It prints
+`current`, `would`, `idf`, and `mask` for each initialization, light/deep entry, timer, clock and
+cleanup write. `current` is the hardware read; `would` simulates successive writes including the
+initialization tables. `idf` is the expected word for this supported flag profile and eFuse bias.
+Write-only command readbacks are not retained state. The `analog` phase uses slave:register
+addresses (e.g. `0x6d05`) for bounded reads of regulator ownership; it never writes ENIF/XPD.
+The probe temporarily routes clocks for TIMG calibration and analog reads, restores their gates,
+and leaves the PMU state tables, power forces and sleep request untouched. A PASS means the plan
+matches the reference encoding, **not** that reset/ROM values already match or sleep works.
+Named-field table encodings are checked against literal IDF words at comptime. Calculated rows
+receive an independent expected word rather than copying the HAL result. The probe starts with
+`default_light`, `default_deep` and `default_light_xtal_off`: fixed reference inputs (Q13.19 slow period
+3495253, fast period 26214, fallback biases 25/26) compared directly with checked-in literal words.
+The later `light`/`deep`/`light_xtal_off` phases use measured clocks and burned biases; a separate raw-register
+IDF implementation specializes the expected values for those inputs. The simulated expected state
+is carried separately from the HAL state, so one wrong write cannot seed both columns.
+
+`examples/espressif/esp/tools/sleep_c6_idf_reference.py` compiles unmodified ESP-IDF v5.5.1
+`pmu_param.c`, `pmu_sleep.c`, `pmu_hal.c` and `pmu_init.c` on the host. RAM registers use IDF's
+actual `pmu_ll.h` and `pmu_struct.h`; minimal shims supply platform plumbing and eFuse inputs.
+Its checked-in output is `hal/pmu_c6_idf_vectors.zon`: all 60 initialization defaults plus nine
+sleep profiles combining three fuse/period sets with XTAL-on light, timer-only default deep,
+and XTAL-off light sleep, all with LP_FAST=RC_FAST. The former `deep_xtal` vectors were removed:
+they reproduced IDF's bug, where `pmu_sleep.c:273–275` updates the local `power_default` after it
+is copied to `config->power` at line 230. They are not safe operating profiles. Regenerate and verify byte identity with:
+
+```sh
+python3 examples/espressif/esp/tools/sleep_c6_idf_reference.py --check --idf /home/valthon/esp/esp-idf-v5.5.1
+```
+
+Run `zig build test-sleep-c6 -Dexample=selftest_sleep_c6_regs` in `examples/espressif/esp` to
+compare the actual HAL plan, using generated register types, with every literal word and mask.
+`zig build test` does not need IDF; the committed vectors supply the reference. Measured runtime
+inputs still use the Zig specialization described above; the literal profiles are checked against
+IDF's own C computation. Evidence: host comparisons, plus the hardware runs listed below.
+
+Diagnostics do not require USB or a trace callback. Reserve **`0x50003fe0..0x50003fef`** in LP SRAM
+(the mailbox's `0xe0..0xef`, separate from s5's `0xf0..0xff`). The low byte at **`0x50003fe0`** is
+the latest milestone; the word at **`0x50003fe4`** is the pending MMIO address, or zero for a
+non-register boundary. The words at **`0x50003fe8`** and **`0x50003fec`** hold the bench pending
+marker `0xc651ee90` and its complement. They are written before entry and cleared after hardware
+restoration, before the separately bounded USB reenumeration wait.
+On reboot, the self-test consumes the marker before loading LP firmware or starting another sleep;
+unexpected reset with a valid marker repeatedly reports `recovered_hang: FAIL` (s7 expects
+`PASS` only for reset `0x10` at sleep-request milestone `0x41`) with reset reason,
+marker, milestone and address. RWDT system reset is reset code `0x10` (TRM Table 8.1-1); reset code
+5 is normal deep-sleep wake. Each write/poll boundary stores the record before accessing hardware.
+Existing `Step` values `0x80..0x8a`, `0x91`, `0x92` still invoke trace callbacks.
+Additional bytes: `0x10..0x19` analog bus/calibration; `0x20..0x29` CPU/LP clock calibration;
+`0x30` PMU initialization; `0x31` sleep tables; `0x32` wake routing; `0x33` timer arming;
+`0x34` flag/timer cleanup; `0x35` EXT1 restoration; `0x36` LP timer snapshot; `0x40` cache suspend; **`0x41` sleep request**;
+`0x42` eFuse-IDLE wait; `0x43` cache resume. Use the recorded address to identify the particular
+register within a phase. A stalled CPU cannot execute a software timeout; bench RWDT runs independently.
+
+After a reset into the ROM downloader, read before loading an application/LP image, for example
+`esptool --chip esp32c6 --before no_reset --after no_reset read_mem 0x50003fe0` and the same command
+with `0x50003fe4` (newer esptool spells this `read-mem`). Avoid a power cycle; retention depends on
+the reset domain (§§5.3.2,12.4.2.4). `lp_core.load()` clears LP SRAM, including this record.
+The marker and milestone record are diagnostic evidence only; verify retained bytes and reset recovery
+on the boards before relying on the bench watchdog.
+
+Hardware evidence, all on one ESP32-C6 XIAO (rev v0.1), image boot, with bench
+recovery enabled, 2026-11-19, using `selftest_sleep_c6_s*` and
+`selftest_sleep_c6_regs`. In the initial timer-measurement build, s2 returned in 4 of 4 runs with LP timer wake
+**0x10**, no hang and no RWDT reset, but the old `timer_100ms` check failed in
+all four: `ticks=31413, 31533, 31526, 31416` and `active_us=147366, 148139, 148020,
+147253`. Three register-probe runs taken alongside them each matched compiled
+ESP-IDF v5.5.1 on all 248 rows; a separate probe build reported
+pass=253. With a timer check without the 99% bound and setup ceiling: s2 passed 2/2 in 2 of 2 runs (`setup_us` about
+19.8 ms, `stopped_us` about 80.6 ms of a 100 ms request), and in 3 of 3 runs each
+s1 (guards) 3/3, s3 (retention at 100/250/500 ms) 4/4, s4 (EXT1 GPIO wake via the
+LP core) 2/2 and s6 (USB reconnect and nonce echo) 13/13.
+Deep sleep (s5) hung with that build. These ran on earlier versions; timer
+checks, PMU tables, LP_FAST startup and logger changed since; the changes
+since are built only / unit-tested except where the matching-tree runs below
+exercise them. The tightened timer check ran in those matching-tree runs.
+
+In the initial timer-measurement build, `ticks` counts LP_SLOW_CLK over the
+entire call, including restoration;
+`active_us` is stall-sensitive SYSTIMER UNIT1 ticks divided by 16 over that same call,
+including PMU initialization, calibration and USB reattachment. Neither value measures
+only sleep; that output omits the measured LP frequency needed to convert ticks.
+IDF v5.5.1 `sleep_modes.c:1431,1501,1808–1809` anchors the timer before calibration/setup
+and subtracts hardware/software overhead from the request. This HAL likewise anchors raw
+ticks before setup, without IDF's estimated adjustment. Requiring 90% of the original
+request to be spent stalled excludes setup time, which consumes part of that interval.
+
+The timer check prints `requested_us`, `requested_ticks`, and awake-calibrated
+`lp_hz` (LP ticks over a SYSTIMER-timed 100 ms, multiplied by ten). `setup_us` measures
+LP time from just before the call to the request trace; `slept_ticks`/`slept_us` measure
+the request-to-wake trace window, including cache/PMU transitions, before clock and USB
+restoration. `call_lp_us` and `systimer_us` span the whole call. `sleep_active_us` counts
+SYSTIMER time in the request-to-wake window; `stopped_us` is its LP time minus SYSTIMER
+time (TRM §§12.4.3,13.3–13.4.1). The check requires entry-to-wake LP ticks within 99–120%
+of the request (the timer is anchored at entry),
+setup of at most 30 ms, and at least 1 ms and 90% of the request-to-wake window with
+SYSTIMER stopped. Setup delays alone, immediate wake and busy waiting cannot satisfy
+these checks.
+
+C6 `selftest_sleep_c6_s1` checks awake counter and
+validation/USB guards; s2 sleeps 100 ms; s3 checks 100/250/500 ms, runtime SRAM patterns and clock
+restoration; s4 has the LP core drive GPIO0 high internally, with a one-second timer fallback and
+separate GPIO cause/pin checks (no wiring); s5 detects timer/deep-reset plus a retained LP memory
+counter on reboot and builds only for the `esp32_c6` image-boot target; s6 reconnects without
+sleep and sleeps 100/500 ms, checking bus reset, register restoration and bidirectional CDC using
+the C3 nonce protocol. s7 requests 10-second LP-timer light sleep with XTAL on and a three-second
+bench RWDT deadline. **Install s7 in flash using the `esp32_c6` image-boot target**, as for s5.
+RAM-loaded flashless code cannot restart itself after the intended watchdog reset; s7 therefore
+builds only for image boot. Pass requires reboot with RWDT system-reset cause `0x10` and
+`recovered_hang: PASS`; reaching the timer fallback reports FAIL. s8 checks 100/250/500 ms
+retention/restoration with LP_FAST=RC_FAST and XTAL off in both sleep tables. After **each** detach reopen the port, send `USJ?` after 1.5 s, then echo
+`USJ nonce=xxxxxxxx` as `ACK xxxxxxxx`. Summaries start after 1.5 s and repeat every three seconds.
+Every C6 sleep stage waits for the single ASCII byte **`S`** over USB Serial/JTAG before its
+first sleep, on every boot. Open the CDC port, wait for `ARMED? send S to start`, then send `S`
+without needing a newline. For example, run pyserial's
+`python3 -m serial.tools.miniterm /dev/ttyACM0 115200`, then type `S` (exit with Ctrl-]).
+Do not configure a host to resend `S`
+automatically on reconnect. Replugging a hung board leaves it waiting for a new byte, so normal
+USB flashing works without BOOT. Deep-reset/recovery reports run before the arm wait and never
+start a second sleep. The register probe never sleeps and needs no arm byte.
+
+Remaining IDF differences: this subset keeps light-sleep CPU/TOP/HP memory and flash supply on,
+has no peripheral retention, RTOS timing compensation or wake stub, uses bounded analog/calibration
+and UART waits, and temporarily restores modem clock maps. A real PLL calibration failure returns
+on XTAL as described above. Bench mode deliberately changes watchdog sleep policy. Evidence:
+XIAO ESP32-C6 (rev v0.1), `esp32_c6` image boot, 2026-11-19,
+same code as this tree, 3 runs per stage, armed
+by the host: s1 3/3, s2 2/2, s3 4/4, s4 2/2, s5 (deep sleep: reset, timer wake, LP memory) 3/3,
+s6 13/13, s7 (RWDT reset 3 s into a 10 s light sleep, `recovered_hang: PASS reset=0x10`) 1/1 and
+s8 (XTAL-off light sleep with LP_FAST on RC_FAST) 4/4 in every run; no hang. The register probe
+showed would-write equal to the IDF-derived value on all 284 rows in a
+separate run on 2026-11-19. That probe ran on an earlier version; logger
+and panic handling changed since; the changes since are built only / unit-tested.
+Not run on the Super Mini or the C6 rev v0.2.
+
+GPIO8/LP_AON.STORE0 carry HAL milestones. The tests reserve GPIO0 for s4 and the last 16 LP
+mailbox bytes for s5; do not combine them with another LP-memory owner.
 
 ## ESP32-C6 boot modes and clocks
 
@@ -493,6 +746,29 @@ Flash targets use the ROM's initial flash mapping/cache configuration (TRM §5.3
 PLL setup retains ROM analog calibration; this port does not recalibrate or power-cycle the PLL.
 CPU frequencies are 80/120/160 MHz from PLL or 40 MHz XTAL divided by 1/2/4/8/16/32; APB is
 40 MHz with PLL and follows the divided XTAL otherwise (TRM §8.2.4.1).
+
+C6 application initialization enables RC_FAST, waits 50 µs, selects it for LP_FAST, then waits
+3 µs, matching IDF v5.5.1 `rtc_clk.c:90–95,127–130` / `soc/rtc.h:62–64` and v6.0.2
+`components/esp_system/port/soc/esp32c6/clk.c:55–56` (the local v5.5.1 checkout lacks that file).
+TRM v1.2 §8.2.4.2 and Register 8.75 define RC_FAST vs XTAL_D2. LP CPU uses LP_FAST;
+LP UART/I2C select LP_FAST or XTAL_D2 independently (Table 8.2-5, Register 8.84). Their LP_FAST
+rate is the nominal 17.5 MHz RC oscillator instead of crystal-derived 20 MHz; supply a measured
+`source_hz` for baud/SCL accuracy. Explicit XTAL_D2 peripheral selections remain crystal-based and
+must be quiesced for XTAL-off sleep. LP_TIMER and RWDT count LP_SLOW, whose selection is unchanged
+(§12.4.3, §15.2.2.2); LP firmware delay loops tied to LP_FAST change rate. Light sleep keeps the LP
+peripheral domain; `lp_core` wake keeps RC_FAST in LP_SLEEP too. HP CPU/APB and radio PLL/XTAL,
+modem clock maps and Wi-Fi/BLE/802.15.4 clock gates are unchanged by this startup selection, which
+also matches IDF's radio environment. Wi-Fi's low-power clock remains RC_SLOW
+(`analog/esp32_c6.zig`, `radio_init`); Wi-Fi/BLE still require the PLL CPU source
+(TRM §8.2.4.4). Radio and LP behavior after the change is built only.
+
+The prior s5 deep image hung the XIAO (USB disappeared about 1.75 s after boot, no wake or RWDT
+reset). The source/TRM hypothesis is loss of LP_FAST when that image powered down XTAL while
+FAST_CLK_SEL retained its reset value, XTAL_D2 (Register 8.75). PMU HP-state XTAL/PLL waits use
+LP_DYN_FAST=LP_FAST (§12.4.2.3, §12.4.2.5), and watchdog reset lengths need RTC_DYN_FAST
+(Register 15.1). Switching LP_FAST to RC_FAST and refusing unsafe XTAL-off profiles made s5, s7 and s8 pass
+(above). That is consistent with the hypothesis but does not isolate it: the same change also
+powers down flash and unused LP domains in deep sleep, as IDF does.
 
 RNG reads enable the asynchronous RC_FAST path and are serialized below 1 MHz. On C6, an active
 SAR ADC or radio ADC is required for true randomness (TRM §26.3–26.4). The HAL does not enable an
