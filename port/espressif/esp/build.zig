@@ -9,6 +9,7 @@ chips: struct {
     esp32_c3_direct_boot: *const microzig.Target,
     esp32_c3_flashless: *const microzig.Target,
     esp32_c6: *const microzig.Target,
+    esp32_c6_lp: *const microzig.Target,
     esp32_c6_direct_boot: *const microzig.Target,
     esp32_c6_flashless: *const microzig.Target,
 },
@@ -255,6 +256,23 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                         },
                     ),
                 },
+            }),
+            // TRM v1.2 §§3.3, 3.7.1: LP reset PC is SRAM + 0x80.
+            .esp32_c6_lp = chip_esp32_c6.derive(.{
+                .preferred_binary_format = .binary,
+                .ram_image = true,
+                .cpu = .{
+                    .name = "esp_lp_riscv",
+                    .root_source_file = b.path("src/cpus/esp_lp_riscv.zig"),
+                },
+                .hal = .{ .root_source_file = b.path("src/hal_lp.zig") },
+                .chip = .{
+                    .name = "ESP32-C6",
+                    .register_definition = chip_esp32_c6.chip.register_definition,
+                    .patch_files = chip_esp32_c6.chip.patch_files,
+                    .memory_regions = &.{.{ .name = "LP_RAM", .tag = .ram, .offset = 0x5000_0000, .length = 16 * 1024, .access = .rwx }},
+                },
+                .linker_script = .{ .generate = .none, .file = b.path("ld/esp32_c6/lp_sections.ld") },
             }),
             .esp32_c6 = chip_esp32_c6.derive(.{}),
             .esp32_c6_direct_boot = chip_esp32_c6.derive(.{

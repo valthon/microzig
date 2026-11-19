@@ -4,6 +4,8 @@ const std = @import("std");
 pub const esp_image = @import("esp_image");
 const microzig = @import("microzig");
 
+pub const lp_core = if (compatibility.chip == .esp32_c6) @import("hal/lp_core.zig") else void;
+
 pub const cache = @import("hal/cache.zig");
 pub const adc = @import("hal/adc.zig");
 pub const clocks = @import("hal/clocks.zig");
@@ -190,6 +192,14 @@ pub const pcnt = @import("hal/pcnt.zig");
 pub const etm = @import("hal/etm.zig");
 
 pub const mcpwm = @import("hal/mcpwm.zig");
+
+pub const lp_io = if (compatibility.chip == .esp32_c6) @import("hal/lp_io.zig") else void;
+
+pub const lp_timer = if (compatibility.chip == .esp32_c6) @import("hal/lp_timer.zig") else void;
+
+pub const lp_uart = if (compatibility.chip == .esp32_c6) @import("hal/lp_uart.zig") else void;
+
+pub const lp_i2c = if (compatibility.chip == .esp32_c6) @import("hal/lp_i2c.zig") else void;
 
 pub const sha = @import("hal/sha.zig");
 

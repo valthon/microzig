@@ -45,10 +45,28 @@ pub fn build(b: *std.Build) void {
     const mz_dep = b.dependency("microzig", .{});
     const mb = MicroBuild.init(b, mz_dep) orelse return;
 
+    var lp_images: [std.enums.values(LpImage).len]*MicroBuild.Firmware = undefined;
+    for (std.enums.values(LpImage)) |image| {
+        const lp = mb.add_firmware(.{
+            .name = b.fmt("esp32_c6_lp_{s}", .{@tagName(image)}),
+            .target = mb.ports.esp.chips.esp32_c6_lp,
+            .optimize = optimize,
+            .root_source_file = b.path(b.fmt("src/lp_{s}.zig", .{@tagName(image)})),
+        });
+        lp_images[@backingInt(image)] = lp;
+        mb.install_firmware(lp, .{});
+        mb.install_firmware(lp, .{ .format = .elf });
+    }
+
     const examples: []const Example = &.{
         .{ .name = "compile_wifi", .file = "src/compile_wifi.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_ieee802154", .file = "src/selftest_ieee802154.zig", .chips = &.{.esp32_c6}, .antenna_option = true, .features = .{ .image_boot_only = true } },
         .{ .name = "softap", .file = "src/softap.zig", .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "selftest_lp_irq", .file = "src/selftest_lp_irq.zig", .chips = &.{.esp32_c6}, .lp_image = .irq },
+        .{ .name = "selftest_lp_i2c", .file = "src/selftest_lp_i2c.zig", .chips = &.{.esp32_c6}, .lp_image = .i2c },
+        .{ .name = "selftest_lp_uart", .file = "src/selftest_lp_uart.zig", .chips = &.{.esp32_c6}, .lp_image = .uart },
+        .{ .name = "selftest_lp_timer", .file = "src/selftest_lp_timer.zig", .chips = &.{.esp32_c6}, .lp_image = .timer },
+        .{ .name = "selftest_lp_core", .file = "src/selftest_lp_core.zig", .chips = &.{.esp32_c6}, .lp_image = .counter },
         .{ .name = "selftest_i2s", .file = "src/selftest_i2s.zig" },
         .{ .name = "selftest_parl_io", .file = "src/selftest_parl_io.zig", .chips = &.{.esp32_c6} },
         .{ .name = "selftest_dedicated_gpio", .file = "src/selftest_dedicated_gpio.zig" },
@@ -162,6 +180,10 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .root_source_file = b.path(example.file),
             });
+
+            if (example.lp_image) |image| {
+                fw.exe.root_module.addAnonymousImport("lp_image", .{ .root_source_file = lp_images[@backingInt(image)].get_emitted_bin(.binary) });
+            }
 
             if (example.sleep_stage) |stage| {
                 const options = b.addOptions();
@@ -333,6 +355,7 @@ const Example = struct {
     ble_options: bool = false,
     /// Receives `-Dantenna` as module `antenna_options`.
     antenna_option: bool = false,
+    lp_image: ?LpImage = null,
     /// Chips whose peripherals and board assumptions this example supports.
     chips: []const Chip = &.{ .esp32_c3, .esp32_c6 },
 };
@@ -366,3 +389,5 @@ fn parse_mac(text: []const u8) ?u48 {
     }
     return if (count == 6) value else null;
 }
+
+const LpImage = enum { counter, timer, uart, i2c, irq };

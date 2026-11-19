@@ -570,6 +570,85 @@ explicit CH0 at offset 0xD0. `patches/esp32_c6.zon`, wired through `chip.patch_f
 only the registers at 0x190 and 0x250 to CH1 and CH2 after loading. It leaves addresses, fields,
 and the vendored input unchanged; expected-name checks detect incompatible vendor updates.
 
+## ESP32-C6 LP core
+
+`chips.esp32_c6_lp` builds RV32IMAC raw binaries for the 16 KiB LP SRAM
+(TRM v1.2 §§3.3, 3.7.1). The reset entry is at 0x50000080; the vector
+table starts at 0x50000000. The linker reserves 1 KiB for stack and the
+top 256 bytes for a mailbox. Oversized images fail to link. LP startup
+initializes BSS on each reset; initialized data is loaded by HP once.
+An application interrupt callback receives the LP peripheral source mask
+and must acknowledge each source before returning. Interrupts default to
+disabled; exceptions and unhandled interrupts halt. HP clock/ROM init is
+not used. `esp32_c6_lp_counter.bin` is built with the examples. Evidence:
+**built only** for `lp_counter`; LP I2C board evidence is listed below.
+No power measurements.
+
+`hal.lp_core` loads a raw binary and starts/stops/wakes the LP CPU. Load at
+cold boot or after the asynchronous stop flow completes, with HP active;
+there is no live-image replacement or debugger-aware reset support. The
+caller owns all LP SRAM and must serialize configuration between cores.
+HP, timer and ETM wake masks are supported; ETM routing belongs to `hal.etm`.
+The first wake is HP-initiated. `Mailbox` reserves aligned single-writer words
+at 0x50003f00 with fences, never LP SRAM AMOs (§3.7.1). HP owns `command`;
+LP owns payload and `sequence`, which it publishes last. Treat payload as
+stable only while LP sleeps; this is not a multi-writer queue.
+`selftest_lp_core` embeds the generated LP image, checks the counter and a
+second HP wake. Evidence: **built only**.
+
+`hal.lp_io` configures LP GPIO0–7 (TRM §§7.7, 7.13, 7.16.4), reads pads,
+and uses write-one set/clear for outputs. Function 1 selects the fixed LP
+UART/I2C pins; this chip has no LP GPIO matrix. HP and LP may both call it
+with exclusive ownership. It does not release pad holds or configure sleep
+pad overrides. `selftest_lp_core` toggles GPIO0 on successive LP wakes,
+checks LP input and HP GPIO matrix input, then drives it from HP. No wiring;
+GPIO0 must be free. Evidence: **built only**.
+
+`hal.lp_timer` snapshots the 48-bit RTC timer and arms/acknowledges/disables
+target 1 (TRM §§12.4.3, 12.10.3). HP or LP may own it, never concurrently.
+Intervals are LP_SLOW_CLK ticks; no RC calibration, wall-time precision or
+deep-sleep power validation is claimed. Target 0 is preserved. Periodicity
+is implemented by rearming on every LP reset/wake. `selftest_lp_timer`
+embeds its own LP program, counts repeated timer wakes from HP and checks
+stop. Evidence: **built only**.
+
+`hal.lp_uart` provides bounded polling 8N1 byte I/O, error reporting,
+register synchronization and internal loopback (TRM §§27.4, 27.7.2).
+It uses LP_FAST or XTAL/2 with an explicit source frequency; calibrate RC
+for an accurate external baud and keep XTAL powered if selecting XTAL/2.
+External I/O uses fixed GPIO4 RX/GPIO5 TX (Table 7.13-1). No DMA, flow
+control or interrupt buffering. HP/LP must transfer controller ownership.
+`selftest_lp_uart` verifies 64 looped-back bytes and empty-RX timeout on
+both cores without touching pads. Evidence: **built only**.
+
+`hal.lp_i2c` provides polling 7-bit master address probes, writes of up to
+15 data bytes and reads of 1–16 bytes (TRM §§29.4–29.6, 29.11.1). GPIO6 is
+SDA, GPIO7 SCL; both must be free. Select LP_FAST or powered XTAL/2 with
+an explicit source frequency. Timing ranges are checked; the LP path does
+not use the HP PCR prescaler. NACK, arbitration, FIFO and timeout failures
+are returned; every poll is bounded and the FSM is reset after failure.
+A detected NACK remains `Nack` even if its STOP outlasts the poll budget.
+Completion with unsent TX bytes is rejected as `Fifo`, including stale
+completion after an aborted STOP.
+No slave mode, DMA, interrupt servicing, 10-bit addresses, repeated-START
+combined transfers or GPIO recovery of a physically stuck external bus.
+External devices need suitable pullups. `selftest_lp_i2c` uses weak internal
+pulls on an unwired bus, requires 112 NACKs on each core, exercises read/
+write NACKs and checks the next probe recovers. Evidence recorded 2026-11-18:
+`selftest_lp_i2c` passed 5/5 three times on each of the Super Mini
+ESP32-C6FH4 (rev v0.2) and XIAO ESP32-C6 (rev v0.1). This ran on an earlier
+version; preserving NACK on STOP timeout, rejecting unsent-TX completions,
+LP_FAST startup and logger changed since; the changes since are built only.
+The other LP examples above have build evidence only.
+
+The named ETM task `hal.etm.Task.lp_cpu_wake` is ID 154 (Table 11.3-2).
+`selftest_lp_core` also routes an unwired GPIO1 edge to that task and checks
+the LP wake flag and next count; GPIO0/1 must be free. `selftest_lp_irq`
+interrupts an already-running LP CPU from HP, checks source decoding at
+vector 30 and continuation after `mret`. Each self-test waits at least
+1.5 s before reporting, then repeats cases and summary every second.
+These additional paths are **built only**, not run on hardware.
+
 ## ESP32-C6 BLE controller and HCI
 
 `hal.radio.bluetooth.Controller.start(allocator)` ports the controller-only
