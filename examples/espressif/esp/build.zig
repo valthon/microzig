@@ -19,6 +19,21 @@ pub fn build(b: *std.Build) void {
     if (wifi_password.len == 0 and !std.mem.eql(u8, wifi_auth, "none"))
         std.process.fatal("-Dwifi_auth={s} needs -Dwifi_password", .{wifi_auth});
     const expected_mac_text = b.option([]const u8, "expected_mac", "selftest_c6_core: the board's efuse MAC (aa:bb:cc:dd:ee:ff); unset reports SKIP");
+    const softap_ssid = b.option([]const u8, "softap_ssid", "SoftAP SSID (1..32 bytes)") orelse "microzig-softap";
+    const softap_password = b.option([]const u8, "softap_password", "SoftAP WPA2 passphrase (8..63 printable ASCII bytes)") orelse "microzig-demo";
+    if (softap_ssid.len == 0 or softap_ssid.len > 32)
+        std.process.fatal("SoftAP SSID must be 1..32 bytes", .{});
+    if (softap_password.len < 8 or softap_password.len > 63)
+        std.process.fatal("SoftAP passphrase must be 8..63 printable ASCII bytes", .{});
+    for (softap_password) |ch| {
+        if (ch < 32 or ch > 126) std.process.fatal("SoftAP passphrase must be printable ASCII", .{});
+    }
+    const dhcp_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/softap_dhcp.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    b.step("test", "Test the example-local DHCP server").dependOn(&b.addRunArtifact(dhcp_tests).step);
     const expected_mac: ?u48 = if (expected_mac_text) |text| parse_mac(text) orelse
         std.process.fatal("-Dexpected_mac={s}: expected six hex bytes separated by ':'", .{text}) else null;
 
@@ -27,6 +42,7 @@ pub fn build(b: *std.Build) void {
 
     const examples: []const Example = &.{
         .{ .name = "compile_wifi", .file = "src/compile_wifi.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
+        .{ .name = "softap", .file = "src/softap.zig", .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
         .{ .name = "selftest_i2s", .file = "src/selftest_i2s.zig" },
         .{ .name = "selftest_parl_io", .file = "src/selftest_parl_io.zig", .chips = &.{.esp32_c6} },
         .{ .name = "selftest_dedicated_gpio", .file = "src/selftest_dedicated_gpio.zig" },
@@ -143,6 +159,13 @@ pub fn build(b: *std.Build) void {
                 options.addOption([]const u8, "password", wifi_password);
                 options.addOption([]const u8, "auth", wifi_auth);
                 fw.exe.root_module.addOptions("wifi_options", options);
+            }
+
+            if (std.mem.eql(u8, example.name, "softap")) {
+                const options = b.addOptions();
+                options.addOption([]const u8, "ssid", softap_ssid);
+                options.addOption([]const u8, "password", softap_password);
+                fw.exe.root_module.addOptions("softap_options", options);
             }
 
             if (example.features.lwip) {

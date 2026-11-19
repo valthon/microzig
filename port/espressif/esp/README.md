@@ -203,6 +203,52 @@ lease and the AP's first TCP connection after each boot echoed 10/10 lines in 8 
 This ran on an earlier version; Wi-Fi protocol/inactivity argument types and the
 optional TX-done callback changed since; the changes since are built only.
 
+#### SoftAP (C3 and C6)
+
+`softap` is a standalone WPA2-PSK/CCMP AP on channel 6, limited to four associated
+stations. It uses only WPA2 Personal; open, WEP, WPA/WPA2 mixed, WPA3 and enterprise
+modes are not offered by this example. STA and `tcp_server` are unchanged.
+Build from `examples/espressif/esp` with the pinned Zig:
+
+```sh
+zig build -Dexample=softap -Doptimize=ReleaseSmall \
+  -Dsoftap_ssid=microzig-softap -Dsoftap_password=microzig-demo
+zig build test # host-side DHCP packet tests
+```
+
+SSID and passphrase default to `microzig-softap` and `microzig-demo`. SSIDs must be
+1–32 bytes; passphrases must be 8–63 printable ASCII bytes. The passphrase is embedded
+in firmware and is not logged. Outputs are `esp32_c3_softap` and `esp32_c6_softap`
+(image boot only, `.bin` and `.elf`, under `zig-out/firmware`); flash with the same
+image-boot setup as `tcp_server`.
+
+The AP is `192.168.4.1/24`. The vendored lwIP build has a DHCP **client**, not a
+server, so `src/softap_dhcp.zig` supplies an example-local minimal DHCPv4 server
+using lwIP raw UDP on the AP netif. Its four MAC-keyed leases cover
+`192.168.4.2`–`192.168.4.5`, last one hour, and advertise the AP as gateway.
+Offers reserve a slot for 30 seconds; renew/rebind, INIT-REBOOT, release and decline
+are supported (declined addresses are quarantined for one hour). Disconnecting does
+not revoke a lease; four different clients can exhaust the pool until release or
+expiry. Leases are volatile across reboot. Ethernet clients only: no relays, option
+overload, DHCPINFORM, DNS service, routing/NAT or Internet access.
+
+A station should join, acquire a lease, ping `192.168.4.1`, and connect to
+`192.168.4.1:7` for TCP echo. Echo serves one connection at a time; an idle client
+holds that slot until disconnect. `SOFTAP up ssid=... ip=192.168.4.1` announces
+readiness, join/leave lines include MAC and AID, DHCP ACK lines include MAC and leased
+IP, and each closed TCP connection reports bytes echoed. A reporter first runs after
+1.5 seconds and repeats status every three seconds so late USB reattachment can see it.
+Join/leave, lease and connection events themselves are not replayed.
+
+Evidence: DHCP packet logic is host unit-tested. `softap` ran on hardware
+(image boot, 2026-11-19) with an ESP32-S3 station using ESP-IDF v6.0.2 `esp_wifi` and the lwIP DHCP
+client: on a XIAO ESP32-C6 (rev v0.1), a C6 Super Mini (rev v0.2) and an ESP32-C3 (rev v0.4) as AP, the S3 associated
+(WPA2-PSK, channel 6), leased 192.168.4.2, and got 5/5 then 10/10 ping replies from
+`192.168.4.1`. TCP echo was not run: the S3 peer image has no TCP client. The XIAO run
+used the generic C6 image, not a XIAO board build. This ran on an earlier
+version; radio lifecycle/ABI handling, logger and LP_FAST startup changed since;
+the changes since are built only / unit-tested.
+
 #### Wi-Fi initialization and limits
 
 Only `.none` power save is supported on C6; modem/light sleep retention is not implemented.
