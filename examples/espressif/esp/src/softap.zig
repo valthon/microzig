@@ -1,3 +1,8 @@
+//! W4 peer: flash selftest_wifi_softap_echo on a C3 station for a C6 AP,
+//! or on a C6 station for a C3 AP. Use identical -Dsoftap_ssid and
+//! -Dsoftap_password options on both builds.
+//! Start this AP first. TCP echo is at 192.168.4.1:7, no PC on the AP needed.
+//! Station expects SELFTEST wifi_softap_echo DONE pass=13 fail=0.
 const std = @import("std");
 
 const microzig = @import("microzig");

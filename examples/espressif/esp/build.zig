@@ -8,8 +8,8 @@ const MicroBuild = microzig.MicroBuild(.{
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const maybe_example = b.option([]const u8, "example", "only build matching examples");
-    const wifi_ssid = b.option([]const u8, "wifi_ssid", "Wi-Fi station SSID for tcp_server and selftest_wifi_lifecycle") orelse "SSID";
-    const wifi_password = b.option([]const u8, "wifi_password", "Wi-Fi station passphrase for tcp_server and selftest_wifi_lifecycle") orelse "";
+    const wifi_ssid = b.option([]const u8, "wifi_ssid", "Wi-Fi station SSID for tcp_server and Wi-Fi self-tests") orelse "SSID";
+    const wifi_password = b.option([]const u8, "wifi_password", "Wi-Fi station passphrase for tcp_server and Wi-Fi self-tests") orelse "";
     // Names of hal.radio.wifi.AuthMethod; the station joins no AP weaker than this.
     const wifi_auth = b.option([]const u8, "wifi_auth", "Weakest AP auth the station accepts, a hal.radio.wifi.AuthMethod name (default: wpa2_personal with a passphrase, none without)") orelse
         if (wifi_password.len != 0) "wpa2_personal" else "none";
@@ -61,7 +61,10 @@ pub fn build(b: *std.Build) void {
     const examples: []const Example = &.{
         .{ .name = "compile_wifi", .file = "src/compile_wifi.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_ieee802154", .file = "src/selftest_ieee802154.zig", .chips = &.{.esp32_c6}, .antenna_option = true, .features = .{ .image_boot_only = true } },
-        .{ .name = "softap", .file = "src/softap.zig", .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "selftest_wifi_softap_echo", .file = "src/selftest_wifi_softap_echo.zig", .wifi_options = true, .softap_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "selftest_wifi_open_ap", .file = "src/selftest_wifi_open_ap.zig", .wifi_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "selftest_wifi_tx_done", .file = "src/selftest_wifi_tx_done.zig", .wifi_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "softap", .file = "src/softap.zig", .softap_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
         .{ .name = "selftest_lp_irq", .file = "src/selftest_lp_irq.zig", .chips = &.{.esp32_c6}, .lp_image = .irq },
         .{ .name = "selftest_lp_i2c", .file = "src/selftest_lp_i2c.zig", .chips = &.{.esp32_c6}, .lp_image = .i2c },
         .{ .name = "selftest_lp_uart", .file = "src/selftest_lp_uart.zig", .chips = &.{.esp32_c6}, .lp_image = .uart },
@@ -241,7 +244,7 @@ pub fn build(b: *std.Build) void {
                 fw.exe.root_module.addOptions("wifi_options", options);
             }
 
-            if (std.mem.eql(u8, example.name, "softap")) {
+            if (example.softap_options) {
                 const options = b.addOptions();
                 options.addOption([]const u8, "ssid", softap_ssid);
                 options.addOption([]const u8, "password", softap_password);
@@ -385,6 +388,8 @@ const Example = struct {
     mac_option: bool = false,
     /// Receives station credentials as module `wifi_options`.
     wifi_options: bool = false,
+    /// Receives the SoftAP SSID and passphrase as module `softap_options`.
+    softap_options: bool = false,
     /// Receives BLE options as `ble_options` and `-Dantenna` as `antenna_options`.
     ble_options: bool = false,
     /// Receives `-Dantenna` as module `antenna_options`.

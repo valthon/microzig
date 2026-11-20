@@ -1,5 +1,6 @@
 //! N2/N4 regression exercise, followed by the ordinary DHCP/TCP echo server.
-//! Edit the NOTE credentials in tcp_server.zig; no external wiring is required.
+//! Use -Dwifi_ssid/-Dwifi_password/-Dwifi_auth; no external wiring is required.
+//! Peer: matching station AP with DHCP; expected wifi_lifecycle DONE pass=8 fail=0.
 const microzig = @import("microzig");
 const server = @import("tcp_server.zig");
 
