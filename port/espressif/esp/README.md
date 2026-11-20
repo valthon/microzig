@@ -276,7 +276,9 @@ promiscuous phase can overrun by up to 0.5 s.
 
 ### Wi-Fi station and RTOS
 
-The optional TX-done callback is built only (host cross-compilation in `compile_wifi` for C3/C6); it has not been run on hardware.
+The optional TX-done callback ran on hardware through `selftest_wifi_tx_done` (W2 below):
+10 of 10 callbacks, `DONE pass=3 fail=0` in 3 of 3 boots each on the C3 and the Super Mini,
+this series (2026-11-20). It is also cross-compiled in `compile_wifi` for C3/C6.
 
 C6 `tcp_server` is built for the image-boot target. Set station credentials at build time
 with `-Dwifi_ssid='bench-ap' -Dwifi_password='example-passphrase'`; these options also apply to
@@ -291,8 +293,9 @@ Defaults remain SSID `SSID` and an empty password. `-Dwifi_auth` sets the weakes
 authentication the station accepts, as a `hal.radio.wifi.AuthMethod` name; it defaults to
 `wpa2_personal` when a passphrase is given and `none` without one, so a station with a
 passphrase is configured to reject an open AP of the same name. This authentication
-policy is **built only**: the evidence logs show build rejections for an invalid auth
-name and a missing passphrase, with no open-AP rejection run. A non-`none` value without a
+policy has build-rejection logs for an invalid auth name and a missing passphrase, and
+its runtime check ran on hardware: `selftest_wifi_open_ap` (W3 below) passed 3/3 in 3 of 3
+boots each on the C3, Super Mini and XIAO, this series. A non-`none` value without a
 passphrase is a build error. Credentials are embedded in the firmware; the examples do not
 log them. The scan logs neighbouring APs' SSIDs, which they broadcast. `-D` values are
 also kept in the shell's history and in the build cache (`.zig-cache`), so use a test
@@ -313,8 +316,8 @@ repeated every second from the main task, since USB output before the host
 reopens the port is lost); DHCP is the seventh case and TCP bind/listen on
 port 3333 is the eighth. State and DHCP waits time out after 30 seconds. The AP is
 open with SSID `microzig-lifecycle`; the example has no AP network interface or DHCP server.
-This self-test is built for C3 and C6 image boot (also C3 direct boot); the C6 rev v0.2 run is
-still to do.
+This self-test is built for C3 and C6 image boot (also C3 direct boot); the C6 rev v0.2
+(Super Mini) run is listed under "Runs of pre-W2-fix code" below.
 
 C3 rev v0.4, image boot, as a station on a Pico 2 W MicroPython AP (WPA2, channel 6,
 CYW43 DHCP server), 2026-11-19:
@@ -329,9 +332,77 @@ passed 4 of 5 boots.
 
 XIAO ESP32-C6 (rev v0.1), `esp32_c6` image boot, 2026-11-19, same AP: `tcp_server` got a
 lease and the AP's first TCP connection after each boot echoed 10/10 lines in 8 of 8 boots;
-`selftest_wifi_lifecycle` `DONE pass=8 fail=0` in 3 of 3 boots. C6 rev v0.2 was not run.
+`selftest_wifi_lifecycle` `DONE pass=8 fail=0` in 3 of 3 boots. C6 rev v0.2 was not run that day.
 This ran on an earlier version; Wi-Fi protocol/inactivity argument types and the
-optional TX-done callback changed since; the changes since are built only.
+optional TX-done callback changed since; the runs below cover them.
+
+Runs of pre-W2-fix code, image boot, as a station on the same Pico 2 W AP (WPA2, channel 6),
+2026-11-19/20:
+- `tcp_server` on the C3: 6 of 6 boots got a lease and echoed 10/10 lines when the
+  Pico listed no station (`stations=0`) before each boot. Booted back to back it passed 7
+  of 10 and 3 of 6: a watchdog reset sends no deauthentication, the Pico keeps the old
+  association, and the next boot leases and listens but its TCP connection times out until
+  the Pico drops the old association (waiting for `stations=0` took 2 to 58 s in these
+  runs). A control build of an earlier, unmerged development branch (driver code
+  older than 24ebc5d1) behaved the same (4 of 4 with `stations=0` first, 4 of 8 back to
+  back).
+- `tcp_server` on the Super Mini: 10/10 echo lines in 3 of 3 boots.
+- `selftest_wifi_lifecycle`: `DONE pass=8 fail=0` in 3 of 3 boots each on the C3 and the
+  Super Mini.
+- XIAO, an open failure: `tcp_server` never listened (0 of 3 boots) and `selftest_wifi_lifecycle`
+  failed `connect: Timeout` (`pass=1 fail=7`, 0 of 3). The same control build also never
+  listened on the XIAO (1 run), and the XIAO joined the C3 SoftAP in all W4 runs.
+  Hypothesis, untested: link budget; the XIAO scanned the Pico at -66 dBm, the Super
+  Mini at -45 dBm.
+
+#### Wi-Fi checks W2–W4 (C3 and C6)
+
+These image-boot self-tests print `SELFTEST <suite> <case>: PASS|FAIL` and repeat
+`SELFTEST <suite> DONE pass=N fail=M` every three seconds after completion.
+Hardware runs, 2026-11-19/20 (the AP for W2 and W3 is the Pico 2 W above):
+
+- W2 `wifi_tx_done`: `pass=3 fail=0` with `sent=10 callbacks=10` in 3 of 3 boots each on
+  the C3 and the Super Mini, this series, each boot started once the Pico listed
+  `stations=0`. With pre-W2-fix code the test failed `callbacks: TxDoneTimeout` in 3 of 3
+  boots on both: the callback returns the 802.11 frame, which the old 60-byte Ethernet
+  match never found. Not run on the XIAO with the fix; with pre-W2-fix code it failed
+  `join: Timeout` there (the XIAO-to-Pico link above).
+- W3 `wifi_open_ap` against an open Pico AP: `pass=3 fail=0` in 3 of 3 boots each on the
+  C3, Super Mini and XIAO, this series.
+- W4 `wifi_softap_echo`: `pass=13 fail=0`, with the station's lease and `echoed=2570` in the
+  AP's log, in 3 of 3 boots for each of C3 AP with Super Mini station, C3 AP with XIAO station, Super Mini AP with C3 station and XIAO AP with C3
+  station, this series, with the board not taking part stopped before each boot. The same
+  12 boots also passed with pre-W2-fix code; two earlier Super Mini AP boots there, served
+  by another SoftAP of the same SSID still running, are not counted.
+
+| Image / suite | Expected result | Peer setup and checks |
+| --- | --- | --- |
+| `selftest_wifi_tx_done` / `wifi_tx_done` | `pass=3 fail=0` | AP matching `-Dwifi_ssid`, `-Dwifi_password`, `-Dwifi_auth`; start, join, TX-done. No DHCP or PC needed. Sends ten 60-byte broadcast Ethernet frames with experimental EtherType 0x88b5 and unique sequence tags. Requires a successful callback for every queued frame, found by its tag inside the 802.11 frame the callback returns (not the Ethernet frame sent); prints sent, distinct callback and failed-status counts. Duplicate callbacks cannot cover a missing frame. |
+| `selftest_wifi_open_ap` / `wifi_open_ap` | `pass=3 fail=0` | Open AP matching `-Dwifi_ssid`, with no protected AP of that SSID in range. Build the station with `-Dwifi_auth=wpa2_personal` and a dummy test `-Dwifi_password` of at least eight bytes. Checks start, scan presence, rejection. Requires an incompatible-security/auth-threshold disconnect (IDF reasons 210/211), no association throughout 30 seconds, and 210/211 still the last reason at the end. Missing AP, other disconnect reasons, or unprotected station configuration fail. |
+| `selftest_wifi_softap_echo` / `wifi_softap_echo` | `pass=13 fail=0` | Run `softap` on the other chip first; matching `-Dsoftap_ssid` and `-Dsoftap_password` on both builds (demo defaults work). Checks start, join, DHCP, then ten 257-byte binary payload echoes at `192.168.4.1:7`. Handles partial writes and split/chained receives; checks lengths and every byte. No PC joined to the AP needed. |
+
+Build from `examples/espressif/esp` using the pinned Zig. These commands use only
+demonstration credentials:
+
+```sh
+zig build -Doptimize=ReleaseSmall -Dexample=selftest_wifi_tx_done \
+  -Dwifi_ssid=bench-ap -Dwifi_password=example-passphrase
+zig build -Doptimize=ReleaseSmall -Dexample=selftest_wifi_open_ap \
+  -Dwifi_ssid=bench-open -Dwifi_password=example-passphrase -Dwifi_auth=wpa2_personal
+zig build -Doptimize=ReleaseSmall -Dexample=softap
+zig build -Doptimize=ReleaseSmall -Dexample=selftest_wifi_softap_echo
+```
+
+Outputs are `esp32_c3_<image>` and `esp32_c6_<image>` under
+`zig-out/firmware`, as `.bin` and `.elf`. For W4, flash the C6 `softap` image
+and C3 `selftest_wifi_softap_echo` image, then swap roles and repeat with C3
+as AP and C6 as station. Only one echo client should connect at a time.
+Start the AP before resetting the station. The TCP connect is covered by the first
+echo case. Station state, DHCP, each TX callback, TCP connect and each complete
+write/echo exchange have 30-second deadlines. TCP uses nonblocking lwIP calls;
+there are no retries that turn a failed test into a pass. Reset to run again.
+Credentials use the existing build options and are embedded but never logged by
+these self-tests. The open-AP test's dummy station password is never an AP credential.
 
 #### SoftAP (C3 and C6)
 
@@ -376,8 +447,12 @@ client: on a XIAO ESP32-C6 (rev v0.1), a C6 Super Mini (rev v0.2) and an ESP32-C
 (WPA2-PSK, channel 6), leased 192.168.4.2, and got 5/5 then 10/10 ping replies from
 `192.168.4.1`. TCP echo was not run: the S3 peer image has no TCP client. The XIAO run
 used the generic C6 image, not a XIAO board build. This ran on an earlier
-version; radio lifecycle/ABI handling, logger and LP_FAST startup changed since;
-the changes since are built only / unit-tested.
+version; radio lifecycle/ABI handling, logger and LP_FAST startup changed since.
+With pre-W2-fix code (2026-11-19/20) the same S3 test passed in 3 of 3 boots each with the C3,
+the Super Mini and the XIAO (generic image) as AP: lease 192.168.4.2, 5/5 gateway pings
+and 10/10 pings. The XIAO count is from three boots with the idle boards stopped; two
+earlier XIAO boots were served by another SoftAP of the same SSID and are not counted.
+TCP echo on port 7 ran through W4 above (ESP stations, 12 of 12 boots, this series).
 
 #### Wi-Fi initialization and limits
 
@@ -400,22 +475,27 @@ does not require re-enabling analog helpers. Concurrent PHY/SAR register access 
 C6 radio initialization measures its RC_SLOW source against XTAL using TIMG0 calibration
 (C6 TRM v1.2 §14.3.6, registers 14.18–14.20), writes the resulting Q19 period to STORE1 and
 keeps its own copy for Wi-Fi. It never trusts a retained value from another application;
-calibration timeout returns `SlowClockCalibrationTimeout`. These lifecycle changes are built only.
+calibration timeout returns `SlowClockCalibrationTimeout`. These lifecycle changes ran in the
+Wi-Fi runs above (e.g. `selftest_wifi_lifecycle` 3 of 3 on the Super Mini); no
+check reads the calibrated period itself.
 C6 startup follows ESP-IDF v6.0.2 `bootloader_init_mem`: it disables the HP_APM,
 LP_APM0 and LP_APM access-path filters and puts all implemented HP masters and the
 LP CPU in TEE mode (C6 TRM v1.2 §§16.3.1, 16.3.2.3, 16.4). This covers Wi-Fi M4
 and SPI/GDMA M16; drivers no longer change their modes. Region permissions stay
 unchanged. Modem ICG maps follow IDF v6.0.2 `initial_gating_mode`, with BT and
-IEEE802154 enabled in ACTIVE only. These startup changes are built only. The Wi-Fi blobs take `vsnprintf` from
+IEEE802154 enabled in ACTIVE only. These startup changes ran in every C6 run of 24ebc5d1
+driver code in this README; no check reads the APM or ICG state. The Wi-Fi blobs take `vsnprintf` from
 libprintf.a: the ROM's printf and stdio functions need a newlib syscall table that MicroZig does
 not install. C6 links the unmodified IDF v6.0.2 `rom.libc` and
 `rom.libc-suboptimal_for_misaligned_mem` scripts, excluding `rom.newlib` and
 `rom.newlib-normal`. C3 maps only memory/string primitives and `abs` from libc,
 with no reent-dependent libc bindings. The OS adapter uses an ASCII
-comparison for `strcasecmp`. This linker split is built only.
+comparison for `strcasecmp`. This linker split is in every Wi-Fi image of the
+runs above; no check targets it.
 The C6 radio ROM bindings follow ESP-IDF v6.0.2, including its disabled node-search
 bindings so the matching blob supplies them. Both chips use the IDF 64-bit seconds
-layout for the supplicant clock. These type/layout checks are built only.
+layout for the supplicant clock. The C3 and C6 Wi-Fi images with these bindings and this
+layout ran in the Wi-Fi runs above; no check targets them.
 Do not use the SAR analog helpers concurrently with the radio PHY.
 
 ### C3 light sleep and USB-Serial-JTAG
