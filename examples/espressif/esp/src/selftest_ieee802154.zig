@@ -35,6 +35,9 @@ comptime {
 // NOTE: Bench configuration. H2 IDF ieee802154_cli: channel 25, PAN 0x1234,
 // short address 0x0001. Configure the nRF52840 Zephyr raw shell to match the
 // channel/PAN; use a distinct local address. Extended address is in wire order.
+// Run one C6 at a time: a second board still running this image has the same short
+// address and auto-ACKs the peer's frames too, at the same turnaround time. With a
+// second C6 listening, the H2 got a valid ACK for 0 to 3 of 40 frames instead of 40.
 const CHANNEL = 25;
 const PAN_ID: u16 = 0x1234;
 const LOCAL_SHORT: u16 = 0x0002;

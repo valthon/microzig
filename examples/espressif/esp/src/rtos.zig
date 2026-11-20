@@ -1,3 +1,5 @@
+//! C3/C6 queue demo: expected SELFTEST rtos DONE pass=6 fail=0.
+//! Five ordered deliveries, then an empty-queue timeout; about four seconds.
 const std = @import("std");
 
 const microzig = @import("microzig");
@@ -35,7 +37,10 @@ pub const microzig_options: microzig.Options = .{
 
 fn task1(queue: *rtos.Queue(u32)) void {
     for (0..5) |i| {
-        queue.put_one(i, .never) catch unreachable;
+        queue.put_one(@intCast(i), .{ .after = .from_ms(1000) }) catch |err| {
+            std.log.err("producer: {s}", .{@errorName(err)});
+            return;
+        };
         rtos.sleep(.from_ms(500));
     }
 }
@@ -50,10 +55,38 @@ pub fn main() !void {
     esp.time.sleep_ms(1000);
 
     const task = try rtos.spawn(gpa, task1, .{&queue}, .{});
-    defer rtos.wait_and_free(gpa, task);
 
-    while (true) {
-        const item = try queue.get_one(.{ .after = .from_ms(1000) });
+    var delivered: [5]bool = @splat(false);
+    for (&delivered, 0..) |*passed, expected| {
+        const item = queue.get_one(.{ .after = .from_ms(1000) }) catch |err| {
+            std.log.err("consumer: {s}", .{@errorName(err)});
+            continue;
+        };
         std.log.info("got item: {}", .{item});
+        passed.* = item == expected;
+    }
+    // Joining first guarantees no producer can enqueue after the timeout check.
+    rtos.wait_and_free(gpa, task);
+    var timed_out = false;
+    if (queue.get_one(.{ .after = .from_ms(1000) })) |extra| {
+        std.log.err("unexpected extra item: {}", .{extra});
+    } else |err| {
+        timed_out = err == error.Timeout;
+        std.log.info("consumer: {s}", .{@errorName(err)});
+    }
+
+    // Repeat the saved result so a host attaching late can still score the run.
+    while (true) {
+        var pass: usize = 0;
+        for (delivered, 0..) |passed, i| {
+            if (passed) pass += 1;
+            std.log.info("SELFTEST rtos item{d}: {s} expected={d}", .{
+                i, if (passed) "PASS" else "FAIL", i,
+            });
+        }
+        if (timed_out) pass += 1;
+        std.log.info("SELFTEST rtos timeout: {s}", .{if (timed_out) "PASS" else "FAIL"});
+        std.log.info("SELFTEST rtos DONE pass={d} fail={d}", .{ pass, 6 - pass });
+        rtos.sleep(.from_ms(1000));
     }
 }

@@ -19,34 +19,41 @@ priority and threshold; INTPRI is used only for the four CPU software interrupts
 ## Drivers
 
 Hardware results are from RAM images on an ESP32-C3 rev v0.4 and a Super Mini ESP32-C6FH4 rev
-v0.2, as `passed/checks` of the named self-test in `examples/espressif/esp`.
+v0.2, as `passed/checks` of the named self-test in `examples/espressif/esp`, with `fail=0` in
+every run counted; "XIAO" is a XIAO ESP32-C6 rev v0.1. Each result names the code it ran:
+"24ebc5d1" ran at origin/main 24ebc5d1 (2026-11-19); "pre-W2-fix code" is 24ebc5d1 driver code
+with this series' example code before the W2 fix (2026-11-19/20); "this series" ran this
+series' code (images built 2026-11-20). This series changes driver code only in doc comments
+in `hal/radio/wifi.zig`.
 
 | Driver (`hal.*`)                              | C3  | C6  | Self-test                                          | C3 result | C6 result |
 | --------------------------------------------- | --- | --- | -------------------------------------------------- | --------- | --------- |
 | `uart` (UART0/1)                              | yes | yes | `selftest_uart`                                    | 5/5       | 5/5       |
 | `twai` (CAN)                                  | yes | yes | `selftest_twai`                                    | 10/10     | 20/20     |
 | `rmt` (polling TX/RX)                         | yes | yes | `selftest_rmt`                                     | 3/3       | 3/3       |
-| `timer`, `wdt` (timer groups, watchdogs)      | yes | yes | `selftest_timers`                                  | built only (prior 6/6) | built only (prior 6/6) |
-| `usb_serial_jtag` (logging, RX, confirmed TX) | yes | yes | `selftest_usj`                                     | built only (prior 9/9) | built only (prior 9/9) |
+| `timer`, `wdt` (timer groups, watchdogs)      | yes | yes | `selftest_timers`                                  | 6/6, 3 runs (24ebc5d1) | 6/6, 3 runs each on Super Mini and XIAO (24ebc5d1) |
+| `usb_serial_jtag` (logging, RX, confirmed TX) | yes | yes | `selftest_usj`                                     | 9/9 echoes, 3 runs (24ebc5d1) | 9/9 echoes, 3 runs each on Super Mini and XIAO (24ebc5d1) |
 | `gpio` pin interrupts                         | yes | yes | `selftest_gpio_irq`                                | 8/8       | 9/9       |
 | `flash` (erase, write, read)                  | yes | yes | `selftest_flash`                                   | 5/5       | 5/5       |
 | `adc` (ADC1), `temperature`                   | yes | yes | `selftest_adc`                                     | 10/10     | 10/10     |
 | `ledc` PWM and fades (C6: single-range gamma) | yes | yes | `selftest_ledc_fade` (C3), `selftest_c6_ledc` (C6) | 4/4       | 7/7       |
 | `i2c` master                                  | yes | yes | none                                               | see below | built     |
-| `i2s` (Philips stereo 16/32-bit; master TX/RX, shared duplex clocks; integer PLL160M dividers; aligned frames ≤4092 bytes, 4088 for 32-bit; owns I2S0 and DMA pair) | yes | yes | `selftest_i2s`, pads 4/5/6, no wiring; EOF probe: RX_EOF_NUM counts bytes (TRM 30.10 says bits) | built only (prior 7/7) | built only (prior 7/7) |
-| `parl_io` (1/2/4/8-bit; XTAL master TX, external-clock RX, optional valid; aligned 4..65532-byte frames; owns peripheral and DMA pair) | no | yes | `selftest_parl_io`, valid/software-enable loops, ordered byte comparisons, pads 0–7/10/11, no wiring | n/a | built only (prior 16/16) |
+| `i2s` (Philips stereo 16/32-bit; master TX/RX, shared duplex clocks; integer PLL160M dividers; aligned frames ≤4092 bytes, 4088 for 32-bit; owns I2S0 and DMA pair) | yes | yes | `selftest_i2s`, pads 4/5/6, no wiring; EOF probe: RX_EOF_NUM counts bytes (TRM 30.10 says bits) | 7/7, 3 runs (24ebc5d1) | 7/7, 3 runs each on Super Mini and XIAO (24ebc5d1) |
+| `parl_io` (1/2/4/8-bit; XTAL master TX, external-clock RX, optional valid; aligned 4..65532-byte frames; owns peripheral and DMA pair) | no | yes | `selftest_parl_io`, valid/software-enable loops, ordered byte comparisons, pads 0–7/10/11, no wiring | n/a | 16/16, 3 runs each on Super Mini and XIAO (24ebc5d1) |
 | `dedicated_gpio` (8 CPU signals; exclusive pad/signal ownership, CSR set/clear/read) | yes | yes | `selftest_dedicated_gpio`, pad 4, no wiring | 9/9 | 8/8 |
-| `gdma` channel pairs 0–2, SRAM memory copy | yes | yes | `selftest_gdma`; exclusive channels, disjoint SRAM/descriptors, bounded wait | built only (prior 15/15) | built only (prior 16/16) |
+| `gdma` channel pairs 0–2, SRAM memory copy | yes | yes | `selftest_gdma`; exclusive channels, disjoint SRAM/descriptors, bounded wait | 15/15, 3 runs (24ebc5d1) | 16/16, 3 runs each on Super Mini and XIAO (24ebc5d1) |
 | `spi` master (SPI2), GDMA channel 0 transfers | yes | yes | `selftest_spi_dma`                                 | 8/8       | 8/8       |
 | `clocks.sleep` light sleep                    | yes | yes | `selftest_sleep_s*` (C3), `selftest_sleep_c6_s*` (C6) | see below | s1–s4, s6–s8 on XIAO (3 runs each); see "C6 light sleep and deep sleep" |
 | `clocks.sleep` deep sleep                     | no  | yes | `selftest_sleep_c6_s5` (image boot) | n/a | 3/3 on XIAO; see "C6 light sleep and deep sleep" |
-| `sigma_delta` (4 channels, signed density, divider 1–256) | yes | yes | `selftest_sigma_delta` | built only | built only |
-| `pcnt` (4 units, channel 0, signed 16-bit, polling watchpoints, 10-bit filter) | no | yes | `selftest_pcnt` | n/a | built only |
-| `etm` (50 routes; 8 GPIO event/task groups, no interrupt allocation) | no | yes | `selftest_etm` | n/a | built only |
-| `mcpwm` (timer/operator 0, A/B complementary, count-up, symmetric dead time; owns group) | no | yes | `selftest_mcpwm` | n/a | built only |
+| `sigma_delta` (4 channels, signed density, divider 1–256) | yes | yes | `selftest_sigma_delta` | 3/3, 3 runs (24ebc5d1) | 3/3, 3 runs each on Super Mini and XIAO (24ebc5d1) |
+| `pcnt` (4 units, channel 0, signed 16-bit, polling watchpoints, 10-bit filter) | no | yes | `selftest_pcnt` | n/a | 9/9, 3 runs each on Super Mini and XIAO (24ebc5d1) |
+| `etm` (50 routes; 8 GPIO event/task groups, no interrupt allocation) | no | yes | `selftest_etm` | n/a | 5/5, 3 runs each on Super Mini and XIAO (24ebc5d1) |
+| `mcpwm` (timer/operator 0, A/B complementary, count-up, symmetric dead time; owns group) | no | yes | `selftest_mcpwm` | n/a | 6/6, 3 runs each on Super Mini and XIAO (24ebc5d1) |
 | `radio` (Wi-Fi station)                       | yes | yes | `tcp_server` (image boot)                          | TCP echo  | TCP echo  |
 | `radio.ieee802154` (raw MAC, polling)          | no  | yes | `selftest_ieee802154` (image boot, no wiring)        | n/a       | 3/3, H2 and nRF52840 peers |
-| `rtos`                                        | yes | yes | `rtos`                                             | built     | 5/5 items |
+| `rtos`                                        | yes | yes | `rtos`: expected `DONE pass=6 fail=0`, five ordered items + empty-queue timeout | 6/6, 3 runs (pre-W2-fix code) | 6/6, 3 runs each on Super Mini and XIAO (pre-W2-fix code) |
+| `systimer`                                    | yes | yes | `systimer`: expected `DONE pass=4 fail=0`, four IRQs + three 1 s intervals, TIMG0 reference, +/-100 us | 4/4, 3 runs (this series) | 4/4, 3 runs each on Super Mini and XIAO (this series) |
+| custom CPU/APB clocks                         | yes | yes | `custom_clock_config`: expected `DONE pass=3 fail=0`, CPU/APB register readback at 20 MHz + 100 ms ROM busy delay vs systimer, +/-100 us | 3/3, 3 runs (this series) | 3/3, 3 runs each on Super Mini and XIAO (this series) |
 
 C3-only modules produce an explicit compile error on the C6. The C3 I2C master ran on hardware
 through the `i2c_display_ssd1306_c3_oled_042` example. The C6 LEDC blocking fade helper takes a
@@ -57,12 +64,14 @@ for pair 1, or 8 (ADC) for pair 2 during the call. Concurrent drivers/channels
 must not use the selected peripheral's GDMA selector. C6 uses Dummy selectors
 1/4/5. Prior C3 tests observed descriptor errors with reserved selectors;
 that is a hardware observation, not a specified guarantee (C3 Table 2.4-1).
-The reservation documentation is **built only**; prior counts predate it.
+With this reservation, `selftest_gdma` passed 15/15 on the C3 and 16/16 on the
+Super Mini and XIAO, 3 runs each, at 24ebc5d1 (RAM images, 2026-11-19).
 
 I2S diagnostic `rx_eof_num` is a byte count, matching ESP-IDF and the prior
 hardware EOF probe. Its bounds require that many RX bytes and duplex TX
-bytes, without the obsolete sample-count alternative. The bounds change is
-**built only**; prior 7/7 counts predate it.
+bytes, without the obsolete sample-count alternative. With the bounds change,
+`selftest_i2s` passed 7/7 on the C3, Super Mini and XIAO, 3 runs each, at
+24ebc5d1 (RAM images, 2026-11-19).
 
 The USB Serial/JTAG logger waits for the host with the caller's interrupt
 state: it masks interrupts only to claim the writer and update its counters,
@@ -83,8 +92,9 @@ The same limitation applies throughout `Disconnect.begin`/`finish`.
 This logger is host-tested; on hardware it ran on a XIAO ESP32-C6 (rev v0.1),
 2026-11-19, with `selftest_wifi_lifecycle` (logger: same code as this tree):
 10 of 10 watchdog boots with the port opened 40 s late gave USB output, each
-starting with an `at most 25 lines` report. The 9/9 USB counts are from an
-earlier logger. Radio evidence is documented in "BLE bench examples" and "IEEE 802.15.4 raw MAC (C6)".
+starting with an `at most 25 lines` report. With this logger, `selftest_usj`
+(RAM image, host echo script) passed 9/9 echo cases on the C3, Super Mini and
+XIAO, 3 runs each, at 24ebc5d1 (2026-11-19). Radio evidence is documented in "BLE bench examples" and "IEEE 802.15.4 raw MAC (C6)".
 
 A logger with unmasked 2 ms drains and no panic takeover ran on a Super
 Mini ESP32-C6FH4 (rev v0.2, `esp32_c6` image boot), 2026-11-19
@@ -101,7 +111,9 @@ the buffer on each reopen (`PurgeComm`, its default on Windows), and 3 of the
 6 stalls left no drop report in the output. That the purge discarded those
 reports is an inference from this one comparison, not a separate test.
 This ran on an earlier version; logger ownership/loss accounting, panic takeover
-and LP_FAST startup changed since; the changes since are built only / unit-tested.
+and LP_FAST startup changed since. The changed logger ran in every 24ebc5d1
+self-test run in this README (including the `selftest_usj` echoes above), but
+this loss measurement has not been repeated on it.
 
 On an ESP32-C6, SERIAL_IN_EP_DATA_FREE can read 0 at boot with nothing
 committed: IN_EP1_ST (C6 TRM v1.2 register 32.19) idle and the host's IN
@@ -123,13 +135,15 @@ shorter deadlines can expire before transmission. The low check and gating
 write exclude interrupts; phase waits do not. `ClockGateFailed` reports a
 pad still high after gating. Mid-count divider changes are a hardware
 observation from the prior 16/16 tests at divider 40, not a TRM guarantee
-(C6 §38.5.1 gives a maximum factor of 65535). The interrupt-safe gating
-change is **built only**; those counts predate it.
+(C6 §38.5.1 gives a maximum factor of 65535). With the interrupt-safe
+gating, `selftest_parl_io` passed 16/16 on the Super Mini and XIAO, 3 runs
+each, at 24ebc5d1 (RAM images, 2026-11-19).
 
 Timer-group clock enable clears MWDT flash-boot mode only when releasing a
 group held in reset, inside a critical section. Calls on an active group do
-not unlock, relock or update the watchdog. The prior timer hardware counts
-predate this change; current evidence is **built only**.
+not unlock, relock or update the watchdog. With this change,
+`selftest_timers` passed 6/6 on the C3, Super Mini and XIAO, 3 runs each, at
+24ebc5d1 (RAM images, 2026-11-19).
 
 The lifecycle test counts TCP bind/listen as an eighth check, publishing
 success only after it completes. Setup, reporter-spawn and TCP setup failures
@@ -146,10 +160,10 @@ Lifecycle evidence is under "Wi-Fi station and RTOS"; NVS evidence is under
 
 | Crypto driver | Chips | Limits | Evidence |
 | --- | --- | --- | --- |
-| `sha` | C3, C6 | SHA-1/224/256; CPU, no DMA; synchronous whole-message API, exclusive against DS/HMAC; TRM §23.4.2.1 | built only; `selftest_sha` compares empty, abc, padding boundaries and multi-block input with std.crypto |
-| `aes` | C3, C6 | AES-128/256 CPU ECB, software CBC/OFB/CTR/CFB8/CFB128 chaining; whole blocks except CFB8, no padding/authentication/DMA, exclusive against DS; TRM §§19.4–19.5 | built; host `aes/cfb128_vectors.zig` tests pin CFB128 to `std.crypto`; `selftest_aes` SP 800-38A encrypt/decrypt vectors; current vectors built and host unit-tested; no C3/C6 hardware run of these vectors |
-| `rsa` | C3, C6 | Raw integer operations: modular exponent/multiply 32–3072 bits, multiply 32–1536 bits; odd modulus, caller supplies R², little-endian u32 limbs, bounded polling, exclusive against DS; TRM §§22.3.1–22.3.4 | built only; `selftest_rsa` compares with std.crypto.ff and wide integer multiplication |
-| `ecc` | C6 only (compile-time gate) | P-192/P-256 affine point verification and verified multiplication; big-endian fixed-size coordinates/scalars, nonzero scalar below group order; no ECDSA/ECDH protocol or Jacobian API; TRM §§20.3.2–20.7 | built only; `selftest_ecc` compares with std.crypto P256 and ff P-192 doubling, including invalid inputs |
+| `sha` | C3, C6 | SHA-1/224/256; CPU, no DMA; synchronous whole-message API, exclusive against DS/HMAC; TRM §23.4.2.1 | `selftest_sha` compares empty, abc, padding boundaries and multi-block input with std.crypto: 21/21 on the C3, Super Mini and XIAO, 3 runs each, at 24ebc5d1 (RAM images, 2026-11-19) |
+| `aes` | C3, C6 | AES-128/256 CPU ECB, software CBC/OFB/CTR/CFB8/CFB128 chaining; whole blocks except CFB8, no padding/authentication/DMA, exclusive against DS; TRM §§19.4–19.5 | built; host `aes/cfb128_vectors.zig` tests pin CFB128 to `std.crypto`; `selftest_aes` SP 800-38A encrypt/decrypt vectors: 24/24 on the C3, Super Mini and XIAO, 3 runs each, at 24ebc5d1 (RAM images, 2026-11-19) |
+| `rsa` | C3, C6 | Raw integer operations: modular exponent/multiply 32–3072 bits, multiply 32–1536 bits; odd modulus, caller supplies R², little-endian u32 limbs, bounded polling, exclusive against DS; TRM §§22.3.1–22.3.4 | `selftest_rsa` compares with std.crypto.ff and wide integer multiplication: 12/12 on the C3, Super Mini and XIAO, 3 runs each, at 24ebc5d1 (RAM images, 2026-11-19) |
+| `ecc` | C6 only (compile-time gate) | P-192/P-256 affine point verification and verified multiplication; big-endian fixed-size coordinates/scalars, nonzero scalar below group order; no ECDSA/ECDH protocol or Jacobian API; TRM §§20.3.2–20.7 | `selftest_ecc` compares with std.crypto P256 and ff P-192 doubling, including invalid inputs: 7/7 on the Super Mini and XIAO, 3 runs each, at 24ebc5d1 (RAM images, 2026-11-19) |
 
 AES CFB128 uses the forward block transform for encryption and decryption, with
 ciphertext feedback. This matches ESP-IDF's `esp_aes_crypt_cfb128` CPU path in
@@ -251,13 +265,38 @@ requests acknowledged, at -74 to -73 dBm.
 The uncommitted run has no verified equivalence to this tree. The second set
 ran on an earlier version; radio/HAL guards and dependencies, antenna selection, logger
 and LP_FAST startup changed since. The third set ran on an earlier version;
-logger and LP_FAST startup changed since. The changes since are built only /
-unit-tested; these counts do not establish radio behavior in this tree.
+logger and LP_FAST startup changed since. The counts above do not establish radio
+behavior in this tree; the runs below do.
+
+Runs on this tree's radio code (image boot, peers as above, channel 25), each
+3 of 3 runs with `DONE pass=3 fail=0`:
+
+- Super Mini, generic image, pre-W2-fix code (2026-11-19). Against the H2: in each
+  run the C6 received 40 ACK-request, 40 no-ACK and 2 broadcast frames, the
+  H2 counted 40 of 40 ACKs, and the C6's two ACK requests were acknowledged.
+  Against the nRF: the nRF sent 77, 74 and 72 frames with return code 0 (5,
+  8 and 10 with another code); the C6 counted `rx=` 75, 77 and 73, and its
+  two ACK requests were acknowledged 1, 0 and 2 times.
+- XIAO, board build, 24ebc5d1 driver code with this series' `selftest_ieee802154`
+  code apart from comments (2026-11-20), with the Super Mini stopped.
+  Against the H2: in each run the C6 received 40 ACK-request, 40 no-ACK and 2
+  broadcast frames, the H2 counted 40 of 40 ACKs, and the C6's two ACK requests
+  were acknowledged. Against the nRF: the nRF sent 77, 76 and 75
+  frames with return code 0; the C6 counted `rx=` 78, 76 and 75, and its two
+  ACK requests were acknowledged 2, 0 and 2 times. The generic image on the
+  XIAO against the H2 in the same session: 36, 38 and 36 of 40 ACKs.
+
+An earlier XIAO board-build set of pre-W2-fix code gave the H2 only 1, 1 and 0 of 40
+ACKs while the Super Mini was still running `selftest_ieee802154` (generic
+image, same short address). In a repeat of pre-W2-fix code with the Super Mini running
+that image, a rebuilt XIAO board build gave 3, 1 and 1 of 40; with the Super Mini
+stopped, 40, 40 and 40 (see the example's header note).
 
 `selftest_ieee802154` builds the C6 image-boot target and the XIAO ESP32C6 board
 target; on a XIAO use the board build, which powers the rf switch (about 20 dB);
 `-Dantenna=external` selects the U.FL connector (default `internal`);
-external selection is **built only**, with no hardware run (`antenna-ext.log` is empty).
+external selection is **built only**, with no hardware run (`antenna-ext.log` is empty); the
+run needs a U.FL antenna fitted at a bench session.
 Its NOTE constants select channel 25, PAN 0x1234, local short address 0x0002 and H2 peer 0x0001.
 Configure the H2 IDF `ieee802154_cli` and nRF52840 Zephyr raw shell on that
 channel/PAN with distinct addresses. The test first checks energy-detect
@@ -304,7 +343,31 @@ For other build options, see "SoftAP (C3 and C6)", "BLE bench examples"
 and "Boards and hardware validation".
 On both boards the server scanned, associated with a WPA2 hotspot, got a DHCP
 lease and echoed a TCP message on port 3333 (image boot behind the ESP-IDF v6.0.2 bootloader).
-The C6 `rtos` RAM image received all five queue items, then returned `error.Timeout` as written.
+The earlier C6 `rtos` RAM image received all five queue items, then returned
+`error.Timeout`. The current demo reports five ordered-delivery cases plus an
+empty-queue timeout case after joining the producer (`SELFTEST rtos DONE pass=6
+fail=0`). It passed 6/6 from RAM on the C3, Super Mini and XIAO, 3 runs each, with
+pre-W2-fix code (2026-11-19).
+
+`systimer` observes four interrupts in at most five seconds of TIMG0 time (six of
+systimer time), then checks their three consecutive intervals against TIMG0's 1 MHz
+counter (80 MHz APB on C3, PLL_F80M on C6, divider 80). Both counters derive from the
+one 40 MHz crystal, so each interval must be 1 s +/-100 us: the margin covers timestamp
+latency (measured 999,997 to 1,000,002 us) and still fails a wrong ticks-per-us value
+(at least 6.25% off). An additional half-period observation rejects extra interrupts.
+The first alarm's phase is not scored. The ISR only clears the alarm and increments an
+atomic counter; main captures timestamps without logging during observation. See C3
+TRM v1.4 sections 10.3, 11.2.1 and C6 TRM v1.2 sections 13.3, 13.5.3, 14.3.1.
+`custom_clock_config` decodes the XTAL source and CPU/APB divider registers,
+including C6's root/AHB/APB dividers and disabled automatic APB reduction
+(C3 TRM v1.4 section 6.2; C6 TRM v1.2 section 8.2.4.1). Both frequencies must
+match the configured 20 MHz. Its CPU-calibrated ROM busy delay requests 100 ms
+and must measure 100 ms +/-100 us against systimer: CPU and systimer share the
+crystal, call overhead measured 4 to 5 us, and a calibration one tick per us off
+is 5% off. These are peripheral clock-ratio checks, not absolute oscillator
+calibration. From RAM on the C3, Super Mini and XIAO, 3 runs each, this series
+(2026-11-20), `systimer` passed 4/4 and `custom_clock_config` passed 3/3 in every run. All three
+demos repeat the saved case results and DONE line for late host attachment.
 C3 Wi-Fi examples remain in the build.
 `selftest_wifi_lifecycle` shares `tcp_server.zig`'s build-time station credentials and
 TCP echo server. With the test hotspot present it starts, connects, waits through a PLL
@@ -806,8 +869,11 @@ s6 13/13, s7 (RWDT reset 3 s into a 10 s light sleep, `recovered_hang: PASS rese
 s8 (XTAL-off light sleep with LP_FAST on RC_FAST) 4/4 in every run; no hang. The register probe
 showed would-write equal to the IDF-derived value on all 284 rows in a
 separate run on 2026-11-19. That probe ran on an earlier version; logger
-and panic handling changed since; the changes since are built only / unit-tested.
-Not run on the Super Mini or the C6 rev v0.2.
+and panic handling changed since. At 24ebc5d1 (2026-11-19) the probe, from RAM, passed
+284/284 in 3 runs each on the Super Mini and the XIAO.
+Super Mini ESP32-C6FH4 (rev v0.2), `esp32_c6` image boot, 24ebc5d1, 2026-11-19, 3 runs
+per stage armed by the host: s1 3/3, s2 2/2, s3 4/4, s4 2/2, s5 3/3, s6 13/13, s7 1/1
+(`recovered_hang: PASS reset=0x10`) and s8 4/4 in every run; no hang.
 
 GPIO8/LP_AON.STORE0 carry HAL milestones. The tests reserve GPIO0 for s4 and the last 16 LP
 mailbox bytes for s5; do not combine them with another LP-memory owner.
@@ -840,7 +906,9 @@ peripheral domain; `lp_core` wake keeps RC_FAST in LP_SLEEP too. HP CPU/APB and 
 modem clock maps and Wi-Fi/BLE/802.15.4 clock gates are unchanged by this startup selection, which
 also matches IDF's radio environment. Wi-Fi's low-power clock remains RC_SLOW
 (`analog/esp32_c6.zig`, `radio_init`); Wi-Fi/BLE still require the PLL CPU source
-(TRM §8.2.4.4). Radio and LP behavior after the change is built only.
+(TRM §8.2.4.4). After the change, the LP self-tests ran at 24ebc5d1 and the radio examples
+on 24ebc5d1 driver code, on the Super Mini and XIAO (results in their sections); none
+measures the LP_FAST rate.
 
 The prior s5 deep image hung the XIAO (USB disappeared about 1.75 s after boot, no wake or RWDT
 reset). The source/TRM hypothesis is loss of LP_FAST when that image powered down XTAL while
@@ -884,7 +952,10 @@ verifies a gamma fade reaches its expected final duty. It also needs no wiring. 
 use a zero-scale gamma range with DUTY_START and PARA_UP, rather than leaving the duty engine
 stopped (TRM §35.3.4.1 and §35.5, registers 35.1–35.2).
 
-Current core self-test reporting is **built only**. Historical results below
+Current core self-test reporting, at 24ebc5d1 from RAM (2026-11-19): without the option,
+84 passed with `mac: SKIP` in 3 runs each on the Super Mini and the XIAO; with
+`-Dexpected_mac` set to each board's own MAC, 85/85 in 3 runs each. The `selftest_c6_ledc`
+result below was not re-run. Historical results below
 predate the SKIP change. Evidence: on the Super Mini ESP32-C6FH4 rev v0.2, from RAM, `selftest_c6_core` passed 85/85 and
 `selftest_c6_ledc` passed 7/7. `selftest_c6_core` also passed 85/85 from RAM on the Super Mini and
 on a XIAO ESP32-C6 rev v0.1, each with `-Dexpected_mac` set to its own MAC and without the option;
@@ -937,7 +1008,7 @@ An application interrupt callback receives the LP peripheral source mask
 and must acknowledge each source before returning. Interrupts default to
 disabled; exceptions and unhandled interrupts halt. HP clock/ROM init is
 not used. `esp32_c6_lp_counter.bin` is built with the examples. Evidence:
-**built only** for `lp_counter`; LP I2C board evidence is listed below.
+`lp_counter` runs inside `selftest_lp_core` (7/7, below); LP I2C board evidence is listed below.
 No power measurements.
 
 `hal.lp_core` loads a raw binary and starts/stops/wakes the LP CPU. Load at
@@ -950,7 +1021,8 @@ at 0x50003f00 with fences, never LP SRAM AMOs (§3.7.1). HP owns `command`;
 LP owns payload and `sequence`, which it publishes last. Treat payload as
 stable only while LP sleeps; this is not a multi-writer queue.
 `selftest_lp_core` embeds the generated LP image, checks the counter and a
-second HP wake. Evidence: **built only**.
+second HP wake. Evidence: 7/7 from RAM in 3 runs each on the Super Mini and the
+XIAO, at 24ebc5d1 (2026-11-19).
 
 `hal.lp_io` configures LP GPIO0–7 (TRM §§7.7, 7.13, 7.16.4), reads pads,
 and uses write-one set/clear for outputs. Function 1 selects the fixed LP
@@ -958,7 +1030,8 @@ UART/I2C pins; this chip has no LP GPIO matrix. HP and LP may both call it
 with exclusive ownership. It does not release pad holds or configure sleep
 pad overrides. `selftest_lp_core` toggles GPIO0 on successive LP wakes,
 checks LP input and HP GPIO matrix input, then drives it from HP. No wiring;
-GPIO0 must be free. Evidence: **built only**.
+GPIO0 must be free. Evidence: its `lp_io_high`, `lp_io_low` and `hp_lp_io` cases are
+part of the `selftest_lp_core` 7/7 runs above.
 
 `hal.lp_timer` snapshots the 48-bit RTC timer and arms/acknowledges/disables
 target 1 (TRM §§12.4.3, 12.10.3). HP or LP may own it, never concurrently.
@@ -966,7 +1039,8 @@ Intervals are LP_SLOW_CLK ticks; no RC calibration, wall-time precision or
 deep-sleep power validation is claimed. Target 0 is preserved. Periodicity
 is implemented by rearming on every LP reset/wake. `selftest_lp_timer`
 embeds its own LP program, counts repeated timer wakes from HP and checks
-stop. Evidence: **built only**.
+stop. Evidence: 4/4 from RAM in 3 runs each on the Super Mini and the XIAO,
+at 24ebc5d1 (2026-11-19).
 
 `hal.lp_uart` provides bounded polling 8N1 byte I/O, error reporting,
 register synchronization and internal loopback (TRM §§27.4, 27.7.2).
@@ -975,7 +1049,8 @@ for an accurate external baud and keep XTAL powered if selecting XTAL/2.
 External I/O uses fixed GPIO4 RX/GPIO5 TX (Table 7.13-1). No DMA, flow
 control or interrupt buffering. HP/LP must transfer controller ownership.
 `selftest_lp_uart` verifies 64 looped-back bytes and empty-RX timeout on
-both cores without touching pads. Evidence: **built only**.
+both cores without touching pads. Evidence: 5/5 from RAM in 3 runs each on the
+Super Mini and the XIAO, at 24ebc5d1 (2026-11-19).
 
 `hal.lp_i2c` provides polling 7-bit master address probes, writes of up to
 15 data bytes and reads of 1–16 bytes (TRM §§29.4–29.6, 29.11.1). GPIO6 is
@@ -994,8 +1069,8 @@ write NACKs and checks the next probe recovers. Evidence recorded 2026-11-18:
 `selftest_lp_i2c` passed 5/5 three times on each of the Super Mini
 ESP32-C6FH4 (rev v0.2) and XIAO ESP32-C6 (rev v0.1). This ran on an earlier
 version; preserving NACK on STOP timeout, rejecting unsent-TX completions,
-LP_FAST startup and logger changed since; the changes since are built only.
-The other LP examples above have build evidence only.
+LP_FAST startup and logger changed since. With those changes, at 24ebc5d1
+(2026-11-19), it passed 5/5 from RAM in 3 runs each on the same two boards.
 
 The named ETM task `hal.etm.Task.lp_cpu_wake` is ID 154 (Table 11.3-2).
 `selftest_lp_core` also routes an unwired GPIO1 edge to that task and checks
@@ -1003,7 +1078,8 @@ the LP wake flag and next count; GPIO0/1 must be free. `selftest_lp_irq`
 interrupts an already-running LP CPU from HP, checks source decoding at
 vector 30 and continuation after `mret`. Each self-test waits at least
 1.5 s before reporting, then repeats cases and summary every second.
-These additional paths are **built only**, not run on hardware.
+At 24ebc5d1 (2026-11-19), from RAM, 3 runs each on the Super Mini and the XIAO:
+`selftest_lp_core` 7/7, including `etm_wake`, and `selftest_lp_irq` 4/4.
 
 ## Partition table
 
@@ -1012,8 +1088,12 @@ modifying flash. `Table.decode` is also usable on host byte images. The whole
 table is checked for magic, flash bounds, partition overlap, duplicate labels,
 and MD5 when present before `find_data(.nvs, "nvs")` returns a partition.
 Limits: default table offset only, at most 95 entries, no decryption. Partition
-flags are retained for callers to enforce. Evidence: built only, unit-tested;
-no board execution. Format reference: ESP-IDF
+flags are retained for callers to enforce. `selftest_nvs` lists all decoded
+partitions, requires every entry of ESP-IDF's default single-app table (`nvs`,
+`phy_init`, `factory` at 0x9000, 0xf000, 0x10000) and requires the MD5 entry to match
+the bytes read from flash; it also checks rejection of a digest corrupted in RAM.
+These cases passed as part of `selftest_nvs` 12/12 on the C3, Super Mini and XIAO
+(this series, see "NVS board self-test"). The decoder is unit-tested. Format reference: ESP-IDF
 `components/partition_table/gen_esp32part.py`.
 
 ## NVS format
@@ -1021,7 +1101,8 @@ no board execution. Format reference: ESP-IDF
 `hal/nvs_format.zig` implements version 2 headers, entry layout, ROM-compatible
 CRC32, span validation, bitmap iteration and a fixed-size page hash map. Bucket
 collisions require a full key comparison. No allocation or target imports.
-Evidence: built only, unit-tested, including an ESP-IDF-generated page image.
+Evidence: unit-tested, including an ESP-IDF-generated page image, and on boards
+through `selftest_nvs` (see "NVS board self-test").
 The fixture `src/hal/nvs_testdata/idf.bin` was generated offline from the CSV
 beside it with ESP-IDF's `components/nvs_flash/nvs_partition_generator/`
 `nvs_partition_gen.py generate <absolute-idf.csv> <absolute-idf.bin> 0x3000
@@ -1096,8 +1177,9 @@ isolation, commit/reopen/erase, full partition and reclaimed space, multi-page
 blobs, failed replacement preserving the old value, maximum strings, corrupt
 payload CRC, and power loss after each operation in a rollover workload. The
 ESP-IDF fixture is read, modified and reopened through the store. The board
-self-test (below) ran on hardware on an earlier version of this store; the
-changes since are unit-tested only. References: ESP-IDF `components/nvs_flash/src/nvs_types.*`,
+self-test (below) ran on hardware on an earlier version of this store, and on
+this store's code (this series) on the C3, Super Mini and XIAO (12/12).
+References: ESP-IDF `components/nvs_flash/src/nvs_types.*`,
 `nvs_page.*` and `nvs_pagemanager.cpp`. Derived code credits
 `totorototo`'s MicroZig implementation in source.
 
@@ -1107,15 +1189,29 @@ Build `examples/espressif/esp` with `zig build -Doptimize=ReleaseSmall
 -Dexample=selftest_nvs`. Outputs `esp32_c3_selftest_nvs.bin` and
 `esp32_c6_selftest_nvs.bin` (and ELF files); only ESP-IDF image-boot targets are
 registered. No external wiring is required. Use an existing ESP-IDF bootloader
-and partition table at `0x8000` with an unencrypted writable data/NVS partition
-labelled `nvs` (at least 12 KiB). Install the app at the table's app offset with
+and ESP-IDF's default single-app partition table (`partitions_singleapp.csv`: `nvs`
+0x9000/0x6000, `phy_init` 0xf000/0x1000, `factory` 0x10000/1 MiB, with its MD5 entry) at
+`0x8000`; `partition_list` fails on any other layout. Install the app at 0x10000 with
 the usual image-boot procedure. This example neither installs a table nor
 formats a missing partition; invalid/missing tables report failure before NVS
 writes. Back up existing data before running a flash-write self-test.
 
-The self-test reserves namespace `mz_selftest`; it writes all integer widths,
+Expected result: `SELFTEST nvs DONE pass=12 fail=0` (the original eight cases
+plus `read_only`, `purge`, `partition_list` and `partition_md5`). This series
+(2026-11-20), image boot (the C3 behind the second-stage bootloader read back from its
+original flash): `DONE pass=12 fail=0` in
+3 of 3 boots each on the C3, the Super Mini and the XIAO, with `boots` rising by one on
+each boot without reflashing (C3 1, 2 and 3; Super Mini and XIAO 4, 5 and 6, counting on from earlier runs). No power-cut tests are performed.
+
+The self-test reserves namespaces `mz_selftest` and `mz_purge`; it writes all integer widths,
 a string, a 6000-byte multi-page blob, and 300 counter updates, commits, reopens,
-checks values, erases its test keys, then reopens to verify absence. A final
+checks values, erases its test keys, then reopens to verify absence. The
+read-only case rejects integer/string/blob writes, key erasure and commit, then
+re-initializes and verifies the committed values remain. In `mz_purge`, a
+`read_write_purge` handle erases all three test keys (integer, string and blob);
+raw flash reads verify the string/blob payloads were zeroed. Re-initialization
+finds those keys absent, and a new write survives commit and re-initialization
+before cleanup. This empties the test namespace, not the whole partition. A final
 `boots_increment` case increments the u32 key `boots`, commits, reopens and reads it back;
 This case checks the increment and same-boot reopen, not persistence across boots.
 `boots` is never erased, so `SELFTEST nvs boots=N` must rise by one on each
@@ -1131,7 +1227,7 @@ v0.4): 8/8 on each, with `boots=1` after flashing and `boots=2` after a
 watchdog reset. The run records identify an uncommitted build; no equivalence
 to this tree is claimed. That example called the boot-count case `persist`.
 Open modes, blob/reclaim/recovery handling and the `boots_increment` case name
-have changed since; the changes since are built only / unit-tested.
+have changed since; the runs above cover them on all three boards.
 
 The board workload also runs twice against a simulated minimum 12 KiB partition
 in host tests, with guard pages and an unrelated namespace checked after
@@ -1610,7 +1706,8 @@ or block. Buffers support 255-byte ACL payloads and full-length HCI events.
 Read BD_ADDR and LE Read Buffer Size, including completion status and response
 length. Output starts after 1.5 seconds and repeats `SELFTEST ble_hci DONE
 pass=N fail=M` every three seconds. Evidence: see the per-build counts under
-"BLE bench examples" below.
+"BLE bench examples" below (at 24ebc5d1: 4/4 in 3 of 3 boots each on the Super Mini
+and XIAO).
 
 ## Minimal Zig BLE host
 
@@ -1708,7 +1805,7 @@ Every committed build below ran on an earlier version. Since the 0 dBm runs,
 TX power, controller interrupt/protocol guards, antenna selection/reporting,
 logger and LP_FAST startup changed. Since the initial +9 dBm runs, the same
 items except TX power changed. Since the diagnostic +9 dBm runs, logger and
-LP_FAST startup changed. The changes since are built only / unit-tested.
+LP_FAST startup changed. The runs on this tree's BLE code follow the two tables.
 Rows marked "an uncommitted build" have no verified equivalence to this tree.
 
 XIAO ESP32-C6, all at 0 dBm:
@@ -1796,8 +1893,25 @@ Open, not passes:
   `SOC_BLE_USE_WIFI_PWR_CLK_WORKAROUND`, gave 7 and 8 of 10 in sets run
   alternately with the 1 and 8 above (uncommitted experiment): no measurable
   difference. The driver keeps divider 399.
-* The +9 dBm default has run only on the Super Mini; the XIAO results above
-  predate it.
+* The XIAO results in the table above predate the +9 dBm default; the XIAO
+  runs below use it.
+
+Runs on this tree's BLE code, image boot, +9 dBm default (`bluetooth.zig`), H2 NimBLE
+peer, 2026-11-19/20 (generic build on the Super Mini, board build on the XIAO except
+`selftest_ble_hci`, which has no board build):
+
+| Example | Commit | Super Mini | XIAO |
+| --- | --- | --- | --- |
+| `selftest_ble_hci` (no peer) | 24ebc5d1 | 4/4 in 3 of 3 boots | 4/4 in 3 of 3 boots |
+| `ble_scan` | pre-W2-fix code | 4/4 in 3 of 3 runs | 4/4 in 3 of 3 runs |
+| `ble_peripheral`, H2 central | pre-W2-fix code | 6/6 in 3 of 3 runs | 6/6 in 3 of 3 runs |
+| `ble_central`, H2 peripheral | pre-W2-fix code | 13/13 in 18 of 20 runs | 13/13 in 19 of 20 runs |
+
+The 3 failed central runs of 40 stopped at `discover` with `disconnect_reason=3e`
+and the H2 logged no connection (`connected=0`). No H2-to-nRF or other peer-to-peer
+BLE control ran in this session, so the failures are not located on either side.
+The nRF52840 BLE rows were not re-run on this tree: the nRF was running its 802.15.4
+image, and switching it to the BLE image needs a double-tap reflash at a bench session.
 
 ### Known limits
 
@@ -1823,7 +1937,8 @@ that can leave the state: *own* (this store's writes, reset anywhere),
 damaged flash). Where no test is named, the writer is argued from the write
 order in `nvs.zig` and `nvs_storage.cpp`, not tested.
 
-- This version has not run on a board: every reset test is a host test. *Own.*
+- This version ran on a board only through `selftest_nvs` (12/12 on the C3, Super Mini
+  and XIAO, this series; no reset during a write): every reset test is a host test. *Own.*
 - A blob rewritten on one page and reset before its index reads as the old
   blob here and is lost when ESP-IDF boots that image (rule 1; 12 images of
   the crash replay). *Own, ESP-IDF.*
