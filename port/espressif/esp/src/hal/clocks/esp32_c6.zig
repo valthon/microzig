@@ -138,6 +138,17 @@ pub const Config = struct {
     }
 };
 
+/// Application startup only, before starting LP firmware or configuring LP baud rates.
+/// TRM v1.2 §8.2.4.2, Register 8.75; §12.4.2.3: HP-state PMU waits
+/// need a live LP_FAST source when XTAL is powered down. Match IDF v6.0.2
+/// esp_system/port/soc/esp32c6/clk.c:55–56 and v5.5.1 rtc_clk.c:90–95,127–130.
+pub fn init_lp_fast() void {
+    PMU.HP_SLEEP_LP_CK_POWER.modify(.{ .HP_SLEEP_XPD_FOSC_CLK = 1 });
+    rom.functions.ets_delay_us(50);
+    peripherals.LP_CLKRST.LP_CLK_CONF.modify(.{ .FAST_CLK_SEL = 0 });
+    rom.functions.ets_delay_us(3);
+}
+
 fn switch_to_pll(cpu_freq: CpuClockSource.PllClock.CpuFreq) void {
     const div = cpu_freq.divider();
 

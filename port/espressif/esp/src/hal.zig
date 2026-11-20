@@ -4,14 +4,23 @@ const std = @import("std");
 pub const esp_image = @import("esp_image");
 const microzig = @import("microzig");
 
+pub const lp_core = if (compatibility.chip == .esp32_c6) @import("hal/lp_core.zig") else void;
+
 pub const cache = @import("hal/cache.zig");
 pub const adc = @import("hal/adc.zig");
 pub const clocks = @import("hal/clocks.zig");
 pub const compatibility = @import("hal/compatibility.zig");
 pub const drivers = @import("hal/drivers.zig");
 pub const efuse = @import("hal/efuse.zig");
+pub const nvs_flash = @import("hal/nvs_flash.zig");
+pub const nvs = @import("hal/nvs.zig");
+pub const partition_table = @import("hal/partition_table.zig");
 pub const flash = @import("hal/flash.zig");
+pub const parl_io = if (compatibility.chip == .esp32_c6) @import("hal/parl_io.zig") else void;
+pub const dedicated_gpio = @import("hal/dedicated_gpio.zig");
+pub const gdma = @import("hal/gdma.zig");
 pub const gpio = @import("hal/gpio.zig");
+pub const i2s = @import("hal/i2s.zig");
 pub const i2c = @import("hal/i2c.zig");
 pub const ledc = switch (compatibility.chip) {
     .esp32_c3 => @import("hal/ledc.zig"),
@@ -150,6 +159,7 @@ test {
     _ = rtos;
     _ = radio;
     _ = usb_serial_jtag;
+    _ = @import("hal/usb_serial_jtag/state.zig");
     _ = @import("hal/gpio_encoding.zig");
     _ = @import("hal/gpio/esp32_c6.zig");
     _ = @import("hal/i2c_logic.zig");
@@ -170,8 +180,41 @@ fn compile_check_accessors(index: u32) callconv(.c) void {
     microzig.cpu.interrupt.clear_pending(int);
     std.mem.doNotOptimizeAway(microzig.cpu.interrupt.get_type(int));
     std.mem.doNotOptimizeAway(microzig.cpu.interrupt.get_mapped_interrupt(.i2c_ext0));
+    // Compile the partition/flash adapter for each target without executing it.
+    const device: flash.Flash = .{ .size = 0x400000, .protected_end = 0x400000, .allow_running_image = false };
+    const backend = nvs_flash.open(device, "nvs") catch return;
+    var word: [4]u8 = undefined;
+    backend.read(0, &word) catch return;
+    backend.write(0, &word) catch return;
+    backend.erase(0) catch return;
 }
 
 test {
     _ = @import("hal/uart/timing.zig");
+    _ = @import("hal/radio/ieee802154_frame.zig");
+    _ = @import("hal/radio/ieee802154_rx.zig");
 }
+
+pub const sigma_delta = @import("hal/sigma_delta.zig");
+
+pub const pcnt = @import("hal/pcnt.zig");
+
+pub const etm = @import("hal/etm.zig");
+
+pub const mcpwm = @import("hal/mcpwm.zig");
+
+pub const lp_io = if (compatibility.chip == .esp32_c6) @import("hal/lp_io.zig") else void;
+
+pub const lp_timer = if (compatibility.chip == .esp32_c6) @import("hal/lp_timer.zig") else void;
+
+pub const lp_uart = if (compatibility.chip == .esp32_c6) @import("hal/lp_uart.zig") else void;
+
+pub const lp_i2c = if (compatibility.chip == .esp32_c6) @import("hal/lp_i2c.zig") else void;
+
+pub const sha = @import("hal/sha.zig");
+
+pub const aes = @import("hal/aes.zig");
+
+pub const rsa = @import("hal/rsa.zig");
+
+pub const ecc = @import("hal/ecc.zig");

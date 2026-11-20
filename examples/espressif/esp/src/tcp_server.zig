@@ -1,4 +1,5 @@
 const std = @import("std");
+const wifi_options = @import("wifi_options");
 
 const microzig = @import("microzig");
 const hal = microzig.hal;
@@ -48,79 +49,129 @@ pub const microzig_options: microzig.Options = .{
         .radio = .{
             .wifi = .{
                 .on_packet_received = on_packet_received,
+                .on_event = on_wifi_event,
             },
         },
     },
 };
 
-// NOTE: Change these to match your setup.
-const SSID = "SSID";
-const PASSWORD: []const u8 = "";
-const AUTH_METHOD: radio.wifi.AuthMethod = .none;
+/// From -Dwifi_auth; build.zig derives wpa2_personal from a non-empty passphrase.
+const AUTH_METHOD = std.meta.stringToEnum(radio.wifi.AuthMethod, wifi_options.auth) orelse
+    @compileError("wifi_options.auth is not a hal.radio.wifi.AuthMethod name");
 const SERVER_PORT = 3333;
 
 var maybe_netif: ?*lwip.c.netif = null;
 
 var wifi_ready_signal: rtos.Signal(void) = .{};
+var ap_started: std.atomic.Value(bool) = .init(false);
+
+// Lifecycle self-test result, repeated by `lifecycle_reporter` because USB
+// output before the host reopens the port after reset is lost.
+const lifecycle_checks = 8;
+var lifecycle_step: []const u8 = "setup";
+var lifecycle_passed: u32 = 0;
+var lifecycle_error: ?anyerror = null;
+var lifecycle_done: std.atomic.Value(bool) = .init(false);
 
 extern fn netconn_new_with_proto_and_callback(t: lwip.c.enum_netconn_type, proto: lwip.c.u8_t, callback: ?*const anyopaque) [*c]lwip.c.struct_netconn;
 pub fn main() !void {
-    var heap_allocator: microzig.Allocator = try .init_with_heap(16384);
-    const gpa = heap_allocator.allocator();
+    try run(false);
+}
 
+/// Shared entry point so the lifecycle test uses the same build-time credentials
+/// and the same lwIP/DHCP/TCP echo implementation as the ordinary server.
+pub fn run(comptime lifecycle_selftest: bool) !void {
+    var heap_allocator = microzig.Allocator.init_with_heap(16384) catch |err| {
+        if (lifecycle_selftest) lifecycle_fail(err);
+        return err;
+    };
+    var netif: lwip.c.netif = undefined;
+    run_server(lifecycle_selftest, heap_allocator.allocator(), &netif) catch |err| {
+        // lwIP retains the allocator and registered netif. Park inside their
+        // owning frame so callbacks and allocations remain valid during FAIL.
+        if (lifecycle_selftest) lifecycle_fail(err);
+        return err;
+    };
+}
+
+fn run_server(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip.c.netif) !void {
     try radio.wifi.init(gpa, .{});
     defer radio.wifi.deinit();
 
     exports.gpa = gpa;
     lwip.c.tcpip_init(null, null);
 
-    var netif: lwip.c.netif = undefined;
-    _ = lwip.c.netifapi_netif_add(
-        &netif,
+    try lwip.c_err(lwip.c.netifapi_netif_add(
+        netif,
         @ptrCast(lwip.c.IP4_ADDR_ANY),
         @ptrCast(lwip.c.IP4_ADDR_ANY),
         @ptrCast(lwip.c.IP4_ADDR_ANY),
         null,
         netif_init,
         lwip.c.tcpip_input,
-    );
-    maybe_netif = &netif;
-    try lwip.c_err(lwip.c.netifapi_netif_common(&netif, null, lwip.c.dhcp_start));
+    ));
+    maybe_netif = netif;
+    try lwip.c_err(lwip.c.netifapi_netif_common(netif, null, lwip.c.dhcp_start));
 
-    try radio.wifi.apply(.{
-        .sta = .{
-            .ssid = SSID,
-            .password = PASSWORD,
-            .auth_method = AUTH_METHOD,
-        },
-    });
-
-    try radio.wifi.start();
-    while (!radio.wifi.get_sta_state().is_started()) {
-        rtos.sleep(.from_ms(100));
+    const station: radio.wifi.Config.Station = .{
+        .ssid = wifi_options.ssid,
+        .password = wifi_options.password,
+        .auth_method = AUTH_METHOD,
+    };
+    if (lifecycle_selftest) {
+        // Configure a deterministic AP while stopped, then enter STA for the test.
+        // The running STA->AP_STA transition below changes only the mode.
+        try radio.wifi.apply(.{ .ap_sta = .{
+            .sta = station,
+            .ap = .{ .ssid = "microzig-lifecycle", .channel = 1, .max_connections = 2 },
+        } });
     }
+    try radio.wifi.apply(.{ .sta = station });
 
-    {
-        std.log.info("Scanning for access points...", .{});
-        var scan_iter = try radio.wifi.scan(.{});
-        defer scan_iter.deinit();
-        while (try scan_iter.next()) |record| {
-            std.log.info("Found ap `{s}` RSSI: {} Channel: {}, Auth: {?t}", .{
-                record.ssid,
-                record.rssi,
-                record.primary_channel,
-                record.auth_mode,
-            });
+    if (lifecycle_selftest) {
+        // Default 4096-byte reporter stack shares the Wi-Fi/lwIP allocator:
+        // linker-defined heap region minus the 16 KiB stack reserve above.
+        // Spawn failure uses the main task to repeat FAIL.
+        lifecycle_step = "reporter_spawn";
+        _ = try rtos.spawn(gpa, lifecycle_reporter, .{}, .{});
+        lifecycle_step = "start";
+        try run_lifecycle();
+    } else {
+        try radio.wifi.start();
+        while (!radio.wifi.get_sta_state().is_started()) {
+            rtos.sleep(.from_ms(100));
+        }
+
+        {
+            std.log.info("Scanning for access points...", .{});
+            var scan_iter = try radio.wifi.scan(.{});
+            defer scan_iter.deinit();
+            while (try scan_iter.next()) |record| {
+                // Neighbour SSIDs are broadcast, not credentials.
+                std.log.info("Found ap `{s}` RSSI: {} Channel: {}, Auth: {?t}", .{
+                    record.ssid,
+                    record.rssi,
+                    record.primary_channel,
+                    record.auth_mode,
+                });
+            }
+        }
+
+        try radio.wifi.connect();
+        while (radio.wifi.get_sta_state() != .connected) {
+            rtos.sleep(.from_ms(100));
         }
     }
+    try lwip.c_err(lwip.c.netifapi_netif_common(maybe_netif.?, lwip.c.netif_set_link_up, null));
 
-    try radio.wifi.connect();
-    while (radio.wifi.get_sta_state() != .connected) {
-        rtos.sleep(.from_ms(100));
+    if (lifecycle_selftest) {
+        lifecycle_step = "dhcp";
+        wifi_ready_signal.wait_with_timeout(.{ .after = .from_ms(30_000) }) catch |err| lifecycle_fail(err);
+        lifecycle_pass();
+        lifecycle_step = "tcp_listen";
+    } else {
+        wifi_ready_signal.wait();
     }
-    _ = lwip.c.netifapi_netif_common(maybe_netif.?, lwip.c.netif_set_link_up, null);
-
-    wifi_ready_signal.wait();
 
     std.log.info("Listening on {f}:{}", .{ IP_Formatter.init(netif.ip_addr), SERVER_PORT });
 
@@ -137,6 +188,11 @@ pub fn main() !void {
 
     try lwip.c_err(lwip.c.netconn_listen(server_conn));
     std.log.info("TCP Server listening...", .{});
+    if (lifecycle_selftest) {
+        lifecycle_pass();
+        lifecycle_done.store(true, .release);
+        lifecycle_report();
+    }
 
     while (true) : (rtos.sleep(.from_ms(200))) {
         var client_conn: ?*lwip.c.netconn = null;
@@ -156,6 +212,108 @@ pub fn main() !void {
             std.log.err("error while connected to client: {t}", .{err});
             continue;
         };
+    }
+}
+
+fn on_wifi_event(event: radio.wifi.Event) void {
+    switch (event) {
+        .ApStart => ap_started.store(true, .monotonic),
+        .ApStop => ap_started.store(false, .monotonic),
+        else => {},
+    }
+}
+
+fn wait_sta(comptime expected: radio.wifi.StaState) error{Timeout}!void {
+    const deadline = microzig.drivers.time.Deadline.init_relative(hal.time.get_time_since_boot(), .from_ms(30_000));
+    while (radio.wifi.get_sta_state() != expected) {
+        if (deadline.is_reached_by(hal.time.get_time_since_boot())) return error.Timeout;
+        rtos.sleep(.from_ms(20));
+    }
+}
+
+fn run_lifecycle() !void {
+    std.log.info("Wi-Fi lifecycle: start", .{});
+    try radio.wifi.start();
+    try wait_sta(.started);
+    lifecycle_pass();
+
+    lifecycle_step = "connect";
+    std.log.info("Wi-Fi lifecycle: connect", .{});
+    try radio.wifi.connect();
+    try wait_sta(.connected);
+    // Keep the PHY active through a tracking period before closing it.
+    rtos.sleep(.from_ms(1100));
+    lifecycle_pass();
+
+    lifecycle_step = "stop";
+    std.log.info("Wi-Fi lifecycle: stop", .{});
+    try radio.wifi.stop();
+    try wait_sta(.stopped);
+    if (hal.compatibility.chip == .esp32_c6) {
+        // N2: initialized Wi-Fi keeps MAC/APB/BB clocks; IDF never gates FE.
+        const clocks = microzig.chip.peripherals.MODEM_SYSCON.CLK_CONF1.read();
+        if (clocks.CLK_WIFIMAC_EN == 0 or clocks.CLK_WIFI_APB_EN == 0 or
+            clocks.CLK_WIFIBB_22M_EN == 0 or clocks.CLK_WIFIBB_40M_EN == 0 or
+            clocks.CLK_WIFIBB_44M_EN == 0 or clocks.CLK_WIFIBB_80M_EN == 0 or
+            clocks.CLK_WIFIBB_40X_EN == 0 or clocks.CLK_WIFIBB_80X_EN == 0 or
+            clocks.CLK_WIFIBB_40X1_EN == 0 or clocks.CLK_WIFIBB_80X1_EN == 0 or
+            clocks.CLK_WIFIBB_160X1_EN == 0 or clocks.CLK_FE_APB_EN == 0 or
+            clocks.CLK_FE_80M_EN == 0 or clocks.CLK_FE_160M_EN == 0 or
+            clocks.CLK_FE_CAL_160M_EN == 0) return error.ClockGatedAfterStop;
+    }
+    lifecycle_pass();
+
+    lifecycle_step = "restart";
+    std.log.info("Wi-Fi lifecycle: start again", .{});
+    try radio.wifi.start();
+    try wait_sta(.started);
+    lifecycle_pass();
+
+    lifecycle_step = "reconnect";
+    std.log.info("Wi-Fi lifecycle: connect again", .{});
+    try radio.wifi.connect();
+    try wait_sta(.connected);
+    lifecycle_pass();
+
+    lifecycle_step = "sta_to_ap_sta";
+    std.log.info("Wi-Fi lifecycle: STA -> AP_STA", .{});
+    ap_started.store(false, .monotonic);
+    try radio.wifi.set_mode(.ap_sta);
+    const deadline = microzig.drivers.time.Deadline.init_relative(hal.time.get_time_since_boot(), .from_ms(30_000));
+    while (!ap_started.load(.monotonic)) {
+        if (deadline.is_reached_by(hal.time.get_time_since_boot())) return error.Timeout;
+        rtos.sleep(.from_ms(20));
+    }
+    if (try radio.wifi.get_mode() != .ap_sta) return error.WrongWifiMode;
+    rtos.sleep(.from_ms(1100));
+    try wait_sta(.connected);
+    lifecycle_pass();
+}
+
+fn lifecycle_pass() void {
+    lifecycle_passed += 1;
+    std.log.info("SELFTEST wifi_lifecycle {s}: PASS", .{lifecycle_step});
+}
+
+/// Repeat failures from the main task even if reporter allocation failed.
+fn lifecycle_fail(err: anyerror) noreturn {
+    lifecycle_error = err;
+    lifecycle_done.store(true, .release);
+    while (true) {
+        lifecycle_report();
+        rtos.sleep(.from_ms(1000));
+    }
+}
+
+fn lifecycle_report() void {
+    if (lifecycle_error) |err| std.log.err("SELFTEST wifi_lifecycle {s}: FAIL {t}", .{ lifecycle_step, err });
+    std.log.info("SELFTEST wifi_lifecycle DONE pass={d} fail={d}", .{ lifecycle_passed, lifecycle_checks - lifecycle_passed });
+}
+
+fn lifecycle_reporter() void {
+    while (true) {
+        rtos.sleep(.from_ms(3000));
+        if (lifecycle_done.load(.acquire) and lifecycle_error == null) lifecycle_report();
     }
 }
 

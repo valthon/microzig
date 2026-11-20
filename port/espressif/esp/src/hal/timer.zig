@@ -22,12 +22,35 @@ pub const Group = enum(u1) {
         };
     }
 
-    /// Releases reset without resetting the other timer/watchdog in this group.
+    /// Enables the group without resetting an active timer or watchdog.
+    /// `hal.system.init` holds both groups in reset, and leaving reset restores
+    /// TIMG_WDT_FLASHBOOT_MOD_EN = 1: the MWDT then runs its flash-boot stage 0
+    /// although WDT_EN = 0 (C3 TRM v1.4 §12.2.2.4, register 11.10; C6 TRM v1.2
+    /// §15.2.2.4, register 14.10). Only when releasing reset, clear it again
+    /// atomically with respect to interrupts. An active MWDT is never touched.
     pub fn enable_clock(self: Group) void {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        const was_reset = switch (@import("compatibility.zig").chip) {
+            .esp32_c3 => switch (self) {
+                .timg0 => peripherals.SYSTEM.PERIP_RST_EN0.read().TIMERGROUP_RST != 0,
+                .timg1 => peripherals.SYSTEM.PERIP_RST_EN0.read().TIMERGROUP1_RST != 0,
+            },
+            .esp32_c6 => switch (self) {
+                .timg0 => peripherals.PCR.TIMERGROUP0_CONF.read().TG0_RST_EN != 0,
+                .timg1 => peripherals.PCR.TIMERGROUP1_CONF.read().TG1_RST_EN != 0,
+            },
+        };
         system.enable_clocks_and_release_reset(switch (self) {
             .timg0 => .{ .timergroup0 = true },
             .timg1 => .{ .timergroup1 = true },
         });
+        if (!was_reset) return;
+        const r = self.registers();
+        r.WDTWPROTECT.write(.{ .WDT_WKEY = 0x50d83aa1 });
+        defer r.WDTWPROTECT.write(.{ .WDT_WKEY = 0 });
+        r.WDTCONFIG0.modify(.{ .WDT_FLASHBOOT_MOD_EN = 0 });
+        r.WDTCONFIG0.modify(.{ .WDT_CONF_UPDATE_EN = 1 });
     }
 
     pub fn interrupt_source(self: Group) microzig.cpu.interrupt.Source {

@@ -186,6 +186,23 @@ fn write_bit(mask: PeripheralMask, comptime bit: Bit, value: u1) void {
 /// Disables most peripheral clocks and puts peripherals in the reset state to bring them to a
 /// known state.
 pub fn init() void {
+    // ESP-IDF v6.0.2 bootloader_init_mem (also called by the application):
+    // disable access-path filters and set every implemented master to TEE.
+    // C6 TRM v1.2 §§16.3.1, 16.3.2.3, 16.4: mode 0 is TEE; other masters
+    // reset to REE2. Region boundaries/permissions are left untouched.
+    const peripherals = microzig.chip.peripherals;
+    peripherals.HP_APM.FUNC_CTRL.write(.{});
+    peripherals.LP_APM0.FUNC_CTRL.write(.{});
+    peripherals.LP_APM.FUNC_CTRL.write(.{});
+    // IDF soc/esp32c6/apm_defs.h APM_MASTER_MASK_ALL.
+    inline for (0..32) |id| {
+        if (0x03cd007f & (@as(u32, 1) << id) != 0) {
+            const name = std.fmt.comptimePrint("M{d}", .{id});
+            @field(peripherals.TEE, name ++ "_MODE_CTRL").modify_one(name ++ "_MODE", 0);
+        }
+    }
+    peripherals.LP_TEE.M0_MODE_CTRL.modify(.{ .M0_MODE = 0 });
+
     clocks_enable_clear(.all_but_keep_enabled);
     peripheral_reset_set(.all_but_keep_enabled);
 }

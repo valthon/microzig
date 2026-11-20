@@ -5,8 +5,12 @@ const compatibility = @import("compatibility.zig");
 pub const PeripheralMask = chip_specific.PeripheralMask;
 
 /// Disables most peripheral clocks and puts peripherals in the reset state to bring them to a
-/// known state.
-pub const init = chip_specific.init;
+/// known state. C6 also selects RC_FAST for LP_FAST at application startup.
+pub fn init() void {
+    chip_specific.init();
+    if (compatibility.chip == .esp32_c6)
+        @import("clocks/esp32_c6.zig").init_lp_fast();
+}
 
 /// Enables the clocks of the peripherals in the mask.
 pub const clocks_enable_set = chip_specific.clocks_enable_set;

@@ -125,8 +125,6 @@ pub const RTOS_State = struct {
 /// Automatically called inside hal startup sequence if it the rtos is enabled
 /// in hal options.
 pub fn init() void {
-    if (@import("compatibility.zig").chip == .esp32_c6)
-        @compileError("hal.rtos is only supported on ESP32-C3");
     comptime {
         if (!microzig.options.cpu.interrupt_stack.enable)
             @compileError("rtos requires the interrupt stack cpu option to be enabled");
@@ -1061,7 +1059,7 @@ pub const Semaphore = struct {
         const cs = enter_critical_section();
         defer cs.leave();
 
-        sem.give_impl(&hptw);
+        sem.give_impl(hptw);
     }
 
     fn give_impl(sem: *Semaphore, hptw: *bool) void {
@@ -1120,6 +1118,37 @@ pub const TypeErasedQueue = struct {
         const cs = enter_critical_section();
         defer cs.leave();
         return q.put_non_blocking_from_cs(elements, hptw);
+    }
+
+    pub fn put_front(q: *TypeErasedQueue, elements: []const u8, timeout: Timeout) bool {
+        assert(elements.len <= q.buffer.len);
+        if (elements.len == 0) return true;
+
+        const cs = enter_critical_section();
+        defer cs.leave();
+
+        const resolved_timeout: ResolvedTimeout = .init(timeout);
+
+        while (q.buffer.len - q.len < elements.len) {
+            const maybe_remaining_duration = resolved_timeout.tick() catch return false;
+            q.putters.wait(maybe_remaining_duration);
+        }
+
+        // Move the start back, wrapping around the end of the buffer.
+        q.start = if (q.start >= elements.len)
+            q.start - elements.len
+        else
+            q.start + q.buffer.len - elements.len;
+        q.len += elements.len;
+
+        const first_len = @min(elements.len, q.buffer.len - q.start);
+        @memcpy(q.buffer[q.start..][0..first_len], elements[0..first_len]);
+        @memcpy(q.buffer[0 .. elements.len - first_len], elements[first_len..]);
+
+        var hptw = false;
+        q.getters.wake_one(&hptw);
+        if (hptw) yield_from_cs(.reschedule);
+        return true;
     }
 
     fn put_non_blocking_from_cs(q: *TypeErasedQueue, elements: []const u8, hptw: *bool) usize {

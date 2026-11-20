@@ -10,28 +10,40 @@ const c = @import("esp-wifi-driver");
 const microzig = @import("microzig");
 const TrapFrame = microzig.cpu.TrapFrame;
 const peripherals = microzig.chip.peripherals;
-const RTC_CNTL = peripherals.RTC_CNTL;
-const APB_CTRL = peripherals.APB_CTRL;
+const compatibility = @import("compatibility.zig");
+const clocks_c6 = @import("analog/esp32_c6.zig");
 
 const efuse = @import("efuse.zig");
 pub const bluetooth = @import("radio/bluetooth.zig");
 const osi = @import("radio/osi.zig");
 const timer = @import("radio/timer.zig");
 pub const wifi = @import("radio/wifi.zig");
+pub const ieee802154 = if (compatibility.chip == .esp32_c6) @import("radio/ieee802154.zig") else void;
 
 const log = std.log.scoped(.esp_radio);
 
 pub const Options = struct {
+    /// The port has no RF coexistence scheduler. Select one protocol per image;
+    /// `.ieee802154` also excludes `ble`.
+    protocol: enum { wifi, ieee802154 } = .wifi,
     interrupt: microzig.cpu.Interrupt = .interrupt30,
+    /// Exclusive C6 BLE mode. Wi-Fi initialization is rejected at compile time.
+    ble: bool = false,
     wifi: wifi.Options = .{},
 };
 
 var refcount: std.atomic.Value(usize) = .init(0);
 
-pub fn init(gpa: Allocator) Allocator.Error!void {
-    if (@import("compatibility.zig").chip == .esp32_c6)
-        @compileError("hal.radio is only supported on ESP32-C3");
-    // TODO: check that clock frequency is higher or equal to 80mhz
+pub const InitError = Allocator.Error || error{ CpuClockNotPll, SlowClockCalibrationTimeout };
+
+pub fn init(gpa: Allocator) InitError!void {
+    // C6 TRM v1.2 §8.2.4.4: Wi-Fi requires the PLL CPU clock source.
+    // Read hardware so custom hal.init_sequence clock configurations are checked too.
+    const source = switch (compatibility.chip) {
+        .esp32_c3 => peripherals.SYSTEM.SYSCLK_CONF.read().SOC_CLK_SEL,
+        .esp32_c6 => peripherals.PCR.SYSCLK_CONF.read().SOC_CLK_SEL,
+    };
+    if (source != 1) return error.CpuClockNotPll;
 
     const radio_interrupt = microzig.options.hal.radio.interrupt;
 
@@ -48,7 +60,10 @@ pub fn init(gpa: Allocator) Allocator.Error!void {
         return;
     }
 
+    errdefer _ = refcount.rmw(.Sub, 1, .monotonic);
     try timer.init(gpa);
+    errdefer timer.deinit(gpa);
+    try osi.phy_timer_init(gpa);
 
     {
         const cs = microzig.interrupt.enter_critical_section();
@@ -65,13 +80,15 @@ pub fn init(gpa: Allocator) Allocator.Error!void {
         microzig.cpu.interrupt.set_priority(radio_interrupt, .highest);
     }
 
+    if (compatibility.chip == .esp32_c6) try clocks_c6.calibrate_slow_clock();
+
     log.debug("initialization complete", .{});
 
     const internal_wifi_log_level = switch (builtin.mode) {
         .Debug => c.WIFI_LOG_VERBOSE,
         else => c.WIFI_LOG_NONE,
     };
-    wifi.c_err(c.esp_wifi_internal_set_log_level(internal_wifi_log_level)) catch {
+    if (!microzig.options.hal.radio.ble) wifi.c_err(c.esp_wifi_internal_set_log_level(internal_wifi_log_level)) catch {
         log.warn("failed to set wifi internal log level", .{});
     };
 }
@@ -101,6 +118,16 @@ pub fn read_mac(iface: enum {
 }
 
 fn enable_wifi_power_domain_and_init_clocks() void {
+    switch (compatibility.chip) {
+        .esp32_c3 => enable_wifi_power_domain_and_init_clocks_c3(),
+        .esp32_c6 => clocks_c6.radio_init(),
+    }
+}
+
+fn enable_wifi_power_domain_and_init_clocks_c3() void {
+    const RTC_CNTL = peripherals.RTC_CNTL;
+    const APB_CTRL = peripherals.APB_CTRL;
+
     const system_wifibb_rst: u32 = 1 << 0;
     const system_fe_rst: u32 = 1 << 1;
     const system_wifimac_rst: u32 = 1 << 2;

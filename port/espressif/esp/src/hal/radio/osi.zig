@@ -6,7 +6,8 @@ const c = @import("esp-wifi-driver");
 const microzig = @import("microzig");
 const enter_critical_section = microzig.interrupt.enter_critical_section;
 const peripherals = microzig.chip.peripherals;
-const APB_CTRL = peripherals.APB_CTRL;
+const compatibility = @import("../compatibility.zig");
+const clocks_c6 = @import("../analog/esp32_c6.zig");
 const radio_interrupt = microzig.options.hal.radio.interrupt;
 
 const radio = @import("../radio.zig");
@@ -42,6 +43,16 @@ pub fn strlen(str: ?[*:0]const u8) callconv(.c) usize {
     const s = str orelse return 0;
 
     return std.mem.len(s);
+}
+
+// The blobs use ASCII protocol strings; avoid ROM's newlib locale/reent state.
+pub fn strcasecmp(a: [*:0]const u8, b: [*:0]const u8) callconv(.c) c_int {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const x = std.ascii.toLower(a[i]);
+        const y = std.ascii.toLower(b[i]);
+        if (x != y or x == 0) return @as(c_int, x) - @as(c_int, y);
+    }
 }
 
 pub fn strnlen(str: ?[*:0]const u8, n: usize) callconv(.c) usize {
@@ -157,6 +168,19 @@ pub fn printf(fmt: ?[*:0]const u8, ...) callconv(.c) void {
     syslog(fmt, @cVaStart());
 }
 
+/// Referenced by the C6 PHY blob for debug output; dropped, like esp-radio does by default.
+pub fn putchar(ch: c_int) callconv(.c) c_int {
+    return ch;
+}
+
+/// XTAL frequency in MHz, referenced by the C6 PHY blob.
+pub fn rtc_clk_xtal_freq_get() callconv(.c) c_int {
+    return switch (compatibility.chip) {
+        .esp32_c3 => 40,
+        .esp32_c6 => peripherals.PCR.SYSCLK_CONF.read().CLK_XTAL_FREQ,
+    };
+}
+
 pub fn esp_fill_random(buf: [*c]u8, len: usize) callconv(.c) void {
     log.debug("esp_fill_random {any} {}", .{ buf, len });
 
@@ -165,6 +189,7 @@ pub fn esp_fill_random(buf: [*c]u8, len: usize) callconv(.c) void {
 
 /// Some are weaklinks which can be overriten.
 pub fn export_symbols() void {
+    @export(&strcasecmp, .{ .name = "strcasecmp", .linkage = .weak });
     @export(&strlen, .{ .name = "strlen", .linkage = .weak });
     @export(&strnlen, .{ .name = "strnlen", .linkage = .weak });
     @export(&strrchr, .{ .name = "strrchr", .linkage = .weak });
@@ -192,6 +217,10 @@ pub fn export_symbols() void {
         @export(&printf, .{ .name = name });
     }
     @export(&esp_fill_random, .{ .name = "esp_fill_random" });
+    if (compatibility.chip == .esp32_c6) {
+        @export(&putchar, .{ .name = "putchar", .linkage = .weak });
+        @export(&rtc_clk_xtal_freq_get, .{ .name = "rtc_clk_xtal_freq_get", .linkage = .weak });
+    }
     @export(&esp_event_post, .{ .name = "esp_event_post" });
 }
 
@@ -538,12 +567,23 @@ pub fn queue_send_from_isr(ptr: ?*anyopaque, item_ptr: ?*anyopaque, _hptw: ?*any
     return @intCast(n);
 }
 
-pub fn queue_send_to_back() callconv(.c) void {
-    @panic("queue_send_to_back: not implemented");
+pub fn queue_send_to_back(ptr: ?*anyopaque, item_ptr: ?*anyopaque, block_time_tick: u32) callconv(.c) i32 {
+    // The queue is a FIFO, a plain send already goes to the back.
+    return queue_send(ptr, item_ptr, block_time_tick);
 }
 
-pub fn queue_send_to_front() callconv(.c) void {
-    @panic("queue_send_to_front: not implemented");
+pub fn queue_send_to_front(ptr: ?*anyopaque, item_ptr: ?*anyopaque, block_time_tick: u32) callconv(.c) i32 {
+    log.debug("queue_send_to_front {?} {?} {}", .{ ptr, item_ptr, block_time_tick });
+
+    const queue: *QueueWrapper = @ptrCast(@alignCast(ptr));
+    const item: [*]const u8 = @ptrCast(@alignCast(item_ptr));
+
+    const timeout: rtos.Timeout = switch (block_time_tick) {
+        0 => .non_blocking,
+        c.OSI_FUNCS_TIME_BLOCKING => .never,
+        else => |ticks| .{ .after = .from_ticks(ticks) },
+    };
+    return if (queue.inner.put_front(item[0..queue.item_len], timeout)) 1 else -1;
 }
 
 pub fn queue_recv(ptr: ?*anyopaque, item_ptr: ?*anyopaque, block_time_tick: u32) callconv(.c) i32 {
@@ -735,7 +775,25 @@ fn limit(val: u8, low: u8, high: u8) u8 {
     return if (val < low) low else if (val > high) high else val;
 }
 
-const phy_init_data_default: c.esp_phy_init_data_t = .{
+/// PHY init data. The layout is chip specific and the blob reads it as is: the esp32c3 table
+/// does not describe the esp32c6 PHY.
+const phy_init_data_default: c.esp_phy_init_data_t = switch (compatibility.chip) {
+    .esp32_c3 => phy_init_data_esp32_c3,
+    .esp32_c6 => phy_init_data_esp32_c6,
+};
+
+/// ESP-IDF components/esp_phy/esp32c6/phy_init_data.c (Apache-2.0): two config bytes, the
+/// 18 per-rate TX power limits, zero padding and the trailing 0x51.
+const phy_init_data_esp32_c6: c.esp_phy_init_data_t = .{ .params = blk: {
+    const tx_power_limits = [18]u8{ 0x54, 0x54, 0x50, 0x50, 0x50, 0x4c, 0x4c, 0x4c, 0x4c, 0x48, 0x44, 0x3c, 0x3c, 0x3c, 0x4c, 0x4c, 0x4c, 0x48 };
+    var params: [128]u8 = @splat(0);
+    params[0] = 0x0a;
+    for (tx_power_limits, 0..) |high, i| params[2 + i] = limit(CONFIG_ESP32_PHY_MAX_TX_POWER * 4, 0, high);
+    params[127] = 0x51;
+    break :blk params;
+} };
+
+const phy_init_data_esp32_c3: c.esp_phy_init_data_t = .{
     .params = .{
         0x00,
         0x00,
@@ -869,6 +927,14 @@ const phy_init_data_default: c.esp_phy_init_data_t = .{
 };
 
 fn clocks_phy_set_enabled(enable: bool) void {
+    switch (compatibility.chip) {
+        .esp32_c3 => clocks_phy_set_enabled_c3(enable),
+        .esp32_c6 => clocks_c6.phy_clocks_set_enabled(enable),
+    }
+}
+
+fn clocks_phy_set_enabled_c3(enable: bool) void {
+    const APB_CTRL = peripherals.APB_CTRL;
     const system_wifi_clk_wifi_bt_common_m: u32 = 0x78078F;
 
     var wifi_clk_en = APB_CTRL.WIFI_CLK_EN.read().WIFI_CLK_EN;
@@ -880,26 +946,97 @@ fn clocks_phy_set_enabled(enable: bool) void {
     APB_CTRL.WIFI_CLK_EN.write(.{ .WIFI_CLK_EN = wifi_clk_en });
 }
 
+// ESP-IDF phy_init.c / phy_common.c lifecycle. The selected protocol is
+// exclusive for this image; Wi-Fi retains its adapter enable/disable calls.
+// These OS adapter entry points and the timer callback run in task context.
+const phy = struct {
+    const is_wifi = microzig.options.hal.radio.protocol == .wifi;
+    extern fn phy_init_param_set(param: u8) void;
+    extern fn phy_wifi_enable_set(enabled: u8) void;
+    extern fn phy_bbpll_en_usb(enabled: bool) void;
+    extern fn phy_wakeup_init() void;
+    extern fn phy_close_rf() void;
+    extern fn phy_xpd_tsens() void;
+    extern fn phy_param_track_tot(wifi_enabled: bool, bt_enabled: bool) void;
+
+    // Like IDF's _lock_acquire: calibration must allow interrupts/task scheduling.
+    // Short blob register critical sections use the existing PHY OS callbacks.
+    var mutex: rtos.Mutex = .{};
+    var ref_count: u32 = 0;
+    var calibrated = false;
+    var tracking_timer: c.ets_timer = undefined;
+    var last_tracking_us: u64 = 0;
+    const tracking_period_us = 1_000_000; // IDF default ESP_PHY_PLL_TRACK_PERIOD_MS.
+
+    fn track(_: ?*anyopaque) callconv(.c) void {
+        mutex.lock();
+        defer mutex.unlock();
+        // A callback already dequeued when disarmed must not access a closed PHY.
+        if (ref_count == 0) return;
+        phy_param_track_tot(is_wifi, !is_wifi);
+        last_tracking_us = get_time_since_boot().to_us();
+    }
+
+    fn enable() void {
+        mutex.lock();
+        defer mutex.unlock();
+
+        if (ref_count == 0) {
+            clocks_phy_set_enabled(true);
+            if (compatibility.chip == .esp32_c6) clocks_c6.calibration_clocks_set_enabled(true);
+            if (calibrated) {
+                phy_wakeup_init();
+            } else {
+                phy_init_param_set(1);
+                // Keep the PLL used by USB-Serial-JTAG during full calibration.
+                phy_bbpll_en_usb(true);
+                var cal_data: c.esp_phy_calibration_data_t = std.mem.zeroes(c.esp_phy_calibration_data_t);
+                _ = c.register_chipv7_phy(&phy_init_data_default, &cal_data, c.PHY_RF_CAL_FULL);
+                calibrated = true;
+            }
+            if (compatibility.chip == .esp32_c6) clocks_c6.calibration_clocks_set_enabled(false);
+            timer.arm(&tracking_timer, .from_us(tracking_period_us), true);
+        }
+        ref_count = std.math.add(u32, ref_count, 1) catch @panic("PHY reference count overflow");
+        // IDF also tracks on enable if more than a period elapsed while disabled.
+        const now = get_time_since_boot().to_us();
+        if (now - last_tracking_us > tracking_period_us) {
+            phy_param_track_tot(is_wifi, !is_wifi);
+            last_tracking_us = now;
+        }
+        // IDF esp_adapter.c does this on every enable, after esp_phy_enable.
+        if (is_wifi) phy_wifi_enable_set(1);
+    }
+
+    fn disable() void {
+        mutex.lock();
+        defer mutex.unlock();
+        // IDF adapter does this even for an unbalanced disable.
+        if (is_wifi) phy_wifi_enable_set(0);
+        if (ref_count == 0) return;
+        ref_count -= 1;
+        if (ref_count != 0) return;
+
+        timer.disarm(&tracking_timer);
+        phy_close_rf();
+        phy_xpd_tsens();
+        // The pinned esp-wifi-sys C3/C6 libphy.a does not export
+        // phy_wait_freq_hw_hop_done (IDF v6.0.2 does). No callable hop wait.
+        clocks_phy_set_enabled(false);
+    }
+};
+
+/// Preallocate the PLL timer before the blob can enable the PHY.
+pub fn phy_timer_init(allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
+    try timer.setfn(allocator, &phy.tracking_timer, phy.track, null);
+}
+
 pub fn phy_disable() callconv(.c) void {
-    log.debug("phy_disable", .{});
-    clocks_phy_set_enabled(false);
+    phy.disable();
 }
 
 pub fn phy_enable() callconv(.c) void {
-    log.debug("phy_enable", .{});
-
-    const cs = enter_critical_section();
-    defer cs.leave();
-
-    clocks_phy_set_enabled(true);
-
-    // TODO: fully implement phy enable
-    var cal_data: c.esp_phy_calibration_data_t = std.mem.zeroes(c.esp_phy_calibration_data_t);
-
-    const phy_version = c.get_phy_version_str();
-    log.debug("phy_version {s}", .{phy_version});
-
-    _ = c.register_chipv7_phy(&phy_init_data_default, &cal_data, c.PHY_RF_CAL_PARTIAL);
+    phy.enable();
 }
 
 pub fn phy_update_country_info(country: [*c]const u8) callconv(.c) c_int {
@@ -959,20 +1096,39 @@ pub fn timer_arm_us(ets_timer_ptr: ?*anyopaque, us: u32, repeat: bool) callconv(
 pub fn wifi_reset_mac() callconv(.c) void {
     log.debug("wifi_reset_mac", .{});
 
-    APB_CTRL.WIFI_RST_EN.write(.{ .WIFI_RST = APB_CTRL.WIFI_RST_EN.read().WIFI_RST | (1 << 2) });
-    APB_CTRL.WIFI_RST_EN.write(.{ .WIFI_RST = APB_CTRL.WIFI_RST_EN.read().WIFI_RST & ~@as(u32, 1 << 2) });
+    switch (compatibility.chip) {
+        .esp32_c3 => {
+            const APB_CTRL = peripherals.APB_CTRL;
+            APB_CTRL.WIFI_RST_EN.write(.{ .WIFI_RST = APB_CTRL.WIFI_RST_EN.read().WIFI_RST | (1 << 2) });
+            APB_CTRL.WIFI_RST_EN.write(.{ .WIFI_RST = APB_CTRL.WIFI_RST_EN.read().WIFI_RST & ~@as(u32, 1 << 2) });
+        },
+        // Same as esp-radio: no MAC reset on the C6. ESP-IDF v6.0.2 pulses MODEM_SYSCON
+        // RST_WIFIMAC here; association works without it.
+        .esp32_c6 => {},
+    }
 }
 
 pub fn wifi_clock_enable() callconv(.c) void {
     log.debug("wifi_clock_enable", .{});
 
     // no op on esp32c3
+    if (compatibility.chip == .esp32_c6) clocks_c6.wifi_clocks_set_enabled(true);
 }
 
 pub fn wifi_clock_disable() callconv(.c) void {
     log.debug("wifi_clock_disable", .{});
 
     // no op on esp32c3
+    if (compatibility.chip == .esp32_c6) clocks_c6.wifi_clocks_set_enabled(false);
+}
+
+pub fn regdma_link_set_write_wait_content(_: ?*anyopaque, _: u32, _: u32) callconv(.c) void {
+    log.err("regdma_link_set_write_wait_content: modem sleep retention is not supported", .{});
+}
+
+pub fn sleep_retention_find_link_by_id(_: c_int) callconv(.c) ?*anyopaque {
+    log.err("sleep_retention_find_link_by_id: modem sleep retention is not supported", .{});
+    return null;
 }
 
 pub fn wifi_rtc_enable_iso() callconv(.c) void {
@@ -1042,8 +1198,22 @@ pub fn get_random(buf: [*c]u8, len: usize) callconv(.c) c_int {
     return 0;
 }
 
-pub fn get_time() callconv(.c) void {
-    @panic("get_time: not implemented");
+// ESP-IDF v6.0.2 wpa_supplicant/port/include/os.h: os_time_t is uint64_t.
+const OsTime = extern struct { sec: u64, usec: c_long };
+
+comptime {
+    std.debug.assert(@offsetOf(OsTime, "usec") == 8);
+    std.debug.assert(@sizeOf(OsTime) == 16);
+}
+
+pub fn get_time(t: ?*anyopaque) callconv(.c) c_int {
+    const os_time: *OsTime = @ptrCast(@alignCast(t orelse return -1));
+    const usec = get_time_since_boot().to_us();
+    os_time.* = .{
+        .sec = @intCast(usec / 1_000_000),
+        .usec = @intCast(usec % 1_000_000),
+    };
+    return 0;
 }
 
 pub fn random() callconv(.c) c_ulong {
@@ -1051,8 +1221,10 @@ pub fn random() callconv(.c) c_ulong {
 }
 
 pub fn slowclk_cal_get() callconv(.c) u32 {
-    // NOTE: esp32c3 specific
-    return 28639;
+    return switch (compatibility.chip) {
+        .esp32_c3 => 28639,
+        .esp32_c6 => clocks_c6.slowclk_cal(),
+    };
 }
 
 pub fn log_write(_: c_uint, _: [*c]const u8, fmt: [*c]const u8, ...) callconv(.c) void {
@@ -1069,8 +1241,21 @@ pub fn log_timestamp() callconv(.c) u32 {
 
 pub const malloc_internal = malloc;
 
-pub fn realloc_internal() callconv(.c) void {
-    @panic("realloc_internal: not implemented");
+pub fn realloc_internal(ptr: ?*anyopaque, len: usize) callconv(.c) ?*anyopaque {
+    log.debug("realloc {?} {}", .{ ptr, len });
+
+    const old = ptr orelse return malloc(len);
+    if (len == 0) {
+        free(old);
+        return null;
+    }
+
+    const old_len: *const usize = @ptrFromInt(@intFromPtr(old) - 8);
+    const new = malloc(len) orelse return null; // the old block stays valid, as in C
+    const copy_len = @min(old_len.*, len);
+    @memcpy(@as([*]u8, @ptrCast(new))[0..copy_len], @as([*]const u8, @ptrCast(old))[0..copy_len]);
+    free(old);
+    return new;
 }
 
 pub const calloc_internal = calloc;
@@ -1086,9 +1271,7 @@ pub fn zalloc_internal(len: usize) callconv(.c) ?*anyopaque {
 
 pub const wifi_malloc = malloc;
 
-pub fn wifi_realloc() callconv(.c) void {
-    @panic("wifi_realloc: not implemented");
-}
+pub const wifi_realloc = realloc_internal;
 
 pub const wifi_calloc = calloc;
 pub const wifi_zalloc = zalloc_internal;

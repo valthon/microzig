@@ -436,7 +436,15 @@ fn _vector_table() align(256) linksection(".ram_vectors") callconv(.naked) void 
     );
 }
 
+/// Fatal paths never resume the interrupted context. Take over its logger
+/// before the first diagnostic, including diagnostics preceding @panic.
+pub fn prepare_panic() void {
+    interrupt.disable_interrupts();
+    if (microzig.config.has_hal) microzig.hal.usb_serial_jtag.logger.prepare_panic();
+}
+
 fn unhandled(_: *TrapFrame) linksection(".ram_text") callconv(.c) void {
+    prepare_panic();
     const mcause = csr.mcause.read();
 
     if (mcause.is_interrupt != 0) {
