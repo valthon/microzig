@@ -7,7 +7,9 @@ SECTIONS
     *(.text*)
     *(.eh_frame*)
 
-    . = ALIGN(8);
+    /* Keep the rodata flash offset and mapped address aligned to its inputs,
+     * including inputs whose alignment exceeds the minimum text padding. */
+    . = ALIGN(MAX(8, ALIGNOF(.rodata)));
   } > IROM
 
   _irom_size = . - _irom_start;

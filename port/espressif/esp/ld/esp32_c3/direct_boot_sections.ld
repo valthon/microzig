@@ -6,7 +6,10 @@ SECTIONS
     KEEP(*(microzig_flash_start))
     *(.text*)
 
-    . = ALIGN(8);
+    /* The explicit .rodata VMA must honor its input sections' alignment.
+     * Pad text so its size remains both the rodata flash offset and DROM offset
+     * (C3 TRM v1.4 section 3.3.3.1, Table 3.3-2). */
+    . = ALIGN(MAX(8, ALIGNOF(.rodata)));
   } > IROM
 
   _irom_size = . - _irom_start;
