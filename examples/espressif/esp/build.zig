@@ -38,7 +38,14 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     }) });
-    b.step("test", "Test the example-local DHCP server").dependOn(&b.addRunArtifact(dhcp_tests).step);
+    const test_step = b.step("test", "Test the DHCP server and systimer interval checks");
+    test_step.dependOn(&b.addRunArtifact(dhcp_tests).step);
+    const systimer_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/systimer.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(systimer_tests).step);
     const expected_mac: ?u48 = if (expected_mac_text) |text| parse_mac(text) orelse
         std.process.fatal("-Dexpected_mac={s}: expected six hex bytes separated by ':'", .{text}) else null;
 

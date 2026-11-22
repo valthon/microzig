@@ -81,6 +81,10 @@ jobs:
       run: zig build test
       working-directory: port/espressif/esp
 
+    - name: examples/espressif/esp
+      run: zig build test
+      working-directory: examples/espressif/esp
+
     - name: gigadevice/gd32
       run: zig build test
       working-directory: port/gigadevice/gd32
