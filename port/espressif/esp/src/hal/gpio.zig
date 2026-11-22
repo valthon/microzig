@@ -14,7 +14,15 @@ pub const pin_count = chip_specific.pin_count;
 
 /// Peripheral signals that can be routed onto a pin.
 pub const InputSignal = chip_specific.InputSignal;
+
+/// Peripheral output signals that can be routed onto a pin.
 pub const OutputSignal = chip_specific.OutputSignal;
+
+/// Feed a peripheral input a constant level through the GPIO matrix instead of a pad.
+/// The signal stays detached from any pad until explicitly re-routed.
+pub fn connect_constant_to_peripheral(signal: InputSignal, level: u1) void {
+    chip_specific.set_input_constant(@backingInt(signal), level);
+}
 
 /// Pad drive strength. The register encoding is chip specific, see
 /// `gpio/<chip>.zig` `drive_strength_value`.

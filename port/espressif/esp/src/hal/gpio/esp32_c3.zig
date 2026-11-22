@@ -287,6 +287,15 @@ pub fn set_input_signal(signal: u8, pin: u5, invert: bool) void {
     });
 }
 
+/// ESP32-C3 TRM v1.4 §5.4.3: IN_SEL 0x1F reads always 0, 0x1E always 1.
+pub fn set_input_constant(signal: u8, level: u1) void {
+    GPIO.FUNC_IN_SEL_CFG[signal].write(.{
+        .IN_SEL = if (level == 0) 0x1f else 0x1e,
+        .IN_INV_SEL = 0,
+        .SEL = 1,
+    });
+}
+
 pub fn set_input_signal_invert(signal: u8, invert: bool) void {
     GPIO.FUNC_IN_SEL_CFG[signal].modify(.{ .IN_INV_SEL = @intFromBool(invert) });
 }

@@ -78,6 +78,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "selftest_lp_uart", .file = "src/selftest_lp_uart.zig", .chips = &.{.esp32_c6}, .lp_image = .uart },
         .{ .name = "selftest_lp_timer", .file = "src/selftest_lp_timer.zig", .chips = &.{.esp32_c6}, .lp_image = .timer },
         .{ .name = "selftest_lp_core", .file = "src/selftest_lp_core.zig", .chips = &.{.esp32_c6}, .lp_image = .counter },
+        .{ .name = "selftest_i2c", .file = "src/selftest_i2c.zig" },
         .{ .name = "selftest_i2s", .file = "src/selftest_i2s.zig" },
         .{ .name = "selftest_parl_io", .file = "src/selftest_parl_io.zig", .chips = &.{.esp32_c6} },
         .{ .name = "selftest_dedicated_gpio", .file = "src/selftest_dedicated_gpio.zig" },
@@ -157,6 +158,7 @@ pub fn build(b: *std.Build) void {
             .prefix = "xiao_esp32_c6",
             .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6,
         },
+        .{ .name = "selftest_i2c", .file = "src/selftest_i2c.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6 },
         // The radio examples again, for the XIAO ESP32-C6's rf switch (see ble_bench.run).
         .{ .name = "ble_scan", .file = "src/ble_scan.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
         .{ .name = "ble_peripheral", .file = "src/ble_peripheral.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },

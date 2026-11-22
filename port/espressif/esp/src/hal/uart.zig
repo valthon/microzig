@@ -120,10 +120,16 @@ pub const UART = struct {
         }
     }
 
+    /// Includes the shift register, not just the FIFO (C3 TRM v1.4 §26.6
+    /// UART_FSM_STATUS_REG / C6 TRM v1.2 §27.6 UART_FSM_STATUS_REG).
+    pub fn is_tx_idle(self: UART) bool {
+        const r = self.regs();
+        return r.STATUS.read().TXFIFO_CNT == 0 and r.FSM_STATUS.read().ST_UTX_OUT == 0;
+    }
+
     pub fn flush_blocking(self: UART, timeout: ?mtime.Duration) error{Timeout}!void {
         const deadline = mtime.Deadline.init_relative(time.get_time_since_boot(), timeout);
-        const r = self.regs();
-        while (r.STATUS.read().TXFIFO_CNT != 0 or r.FSM_STATUS.read().ST_UTX_OUT != 0)
+        while (!self.is_tx_idle())
             try check_deadline(deadline);
     }
 };

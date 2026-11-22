@@ -358,6 +358,16 @@ pub fn set_input_signal(signal: u8, pin: u5, invert: bool) void {
     });
 }
 
+/// ESP32-C6 TRM v1.2 §7.4.3: FUNC_IN_SEL 0x3C reads always 0, 0x38 always 1.
+pub fn set_input_constant(signal: u8, level: u1) void {
+    func_in_sel(signal).write(.{
+        .FUNC0_IN_SEL = if (level == 0) 0x3c else 0x38,
+        .FUNC0_IN_INV_SEL = 0,
+        .SIG0_IN_SEL = 1,
+        .padding = 0,
+    });
+}
+
 pub fn set_input_signal_invert(signal: u8, invert: bool) void {
     func_in_sel(signal).modify(.{ .FUNC0_IN_INV_SEL = @intFromBool(invert) });
 }

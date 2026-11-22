@@ -140,7 +140,10 @@ pub const SPI = enum(u2) {
             .CLK_EN = 1,
         });
 
-        // this also enables using all 16 words
+        // C3 TRM v1.4 §27.7.2 / C6 TRM v1.2 §28.7.2, Tables
+        // 27.7-1 / 28.7-1: mode 0 is USER.CK_OUT_EDGE = 0 and
+        // MISC.CK_IDLE_EDGE = 0 (both registers are cleared here).
+        // This also enables using all 16 words.
         self.register("USER").write_raw(0);
 
         switch (compatibility.chip) {
@@ -364,6 +367,45 @@ pub const SPI = enum(u2) {
         read_buffer: []u8,
     ) void {
         self.transceivev_blocking(&.{write_buffer}, &.{read_buffer});
+    }
+
+    /// One full-duplex FIFO transaction (1–64 bytes), with bounded UPDATE and
+    /// completion waits. Own SPI2 exclusively. On timeout SPI2 is reset;
+    /// call apply() before reusing it. No DMA descriptors are used.
+    pub fn transceive_blocking_timeout(
+        self: SPI,
+        write_buffer: []const u8,
+        read_buffer: []u8,
+        timeout: mtime.Duration,
+    ) error{ InvalidLength, Busy, Timeout }!void {
+        if (write_buffer.len == 0 or write_buffer.len > fifo_byte_len or
+            write_buffer.len != read_buffer.len) return error.InvalidLength;
+        if (@field(self.register("CMD").read(), register_name("USR")) != 0) return error.Busy;
+        const deadline = mtime.Deadline.init_relative(time.get_time_since_boot(), timeout);
+        errdefer system.peripheral_reset(.{ .spi2 = true });
+        const write_vec: SliceVector([]const u8) = .init(&.{write_buffer});
+        var write_iter = write_vec.iterator();
+        self.fill_fifo(&write_iter, write_buffer.len);
+        self.configure_transfer(true, true, @intCast(write_buffer.len * 8), .single_two_wires);
+        self.clear_transfer_done();
+        self.modify_register("DMA_CONF", .{
+            .RX_AFIFO_RST = 1,
+            .BUF_AFIFO_RST = 1,
+            .DMA_AFIFO_RST = 1,
+        });
+        self.modify_register("CMD", .{ .UPDATE = 1 });
+        while (@field(self.register("CMD").read(), register_name("UPDATE")) != 0) {
+            if (deadline.is_reached_by(time.get_time_since_boot())) return error.Timeout;
+        }
+        self.modify_register("CMD", .{ .USR = 1 });
+        while (@field(self.register("DMA_INT_RAW").read(), register_name("TRANS_DONE_INT_RAW")) == 0 or
+            @field(self.register("CMD").read(), register_name("USR")) != 0)
+        {
+            if (deadline.is_reached_by(time.get_time_since_boot())) return error.Timeout;
+        }
+        const read_vec: SliceVector([]u8) = .init(&.{read_buffer});
+        var read_iter = read_vec.iterator();
+        self.read_fifo(&read_iter, read_buffer.len);
     }
 
     pub const DmaBuffers = struct {

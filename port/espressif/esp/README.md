@@ -26,9 +26,9 @@ Other results identify their boards and runs below; dates are included where rec
 
 | Driver (`hal.*`)                              | C3  | C6  | Self-test                                          | C3 evidence | C6 evidence |
 | --------------------------------------------- | --- | --- | -------------------------------------------------- | --------- | --------- |
-| `uart` (UART0/1)                              | yes | yes | `selftest_uart`                                    | 5/5       | 5/5       |
-| `twai` (CAN)                                  | yes | yes | `selftest_twai`                                    | 10/10     | 20/20     |
-| `rmt` (polling TX/RX)                         | yes | yes | `selftest_rmt`                                     | 3/3       | 3/3       |
+| `uart` (UART0/1) | yes | yes | `selftest_uart`, external echo; Pico 2 W peer (C3), Pico 2 W or RP2040-GEEK peer (C6); expected `DONE pass=7 fail=0`; harness below | 3/3 runs, `DONE pass=7 fail=0`, Pico 2 W peer | 3/3 runs, `DONE pass=7 fail=0`, each on Super Mini ESP32-C6 (Pico 2 W peer) and XIAO ESP32-C6 (RP2040-GEEK peer) |
+| `twai` (CAN) | yes | yes | `selftest_twai`, transceiver + SLCAN host echo; expected C3 `DONE pass=12 fail=0`, C6 both controllers `DONE pass=24 fail=0` | 3/3 runs, `DONE pass=12 fail=0`, WeAct USB2CANFD host | 3/3 runs, `DONE pass=24 fail=0`, Super Mini ESP32-C6, WeAct USB2CANFD host |
+| `rmt` (polling TX/RX) | yes | yes | `selftest_rmt`, Pico edge timer/replay; requires external widths/replay, `DONE pass=3 fail=0` | 3/3 runs, `DONE pass=3 fail=0`, Pico 2 W peer | 3/3 runs, `DONE pass=3 fail=0`, Super Mini ESP32-C6, Pico 2 W peer |
 | `timer`, `wdt` (timer groups, watchdogs)      | yes | yes | `selftest_timers`                                  | 6/6, 3 runs (24ebc5d1) | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `wdt.Rtc` core reset, C6 USB recovery         | yes | yes | `selftest_rwdt` (from flash)                       | 1/1 in 3 of 3 boots, direct boot (2026-11-20) | 1/1 in 3 of 3 boots each on Super Mini ESP32-C6 (image boot) and XIAO ESP32-C6 (direct boot) (2026-11-20) |
 | `usb_serial_jtag` (logging, RX, confirmed TX) | yes | yes | `selftest_usj`                                     | 9/9 echoes, 3 runs (24ebc5d1) | 9/9 echoes, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
@@ -36,12 +36,12 @@ Other results identify their boards and runs below; dates are included where rec
 | `flash` (erase, write, read)                  | yes | yes | `selftest_flash`                                   | 5/5       | 5/5       |
 | `adc` (ADC1), `temperature`                   | yes | yes | `selftest_adc`                                     | 10/10     | 10/10     |
 | `ledc` PWM and fades (C6: single-range gamma) | yes | yes | `selftest_ledc_fade` (C3), `selftest_c6_ledc` (C6) | 4/4       | 7/7       |
-| `i2c` master                                  | yes | yes | none                                               | see below | built     |
-| `i2s` (Philips stereo 16/32-bit; master TX/RX, shared duplex clocks; integer PLL160M dividers; aligned frames ≤4092 bytes, 4088 for 32-bit; owns I2S0 and DMA pair) | yes | yes | `selftest_i2s`, pads 4/5/6, no wiring; EOF probe: RX_EOF_NUM counts bytes (TRM 30.10 says bits) | built only (prior 7/7) | built only (prior 7/7) |
-| `parl_io` (1/2/4/8-bit; XTAL master TX, external-clock RX, optional valid; aligned 4..65532-byte frames; owns peripheral and DMA pair) | no | yes | `selftest_parl_io`, valid/software-enable loops, ordered byte comparisons, pads 0–7/10/11, no wiring | n/a | built only (prior 16/16) |
+| `i2c` master                                  | yes | yes | `selftest_i2c`, RP2350 peer; expected 8/8          | see below | 8/8 in 5 of 5 boots on Super Mini ESP32-C6 (image boot) |
+| `i2s` (Philips stereo 16/32-bit; master TX/RX, shared duplex clocks; integer PLL160M dividers; aligned frames ≤4092 bytes, 4088 for 32-bit; owns I2S0 and DMA pair) | yes | yes | `selftest_i2s`, Pico PIO slave; harness below; requires external EOF/data/guards, `DONE pass=8 fail=0` | 3/3 runs, `DONE pass=8 fail=0`, Pico 2 W peer | 3/3 runs, `DONE pass=8 fail=0`, Super Mini ESP32-C6, Pico 2 W peer |
+| `parl_io` (1/2/4/8-bit; XTAL master TX, external-clock RX, optional valid; aligned 4..65532-byte frames; owns peripheral and DMA pair) | no | yes | `selftest_parl_io`, Pico capture/replay, GPIO0–7/18/19; requires external data/guards, `DONE pass=16 fail=0` | n/a | 3/3 runs, `DONE pass=16 fail=0`, Super Mini ESP32-C6, Pico 2 W peer |
 | `dedicated_gpio` (8 CPU signals; exclusive pad/signal ownership, CSR set/clear/read) | yes | yes | `selftest_dedicated_gpio`, pad 4, no wiring | 9/9 | 8/8 |
 | `gdma` channel pairs 0–2, SRAM memory copy | yes | yes | `selftest_gdma`; exclusive channels, disjoint SRAM/descriptors, bounded wait | 15/15, 3 runs (24ebc5d1) | 16/16, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
-| `spi` master (SPI2), GDMA channel 0 transfers | yes | yes | `selftest_spi_dma`                                 | 8/8       | 8/8       |
+| `spi` master (SPI2), GDMA channel 0 transfers | yes | yes | `selftest_spi_dma`, Pico PIO mode-0 slave; requires external previous-frame echo, `DONE pass=8 fail=0` | 3/3 runs, `DONE pass=8 fail=0`, Pico 2 W peer | 3/3 runs, `DONE pass=8 fail=0`, Super Mini ESP32-C6, Pico 2 W peer |
 | `clocks.sleep` light sleep                    | yes | yes | `selftest_sleep_s*` (C3, OLED or beacon), `selftest_sleep_c6_s*` (C6) | see below | s1–s4, s6–s8 on Super Mini ESP32-C6 and XIAO ESP32-C6 (3 runs each); see "C6 light sleep and deep sleep" |
 | `clocks.sleep` deep sleep                     | no  | yes | `selftest_sleep_c6_s5` (image boot) | n/a | 3/3 on Super Mini ESP32-C6 and XIAO ESP32-C6; see "C6 light sleep and deep sleep" |
 | `sigma_delta` (4 channels, signed density, divider 1–256) | yes | yes | `selftest_sigma_delta` | 3/3, 3 runs (24ebc5d1) | 3/3, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
@@ -53,6 +53,72 @@ Other results identify their boards and runs below; dates are included where rec
 | `rtos`                                        | yes | yes | `rtos`: expected `DONE pass=6 fail=0`, five ordered items + empty-queue timeout | 6/6, 3 runs (24ebc5d1) | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `systimer`                                    | yes | yes | `systimer`: expected `DONE pass=4 fail=0`, four IRQs + three 1 s intervals, TIMG0 reference, +/-100 us | 4/4, 3 runs (2026-11-20) | 4/4, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-20) |
 | custom CPU/APB clocks                         | yes | yes | `custom_clock_config`: expected `DONE pass=3 fail=0`, CPU/APB register readback at 20 MHz + 100 ms ROM busy delay vs systimer, +/-100 us | 3/3, 3 runs (2026-11-20) | 3/3, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-20) |
+
+### External self-test peers and harness
+
+The UART, SPI DMA, I2S, RMT, PARL_IO and LP UART/I2C entries above and below
+state the peer and required checks. Run each test with the external peer attached.
+The Pico 2 W RAM firmware is
+[`esp_peer.zig`](../../../examples/raspberrypi/rp2xxx/src/esp_peer.zig), built as
+`pico2_w_ram_esp_peer` in `examples/raspberrypi/rp2xxx`. Its USB CDC console
+accepts `mode <mode> <c3|c6>`, `status`, `reset` (return to flash) and `boot`
+(ROM USB loader). Select the mode before starting the ESP image.
+
+Connect common GND; power each board from its own USB. The C3 harness uses
+L0/L1/L2/L3 = ESP GPIO0/1/3/10 to Pico GP0/1/2/3 respectively. The Super Mini ESP32-C6
+harness uses L0–L7 = ESP GPIO0–7 to Pico GP8–15, GPIO18 clock to GP16 and
+GPIO19 valid to GP17. The C6 bank also serves the fixed LP pins. These GPIO
+numbers describe the generic harness; the XIAO ESP32-C6 UART uses the RP2040-GEEK route below.
+
+| ESP test | Pico command | Signal roles and required checks |
+| --- | --- | --- |
+| `selftest_uart` | `mode uart c3` or `mode uart c6` | L1 ESP TX → peer RX, L0 ESP RX ← peer TX. Automatic route probe, 300-byte echoes at 115200 and 1 Mbaud, TX timing ±10%, parity rejection/acceptance; `SELFTEST uart DONE pass=7 fail=0`. |
+| `selftest_spi_dma` | `mode spi c3` or `mode spi c6` | L0 MISO, L1 MOSI, L2 SCLK, L3 active-low CS. Mode 0, MSB first, 1 MHz; peer returns the previous frame, zero-padded. Five lengths 1/64/4092/4096/10000, TX-only then RX-only, FIFO after DMA, guards and throughput ±10%; `SELFTEST spi_dma DONE pass=8 fail=0`. Hold CS high/SCLK idle 110 ms between frames. |
+| `selftest_i2s` | `mode i2s c3` or `mode i2s c6` | L0 DIN, L1 DOUT, L2 BCK, L3 WS. Philips stereo 16/32-bit at 1 MHz BCK; previous-transfer echo of the sample bits, starting one BCK after the first WS fall. EOF, six size/width pairs and separate directions with guards; `SELFTEST i2s DONE pass=8 fail=0`. Leave BCK/WS idle 110 ms between transfers. |
+| `selftest_rmt` | `mode rmt c3` or `mode rmt c6` | L1 ESP TX capture, L0 peer replay to ESP RX. Peer measures 64/137-item absolute widths, ends after 2 ms low and replays after 20 ms. ESP checks levels, widths ±1 tick and TX duration ±100 us; `SELFTEST rmt DONE pass=3 fail=0`. Require `PEER rmt tx_widths_64: PASS` and `tx_widths_137: PASS` (±2 us, excluding final low). |
+| `selftest_parl_io` | `mode parl c6` | L0–L7 data, GPIO18 clock, GPIO19 valid. Peer captures falling edges, discards setup bursts <16 edges, detects 1 ms idle, then replays after 20 ms at 1 MHz. ESP releases all ten pads before RX. Widths 1/2/4/8 × valid/software gating × 64/4096 bytes, data and guards; `SELFTEST parl_io DONE pass=16 fail=0`. |
+| `selftest_lp_uart` | `mode lpuart c6` | GPIO4 RX ← GP12 TX, GPIO5 TX → GP13 RX, 115200 8N1. Load, echo and empty timeout on LP/HP; `SELFTEST lp_uart DONE pass=5 fail=0`. |
+| `selftest_lp_i2c` | `mode i2c c6` | GPIO6 SDA ↔ GP14, GPIO7 SCL ↔ GP15, target 0x42 at 100 kHz. Load and LP/HP scan/readback/NACK recovery; `SELFTEST lp_i2c DONE pass=7 fail=0`. |
+
+After ESP DONE, request `status`: require `errors=0` and no `PEER ... FAIL`.
+Require clock PASS within 1% for UART/LP UART baud and SPI/I2S/PARL 1 MHz,
+and `PEER uart parity_rx: PASS` for UART. SPI/I2S reply during the next
+ESP-clocked transfer; RMT/PARL reply in a separate window. These tests release
+their driven pads before asynchronous replay.
+
+The host tools in [`examples/espressif/esp/tools/bench`](../../../examples/espressif/esp/tools/bench)
+use pyserial and require explicit serial-port arguments:
+
+- `python pico_peer.py load --port <MicroPython-port> <RAM-UF2>` enters the
+  MicroPython raw REPL and loads the RAM UF2 through the Windows BOOTSEL drive.
+  It discovers the new CDC port by USB VID:PID and product string. Use
+  `python pico_peer.py mode --port <peer-port> <mode> <bank>` before the ESP
+  test, then `python pico_peer.py status --port <peer-port>` and optionally
+  `python pico_peer.py log --port <peer-port> <seconds>` to collect verdicts.
+- For XIAO ESP32-C6 UART, keep debugprobe on the RP2040-GEEK: ESP TX D6/GPIO16 →
+  GEEK GP5 RX, ESP RX D2/GPIO2 ← GP4 TX, plus GND. Connect only one UART
+  route. `python geek_uart_peer.py --port <GEEK-port> --seconds 30` echoes
+  the same baud/parity phases as the Pico and reports the parity verdict.
+- TWAI uses an Adafruit CAN Pal TJA1051T/3 and a WeAct SLCAN adapter.
+  C6 GPIO20 TX → CAN Pal TX, GPIO17 RX ← CAN Pal RX; C3 uses GPIO4 TX
+  and GPIO7 RX. CAN Pal VCC goes to 3V3 and SLNT to GND, all grounds are
+  common, CANH/CANL connect to the adapter, and both bus ends have 120 Ω
+  termination. Start the ESP image, then
+  `python can_echo.py --esp <ESP-port> --can <adapter-port>`. It owns both
+  ports, opens each bitrate before releasing the ESP ready handshake and
+  echoes frames with ID XOR 1 preserving format/RTR/raw DLC/data. A data
+  frame with DLC 9..15 gets a DLC 8 reply carrying its first seven bytes
+  and the received DLC, since not every adapter sends a classic DLC above
+  8; the ESP self-receives the frame itself. The host sends listen-only
+  traffic until the ESP reports `listen_done`, and coordinates bus-off
+  recovery. Both ends use 500 kbit/s for bus-off. The ESP switches its RX
+  input to constant dominant 90 us after the TX request: at 2 us/bit the
+  data field spans bits 19–82, [38, 166) us. Bit framing/stuffing: ESP32-C3
+  TRM v1.4 §§31.2.1, 31.2.2.1; ESP32-C6 TRM v1.2 §§33.2.1, 33.2.2.1.
+  Fault confinement: ESP32-C3 TRM v1.4 §31.4.7; ESP32-C6 TRM v1.2 §33.4.7.
+  Require
+  `SELFTEST twai DONE pass=12 fail=0` (C3) or `pass=24 fail=0` (both C6
+  controllers), plus host exit 0.
 
 C3-only modules produce an explicit compile error on the C6. The C3 I2C master ran on hardware
 through the `i2c_display_ssd1306_c3_oled_042` example. The C6 LEDC blocking fade helper takes a
@@ -66,10 +132,10 @@ that is a hardware observation, not a specified guarantee (C3 Table 2.4-1).
 With this reservation, `selftest_gdma` passed 15/15 on the C3 and 16/16 on the
 Super Mini ESP32-C6 and XIAO ESP32-C6, 3 runs each, at 24ebc5d1 (RAM images, 2026-11-19).
 
-I2S diagnostic `rx_eof_num` is a byte count, matching ESP-IDF and the prior
-hardware EOF probe. Its bounds require that many RX bytes and duplex TX
-bytes, without the obsolete sample-count alternative. The bounds change is
-**built only**; prior 7/7 counts predate it.
+I2S diagnostic `rx_eof_num` is a byte count, matching ESP-IDF v5.5.1
+`components/hal/esp32c6/include/hal/i2s_ll.h::i2s_ll_rx_set_eof_num`.
+Its bounds require that many RX bytes and duplex TX bytes.
+The external `eof_num` case checks 64 received bytes, echoed data and guards.
 
 The USB Serial/JTAG logger waits for the host with the caller's interrupt
 state: it masks interrupts only to claim the writer and update its counters,
@@ -107,14 +173,15 @@ DATA_FREE read and WR_DONE receives a zero-length packet, which CDC ACM
 ignores. The boot-time release is included in the tested XIAO ESP32-C6 logger above
 (same code as this tree).
 
-PARL_IO stretches every TX setup clock to factor 65535 before gating it low.
+PARL_IO stretches every TX setup clock to factor 65535 before gating it low,
+and routes the clock to its pad only after stretching, so a receiver sees
+the gating edges and not the full-rate prime.
 At a 40 MHz XTAL, allow about 2 ms of setup plus frame time in `timeout_us`;
 shorter deadlines can expire before transmission. The low check and gating
 write exclude interrupts; phase waits do not. `ClockGateFailed` reports a
 pad still high after gating. Mid-count divider changes are a hardware
-observation from the prior 16/16 tests at divider 40, not a TRM guarantee
-(C6 §38.5.1 gives a maximum factor of 65535). The interrupt-safe gating
-change is **built only**; those counts predate it.
+observation; C6 TRM v1.2 §38.5.1 specifies a maximum factor of 65535.
+The external test covers valid/software gating at each supported width.
 
 Timer-group clock enable clears MWDT flash-boot mode only when releasing a
 group held in reset, inside a critical section. Calls on an active group do
@@ -185,6 +252,51 @@ heap region minus a 16 KiB stack reserve (`core/src/allocator.zig`, `heap` and
 `init_with_heap`). The heap is not fixed at 16 KiB.
 Lifecycle evidence is under "Wi-Fi station and RTOS"; NVS evidence is under
 "NVS board self-test".
+
+### I2C master peer self-test
+
+`selftest_i2c` on C3 and C6 expects `SELFTEST i2c DONE pass=8 fail=0`:
+initialization, 111 absent-address NACKs, exactly one peer ACK at 0x42,
+peer protocol identification, pattern write, separate STOP/start readback,
+repeated-start register read, and clock-stretched read. Only `NoAcknowledge`
+counts as NACK; timeouts and other transfer errors fail the scan. Use an
+isolated bus with only the peer.
+
+Build the ESP in `examples/espressif/esp` with
+`zig build -Doptimize=ReleaseSmall -Dexample=selftest_i2c`. C3 and Super Mini ESP32-C6
+use SDA GPIO5 / SCL GPIO6. The XIAO ESP32-C6 lacks these edge pads: use
+`xiao_esp32_c6_selftest_i2c.bin`, which uses D4/GPIO22 / D5/GPIO23 per
+`src/boards/xiao_esp32_c6.zig`'s pin map. Wire SDA to Pico 2 W GP4 (physical
+pin 6), SCL to GP5 (pin 7), and connect grounds (e.g. Pico pin 8). Both ends
+enable their internal pull-ups; the run below used them alone, with no
+external resistors. External 4.7 kohm pull-ups to 3.3 V are recommended for
+longer wires or faster clocks.
+
+Build the peer in `examples/raspberrypi/rp2xxx` with
+`zig build -Doptimize=ReleaseSmall -Dexample=pico2_w_ram_i2c_slave_peer`.
+Load `pico2_w_ram_i2c_slave_peer.uf2` onto the Pico 2 W before starting the
+ESP. This RAM image uses the HAL `i2c_slave` at 0x42 with an 8-bit register
+pointer: first written byte selects the register; subsequent written/read
+bytes increment it. STOP retains the pointer. Read-only registers are
+0xf0 (delayed 0xa5), 0xf1 (stretch capability = 1), 0xf2 (immediate 0xa5),
+and 0xf3 (protocol version = 1); all others are RAM.
+
+The peer services the HAL slave handler by polling, with its NVIC IRQ masked;
+register state belongs exclusively to the main loop. For 0xf0 it waits 20 us
+before servicing RD_REQ, which holds SCL low (RP2350 Datasheet
+§12.2.10.1.2). The ESP requires the same byte as the normal read and at least
+8 us additional elapsed time. Transfers have a 100 ms software deadline and retain
+the HAL's hardware SCL timeout (ESP32-C6 TRM v1.2 §29.4.8; command sequence
+§29.4.9; ESP32-C3 TRM v1.4 ch.28). A protocol-compatible alternate peer may
+advertise capability 0: then `clock_stretch: SKIP` is explicit and the expected
+summary becomes `DONE pass=7 fail=0`. The supplied peer always advertises 1;
+missing peers and failed capability reads fail rather than skip.
+
+Evidence: Super Mini ESP32-C6 (GPIO5/6), image boot, to a Pico 2 W (GP4/GP5)
+running the peer from RAM, jumper wires and common GND, internal pull-ups at
+both ends, 100 kHz, 2026-11-20: 8/8 in 5 of 5 boots. With the peer's 20 us
+stretch, the stretched read measured +14 to +17 us over normal reads of
+214–215 us, hence the +8 us threshold.
 
 ### Crypto accelerators
 
@@ -1127,8 +1239,13 @@ It uses LP_FAST or XTAL/2 with an explicit source frequency; calibrate RC
 for an accurate external baud and keep XTAL powered if selecting XTAL/2.
 External I/O uses fixed GPIO4 RX/GPIO5 TX (Table 7.13-1). No DMA, flow
 control or interrupt buffering. HP/LP must transfer controller ownership.
-`selftest_lp_uart` verifies 64 looped-back bytes and empty-RX timeout on
-both cores without touching pads. Evidence: **built only**.
+`selftest_lp_uart` uses XTAL/2 at 115200 8N1 with HP awake. Wire GPIO4 RX
+from Pico GP12 TX and GPIO5 TX to GP13 RX, plus common GND. Select
+`mode lpuart c6` before starting. It checks load, a 64-byte external echo and
+empty-RX timeout on LP and HP: expected `SELFTEST lp_uart DONE pass=5 fail=0`.
+Require `PEER lpuart clk: PASS`, status `errors=0` and no peer FAIL verdicts.
+Evidence: 3/3 runs, `DONE pass=5 fail=0`, on the Super Mini ESP32-C6 against
+the Pico 2 W peer, with peer `errors=0` and its clock check passing.
 
 `hal.lp_i2c` provides polling 7-bit master address probes, writes of up to
 15 data bytes and reads of 1–16 bytes (TRM §§29.4–29.6, 29.11.1). GPIO6 is
@@ -1141,14 +1258,17 @@ Completion with unsent TX bytes is rejected as `Fifo`, including stale
 completion after an aborted STOP.
 No slave mode, DMA, interrupt servicing, 10-bit addresses, repeated-START
 combined transfers or GPIO recovery of a physically stuck external bus.
-External devices need suitable pullups. `selftest_lp_i2c` uses weak internal
-pulls on an unwired bus, requires 112 NACKs on each core, exercises read/
-write NACKs and checks the next probe recovers. Evidence recorded 2026-11-18:
-`selftest_lp_i2c` passed 5/5 three times on each of the Super Mini
-ESP32-C6FH4 (rev v0.2) and XIAO ESP32-C6 (rev v0.1). This ran on an earlier
-version; preserving NACK on STOP timeout, rejecting unsent-TX completions,
-LP_FAST startup and logger changed since; the changes since are built only.
-The other LP examples above have build evidence only.
+External devices need suitable pullups. For `selftest_lp_i2c`, connect GPIO6 SDA
+to Pico GP14 and GPIO7 SCL to GP15, plus common GND; both ends enable internal
+pull-ups at 100 kHz (external 4.7 kΩ pull-ups may be added). Select `mode i2c c6`.
+The Pico I2C1 target at 0x42 implements the register-file protocol from
+`examples/raspberrypi/rp2xxx/src/i2c_slave_peer.zig`: pointer byte, auto-increment,
+STOP retains the pointer, 0xf2=0xa5 and version 1 at 0xf3. On LP and then HP,
+the test requires one ACK at 0x42 and 111 NACKs in 0x08–0x77, a 14-byte
+write/readback plus version check, and NACK at 0x55 followed by ACK at 0x42.
+Together with load, expect `SELFTEST lp_i2c DONE pass=7 fail=0` and peer `errors=0`.
+Evidence: 3/3 runs, `DONE pass=7 fail=0`, on the Super Mini ESP32-C6 against
+the Pico 2 W peer, with peer `errors=0`.
 
 The named ETM task `hal.etm.Task.lp_cpu_wake` is ID 154 (Table 11.3-2).
 `selftest_lp_core` also routes an unwired GPIO1 edge to that task and checks
