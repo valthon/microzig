@@ -1682,7 +1682,9 @@ The controller is a singleton with one connection. There is no shutdown/restart
 API; a failed startup requires reboot. Controller tasks, NPL objects and PHY
 tracking use the supplied allocator for this boot lifetime. NPL callouts use
 millisecond resolution; modem sleep and pairing/secure-connections crypto are
-disabled. This does not implement SMP or bonding.
+disabled. This does not implement SMP or bonding. The controller's LP timer divider
+stays at 399; IDF's `bt.c` uses 4 on chip revisions above v0.0 under
+`SOC_BLE_USE_WIFI_PWR_CLK_WORKAROUND`.
 
 `send_command` takes an HCI command header and parameters; `send_acl` takes the
 ACL header and payload. Neither includes an H4 packet-type byte. Both copy their
@@ -1732,6 +1734,22 @@ Pairing requests receive Pairing Not Supported. Connection-parameter update
 requests on LE signaling are rejected, retaining the negotiated interval.
 Notification payloads and counts are available in the host state.
 
+Central connection creation matches ESP-IDF v5.5.1's pinned NimBLE
+[`ble_gap_conn_params_dflt`](https://github.com/espressif/esp-nimble/blob/b45dcedcafb7888174c3567002c36b342ec0b723/nimble/host/src/ble_gap.c)
+and [`BLE_GAP_INITIAL_*`](https://github.com/espressif/esp-nimble/blob/b45dcedcafb7888174c3567002c36b342ec0b723/nimble/host/include/host/ble_gap.h):
+10 ms continuous initiating scan, 30–50 ms connection interval, zero latency,
+2.56 s supervision timeout and zero connection-event length hints.
+
+ATT transactions use the 30 s deadline required by Bluetooth Core v6.0
+[Vol 3 Part F §3.3.3](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-60/out/en/host/attribute-protocol--att-.html),
+separate from the 2 s HCI command deadline. After an ATT timeout the host rejects
+further ATT traffic until a new connection; the caller must disconnect the
+fixed bearer. A write may already have taken effect: do not resend it on the
+expired bearer. IDF's pinned NimBLE
+[`ble_gattc_timer`](https://github.com/espressif/esp-nimble/blob/b45dcedcafb7888174c3567002c36b342ec0b723/nimble/host/src/ble_gattc.c)
+also terminates the link after its 30 s timeout. Disconnect waits allow the
+negotiated supervision timeout in addition to the HCI command deadline.
+
 Evidence: desktop unit tests of HCI status and credit handling, multi-report
 AD parsing, fragmented ATT responses, discovery with non-default handles,
 notifications, server permissions, CCCD validation and write commands; the
@@ -1750,9 +1768,9 @@ zig build -Doptimize=ReleaseSmall -Dexample=ble_central -Dble_peer_name=H2-PEER
 
 Each command builds the C6 image-boot target, installed as
 `esp32_c6_<example>.bin` and `.elf` under `zig-out/firmware`. `ble_scan`,
-`ble_peripheral` and `ble_central` also build for the XIAO ESP32C6 board as
+`ble_peripheral` and `ble_central` also build for the XIAO ESP32-C6 board as
 `xiao_esp32_c6_ble_scan`, `xiao_esp32_c6_ble_peripheral` and
-`xiao_esp32_c6_ble_central` (same commands). On a XIAO use those board
+`xiao_esp32_c6_ble_central` (same commands). On a XIAO ESP32-C6 use those board
 builds: they power the rf switch in front of the antenna (GPIO3 low, GPIO14
 selects the antenna; `boards/xiao_esp32_c6.zig`). `-Dantenna=external` selects
 the U.FL connector instead of the ceramic antenna (default `internal`). They use USB Serial
@@ -1770,11 +1788,27 @@ controller heap. No GPIO wiring is needed. Run one role at a time.
   serve. The notification counter is per connection and encoded little-endian.
 * `ble_central` targets **H2-PEER** by default. `-Dble_peer_name` can select the
   Zephyr peer's configured name. It allows 15 seconds each for scanning and
-  connecting, discovers handles, reads FFF1, writes and verifies `MZ-C6`, sends
+  connecting per attempt, with **three attempts total** and a **250 ms backoff**
+  only for 0x3e establishment failures. This includes a 0x3e disconnect during
+  initial discovery after the controller reports a handle. Bluetooth Core v6.0
+  [Vol 1 Part F §2.59](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-60/out/en/architecture%2C-change-history%2C-and-conventions/controller-error-codes.html)
+  defines 0x3e; [Vol 6 Part B §4.5 and §4.5.2](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-60/out/en/low-energy-controller/link-layer-specification.html)
+  distinguish connection creation from establishment and specify the initial
+  supervision timeout. The retry count and backoff are this bench's policy.
+  Other errors (including scan/host timeouts, 0x08 disconnects and ATT errors)
+  fail immediately. After discovery it never retries. It reads FFF1, writes and verifies `MZ-C6`, sends
   and verifies a write command `MZ-C6-WNR`, subscribes to FFF2, requires two
   notifications within six seconds, unsubscribes, and disconnects. It leaves
   `MZ-C6-WNR` in the peer's FFF1 value. Each step prints
   `SELFTEST ble_central <step>: PASS|FAIL`; failures include HCI/ATT status.
+  Each attempt is logged; the repeated `BLE ble_central attempts=N` info line
+  reports attempts used without adding a check. Success still requires all 13
+  checks, including discovery and the full GATT sequence on the successful link.
+  Before DONE, both success and failure paths close any remaining connection
+  and wait one negotiated supervision timeout plus 100 ms with the local link
+  stopped, allowing a peer that missed termination to release its link. A
+  teardown error prints FAIL and withholds DONE; reset both peers before the
+  next run in that case. The original failure diagnostics survive cleanup.
 
 The three role examples start a reporter before controller initialization. It
 prints RUNNING or DONE after 1.5 seconds, then every three seconds, so opening
@@ -1784,108 +1818,35 @@ central run. A peripheral continues waiting for a peer without marking the
 connection tests passed. The peer-free HCI test delays 1.5 seconds before its
 checks and repeats DONE every three seconds.
 
-Evidence on two C6 boards, a XIAO ESP32-C6 (rev v0.1) and a Super Mini
-ESP32-C6FH4 (rev v0.2), against an ESP32-H2 NimBLE peer and a XIAO nRF52840
-Zephyr peer. "Generic" is the `esp32_c6_*` chip build, "board" the
-`xiao_esp32_c6_*` build (on the XIAO, only the board build powers the rf
-switch). All runs below are dated 2026-11-19. A count is runs that printed `DONE`
-with `fail=0`. The 0 dBm builds use the initial TX-power setting; the +9 dBm
-builds use IDF v5.5.1's default (`BT_CONTROLLER_INIT_CONFIG_DEFAULT`).
-"Initial" and "diagnostic" distinguish the recorded +9 dBm run sets.
-Every committed build below ran on an earlier version. Since the 0 dBm runs,
-TX power, controller interrupt/protocol guards, antenna selection/reporting,
-logger and LP_FAST startup changed. Since the initial +9 dBm runs, the same
-items except TX power changed. Since the diagnostic +9 dBm runs, logger and
-LP_FAST startup changed. The changes since are built only / unit-tested.
-Rows marked "an uncommitted build" have no verified equivalence to this tree.
+Evidence, image boot, +9 dBm TX power (the IDF v5.5.1 `BT_CONTROLLER_INIT_CONFIG_DEFAULT`
+value), against an ESP32-H2 NimBLE peer; the Super Mini ESP32-C6 ran the generic `esp32_c6_*` build
+and the XIAO ESP32-C6 the `xiao_esp32_c6_*` board build, except `selftest_ble_hci`, which has no
+board build. A count is runs that printed `DONE` with `fail=0`.
 
-XIAO ESP32-C6, all at 0 dBm:
-
-| Example | Build (source) | Peer | Result |
+| Example | Code | Super Mini ESP32-C6 | XIAO ESP32-C6 |
 | --- | --- | --- | --- |
-| `selftest_ble_hci` | generic, an uncommitted build, two different images | none | debug image c6e74a305fa93b30: 4/4, 1 run; earlier a50cb04be3d6b298: `ControllerFailed` at init (0 pass, 1 fail), 1 run |
-| `ble_scan` | generic, 0 dBm initial | advertisers incl. the H2/nRF | 4/4 checks, 2 of 2 runs |
-| `ble_scan` | board, 0 dBm board | advertisers incl. the H2/nRF | 4/4 checks, 1 of 1 run |
-| `ble_peripheral` | generic, 0 dBm initial | H2 central | 6/6, 1 of 1 run |
-| `ble_peripheral` | generic, 0 dBm initial | nRF central | 6/6, 1 of 1 run |
-| `ble_peripheral` | board, 0 dBm board | H2 central | 6/6, 1 of 1 run |
-| `ble_central` | generic, 0 dBm initial | H2 peripheral | 13/13, 1 of 1 run |
-| `ble_central` | generic, 0 dBm initial | nRF peripheral | 13/13 in 1 of 5 runs |
-| `ble_central` | generic, an uncommitted build | nRF peripheral | 13/13 in 7 of 13 runs |
-| `ble_central` | board, an uncommitted build | nRF peripheral | 13/13 in 8 of 8 runs |
+| `selftest_ble_hci` (no peer) | 24ebc5d1 | 4/4 in 3 of 3 boots | 4/4 in 3 of 3 boots |
+| `ble_scan` | 24ebc5d1 | 4/4 in 3 of 3 runs | 4/4 in 3 of 3 runs |
+| `ble_peripheral`, H2 central | 24ebc5d1 | 6/6 in 3 of 3 runs | 6/6 in 3 of 3 runs |
+| `ble_central`, H2 peripheral | 2026-11-20 | 13/13 in 20 of 20 boots | 13/13 in 20 of 20 boots |
 
-Every failed central run against the nRF stopped at `discover` with
-`Disconnected`. The first four failures came from a build that predates the
-reason field; every later failure shows `disconnect_reason=3e`, Connection
-Failed to be Established. The
-current board build of `ble_central` has no committed-build hardware
-evidence against the nRF. The central's nRF reliability with the generic build is a known
-failure, not a pass.
+In the 40 `ble_central` boots the H2 held no link before each boot and logged one
+connection and one disconnect per boot. Three boots (two on the Super Mini ESP32-C6, one on the
+XIAO ESP32-C6) used the 0x3e establishment retry, passing on attempt 2 or 3.
 
-Super Mini ESP32-C6FH4, generic build:
+Against a XIAO nRF52840 Zephyr peer, Super Mini ESP32-C6, generic build, 2026-11-20:
+`ble_peripheral` with the nRF as GATT central passed 6/6 in 3 of 3 runs (the nRF counted
+2 connections and 0 failures in each); `ble_central` with `-Dble_peer_name=NRF-PEER` passed
+13/13 in 3 of 3 runs, each on the first attempt. In a peer control without a C6, the nRF as central connected to the
+H2 peripheral 20 times: all 20 connected, and the disconnect reasons were 0x16 in 18 and
+0x3e in 2.
 
-| Example | Build (source), TX power | Peer | Result |
-| --- | --- | --- | --- |
-| `selftest_ble_hci` | initial, 0 dBm | none | 4/4 checks, 1 run |
-| `ble_scan` | initial, 0 dBm | advertisers incl. the H2/nRF | 4/4 checks, 1 run |
-| `ble_central` | initial, 0 dBm | nRF, all advertising channels | 13/13 in 7 of 12 runs |
-| `ble_central` | initial, 0 dBm | nRF on channel 37 / 38 / 39 only | 4 of 4 / 4 of 10 / 4 of 4 runs |
-| `ble_central` | an uncommitted build with +9 dBm | nRF on channel 38 only | 9 of 10 runs |
-| `ble_central` | initial, +9 dBm | nRF, all advertising channels | 6 of 6 runs |
-| `ble_central` | initial, 0 dBm | H2 | 1 of 6 runs |
-| `ble_central` | initial, +9 dBm | H2 | 1 of 6 runs |
-| `ble_central` | an uncommitted build, image 055cb9e63773dc83, 0 dBm (riram set) | H2 | 3 of 6 runs |
-| `ble_central` | an uncommitted build, image d062a24e16611a44, +9 dBm (rp9 set) | H2 | 3 of 6 runs |
-| `ble_peripheral` | initial, 0 dBm | H2 central / nRF central | 6/6 in one C6 log; separate H2 run/connection not confirmed by that C6 evidence |
-| `ble_peripheral` | initial, +9 dBm | H2 central / nRF central | 1 of 1 / 0 of 2 runs |
-| `selftest_ble_hci` | diagnostic, +9 dBm | none | 4/4 checks, 1 run |
-| `ble_scan` | diagnostic, +9 dBm | 10 advertisers incl. the H2 | 4/4 checks, 1 run |
-| `ble_peripheral` | diagnostic, +9 dBm | H2 central / nRF central | 1 of 1 / 0 of 1 run |
-| `ble_central` | diagnostic, +9 dBm | nRF, all advertising channels | 8 of 11 runs |
-| `ble_central` | diagnostic, +9 dBm | H2 | 6 of 10 runs |
-
-In the diagnostic +9 dBm run set, `ble_scan` counted 219 reports in 10 s, 83 of them from the H2
-at a median of -36 dBm. In the `ble_peripheral` run with the nRF as central,
-the nRF's first connect ended with 0x3e, so its GATT sequence found no link;
-its scripted reconnect only reads, and the C6 stopped at 4/6 (connection
-passed, no subscription). Of the three
-failed central runs against the nRF, two ended in `discover` with 0x3e (in one
-the nRF never received the CONNECT_IND, in the other it did) and one in
-`discover: FAIL Timeout` with the link still up on both sides; that timeout
-did not recur in the other ten runs. In every failed central run against the
-H2, the H2 logged no connection and the C6 reported 0x3e.
-
-At 0 dBm the nRF received the Super Mini's adverts at a median of -75 dBm,
-against -65 dBm at +9 dBm. In each failed channel-38 run at 0 dBm the nRF
-never accepted the CONNECT_IND, which is sent only once.
-
-Open, not passes:
-
-* `ble_central` against the H2 passed 1 of 6 on each committed build
-  (initial 0 dBm and initial +9 dBm), with no H2 connection and C6
-  reason 0x3e in their failed runs. Two uncommitted builds
-  each passed 3 of 6: image 055cb9e63773dc83 at 0 dBm (riram set), and
-  d062a24e16611a44 at +9 dBm (rp9 set). The latter's run rp9-1 connected
-  but failed command readback with an ATT timeout, rather than 0x3e.
-  A single nRF-central/H2-peripheral control set (`hw6-ble-ctrl-nrf2h2-nrf.log`)
-  passed 6 of 10 (failed 4 of 10); the cause is not yet located on either side.
-* With the diagnostic +9 dBm build `ble_central` against the H2 passed 6 of 10; in every
-  failed run the H2 logged no connection and the C6 reported 0x3e. A second
-  nRF-central/H2-peripheral control failed 3 of 10, so the cause is not located
-  on the C6 side.
-* With the Super Mini as peripheral, the nRF formed a link in 3 of 10 repeated
-  connects at 0 dBm and 2 of 10 at +9 dBm; every other attempt ended with
-  0x3e. Cause unknown.
-  With the diagnostic +9 dBm build, two sets of
-  10 gave 1 and 8, and the H2 as central 10 of 10. Every other attempt ended
-  with 0x3e, a rate that varies between sets far more than between builds; the
-  nRF-to-H2 control above fails at a similar rate. Setting the controller's LP
-  timer divider to 4 on chip revisions above v0.0, as IDF's bt.c does with
-  `SOC_BLE_USE_WIFI_PWR_CLK_WORKAROUND`, gave 7 and 8 of 10 in sets run
-  alternately with the 1 and 8 above (uncommitted experiment): no measurable
-  difference. The driver keeps divider 399.
-* The +9 dBm default has run only on the Super Mini; the XIAO results above
-  predate it.
+Antenna switch on the XIAO ESP32-C6, `xiao_esp32_c6_ble_scan` with `-Dantenna`, 15 s per
+run, counting the H2's adverts, with no U.FL antenna fitted: `internal`
+gave medians of -37 and -36 dBm (n=40 and 42) in two runs; `external` gave
+-59 and -57 dBm (n=47 and 45). The scans received 462 and 424 adverts from all
+advertisers with `internal`, 254 and 247 with `external`. The drop of about
+21 dB shows that the option moves the rf switch.
 
 ### Known limits
 

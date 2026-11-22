@@ -8,6 +8,8 @@ pub const Advertisement = wire.Advertisement;
 const read16 = wire.read16;
 const write16 = wire.write16;
 const procedure_timeout_ms = 2000;
+// Core Vol 3 Part F §3.3.3; IDF v5.5.1 NimBLE ble_gattc.c uses 30 s too.
+const att_timeout_ms = 30_000;
 const Response = struct {
     len: u8,
     bytes: [255]u8,
@@ -32,6 +34,7 @@ pub const Host = struct {
     connection: ?u16 = null,
     connection_status: ?u8 = null,
     disconnect_reason: ?u8 = null,
+    supervision_timeout_ms: u32 = 2560,
     last_hci_status: u8 = 0,
     last_att_error: u8 = 0,
     server: ?gatt.Server = null,
@@ -46,6 +49,8 @@ pub const Host = struct {
     command_reply: ?Response = null,
     att_pending: ?u8 = null,
     att_reply: ?Response = null,
+    // An expired request makes this fixed ATT bearer unusable until reconnect.
+    att_timed_out: bool = false,
     rx: [260]u8 = undefined,
     rx_len: usize = 0,
     rx_expected: usize = 0,
@@ -148,7 +153,9 @@ pub const Host = struct {
         };
         const peer = self.found.?;
         try self.scan(false);
-        var parameters: [25]u8 = .{ 0x60, 0, 0x30, 0, 0, peer.address_type, 0, 0, 0, 0, 0, 0, 0, 0x18, 0, 0x28, 0, 0, 0, 0xf4, 1, 0, 0, 0, 0 };
+        // IDF v5.5.1 NimBLE ble_gap_conn_params_dflt: continuous 10 ms
+        // initiating scan, 30–50 ms interval, latency 0, supervision 2.56 s.
+        var parameters: [25]u8 = .{ 0x10, 0, 0x10, 0, 0, peer.address_type, 0, 0, 0, 0, 0, 0, 0, 0x18, 0, 0x28, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
         @memcpy(parameters[6..12], &peer.address);
         self.connection_status = null;
         _ = try self.command(0x200d, &parameters);
@@ -168,7 +175,9 @@ pub const Host = struct {
     pub fn disconnect(self: *Host) Error!void {
         const handle = self.connection orelse return error.NoConnection;
         _ = try self.command(0x0406, &.{ @truncate(handle), @truncate(handle >> 8), 0x13 });
-        const deadline = self.now() + procedure_timeout_ms;
+        // The controller may need the supervision timeout to terminate a
+        // silent peer; the HCI command deadline alone can expire too soon.
+        const deadline = self.now() + self.supervision_timeout_ms + procedure_timeout_ms;
         while (self.connection != null) try self.wait(deadline);
     }
 
@@ -252,7 +261,9 @@ pub const Host = struct {
                             const handle = read16(data[4..6]);
                             if (handle > 0x0eff or self.connection != null) return error.InvalidPacket;
                             self.connection = handle;
+                            self.supervision_timeout_ms = @as(u32, read16(data[data.len - 3 ..][0..2])) * 10;
                             self.disconnect_reason = null;
+                            self.att_timed_out = false;
                             self.acl_credits = self.acl_capacity;
                             self.peer_notify = 0;
                             self.notifications = 0;
@@ -260,6 +271,11 @@ pub const Host = struct {
                             self.rx_expected = 0;
                             if (self.server) |*server| server.disconnected();
                         }
+                    },
+                    3 => {
+                        if (data.len != 12) return error.InvalidPacket;
+                        if (data[3] == 0 and self.connection == read16(data[4..6]))
+                            self.supervision_timeout_ms = @as(u32, read16(data[10..12])) * 10;
                     },
                     2 => {
                         var reports = try wire.Reports.init(data[2..]);
@@ -323,6 +339,7 @@ pub const Host = struct {
         }
     }
     fn send_fixed(self: *Host, cid: u16, payload: []const u8) Error!void {
+        if (cid == 4 and self.att_timed_out) return error.Timeout;
         if (payload.len > gatt.mtu) return error.Unsupported;
         const deadline = self.now() + procedure_timeout_ms;
         while (self.acl_credits == 0) {
@@ -347,6 +364,7 @@ pub const Host = struct {
     }
     fn att(self: *Host, data: []const u8) Error!void {
         if (data.len == 0 or data.len > gatt.mtu) return error.InvalidPacket;
+        if (self.att_timed_out) return;
         if (data[0] == 0x1b or data[0] == 0x1d) {
             if (data.len < 3) return error.InvalidPacket;
             if (read16(data[1..3]) == self.peer_notify and self.peer_notify != 0) {
@@ -383,16 +401,23 @@ pub const Host = struct {
     }
     fn exchange(self: *Host, pdu: []const u8) Error!Response {
         if (self.connection == null) return error.NoConnection;
+        if (self.att_timed_out) return error.Timeout;
         if (self.att_pending != null) return error.Busy;
         self.att_pending = pdu[0];
         defer self.att_pending = null;
         self.att_reply = null;
         self.last_att_error = 0;
         try self.send_fixed(4, pdu);
-        const deadline = self.now() + procedure_timeout_ms;
+        const deadline = self.now() + att_timeout_ms;
         while (self.att_reply == null) {
             if (self.connection == null) return error.Disconnected;
-            try self.wait(deadline);
+            self.wait(deadline) catch |err| {
+                // Requests have no transaction ID. A late response must never
+                // satisfy a later request. The caller must disconnect, as
+                // NimBLE ble_gattc_timer does for its fixed ATT bearer.
+                if (err == error.Timeout) self.att_timed_out = true;
+                return err;
+            };
         }
         const response = self.att_reply.?;
         self.att_reply = null;
@@ -532,6 +557,7 @@ const Fixture = struct {
     // Send a credits-only NOP completion ahead of the next command's reply.
     nop_first: bool = false,
     capture_only: bool = false,
+    delayed_response_ms: u32 = 0,
     captured: [31]u8 = undefined,
     captured_len: usize = 0,
     clock_ms: u64 = 1000,
@@ -553,6 +579,16 @@ const Fixture = struct {
     fn receive(context: *anyopaque, timeout_ms: u32) Error!wire.Packet {
         const self: *Fixture = @ptrCast(@alignCast(context));
         if (self.len == 0) {
+            if (self.delayed_response_ms != 0) {
+                const delay = @min(timeout_ms, self.delayed_response_ms);
+                self.clock_ms += delay;
+                self.delayed_response_ms -= delay;
+                if (self.delayed_response_ms == 0) {
+                    try self.acl_response(&.{0x13}, false);
+                    return receive(context, 0);
+                }
+                return error.Timeout;
+            }
             self.clock_ms += timeout_ms;
             return error.Timeout;
         }
@@ -571,8 +607,13 @@ const Fixture = struct {
             try self.enqueue(.event, &.{ 0x0e, 3, 1, 0, 0 });
         }
         if (opcode == 0x200d) {
+            if (!std.mem.eql(u8, data[3..7], &.{ 0x10, 0, 0x10, 0 }) or
+                !std.mem.eql(u8, data[16..], &.{ 0x18, 0, 0x28, 0, 0, 0, 0, 1, 0, 0, 0, 0 })) return error.InvalidPacket;
             try self.enqueue(.event, &.{ 0x0f, 4, 0, 1, 0x0d, 0x20 });
-            try self.enqueue(.event, &.{ 0x3e, 19, 1, 0, 7, 0, 0, 0, 1, 2, 3, 4, 5, 6, 24, 0, 0, 0, 0xf4, 1, 0 });
+            try self.enqueue(.event, &.{ 0x3e, 19, 1, 0, 7, 0, 0, 0, 1, 2, 3, 4, 5, 6, 24, 0, 0, 0, 0, 1, 0 });
+        } else if (opcode == 0x0406) {
+            try self.enqueue(.event, &.{ 0x0f, 4, 0, 1, 6, 4 });
+            try self.enqueue(.event, &.{ 5, 4, 0, 7, 0, 0x16 });
         } else {
             var reply: [9]u8 = .{ 0x0e, 4, 1, data[0], data[1], if (self.reject_command) 0x0c else 0, 27, 0, 1 };
             const len: usize = if (opcode == 0x2002) 9 else 6;
@@ -712,4 +753,37 @@ test "client write command is response-free and subscribe uses the discovered CC
     try host.subscribe(.{ .service_start = 0x20, .service_end = 0x2f, .notify = 0x26, .cccd = 0x28 });
     try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x28, 0, 1, 0 }, fixture.captured[8..fixture.captured_len]);
     try std.testing.expectEqual(@as(u16, 0x26), host.peer_notify);
+}
+
+test "a write response after two seconds still completes the ATT transaction" {
+    var fixture: Fixture = .{ .capture_only = true, .delayed_response_ms = 3000 };
+    var host = Host.init(fixture.transport());
+    try host.initialize();
+    host.connection = 7;
+    const before = fixture.clock_ms;
+    try host.write(0x22, "C6", false);
+    try std.testing.expectEqual(before + 3000, fixture.clock_ms);
+    try std.testing.expect(!host.att_timed_out);
+}
+
+test "ATT timeout forbids bearer reuse and late responses but allows disconnect" {
+    var fixture: Fixture = .{ .capture_only = true };
+    var host = Host.init(fixture.transport());
+    try host.initialize();
+    host.connection = 7;
+    const before = fixture.clock_ms;
+    try std.testing.expectError(error.Timeout, host.write(0x22, "C6", false));
+    try std.testing.expectEqual(before + 30_000, fixture.clock_ms);
+    try fixture.acl_response(&.{0x13}, false);
+    try host.poll(1); // A late write response cannot revive this bearer.
+    try std.testing.expectError(error.Timeout, host.write(0x22, "again", false));
+    try std.testing.expectError(error.Timeout, host.write(0x22, "command", true));
+    try host.disconnect();
+    try std.testing.expectEqual(@as(?u16, null), host.connection);
+    // Only a fresh connection makes ATT usable again.
+    try host.connect_named("H2-PEER", 1000);
+    try std.testing.expect(!host.att_timed_out);
+    try std.testing.expectEqual(@as(u32, 2560), host.supervision_timeout_ms);
+    try host.event(&.{ 0x3e, 10, 3, 0, 7, 0, 40, 0, 0, 0, 0xf4, 1 });
+    try std.testing.expectEqual(@as(u32, 5000), host.supervision_timeout_ms);
 }
