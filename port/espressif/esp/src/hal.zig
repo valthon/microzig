@@ -65,6 +65,12 @@ pub const HAL_Options = struct {
     } = .{},
     rtos: rtos.Options = .{},
     radio: radio.Options = .{},
+    /// On C6, recover USB Serial/JTAG at startup after RWDT core reset (0x09).
+    /// Disable when the application manages USB recovery itself.
+    recover_usb_at_startup: bool = true,
+    /// On C6, disable retained EXT1 selection and release its pad holds at startup.
+    /// Disable when the application manages retained wake pads itself.
+    release_ext1_holds_at_startup: bool = true,
 };
 
 /// Clock config applied by the default `init()` function of the hal.
@@ -86,6 +92,16 @@ pub fn init_sequence(clock_cfg: clocks.Config) void {
     system.init();
 
     time.init();
+
+    if (comptime compatibility.chip == .esp32_c6 and microzig.options.hal.release_ext1_holds_at_startup)
+        clocks.sleep.release_ext1_holds_at_startup();
+
+    // Reconnect needs the clocks preserved by system.init() and SYSTIMER's
+    // bounded waits. Run before RTOS tasks or application USB users can start.
+    // C3 USJ is not affected by SRST (C3 TRM v1.4 §30.3.4).
+    // It also keeps its USB connection through RWDT core reset.
+    if (comptime compatibility.chip == .esp32_c6 and microzig.options.hal.recover_usb_at_startup)
+        wdt.Rtc.recover_usb_at_startup();
 
     if (microzig.options.hal.rtos.enable)
         rtos.init();

@@ -22,6 +22,12 @@ pub const Rtc = struct {
             .WDT_STG2 = @backingInt(stages[2].action),
             .WDT_STG3 = @backingInt(stages[3].action),
             .WDT_PROCPU_RESET_EN = 1,
+            // 3.2 us CPU and system reset pulses (value 7), as ESP-IDF v5.5.1
+            // wdt_hal_init sets them (components/hal/wdt_hal_iram.c:57-58;
+            // C3 TRM v1.4 §9.8 Register 9.31 RTC_CNTL_WDTCONFIG0). The reset value 0
+            // is a 100 ns pulse.
+            .WDT_SYS_RESET_LENGTH = 7,
+            .WDT_CPU_RESET_LENGTH = 7,
         });
         rtc.WDTFEED.write(.{ .RTC_WDT_FEED = 1 });
         rtc.WDTCONFIG0.modify(.{ .WDT_EN = 1 });

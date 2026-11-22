@@ -1,6 +1,6 @@
 //! ESP32-C6 sleep. ESP-IDF v5.5.1 sleep_modes.c:978–1162,
 //! esp_hw_support/port/esp32c6/{pmu_init,pmu_sleep,pmu_param,rtc_clk}.c.
-//! TRM v1.2 §§12.4.2.1–7,12.10.1–3. Built only.
+//! TRM v1.2 §§12.4.2.1–7,12.10.1–3. Hardware results: port README.
 //! Light sleep retains CPU, HP SRAM and TOP: no peripheral retention DMA.
 //! Deep defaults power down flash and unused LP domains; radios must be off.
 //! CPU switches to XTAL; PMU powers down PLL, then software recalibrates it.
@@ -11,6 +11,7 @@ const p = microzig.chip.peripherals;
 const pmu = p.PMU;
 const timer = p.LP_TIMER;
 const aon = p.LP_AON;
+const lp_pad_names = .{ "GPIO0", "GPIO1", "GPIO2", "GPIO3", "GPIO4", "GPIO5", "GPIO6", "GPIO7" };
 const usb = @import("usb_serial_jtag.zig");
 const analog = @import("analog/esp32_c6.zig");
 
@@ -26,6 +27,8 @@ pub const milestone_address = setup.milestone_address;
 
 pub const GpioWake = struct { pin: u5, level: u1 };
 /// EXT1-style OR of selected LP GPIO0–7, with independent high/low levels.
+/// Selected pads must not already be held. Sleep owns their input configuration
+/// until return, or until default HAL startup releases them after reset.
 pub const Ext1Wake = struct { pins: u8, levels: u8 };
 pub const UsbPolicy = enum { unchanged, disconnect_and_reenumerate };
 pub const Step = enum(u8) {
@@ -125,9 +128,31 @@ fn decode(raw: u32) WakeCause {
 /// Read before the first sleep call: cause flags are consumed by that call.
 /// Only a deep-sleep reset gives boot wake flags meaning. TRM §8.2.2.7,
 /// §12.4.2.2, LP_CLKRST_RESET_CAUSE and PMU_SLP_WAKEUP_STATUS0.
+/// Reading the cause does not release pad holds or clear status. Default HAL
+/// startup calls release_ext1_holds_at_startup() before application code.
 pub fn wake_cause() BootCause {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
     const reset: ResetReason = @fromBackingInt(@intCast(p.LP_CLKRST.RESET_CAUSE.read().RESET_CAUSE));
-    return .{ .reset = reset, .wake = decode(if (reset == .deep_sleep) pmu.SLP_WAKEUP_STATUS0.read().WAKEUP_CAUSE else 0) };
+    const wake = decode(if (reset == .deep_sleep) pmu.SLP_WAKEUP_STATUS0.read().WAKEUP_CAUSE else 0);
+    return .{ .reset = reset, .wake = wake };
+}
+
+/// Release only the retained EXT1-selected pad holds, preserving wake status
+/// and other pads' holds. Disable selection first, as ESP-IDF v5.5.1
+/// cpu_start.c:773–777 / sleep_gpio.c:188–201 do on deep-sleep startup.
+/// Unlike IDF, also recover after an interrupted sleep preparation: CPU and
+/// Core resets preserve the LP system (TRM v1.2 §8.1.3, Table 8.1-1), including
+/// LP_AON.GPIO_HOLD0 (§12.10.2 register 12.60). System/Chip resets clear it.
+/// Default HAL startup calls this before application pad users, irrespective
+/// of reset cause. With HAL_Options.release_ext1_holds_at_startup=false,
+/// call manually before reconfiguring retained wake pads. Serialize with LP users.
+pub fn release_ext1_holds_at_startup() void {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    const pins = aon.EXT_WAKEUP_CNTL.read().EXT_WAKEUP_SEL;
+    disable_ext1();
+    release_ext1_holds(pins);
 }
 
 /// Uses the shared software snapshot. Serialize with LP snapshot users (§12.4.3).
@@ -136,6 +161,10 @@ pub fn rtc_ticks() u48 {
     return @import("lp_timer.zig").now();
 }
 
+/// Selected EXT1 pads get the LP GPIO input path with LP IO clock enabled.
+/// LP peripherals stay powered in light sleep, so no pad hold is added.
+/// Pad settings and the clock gate are restored before return, also on error.
+/// IDF sleep_modes.c:2046–2060; TRM §§7.7,7.9,12.4.2.4.
 pub fn enter_light_sleep(config: Config) Error!WakeCause {
     return enter(config, false);
 }
@@ -144,6 +173,11 @@ pub fn enter_light_sleep(config: Config) Error!WakeCause {
 /// image-boot application before calling. LP SRAM survives (§5.3.2); application
 /// startup must leave its retained area untouched. No wake stub is installed.
 /// USB policy detaches before entry; ROM/application reinitializes USB on reboot.
+/// EXT1 pads are held when LP peripherals power down (unless lp_core is set),
+/// retaining the input path and caller's pulls; external input can still change.
+/// Default HAL startup releases these holds on reboot, before application code.
+/// Errors release holds and restore pad/clock settings here.
+/// IDF sleep_modes.c:2037–2081, sleep_gpio.c:188–201; TRM §§7.7,7.9,12.4.2.4.
 pub fn enter_deep_sleep(config: Config) Error!noreturn {
     _ = try enter(config, true);
     return error.UnexpectedWake;
@@ -181,6 +215,10 @@ fn enter(config: Config, deep: bool) Error!WakeCause {
     if ((config.uart0 and p.UART0.SLEEP_CONF2.read().WK_MODE_SEL != 0) or
         (config.uart1 and p.UART1.SLEEP_CONF2.read().WK_MODE_SEL != 0)) return error.UnsupportedUartMode;
     if (aon.GPIO_MUX.read().SEL & ext1.pins != ext1.pins) return error.InvalidPin;
+    // Startup releases retained EXT1 holds. Any remaining hold belongs to the
+    // caller: it prevents our input setup from reaching the pad (TRM §7.9).
+    // Reject rather than silently unholding and changing a caller-owned pad.
+    if (aon.GPIO_HOLD0.read().GPIO_HOLD0 & ext1.pins != 0) return error.InvalidPin;
     if (config.usb_policy == .unchanged and !config.allow_usb_loss and p.USB_DEVICE.CONF0.read().USB_PAD_ENABLE != 0)
         return error.UsbSerialJtagActive;
     // Reject before regulator handoff or USB detachment. TRM §12.4.2.5.
@@ -275,8 +313,49 @@ fn enter_on_xtal(config: Config, deep: bool, cal: setup.Calibration, periods: sl
     defer if (config.bench_recovery)
         pmu.HP_SLEEP_HP_SYS_CNTL.modify(.{ .HP_SLEEP_DIG_PAUSE_WDT = 1 });
     config.mark(.gpio);
+    const io_clock = p.LP_PERI.CLK_EN.read().LP_IO_CK_EN;
+    defer if (ext1.pins != 0) {
+        // Restore the independent gate: rtc_io_ll.h:59–65; TRM §8.2.4
+        // (TRM v1.2 omits LPPERI_CLK_EN; the field follows IDF).
+        p.LP_PERI.CLK_EN.modify(.{ .LP_IO_CK_EN = io_clock });
+    };
+    if (ext1.pins != 0) {
+        // IDF components/hal/esp32c6/include/hal/rtc_io_ll.h:59–65,
+        // sleep_modes.c:2046–2049; TRM §8.2.4 (independent LP clock gate).
+        p.LP_PERI.CLK_EN.modify(.{ .LP_IO_CK_EN = 1 });
+        // This is a gate control, not a readiness flag. IDF rtc_io_ll.h:59–65
+        // polls this same control bit; TRM §8.2.4 defines no LP IO ready signal.
+    }
+    var pads: [8]u32 = undefined;
+    inline for (lp_pad_names, 0..) |name, pin| {
+        if (ext1.pins & (@as(u8, 1) << pin) != 0) {
+            const r = &@field(p.LP_IO, name);
+            pads[pin] = r.raw;
+            // LP mux ownership was validated above. IDF rtc_io_ll.h:49–51,
+            // 79–87,136–139,414–417; TRM §§7.7,7.16.4, register 7.46.
+            // Use the active input/pulls in sleep, as lp_io.apply does.
+            r.modify(.{ .MCU_SEL = 0, .FUN_IE = 1, .SLP_SEL = 0 });
+        }
+    }
+    defer if (ext1.pins != 0) {
+        disable_ext1();
+        // Restore configuration before unholding; same LP IO fields cited above.
+        inline for (lp_pad_names, 0..) |name, pin| {
+            if (ext1.pins & (@as(u8, 1) << pin) != 0)
+                @field(p.LP_IO, name).write_raw(pads[pin]);
+        }
+        release_ext1_holds(ext1.pins);
+    };
     const gpio = gpio_plan(ext1);
     gpio.apply(0x32);
+    if (ext1.pins != 0 and deep and !config.lp_core) {
+        // IDF sleep_modes.c:2056–2060; C6 rtc_io_ll.h:271–274;
+        // TRM §7.9, register 12.60. Match the LP peripheral power policy
+        // (IDF port/esp32c6/private_include/pmu_param.h:305–308).
+        // Deliberately select before holding, reversing IDF v5.5.1's order:
+        // startup cleanup can find held pads if preparation is interrupted.
+        aon.GPIO_HOLD0.modify(.{ .GPIO_HOLD0 = aon.GPIO_HOLD0.read().GPIO_HOLD0 | ext1.pins });
+    }
     config.mark(.timer);
     const alarm = alarm_plan(target);
     alarm.apply(0x33);
@@ -364,6 +443,19 @@ const Uarts = struct {
 };
 
 const Outcome = enum { woke, rejected, timeout };
+
+// Disable selection before unholding to preserve latched status: IDF v5.5.1
+// sleep_gpio.c:191–199; hal/esp32c6/include/hal/lp_aon_ll.h:57–60;
+// TRM §12.10.2, EXT_WAKEUP_CNTL. Never echo the status-clear trigger.
+fn disable_ext1() void {
+    aon.EXT_WAKEUP_CNTL.modify(.{ .EXT_WAKEUP_SEL = 0, .EXT_WAKEUP_STATUS_CLR = 0 });
+}
+
+// IDF hal/esp32c6/include/hal/rtc_io_ll.h:282–285; TRM §7.9,
+// register 12.60. Only selected pads are released; other holds stay intact.
+fn release_ext1_holds(pins: u8) void {
+    aon.GPIO_HOLD0.modify(.{ .GPIO_HOLD0 = aon.GPIO_HOLD0.read().GPIO_HOLD0 & ~@as(u32, pins) });
+}
 // sleep_modes.c:861–893,895–897,968–970: only light sleep suspends cache.
 // No trace callbacks or flash data references while cache is disabled.
 noinline fn request_sleep(deep: bool) linksection(".ram_text") Outcome {
@@ -397,7 +489,7 @@ noinline fn request_sleep(deep: bool) linksection(".ram_text") Outcome {
     return .timeout;
 }
 
-// sleep_modes.c:1016–1034,1127–1132; pmu_sleep.c:359–380.
+// IDF sleep_modes.c:2078–2081; hal/esp32c6/include/hal/lp_aon_ll.h:35–51.
 // TRM §§12.4.2.2,12.10.2–3. LP software wake latches stay intact.
 fn gpio_plan(ext1: Ext1Wake) setup.Plan {
     var plan: setup.Plan = .{};

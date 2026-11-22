@@ -1,8 +1,33 @@
+//! OLED reporter (default; -Dsleep_report=beacon selects the original wire protocol).
+//! GPIO5/6 are exclusively I2C0 SDA/SCL, 0x3C, or beacon data/clock. GPIO8 blinks.
+//! First main action clears the ENTIRE 128x64 RAM, then shows S1..S6 and BOOT.
+//! Five 12-character lines fit the 72x40 window: stage, step, CODE=hex,
+//! P=passed F=failed, and an inverted final PASS/FAIL which remains on screen.
+//! Counts include one latched display check in OLED mode; a write failure cannot
+//! be erased by a later successful retry. An absent panel cannot show its failure.
+//! S1: BOOT, attached control and USB probes, final PASS P=4 F=0 expected.
+//! S2: BOOT, ARMING, WAIT RESET; after the RWDT reset the flash image boots
+//! again and shows PASS P=2 F=0 for reset cause 9, otherwise FAIL.
+//! S3: BOOT, 100MS, sleep/USB checks, final PASS P=9 F=0 if all pass.
+//! S4: BOOT, 100MS/500MS/GPIO, final PASS P=12 F=0 if all pass.
+//! S3/S4 accept USB loss: a failed USB check makes the final screen FAIL.
+//! S5: BOOT, detach/reset/attach and USB probes, final PASS P=5 F=0 expected.
+//! S6: BOOT, RECONNECT/100MS/500MS and nonce exchanges, PASS P=13 F=0 expected.
+//! In all stages any failed check instead leaves inverted FAIL with its counts,
+//! and line 2 names the first check that failed (e.g. HOST SOF) instead of DONE.
+//! CODE retains ALL original meanings documented below, including HAL 80..92,
+//! indexed checks 70+i/A0+i, diagnostic C0..C2/D0..DF and final 63/64.
+//! OLED adds check index 12: 7C=display PASS, AC=display FAIL (no new beacon bytes).
+//! HAL trace codes are buffered while sleep changes clocks and replayed AFTER
+//! return and timing samples, with I2C configuration re-applied before drawing.
+//! Thus the OLED cannot identify an internal sleep halt; beacon mode still can.
+//! Once final, later repeated diagnostic/result codes leave the screen intact.
+//!
 //! Start with flashless selftest_sleep_s1 (keeps USB attached), then s3/s4.
 //! s2 and s5 are opt-in recovery/re-enumeration experiments; see below.
 //! selftest_sleep is an alias for s4. s1/s2/s5 use USB reports; s3/s4 report
-//! through the beacon only, because C3 light sleep can lose USB after wakeup.
-//! Out-of-band beacon in ALL stage images: GPIO5=data, GPIO6=clock, idle low.
+//! out of band, because C3 light sleep can lose USB after wakeup.
+//! Selectable out-of-band beacon in ALL stage images: GPIO5=data, GPIO6=clock, idle low.
 //! Each byte starts with clock low for >=60 us; then 8 bits MSB first. For
 //! each bit set data while clock is low, wait >=10 us, raise clock for >=10 us,
 //! then lower it. Sample data on each rising edge; eight edges form one code.
@@ -13,7 +38,7 @@
 //! delays and between USB log calls. Logging may delay a heartbeat while its
 //! bounded TX waits run (100 ms per drain); byte framing is unchanged.
 //! GPIO8 (active-low LED) toggles on every code, visibly blinking at the end.
-//! GPIO5/6 also reach the SSD1306; this diagnostic intentionally borrows them.
+//! Beacon mode borrows the SSD1306 pins; OLED mode never drives the beacon.
 //! No USB or retained memory is needed to capture/decode these bytes. A halt
 //! before main/beacon initialization produces no beacon; a halt mid-byte is
 //! recognizable as fewer than eight edges. Capture continuously before load_ram.
@@ -38,10 +63,8 @@
 //! (again each second while the IN FIFO is free) and waits <=10 s for the
 //! matching ACK (cdc_in). The nonce comes from the RNG and differs per phase,
 //! so only a host that read the IN data can pass cdc_in; a bus reset, a free
-//! IN FIFO or a stale OUT string cannot. Observed on a Windows host: IN bytes
-//! sent right after re-enumeration, before the port was reopened, did not
-//! reach the application; the cause is not established. No USB logs occur
-//! between attach and the end of the ACK wait.
+//! IN FIFO or a stale OUT string cannot. No USB logs occur between attach
+//! and the end of the ACK wait.
 //! Codes 0xe0/e1/e2=start reconnect/100ms/500ms; 0xe4=waiting for "USJ?",
 //! 0xe3=nonce sent, waiting for ACK. HAL sleep trace codes keep their meanings.
 //! Beacon 0x70+i=PASS, 0xa0+i=FAIL, i=0..11: groups of four checks for
@@ -69,15 +92,15 @@
 //! s5 also reports cdc_out. 0x0c=before reset, 0x0d=reset and detached,
 //! 0x0e=one-second hold ended, 0x0f=waiting for CDC, 0x61=CDC passed,
 //! 0x62=CDC failed. SOF alone never makes CDC pass.
-//! s2: RWDT core reset with pads detached, WITHOUT sleep. This is a two-load test: after the first
-//! reset, connect to ROM with esptool --before no_reset --after no_reset
-//! --no-stub read_mem 0x60008034 (low 6 bits must be 9, TRM §6.1.4), then
-//! load_ram the SAME s2 flashless image with those same no-reset/no-stub flags.
-//! The second load reports PASS only for a pending s2 journal AND reset cause 9.
-//! Do not reset between these loads: a USB reset changes the evidence. The first
-//! load prints ARMING, then intentionally disappears; allow 10 s for ROM to
-//! reappear. No DONE before this reset is expected. If RWDT fails to fire while
-//! the CPU runs, a bounded wait disables it and reports FAIL instead.
+//! s2: RWDT core reset with USB attached, WITHOUT sleep. Run the direct-boot
+//! build from flash (esp32_c3_direct_boot_selftest_sleep_s2.bin at 0x0), not
+//! a RAM load: s2 does not force download boot, so after the reset the chip
+//! boots the same image again, which reports PASS only for a pending s2 journal
+//! AND RESET_CAUSE_PROCPU 9 (RTC_CNTL_RESET_STATE_REG 0x60008038, TRM v1.4 Register 9.12;
+//! causes in §6.1.4). No host step between the boots: opening the port from
+//! the host can raise a USB-JTAG reset (cause 0x15, TRM v1.4 §6.1.4),
+//! invalidating the retained journal.
+//! If RWDT fails to fire, a bounded wait disables it and reports FAIL instead.
 //! s3: ONE 100 ms sleep, explicitly accepting USB loss, with no pad disconnect.
 //! s4: full timer/GPIO/retention test with the same policy as s3.
 //! TRM §30.4 and ESP-IDF v5.4.2 docs/en/api-guides/usb-serial-jtag-console.rst
@@ -95,6 +118,9 @@
 //! 3 timer_500ms, 4 cpu_stalled_500ms, 5 gpio_pullup,
 //! 6 output_retained, 7 ram_retained, 8 clocks_restored,
 //! 9 host_sof, 10 cdc_in, 11 usb_loss_guard. s3 omits indices 3..5.
+//! cdc_in (10) is a note, not a check, in s3/s4: allow_usb_loss leaves the
+//! endpoints dead after wake by design, so it is never emitted or counted; the
+//! final OLED screen says DONE USBLOST when the IN probe was not consumed.
 //! Each frame ends 0x63=all checks passed or 0x64=at least one failed.
 //! Before USB probing and in every result frame, diagnostics use 0xb1/b2/b3
 //! for the 100ms/500ms/GPIO call, then 0xc0 + five 0xd0|nibble bytes for
@@ -110,15 +136,14 @@
 //! A failed USB check stays a failure even if a later reopen recovers USB.
 //! Repeating 0x52 means download recovery was unavailable; no sleep attempted.
 //!
-//! RWDT recovery for s2..s4 forces Joint Download Boot rather than the unrelated
+//! RWDT recovery for s3/s4 forces Joint Download Boot rather than the unrelated
 //! flash app (TRM §7.2, §9.8 OPTION1). Refuse risky stages if download eFuses
 //! prohibit this. No system-reset fallback: it would clear FORCE_DOWNLOAD_BOOT.
-//! s2 is optional until the controller has established s5 recovery. The reset
-//! recovery of s3/s4 remains unverified; s1 cannot establish watchdog recovery.
-//! §30.3.4 explicitly exempts USJ from JTAG SRST; a digital reset alone is not
-//! evidence that disabled USB pads were restored. Require the actual reconnect.
-//! A later failed sleep should return to ROM by the same core-reset path; this
-//! is an experiment, not a claim that an untested hung RTC FSM can be recovered.
+//! s2 does not set FORCE_DOWNLOAD_BOOT and boots its own flash image (above);
+//! it clears an inherited FORCE_DOWNLOAD_BOOT itself before arming (OPTION1
+//! 0x600080F4 bit 0, TRM v1.4 §9.8 OPTION1).
+//! §30.3.4 explicitly exempts USJ from JTAG SRST. Keep USB pads attached
+//! through the core-reset recovery path.
 //!
 //! Forensics BEFORE loading another image (esptool flags above, add --port):
 //! read_mem 0x50001000 = magic 0xc350bace
@@ -144,19 +169,15 @@
 //! can be stale. No on-chip memory is documented as surviving a true chip reset.
 //! A power cycle can destroy all evidence; capture the last host report too.
 //!
-//! Startup diagnosis: old main cleared USB_PAD_ENABLE before calibration or
-//! sleep: an immediate drop alone does not implicate sleep. HAL init also
-//! configures PLL/CPU clocks before main; s1 reaching its first report checks
-//! that common path. TRM §§6.2, 30.4 require PLL and >=40 MHz APB for USB.
+//! HAL init configures PLL/CPU clocks before main. TRM v1.4 §§6.2, 30.4
+//! require PLL and >=40 MHz APB for USB.
 //! Local ESP-IDF components/esp_hw_support/sleep_console.c disables USJ pads
 //! AND bus clock, restores bus clock BEFORE pads; sleep_modes.c calls it only
 //! in light-sleep preparation (for pad leakage). It is not a startup requirement.
 //! port/esp32c3/rtc_sleep.c configures memory force-PU, regulator, analog sleep
 //! bias and XTAL before rtc_sleep_start requests the FSM (§§9.3–9.5). Our HAL
-//! marks these transitions separately; a missing return now identifies the
-//! operation instead of blaming USB disconnect for all later failures.
-//! The controller's v0.4/Windows result showed SOFs but dead CDC after a 20 ms
-//! pad-only detach. s5 now resets USB_DEVICE (§16.3.5 PERIP_RST_EN0), then keeps
+//! marks these transitions separately to identify the last operation.
+//! s5 resets USB_DEVICE (§16.3.5 PERIP_RST_EN0), then keeps
 //! pads disabled with both pull-ups overridden off (§30.6 register 30.2).
 //! USB 2.0 §7.1.7.3/Table 7-13 TDDIS is electrical disconnect detection, not
 //! Windows removal notification. One second is an experimental host allowance,
@@ -165,6 +186,10 @@
 //! (§9.8 register 9.53). Digital GPIO hold includes USB GPIO18/19 (§5.8,
 //! §9.8 register 9.47); this test never enables hold. s1 reports CONF0 before,
 //! detached, attached, USB_CONF and DIG_PAD_HOLD for diagnosis of inherited state.
+//! Reset-to-first-report startup sequence:
+//! esp_riscv._start -> BSS-only initialization for RAM images -> interrupts ->
+//! microzig_main -> hal.init (cache, watchdogs, clocks, system, time) -> main.
+//! Cache initialization also runs for RAM images.
 //! Hardware results for each stage: see the port README.
 const std = @import("std");
 const microzig = @import("microzig");
@@ -173,6 +198,8 @@ const sleep = hal.clocks.sleep;
 const RTC = microzig.chip.peripherals.RTC_CNTL;
 const USB = microzig.chip.peripherals.USB_DEVICE;
 const build_stage = @import("sleep_test_options").stage;
+const use_oled = @import("sleep_test_options").oled;
+const oled = @import("oled_text.zig");
 // Ordinary retained SRAM, not MMIO. No linked allocation overlaps this area.
 const journal: *volatile [7]u32 = @ptrFromInt(0x50001000);
 const journal_magic = 0xc350bace;
@@ -185,7 +212,130 @@ var last_code: u8 = 1;
 var led_level: u1 = 1;
 var last_beacon_us: u64 = 0;
 
+var display_failed = false;
+var display_busy = false;
+var display_final = false;
+var check_pass: usize = 0;
+var check_fail: usize = 0;
+var display_pass: usize = 0;
+var display_fail: usize = 0;
+var display_deferred = false;
+var deferred_codes: [32]u8 = undefined;
+var deferred_count: usize = 0;
+
+fn display_error(err: (oled.Error || error{NoSpaceLeft})) void {
+    const first = !display_failed;
+    display_failed = true;
+    counts(check_pass, check_fail);
+    // Use the logger directly: the normal log callback services the reporter.
+    if (first and build_stage != 3 and build_stage != 4)
+        hal.usb_serial_jtag.logger.log(.info, .default, "SELFTEST sleep_s{d} display: FAIL error={s}", .{ build_stage, @errorName(err) });
+}
+
+fn draw_code(code: u8) !void {
+    counts(check_pass, check_fail);
+    var buffer: [12]u8 = undefined;
+    try oled.line(0, try std.fmt.bufPrint(&buffer, "S{d} SLEEP", .{build_stage}), false);
+    const step: []const u8 = switch (code) {
+        1 => "BOOT",
+        2 => "CALIBRATED",
+        6 => "ARMING",
+        7 => "RWDT ARMED",
+        8 => "WAIT RESET",
+        9 => "WAIT SOF",
+        0x10, 0xe1 => "100MS",
+        0x20, 0xe2 => "500MS",
+        0x30 => "GPIO",
+        0x40 => "CHECKS ENDED",
+        0x52 => "NO RECOVERY",
+        0x63, 0x64 => "DONE",
+        0x7c, 0xac => "DISPLAY",
+        0xe0 => "RECONNECT",
+        0xe3 => "WAIT ACK",
+        0xe4 => "WAIT USJ",
+        else => "STEP",
+    };
+    const failed_step = if (code == 0x64 and first_failed != null)
+        failed_name(first_failed.?)
+    else if (code == 0x63 and usb_lost_note)
+        "DONE USBLOST"
+    else
+        step;
+    try oled.line(1, failed_step, false);
+    try oled.line(2, try std.fmt.bufPrint(&buffer, "CODE={X:0>2}", .{code}), false);
+    try oled.line(3, try std.fmt.bufPrint(&buffer, "P={d} F={d}", .{ display_pass, display_fail }), false);
+    const final = code == 0x63 or code == 0x64;
+    try oled.line(4, if (final) (if (code == 0x63 and !display_failed) "PASS" else "FAIL") else "", final);
+    display_final = final;
+}
+
+/// Index of the first check reported as failed (0xa0 + i), shown on the final screen.
+var first_failed: ?u8 = null;
+
+/// Short check names for the final screen (font: A-Z, 0-9, space, = : - /).
+fn failed_name(index: u8) []const u8 {
+    if (index == 12) return "DISPLAY";
+    const names: []const []const u8 = if (build_stage == 6)
+        &.{ "RECON OP", "RECON BUSRST", "RECON CDCIN", "RECON CDCOUT", "100 OP", "100 BUSRST", "100 CDCIN", "100 CDCOUT", "500 OP", "500 BUSRST", "500 CDCIN", "500 CDCOUT" }
+    else
+        &.{ "AWAKE", "TIMER 100", "STALL 100", "TIMER 500", "STALL 500", "GPIO PULLUP", "OUTPUT RET", "RAM RET", "CLOCKS", "HOST SOF", "CDC IN", "USB GUARD" };
+    return if (index < names.len) names[index] else "CHECK";
+}
+
+fn show_code(code: u8) void {
+    if (code >= 0xa0 and code <= 0xac and first_failed == null) first_failed = code - 0xa0;
+    if (display_busy or display_final) return;
+    if (display_deferred) {
+        // The HAL's bounded trace has fewer than 32 milestones per call.
+        if (deferred_count < deferred_codes.len) {
+            deferred_codes[deferred_count] = code;
+            deferred_count += 1;
+        } else display_failed = true; // No logging/waits inside the HAL trace.
+        return;
+    }
+    display_busy = true;
+    defer display_busy = false;
+    draw_code(code) catch |err| display_error(err);
+}
+
+fn resume_display() void {
+    if (!use_oled) return;
+    display_busy = true;
+    oled.configure() catch |err| display_error(err);
+    display_busy = false;
+    display_deferred = false;
+    for (deferred_codes[0..deferred_count]) |code| show_code(code);
+    deferred_count = 0;
+}
+
+// Called once results are known, and on repeated USB reports for consistency.
+fn counts(pass: usize, fail: usize) void {
+    check_pass = pass;
+    check_fail = fail;
+    display_pass = pass + @intFromBool(use_oled and !display_failed);
+    display_fail = fail + @intFromBool(use_oled and display_failed);
+}
+
+fn finish(pass: usize, fail: usize) void {
+    counts(pass, fail);
+    if (use_oled) {
+        progress(if (display_failed) 0xac else 0x7c);
+        counts(pass, fail);
+    }
+    progress(if (display_fail == 0) 0x63 else 0x64);
+    // The final write can itself fail: latch and include it in USB totals.
+    counts(pass, fail);
+}
+
 fn beacon(code: u8) void {
+    if (use_oled) {
+        show_code(code);
+        led_level ^= 1;
+        beacon_led.put(led_level);
+        last_beacon_us = hal.time.get_time_since_boot().to_us();
+        return;
+    }
+
     beacon_clock.put(0);
     hal.time.sleep_us(60);
     for (0..8) |bit| {
@@ -234,9 +384,10 @@ fn progress(stage: u8) void {
     RTC.STORE0.write_raw(0xc3500000 | @as(u32, stage));
 }
 
-fn arm_watchdog(ticks_per_second: u32) void {
+fn arm_watchdog(ticks_per_second: u32, force_download: bool) void {
     // §7.2: retained across core reset, so ROM stays reachable for RAM reload.
-    RTC.OPTION1.modify(.{ .FORCE_DOWNLOAD_BOOT = 1 });
+    // s2 instead boots the same image again from flash after the reset.
+    RTC.OPTION1.modify(.{ .FORCE_DOWNLOAD_BOOT = @intFromBool(force_download) });
     const shift: u5 = @as(u5, microzig.chip.peripherals.EFUSE.RD_REPEAT_DATA1.read().WDT_DELAY_SEL) + 1;
     // The reset defaults may pause RWDT in sleep; explicitly clear that bit.
     RTC.WDTWPROTECT.write(.{ .WDT_WKEY = 0x50d83aa1 });
@@ -252,6 +403,7 @@ fn arm_watchdog(ticks_per_second: u32) void {
 
 fn enter(config: sleep.Config, stage: u8) sleep.Error!sleep.WakeCause {
     hal.wdt.Rtc.feed();
+    if (use_oled) display_deferred = true;
     progress(stage);
     var traced = config;
     traced.allow_usb_loss = true;
@@ -312,11 +464,17 @@ const Result = struct {
 };
 
 fn timer_check(ms: u32, ticks: u48, stage: u8, result: *Result, stalled: *Result) sleep.Error!void {
+    // Draw outside both clocks' measurement windows: I2C traffic is active CPU time.
+    if (use_oled) progress(stage);
     const before = sleep.rtc_ticks();
     const active_before = hal.systimer.unit(1).read();
-    const cause = try enter(.{ .timer_ticks = ticks }, stage);
+    const cause = enter(.{ .timer_ticks = ticks }, stage) catch |err| {
+        resume_display();
+        return err;
+    };
     const active_after = hal.systimer.unit(1).read();
     const elapsed = sleep.rtc_ticks() -% before;
+    resume_display();
     const active_us = (active_after -% active_before) / 16;
     result.rtc = elapsed;
     result.active_us = active_us;
@@ -334,11 +492,19 @@ fn timer_check(ms: u32, ticks: u48, stage: u8, result: *Result, stalled: *Result
 }
 
 pub fn main() void {
-    beacon_data.put(0);
-    beacon_clock.put(0);
+    // HAL startup has already initialized clocks/system/time; draw before journal access.
+    if (use_oled) {
+        display_busy = true;
+        oled.init() catch |err| display_error(err);
+        display_busy = false;
+        show_code(1);
+    } else {
+        beacon_data.put(0);
+        beacon_clock.put(0);
+        beacon_data.apply(.{ .output_enable = true });
+        beacon_clock.apply(.{ .output_enable = true });
+    }
     beacon_led.put(1);
-    beacon_data.apply(.{ .output_enable = true });
-    beacon_clock.apply(.{ .output_enable = true });
     beacon_led.apply(.{ .output_enable = true });
     beacon_enabled = true;
     const reset_cause = RTC.RESET_STATE.read().RESET_CAUSE_PROCPU;
@@ -372,24 +538,34 @@ pub fn main() void {
     }
     if (build_stage == 6) stage_six();
     if (build_stage == 2) {
-        std.log.info("SELFTEST sleep_s2 ARMING: expect pad detach, RWDT reset, ROM reconnect, then no-reset reload", .{});
+        // Arm from the measured RTC_SLOW_CLK rate, as s3/s4 do, not the nominal 136 kHz.
+        const cal_rtc = sleep.rtc_ticks();
+        const cal_sys = hal.systimer.unit(0).read();
+        hal.time.sleep_ms(50);
+        const cal_us = (hal.systimer.unit(0).read() -% cal_sys) / 16;
+        const slow_hz: u32 = if (cal_us > 0) @intCast(@as(u64, sleep.rtc_ticks() -% cal_rtc) * 1000000 / cal_us) else 136000;
         journal[6] = pending_magic;
         progress(6);
-        arm_watchdog(136000);
+        arm_watchdog(slow_hz, false);
         progress(7);
-        USB.CONF0.modify(.{ .USB_PAD_ENABLE = 0 });
+        std.log.info("SELFTEST sleep_s2 ARMING: USB stays attached; expect RWDT reset, then this flash image reports rwdt_recovery; slow_hz={d} wdtconfig0=0x{x} stg0_hold={d} stg1_hold={d} delay_sel={d}", .{
+            slow_hz,                                                              RTC.WDTCONFIG0.raw, RTC.WDTCONFIG1.raw, RTC.WDTCONFIG2.raw,
+            microzig.chip.peripherals.EFUSE.RD_REPEAT_DATA1.read().WDT_DELAY_SEL,
+        });
+        report_delay(300);
+        // Keep USB pads attached: C3 retains its connection through RWDT reset.
+        // The TRM guarantees USJ is not affected by SRST (v1.4 §30.3.4).
         progress(8);
         const before = hal.systimer.unit(0).read();
         hal.time.sleep_ms(6500);
         const elapsed_us = (hal.systimer.unit(0).read() -% before) / 16;
         hal.wdt.Rtc.disable();
-        USB.CONF0.modify(.{ .USB_PAD_ENABLE = 1 });
         journal[6] = 0;
         RTC.OPTION1.modify(.{ .FORCE_DOWNLOAD_BOOT = 0 });
         report_simple("rwdt_did_not_reset", false, elapsed_us, reset_cause);
     }
     progress(6);
-    arm_watchdog(136000);
+    arm_watchdog(136000, true);
     progress(7);
     var results = [_]Result{
         .{ .name = "awake_control" },
@@ -436,7 +612,7 @@ pub fn main() void {
     const sysclk_before = microzig.chip.peripherals.SYSTEM.SYSCLK_CONF.raw;
     const cpu_before = microzig.chip.peripherals.SYSTEM.CPU_PER_CONF.raw;
     if (calibration_ticks > 0 and sys_us > 0) {
-        arm_watchdog(@intCast(@as(u64, calibration_ticks) * 1000000 / sys_us));
+        arm_watchdog(@intCast(@as(u64, calibration_ticks) * 1000000 / sys_us), true);
         const ticks100: u48 = @intCast(@as(u64, calibration_ticks) * 100000 / sys_us);
         const ticks500: u48 = @intCast(@as(u64, calibration_ticks) * 500000 / sys_us);
         // Default entry must refuse enabled USB pads before any sleep writes.
@@ -463,6 +639,7 @@ pub fn main() void {
                 results[4].err = err;
             };
 
+            if (use_oled) progress(0x30);
             const gpio_before = sleep.rtc_ticks();
             const high_before = wake_pin.read() == 1;
             // Timer is a fallback: missing GPIO wake must terminate and FAIL.
@@ -474,6 +651,7 @@ pub fn main() void {
                 break :blk null;
             };
             const elapsed = sleep.rtc_ticks() -% gpio_before;
+            resume_display();
             results[5].rtc = elapsed;
             if (cause) |woke| {
                 results[5].cause = woke.raw;
@@ -509,23 +687,39 @@ pub fn main() void {
     const usb = probe_usb();
     results[9].passed = usb.host_seen;
     results[10].passed = usb.cdc_in;
+    usb_lost_note = !usb.cdc_in;
     progress(if (usb.host_seen and usb.cdc_in) 0x50 else 0x51);
     while (true) {
         report_sleep_diagnostics();
         beacon(if (output_matches) 0xb4 else 0xb5);
         beacon(if (ram_matches) 0xb6 else 0xb7);
         beacon(if (slept) 0xb8 else 0xb9);
-        var passed = true;
+        var pass: usize = 0;
+        var fail: usize = 0;
         for (results, 0..) |result, i| {
-            if (build_stage == 3 and i >= 3 and i <= 5) continue;
-            passed = passed and result.passed;
+            if (!counted(i)) continue;
+            if (result.passed) pass += 1 else fail += 1;
+        }
+        counts(pass, fail);
+        for (results, 0..) |result, i| {
+            if (!counted(i)) continue;
             progress(@as(u8, if (result.passed) 0x70 else 0xa0) + @as(u8, @intCast(i)));
             report_delay(100);
         }
-        progress(if (passed) 0x63 else 0x64);
+        finish(pass, fail);
         report_delay(1000);
     }
 }
+
+/// s3 omits the 500 ms and GPIO checks. In s3/s4, cdc_in (index 10) is not a
+/// check: with allow_usb_loss the endpoints stay dead after wake by design
+/// (README "C3 light sleep and USB-Serial-JTAG"); it is reported as a note.
+fn counted(i: usize) bool {
+    if (build_stage == 3 and i >= 3 and i <= 5) return false;
+    return i != 10;
+}
+
+var usb_lost_note = false;
 
 const UsbProbe = struct {
     frame_before: u32,
@@ -578,8 +772,10 @@ fn report_simple(comptime name: []const u8, passed: bool, elapsed_us: u64, reset
     if (build_stage >= 2) RTC.OPTION1.modify(.{ .FORCE_DOWNLOAD_BOOT = 0 });
     report_delay(1500);
     while (true) {
+        finish(@intFromBool(passed), @intFromBool(!passed));
         std.log.info("SELFTEST sleep_s{d} " ++ name ++ ": {s} elapsed_us={d} reset_cause=0x{x}", .{ build_stage, if (passed) "PASS" else "FAIL", elapsed_us, reset_cause });
-        std.log.info("SELFTEST sleep_s{d} DONE pass={d} fail={d}", .{ build_stage, @intFromBool(passed), @intFromBool(!passed) });
+        if (use_oled) std.log.info("SELFTEST sleep_s{d} display: {s}", .{ build_stage, if (display_failed) "FAIL" else "PASS" });
+        std.log.info("SELFTEST sleep_s{d} DONE pass={d} fail={d}", .{ build_stage, display_pass, display_fail });
         progress(0x60);
         report_delay(1000);
     }
@@ -643,6 +839,7 @@ fn stage_one(reset_cause: u6) noreturn {
         @intFromBool(usb.cdc_in) + @as(u3, if (build_stage == 5) @intFromBool(cdc_out) else 0);
     const count: u3 = if (build_stage == 5) 4 else 3;
     while (true) {
+        finish(pass, count - pass);
         std.log.info("SELFTEST sleep_s{d} {s}: {s} elapsed_us={d} hold_us={d} reset_cause=0x{x}", .{ build_stage, if (build_stage == 5) "detach_attach" else "keep_attached", if (pads_ok) "PASS" else "FAIL", elapsed_us, hold_us, reset_cause });
         std.log.info("SELFTEST sleep_s{d} host_sof: {s} wait_us={d} frame_before={d} frame_after={d}", .{ build_stage, if (usb.host_seen) "PASS" else "FAIL", usb.wait_us, usb.frame_before, usb.frame_after });
         std.log.info("SELFTEST sleep_s{d} cdc_in: {s} usb_level_consumed_probe={}", .{ build_stage, if (usb.cdc_in) "PASS" else "FAIL", usb.cdc_in });
@@ -655,7 +852,8 @@ fn stage_one(reset_cause: u6) noreturn {
             RTC.USB_CONF.raw,
             RTC.DIG_PAD_HOLD.raw,
         });
-        std.log.info("SELFTEST sleep_s{d} DONE pass={d} fail={d}", .{ build_stage, pass, count - pass });
+        if (use_oled) std.log.info("SELFTEST sleep_s{d} display: {s}", .{ build_stage, if (display_failed) "FAIL" else "PASS" });
+        std.log.info("SELFTEST sleep_s{d} DONE pass={d} fail={d}", .{ build_stage, display_pass, display_fail });
         report_delay(1000);
     }
 }
@@ -738,10 +936,11 @@ fn stage_six() noreturn {
             results[base].passed = true;
         } else if (calibrated) {
             const ticks: u48 = @intCast(@as(u64, rtc_elapsed) * ms * 1000 / sys_us);
-            arm_watchdog(@intCast(@as(u64, rtc_elapsed) * 1_000_000 / sys_us));
+            arm_watchdog(@intCast(@as(u64, rtc_elapsed) * 1_000_000 / sys_us), true);
             var diagnostics: sleep.Diagnostics = .{};
             const before_rtc = sleep.rtc_ticks();
             const before_active = hal.systimer.unit(1).read();
+            if (use_oled) display_deferred = true;
             const cause = sleep.enter_light_sleep(.{
                 .timer_ticks = ticks,
                 .usb_policy = .disconnect_and_reenumerate,
@@ -754,6 +953,7 @@ fn stage_six() noreturn {
             };
             const active_us = (hal.systimer.unit(1).read() -% before_active) / 16;
             const elapsed_us = @as(u64, sleep.rtc_ticks() -% before_rtc) * sys_us / rtc_elapsed;
+            resume_display();
             hal.wdt.Rtc.disable();
             RTC.OPTION1.modify(.{ .FORCE_DOWNLOAD_BOOT = 0 });
             // Independent RTC versus CPU-stall-sensitive UNIT1 distinguishes
@@ -782,6 +982,9 @@ fn stage_six() noreturn {
         const expected_ack = std.fmt.bufPrint(&ack, "ACK {x:0>8}", .{nonce}) catch unreachable;
         results[base + 2].nonce = nonce;
         results[base + 2].passed = exchange(line, expected_ack);
+        var completed_pass: usize = 0;
+        for (results[0 .. base + 4]) |result| completed_pass += @intFromBool(result.passed);
+        counts(completed_pass, base + 4 - completed_pass);
         // Report the completed phase on the beacon before the next detach; a
         // stale nonce left in the IN FIFO cannot match the next phase's ACK.
         for (results[base..][0..4], base..) |result, i|
@@ -799,8 +1002,9 @@ fn stage_six() noreturn {
                 result.nonce, if (result.err) |err| @errorName(err) else "none",
             });
         }
-        progress(if (pass == results.len) 0x63 else 0x64);
-        std.log.info("SELFTEST sleep_s6 DONE pass={d} fail={d}", .{ pass, results.len - pass });
+        finish(pass, results.len - pass);
+        if (use_oled) std.log.info("SELFTEST sleep_s6 display: {s}", .{if (display_failed) "FAIL" else "PASS"});
+        std.log.info("SELFTEST sleep_s6 DONE pass={d} fail={d}", .{ display_pass, display_fail });
         report_delay(1000);
     }
 }

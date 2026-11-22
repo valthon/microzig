@@ -30,6 +30,7 @@ Other results identify their boards and runs below; dates are included where rec
 | `twai` (CAN)                                  | yes | yes | `selftest_twai`                                    | 10/10     | 20/20     |
 | `rmt` (polling TX/RX)                         | yes | yes | `selftest_rmt`                                     | 3/3       | 3/3       |
 | `timer`, `wdt` (timer groups, watchdogs)      | yes | yes | `selftest_timers`                                  | 6/6, 3 runs (24ebc5d1) | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
+| `wdt.Rtc` core reset, C6 USB recovery         | yes | yes | `selftest_rwdt` (from flash)                       | 1/1 in 3 of 3 boots, direct boot (2026-11-20) | 1/1 in 3 of 3 boots each on Super Mini ESP32-C6 (image boot) and XIAO ESP32-C6 (direct boot) (2026-11-20) |
 | `usb_serial_jtag` (logging, RX, confirmed TX) | yes | yes | `selftest_usj`                                     | 9/9 echoes, 3 runs (24ebc5d1) | 9/9 echoes, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `gpio` pin interrupts                         | yes | yes | `selftest_gpio_irq`                                | 8/8       | 9/9       |
 | `flash` (erase, write, read)                  | yes | yes | `selftest_flash`                                   | 5/5       | 5/5       |
@@ -41,8 +42,8 @@ Other results identify their boards and runs below; dates are included where rec
 | `dedicated_gpio` (8 CPU signals; exclusive pad/signal ownership, CSR set/clear/read) | yes | yes | `selftest_dedicated_gpio`, pad 4, no wiring | 9/9 | 8/8 |
 | `gdma` channel pairs 0–2, SRAM memory copy | yes | yes | `selftest_gdma`; exclusive channels, disjoint SRAM/descriptors, bounded wait | 15/15, 3 runs (24ebc5d1) | 16/16, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `spi` master (SPI2), GDMA channel 0 transfers | yes | yes | `selftest_spi_dma`                                 | 8/8       | 8/8       |
-| `clocks.sleep` light sleep                    | yes | yes | `selftest_sleep_s*` (C3), `selftest_sleep_c6_s*` (C6) | see below | s1–s4, s6–s8 on XIAO (3 runs each); see "C6 light sleep and deep sleep" |
-| `clocks.sleep` deep sleep                     | no  | yes | `selftest_sleep_c6_s5` (image boot) | n/a | 3/3 on XIAO; see "C6 light sleep and deep sleep" |
+| `clocks.sleep` light sleep                    | yes | yes | `selftest_sleep_s*` (C3, OLED or beacon), `selftest_sleep_c6_s*` (C6) | see below | s1–s4, s6–s8 on Super Mini ESP32-C6 and XIAO ESP32-C6 (3 runs each); see "C6 light sleep and deep sleep" |
+| `clocks.sleep` deep sleep                     | no  | yes | `selftest_sleep_c6_s5` (image boot) | n/a | 3/3 on Super Mini ESP32-C6 and XIAO ESP32-C6; see "C6 light sleep and deep sleep" |
 | `sigma_delta` (4 channels, signed density, divider 1–256) | yes | yes | `selftest_sigma_delta` | 3/3, 3 runs (24ebc5d1) | 3/3, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `pcnt` (4 units, channel 0, signed 16-bit, polling watchpoints, 10-bit filter) | no | yes | `selftest_pcnt` | n/a | 9/9, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `etm` (50 routes; 8 GPIO event/task groups, no interrupt allocation) | no | yes | `selftest_etm` | n/a | 5/5, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
@@ -120,6 +121,59 @@ group held in reset, inside a critical section. Calls on an active group do
 not unlock, relock or update the watchdog. With this change,
 `selftest_timers` passed 6/6 on the C3, Super Mini ESP32-C6 and XIAO ESP32-C6, 3 runs each, at
 24ebc5d1 (RAM images, 2026-11-19).
+
+The C3 RTC watchdog (`hal.wdt.Rtc.configure`) sets `WDT_SYS_RESET_LENGTH` and
+`WDT_CPU_RESET_LENGTH` to 7 (3.2 us), as ESP-IDF v5.5.1 `wdt_hal_init` does
+(`components/hal/wdt_hal_iram.c:57-58`; C3 TRM v1.4 Register 9.31). With the reset value 0
+(100 ns) a stage-0 `reset_core` action did not reset the C3 rev v0.4. The C6 RTC watchdog
+sets both lengths to 7 too (C6 TRM v1.2 §15.6 Register 15.1 `RTC_WDT_CONFIG0_REG`,
+`LP_WDT.CONFIG0`; the same IDF lines above).
+
+On the C6, an RWDT core reset (action 3, `reset_core`) reboots the app with cause 0x09 and
+the retained journal, but USJ stops communicating without a host-visible disconnect; a system
+reset (action 4, `reset_system`) reboots with cause 0x10 and USJ re-enumerates (XIAO ESP32-C6, direct
+boot, UART0 and USJ captured together, 2026-11-20).
+C6 TRM v1.2 §8.1.3 includes peripherals in core reset; §32.4 documents USJ's
+BBPLL dependency. IDF v5.5.1
+`components/esp_system/port/soc/esp32c6/system_internal.c::esp_restart_noos`
+keeps BBPLL on for ROM USB logging and uses a CPU reset, with RWDT action 3
+then action 4 as fallback. Its bootloader and sleep protection use action 4
+(`bootloader_init.c::bootloader_config_wdt`, `sleep_modes.c`).
+
+On C6, the default HAL `init_sequence` calls
+`hal.wdt.Rtc.recover_usb_at_startup()` after clocks, system and time
+initialization, before RTOS startup and application USB logging, interrupt
+handlers or other USB users. SYSTIMER must be running for the reconnect's
+bounded waits and detach delay. Applications managing USB themselves can set
+`microzig_options.hal.recover_usb_at_startup = false` to omit the call;
+the public helper remains available for manual use after clock/time setup and
+before USB users start. C3 compiles out this call: it retains its USB connection
+through RWDT core reset. C3 TRM v1.4 §30.3.4 states that USJ is not affected by
+SRST. On C6, the helper handles RWDT core reset (0x09, TRM v1.2 Table 8.1-1),
+after which USJ loses its connection, using the 10 ms soft disconnect/reconnect
+with CONF0 pull override (TRM §32.7 Register 32.3). It preserves the reset
+cause, leaves disabled pads alone, and discards pending USB transfers.
+All other reset causes leave USB alone in this helper, including the USB UART
+reset (0x15) used by the CDC-ACM RTS control (TRM Tables 32.3-2 and 32.4-2).
+The host monitor must follow re-enumeration; no manual reset is required.
+Receive the self-test's PASS over USJ after re-enumeration. With the default HAL
+recovery, `selftest_rwdt`
+reported `core_reset: PASS reset_cause=0x9 journal=true` and `DONE pass=1 fail=0`
+over USJ after re-enumeration in 3 of 3 boots each on the C3 (direct boot), the
+Super Mini ESP32-C6 (image boot) and the XIAO ESP32-C6 (direct boot), 2026-11-20.
+Without the recovery the C6 host did not re-enumerate.
+
+Build `-Dexample=selftest_rwdt` in `examples/espressif/esp` and run the selected
+image from flash, keeping a USB monitor following re-enumeration with no host
+reset between boots. C6 HAL initialization recovers before the first USB log;
+C3 retains its existing path.
+The test clears forced-download boot, journals in retained RTC/LP SRAM, and arms
+stage 0 for a core reset after about two seconds using the measured slow-clock
+rate and eFuse delay factor. The next boot consumes the journal and reports
+`SELFTEST rwdt core_reset: PASS` only with both the pending journal and reset
+cause 0x09 (C3 TRM v1.4 Table 6.1-1; C6 TRM v1.2 Table 8.1-1), followed by
+`SELFTEST rwdt DONE pass=1 fail=0`. Other reset causes cannot pass; failure to
+reset within 6.5 seconds disables the watchdog and reports `DONE pass=0 fail=1`.
 
 The lifecycle test counts TCP bind/listen as an eighth check, publishing
 success only after it completes. Setup, reporter-spawn and TCP setup failures
@@ -496,21 +550,42 @@ by plugging into the PC, `wait_for_host` with an `Attachment` saw the host after
 ten sleeps that followed all saw a bus reset; after an RTC watchdog reset with the PC attached it
 saw the host after 67 us, and again 10/10. In those two runs the `Attachment` was passed and nothing
 cleared `USB_BUS_RESET`, so both rules counted the host: they show that the sleeps after
-`wait_for_host` keep their wait, not which rule kept it (the four cases above separate the two). An
-earlier version of this series without `wait_for_host`, right after power-up, skipped all ten waits.
+`wait_for_host` keep their wait, not which rule kept it (the four cases above separate the two).
 
-Observed with a Windows host: IN bytes the device sent right after re-enumeration, before the host
-reopened the port, did not reach the host application; the cause is not established. The s6
-self-test therefore lets the host speak first: after each re-enumeration the host reopens the
+The s6 self-test lets the host speak first: after each re-enumeration the host reopens the
 port and sends `USJ?` 1.5 s later; the device then sends `USJ nonce=<8 hex digits>` (again each
 second until consumed) and passes `cdc_in` only when the host answers `ACK <same digits>`.
 
 `selftest_sleep_s1` to `selftest_sleep_s6` stage the C3 sleep checks (`selftest_sleep` is s4); the
-file header documents each stage and the GPIO beacon. Results on the C3 rev v0.4: s1 3/3; s4 passes
-every check except `cdc_in`, which fails by design without the reconnect policy; s6 (`wait_for_host`
-with the test's `Attachment`, then reconnect without sleep and a 100 ms and a 500 ms sleep, each
-checked for a bus reset, the nonce echoed back and the OUT string): 12/12 with a Windows host,
-`wait_for_host` true after 3 us. C6 evidence is recorded below.
+file header documents each stage and the result screen on the 0.42-inch SSD1306 panel (GPIO5 SDA,
+GPIO6 SCL): stage, step or the first failed check, `CODE=`, pass/fail counts and an inverted
+final PASS/FAIL. The counts include a latched `display` check. Build with
+`-Dsleep_report=beacon` for the original analyser protocol on those same pins; the two reporters
+are mutually exclusive. HAL trace codes are replayed after sleep and timing samples, because the
+callback may not wait on sleep-affected peripherals, so the OLED cannot show where a sleep
+halted; the beacon can. In s3 and s4 `cdc_in` is a note, not a check: `allow_usb_loss` leaves
+the endpoints dead after wake by design, and the screen shows `DONE USBLOST` instead of `DONE`.
+s2 runs as a direct-boot image from flash with USB attached and does not force download boot:
+after the RTC watchdog core reset the same image boots again and passes `rwdt_recovery` only
+for reset cause 0x9 with its journal pending. Keep USB pads attached: C3 retains its USB
+connection through RWDT core reset. C3 TRM v1.4 §30.3.4 states that USJ is not
+affected by SRST. s2 clears `RTC_CNTL.OPTION1.FORCE_DOWNLOAD_BOOT` itself before arming, including
+state left by older RAM-load images (`OPTION1` 0x600080F4). The reset cause is
+read from `RTC_CNTL_RESET_STATE_REG` 0x60008038 (C3 TRM v1.4 Register 9.12).
+
+Results on the C3 rev v0.4, 2026-11-20, OLED reporter, one run each:
+
+- s1: `DONE pass=4 fail=0` including `display`; the panel read `S1 SLEEP`, `DONE`, `CODE=63`,
+  `P=4 F=0`, `PASS`. An earlier beacon build passed s1 in 3 of 3 runs.
+- s2: `rwdt_recovery PASS reset_cause=0x9`, `DONE pass=2 fail=0`.
+- s3: the panel read `DONE USBLOST`, `CODE=63`, `P=9 F=0`, `PASS`.
+- s4: the panel read `DONE USBLOST`, `P=12 F=0`, `PASS`.
+- s5: 5/5 (`detach_attach`, `host_sof`, `cdc_in`, `cdc_out`, `display`) in all 36 repeated
+  reports.
+- s6 (beacon reporter build, results read over USB): 12/12 with a Windows host
+  (`wait_for_host` with the test's `Attachment`, then reconnect without sleep and a 100 ms
+  and a 500 ms sleep, each checked for a bus reset, the nonce echoed back and the OUT string),
+  `wait_for_host` true after 3 us.
 
 ### C6 light sleep and deep sleep
 
@@ -576,8 +651,29 @@ Wake sources (TRM Table 12.4-1, with the EXT1 omission below):
   before sleeping (§7.7). TRM v1.2 omits EXT1 from Table 12.4-1 and the LP_AON EXT1 field
   descriptions; the selector/levels and source bit 1 follow IDF v5.5.1
   `lp_aon_ll_ext1_set_wakeup_pins` and C6 `pmu_bit_defs.h`. Bit 2 is the separate HP GPIO
-  source, not EXT1. The HAL validates LP mux ownership, consumes EXT1 status,
-  and restores the previous EXT1 selection. It does not reconfigure pads. An already asserted
+  source, not EXT1. The HAL validates LP mux ownership and rejects pre-held selected pads:
+  a hold prevents its input setup from reaching the pad (§7.9), and sleep entry must not
+  silently release an application-owned hold. It enables the independent LP IO clock and
+  selects the LP GPIO input path, preserving pulls. The gate is a control bit, not a
+  readiness flag; IDF `rtc_io_ll.h:59–65` polls that same writable bit. The HAL
+  enables it without a readiness poll (TRM §8.2.4 defines no LP IO readiness condition).
+  When deep sleep powers down LP peripherals, it holds the selected EXT1 pads through
+  `LP_AON.GPIO_HOLD0` (TRM §§7.7,7.9; IDF v5.5.1 `sleep_modes.c:2037–2081`,
+  `hal/esp32c6/include/hal/rtc_io_ll.h:59–65,79–87,136–139,271–285`).
+  Light sleep and deep sleep with `lp_core` retain LP peripheral power and need no new hold.
+  Return/error paths restore pad configuration, release sleep holds and restore the clock gate
+  and previous EXT1 selection. Default C6 HAL `init_sequence` calls
+  `hal.clocks.sleep.release_ext1_holds_at_startup()` alongside USB recovery, before RTOS or
+  application pad users. It disables EXT1 selection before releasing only the selected
+  holds, preserving latched wake status and other pads' holds. IDF v5.5.1
+  `cpu_start.c:773–777` calls `sleep_gpio.c:188–201` for deep-sleep resets only; the HAL
+  also cleans up after an interrupted sleep preparation. CPU and Core resets preserve
+  LP_AON, whereas System and Chip resets reset the LP system (TRM v1.2 §8.1.3,
+  Table 8.1-1; GPIO_HOLD0 register 12.60). Cleanup therefore runs regardless of reset cause.
+  Set `microzig_options.hal.release_ext1_holds_at_startup = false` to manage these
+  retained pads manually, and call the helper before reconfiguring them when release is
+  wanted. `wake_cause()` only reads cause/status; it does not release holds.
+  An already asserted
   source can return `Rejected`; no edge is required. HP-only GPIO wake is not implemented.
 - Light sleep: `uart0`/`uart1` enable the UART edge wake detector. Configure that UART's
   `SLEEP_CONF2.WK_MODE_SEL=0` and `ACTIVE_THRESHOLD` before entry; threshold+3 rising edges wake
@@ -606,7 +702,8 @@ SRAM; LP peripherals are off unless LP-core wake requires them (§12.4.2.4). Suc
 **image-boot flash app**; RAM-loaded code cannot survive. No wake stub is installed; ROM reloads
 flash through its reset path. Read `wake_cause()` before requesting another sleep: it returns
 `reset` (including `.deep_sleep`, reset code 5, §8.2.2) and decoded timer/GPIO/UART/LP flags plus
-raw source bits and EXT1 pin status. Boot wake flags are zero for other reset reasons. Reserve LP
+raw source bits and EXT1 pin status, preserved by startup hold cleanup as described above.
+Boot wake flags are zero for other reset reasons. Reserve LP
 memory explicitly if using it as a reboot counter; HP startup does not initialize LP SRAM (§5.3.2).
 Both entry calls own timer target 0 and PMU sleep/wake/reject flags, and must not share those with
 another sleep manager. Once SLEEP_REQ is written, polling continues until wake or rejection,
@@ -621,7 +718,7 @@ deadline), both LP_WDT pause-in-sleep and HP_SLEEP's digital watchdog pause are 
 Stage 0 uses action 4, called `RESET_RTC` by IDF and **system reset** by TRM v1.2 §15.2.2.2,
 Table 15.2-1: it resets PMU/RTC as well as HP, so a stalled PMU is reset rather than only the CPU.
 Chip-reset mode remains off: system reset preserves internal memory (§8.1.1), including the LP
-SRAM recovery marker. This is a recovery provision, not hardware evidence that it works.
+SRAM recovery marker. s7 below exercises this recovery on hardware.
 A stopped LP slow clock or missing LP dynamic fast clock can defeat this watchdog
 (§15.2.2.2, Register 15.1 reset lengths are in RTC_DYN_FAST_CLK). s7 below tests recovery with
 XTAL kept on and an independent later timer wake; it deliberately avoids testing a hang.
@@ -653,7 +750,7 @@ they reproduced IDF's bug, where `pmu_sleep.c:273–275` updates the local `powe
 is copied to `config->power` at line 230. They are not safe operating profiles. Regenerate and verify byte identity with:
 
 ```sh
-python3 examples/espressif/esp/tools/sleep_c6_idf_reference.py --check --idf /home/valthon/esp/esp-idf-v5.5.1
+python3 examples/espressif/esp/tools/sleep_c6_idf_reference.py --check --idf <esp-idf-v5.5.1 checkout>
 ```
 
 Run `zig build test-sleep-c6 -Dexample=selftest_sleep_c6_regs` in `examples/espressif/esp` to
@@ -684,30 +781,8 @@ After a reset into the ROM downloader, read before loading an application/LP ima
 `esptool --chip esp32c6 --before no_reset --after no_reset read_mem 0x50003fe0` and the same command
 with `0x50003fe4` (newer esptool spells this `read-mem`). Avoid a power cycle; retention depends on
 the reset domain (§§5.3.2,12.4.2.4). `lp_core.load()` clears LP SRAM, including this record.
-The marker and milestone record are diagnostic evidence only; verify retained bytes and reset recovery
-on the boards before relying on the bench watchdog.
+The marker and milestone record are diagnostic evidence only.
 
-Hardware evidence, all on one ESP32-C6 XIAO (rev v0.1), image boot, with bench
-recovery enabled, 2026-11-19, using `selftest_sleep_c6_s*` and
-`selftest_sleep_c6_regs`. In the initial timer-measurement build, s2 returned in 4 of 4 runs with LP timer wake
-**0x10**, no hang and no RWDT reset, but the old `timer_100ms` check failed in
-all four: `ticks=31413, 31533, 31526, 31416` and `active_us=147366, 148139, 148020,
-147253`. Three register-probe runs taken alongside them each matched compiled
-ESP-IDF v5.5.1 on all 248 rows; a separate probe build reported
-pass=253. With a timer check without the 99% bound and setup ceiling: s2 passed 2/2 in 2 of 2 runs (`setup_us` about
-19.8 ms, `stopped_us` about 80.6 ms of a 100 ms request), and in 3 of 3 runs each
-s1 (guards) 3/3, s3 (retention at 100/250/500 ms) 4/4, s4 (EXT1 GPIO wake via the
-LP core) 2/2 and s6 (USB reconnect and nonce echo) 13/13.
-Deep sleep (s5) hung with that build. These ran on earlier versions; timer
-checks, PMU tables, LP_FAST startup and logger changed since; the changes
-since are built only / unit-tested except where the matching-tree runs below
-exercise them. The tightened timer check ran in those matching-tree runs.
-
-In the initial timer-measurement build, `ticks` counts LP_SLOW_CLK over the
-entire call, including restoration;
-`active_us` is stall-sensitive SYSTIMER UNIT1 ticks divided by 16 over that same call,
-including PMU initialization, calibration and USB reattachment. Neither value measures
-only sleep; that output omits the measured LP frequency needed to convert ticks.
 IDF v5.5.1 `sleep_modes.c:1431,1501,1808–1809` anchors the timer before calibration/setup
 and subtracts hardware/software overhead from the request. This HAL likewise anchors raw
 ticks before setup, without IDF's estimated adjustment. Requiring 90% of the original
@@ -724,6 +799,29 @@ of the request (the timer is anchored at entry),
 setup of at most 30 ms, and at least 1 ms and 90% of the request-to-wake window with
 SYSTIMER stopped. Setup delays alone, immediate wake and busy waiting cannot satisfy
 these checks.
+
+External-wake stages, image boot:
+
+| Image-boot example | Expected summary | Operator steps and pass criteria |
+| --- | --- | --- |
+| `selftest_sleep_c6_s9` | `SELFTEST sleep_c6_s9 DONE pass=3 fail=0` | Connect a **3.3 V** USB-UART adapter TX to GPIO17 (XIAO ESP32-C6 D7), RX to GPIO16 (XIAO ESP32-C6 D6), and common GND. The Super Mini ESP32-C6 exposes GPIO17/16 too. Use 115200 8N1, no flow control; keep TX idle high. Send `S` on native USB CDC at `ARMED?`. At `UART_WAKE`, wait **2 seconds**, then send sixteen ASCII `U` bytes once on the adapter. Reopen native CDC after detach to read results. Checks UART setup, UART0-only wake (`0x40`, no timer), and at least 100 ms / 90% CPU stall in the request-to-wake window. Wake bytes may be lost; no payload echo is required. |
+| `selftest_sleep_c6_s10` | `SELFTEST sleep_c6_s10 DONE pass=4 fail=0` | Connect one jumper from **GPIO2** (XIAO ESP32-C6 **D2**, Super Mini ESP32-C6 **GPIO2**) to **3V3 before sending `S`** on native USB CDC at `ARMED?`. At `GPIO_WAKE`, wait **2 seconds**, then **move** the jumper to **GND** and hold through reboot. Never bridge the supply rails. Reopen CDC after reboot; remove the jumper after `DONE`. Checks deep-sleep reset, EXT1-only wake (`0x2`, no timer), GPIO2 status (`0x04`) and retained LP SRAM marker. An initially low pad fails before sleep. |
+
+Install these with the generic **`esp32_c6` image-boot target**, as for s5; neither is
+RAM-load runnable. Both have a 30-second LP timer fallback and bench watchdog recovery;
+timer wake or watchdog reset fails. Do not resend `S` automatically after reconnect.
+GPIO8 beacons HAL milestones and LP_AON.STORE0 records the latest callback, as in s1–s8.
+Result lines repeat every three seconds after a 1.5-second reporting delay.
+S9 uses the existing `clocks.sleep.Config.uart0` source with
+`SLEEP_CONF2.WK_MODE_SEL=0`, `ACTIVE_THRESHOLD=2`: **five rising RX edges** wake the chip
+(C6 TRM v1.2 §27.4.8; ESP-IDF v5.5.1
+`components/hal/esp32c6/include/hal/uart_ll.h`, `uart_ll_set_wakeup_mode` and
+`uart_ll_set_wakeup_edge_thrd(5)`). It resets UART0 after wake to clear the wake signal.
+S10 may instead use a 3.3 V UART TX with common GND as the external level source:
+idle high before `S`, then assert break (low) after the same two-second wait and hold through
+reboot. S10 configures LP input GPIO2 and active-low EXT1 through `clocks.sleep`, then reads
+`wake_cause()` before reconfiguring pads or requesting another sleep (TRM v1.2
+§§7.7,12.4.2.2,12.10.2–3; deep-reset cause §8.2.2.7; LP SRAM retention §5.3.2).
 
 C6 `selftest_sleep_c6_s1` checks awake counter and
 validation/USB guards; s2 sleeps 100 ms; s3 checks 100/250/500 ms, runtime SRAM patterns and clock
@@ -750,16 +848,23 @@ start a second sleep. The register probe never sleeps and needs no arm byte.
 Remaining IDF differences: this subset keeps light-sleep CPU/TOP/HP memory and flash supply on,
 has no peripheral retention, RTOS timing compensation or wake stub, uses bounded analog/calibration
 and UART waits, and temporarily restores modem clock maps. A real PLL calibration failure returns
-on XTAL as described above. Bench mode deliberately changes watchdog sleep policy. Evidence:
-XIAO ESP32-C6 (rev v0.1), `esp32_c6` image boot, 2026-11-19,
-same code as this tree, 3 runs per stage, armed
-by the host: s1 3/3, s2 2/2, s3 4/4, s4 2/2, s5 (deep sleep: reset, timer wake, LP memory) 3/3,
-s6 13/13, s7 (RWDT reset 3 s into a 10 s light sleep, `recovered_hang: PASS reset=0x10`) 1/1 and
-s8 (XTAL-off light sleep with LP_FAST on RC_FAST) 4/4 in every run; no hang. The register probe
-showed would-write equal to the IDF-derived value on all 284 rows in a
-separate run on 2026-11-19. That probe ran on an earlier version; logger
-and panic handling changed since; the changes since are built only / unit-tested.
-Not run on the Super Mini or the C6 rev v0.2.
+on XTAL as described above. Bench mode deliberately changes watchdog sleep policy.
+
+Evidence, `esp32_c6` image boot, 3 runs per stage armed by the host, on the XIAO ESP32-C6 and the
+Super Mini ESP32-C6: s1 3/3, s2 2/2, s3 4/4, s4 2/2, s5 (deep sleep: reset, timer wake, LP memory)
+3/3, s6 13/13, s7 (RWDT reset 3 s into a 10 s light sleep,
+`recovered_hang: PASS reset=0x10`) 1/1 and s8 (XTAL-off light sleep with LP_FAST on
+RC_FAST) 4/4 in every run on both boards; no hang. The register probe, from RAM at
+24ebc5d1 (2026-11-19), matched the IDF-derived value on all 284 rows in 3 runs each
+on the Super Mini ESP32-C6 and the XIAO ESP32-C6.
+External-wake stages on the XIAO ESP32-C6, `esp32_c6` image boot, with an RP2040-GEEK
+running debugprobe v2.3.1 as the 3.3 V USB-UART (GP4 TX, GP5 RX, common GND):
+s9 (GP4 to D7, GP5 to D6) passed 3/3 in 3 of 3 runs with UART wake `0x40`, sixteen `U`
+bytes sent once per run; a control run without the `U` bytes failed `uart0_wake` with
+`wake=0x10` (timer fallback) and reported `DONE pass=2 fail=1`. s10 used the
+UART break as the level source (GP4 to D2): 4/4 in 3 of 3 runs, each waking about 0.3 s
+after the break; a control run without the break woke on the timer (`0x10`) at about 30 s
+and reported `DONE pass=2 fail=2` (`ext1_wake` and `gpio2_status` FAIL).
 
 GPIO8/LP_AON.STORE0 carry HAL milestones. The tests reserve GPIO0 for s4 and the last 16 LP
 mailbox bytes for s5; do not combine them with another LP-memory owner.

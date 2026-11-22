@@ -7,6 +7,7 @@ const MicroBuild = microzig.MicroBuild(.{
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
+    const sleep_report = b.option(enum { oled, beacon }, "sleep_report", "C3 sleep reporter on GPIO5/6 (default oled)") orelse .oled;
     const maybe_example = b.option([]const u8, "example", "only build matching examples");
     const wifi_ssid = b.option([]const u8, "wifi_ssid", "Wi-Fi station SSID for tcp_server and selftest_wifi_lifecycle") orelse "SSID";
     const wifi_password = b.option([]const u8, "wifi_password", "Wi-Fi station passphrase for tcp_server and selftest_wifi_lifecycle") orelse "";
@@ -98,6 +99,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "selftest_sleep_c6_s6", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 6, .chips = &.{.esp32_c6} },
         .{ .name = "selftest_sleep_c6_s7", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 7, .chips = &.{.esp32_c6}, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_sleep_c6_s8", .file = "src/selftest_sleep_c6.zig", .sleep_stage = 8, .chips = &.{.esp32_c6} },
+        .{ .name = "selftest_sleep_c6_s9", .file = "src/selftest_sleep_c6_wake.zig", .sleep_stage = 9, .chips = &.{.esp32_c6}, .features = .{ .image_boot_only = true } },
+        .{ .name = "selftest_sleep_c6_s10", .file = "src/selftest_sleep_c6_wake.zig", .sleep_stage = 10, .chips = &.{.esp32_c6}, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_sleep_s1", .file = "src/selftest_sleep.zig", .sleep_stage = 1, .chips = &.{.esp32_c3} },
         .{ .name = "selftest_sleep_s2", .file = "src/selftest_sleep.zig", .sleep_stage = 2, .chips = &.{.esp32_c3} },
         .{ .name = "selftest_sleep_s3", .file = "src/selftest_sleep.zig", .sleep_stage = 3, .chips = &.{.esp32_c3} },
@@ -122,6 +125,7 @@ pub fn build(b: *std.Build) void {
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_uart", .file = "src/selftest_uart.zig" },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_rmt", .file = "src/selftest_rmt.zig" },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_timers", .file = "src/selftest_timers.zig" },
+        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_rwdt", .file = "src/selftest_rwdt.zig", .features = .{ .flashless = false } },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_usj", .file = "src/selftest_usj.zig" },
         .{ .name = "systimer", .file = "src/systimer.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_twai", .file = "src/selftest_twai.zig" },
@@ -229,6 +233,7 @@ pub fn build(b: *std.Build) void {
             if (example.sleep_stage) |stage| {
                 const options = b.addOptions();
                 options.addOption(u8, "stage", stage);
+                options.addOption(bool, "oled", sleep_report == .oled);
                 fw.exe.root_module.addOptions("sleep_test_options", options);
             }
 
