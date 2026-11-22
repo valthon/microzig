@@ -101,12 +101,14 @@ pub fn Storage(comptime Flash: type) type {
         /// A copy of page `cached`. Every scan goes through it.
         cached: ?u8 = null,
         buf: [page_size]u8 align(4) = undefined,
+        /// Reclaim source snapshot, retained while scans reuse `buf` (4 KiB).
+        reclaim_buf: [page_size]u8 align(4) = undefined,
         page_index: format.PageIndex = .{},
         index_dirty: bool = true,
 
         /// Opens the partition, repairing what an interrupted write may have left behind. A blank
-        /// partition is valid and empty. `self` is initialized in place because it holds a 4 KiB
-        /// page buffer.
+        /// partition is valid and empty. `self` is initialized in place because it holds two 4 KiB
+        /// page buffers.
         pub fn init(self: *Self, flash: Flash, partition_size: u32) Err!void {
             if (partition_size % page_size != 0) return error.InvalidPartition;
             const page_count = partition_size / page_size;
@@ -128,16 +130,17 @@ pub fn Storage(comptime Flash: type) type {
             // From here on in ESP-IDF's order. `PageManager::load`: every
             // page is repaired as it is loaded, then the item that the last
             // write replaced is erased, then an interrupted reclaim finished.
+            var tail_chunk: ?Item = null;
             for (0..self.page_count) |page| switch (self.pages[page].state) {
                 .full, .freeing => try self.repair_full(@intCast(page)),
-                .active => try self.repair_active(@intCast(page)),
+                .active => tail_chunk = try self.repair_active(@intCast(page)),
                 else => {},
             };
             try self.erase_replaced();
             try self.finish_reclaim();
             if (self.count_free() == 0) return error.NotEnoughSpace;
             // `Storage::init`.
-            try self.erase_stale_blobs();
+            try self.erase_stale_blobs(tail_chunk);
         }
 
         /// Opens a namespace, creating it in read-write mode if it doesn't exist.
@@ -783,19 +786,48 @@ pub fn Storage(comptime Flash: type) type {
         }
 
         /// Copies the live items of a page being freed into the fresh active page, then erases it.
+        /// Uses the store's reclaim buffer and one replacement bit per source entry.
+        /// Reads the source and each newer page at most once; the destination is not read.
         fn copy_and_erase(self: *Self, from: u8) Err!void {
             const to = self.active.?;
             assert(self.next_free == 0);
 
             try self.load(from);
+            self.reclaim_buf = self.buf;
+            const source = &self.reclaim_buf;
+            var replaced: std.StaticBitSet(entries_per_page) = .empty;
+            var list: [max_pages]u8 = undefined;
+            const pages = self.page_list(&list);
+            // PageManager::load (v5.5.1 nvs_pagemanager.cpp:75-79)
+            // leaves replacements on FREEING pages. Unlike its blind
+            // copy (113-118), do not move one after its newer value:
+            // Storage::writeItem (nvs_storage.cpp:581-582) would erase
+            // only that live value on the next replacement.
+            var newer = false;
+            for (pages) |page| {
+                if (page == from) {
+                    newer = true;
+                    continue;
+                }
+                if (!newer or page == to) continue;
+                try self.load(page);
+                self.ensure_index();
+                var it: Iterator = .{};
+                while (it.next_published(source)) |index| {
+                    if (replaced.isSet(index)) continue;
+                    const item = format.item_at(source, index);
+                    if (self.page_index.find(&self.buf, item.ns, item.type, item.key_slice(), item.chunk_index, null) != null) replaced.set(index);
+                }
+            }
+
             var bitmap: [32]u8 align(4) = @splat(0xFF);
             var count: u8 = 0;
-            // Every item ESP-IDF's `Page::copyItems` copies, served here or not.
             var it: Iterator = .{};
-            while (it.next_published(&self.buf)) |index| {
-                const item = self.item_in_buf(index);
+            while (it.next_published(source)) |index| {
+                if (replaced.isSet(index)) continue;
+                const item = format.item_at(source, index);
                 const span: u8 = if (format.variable_length(item.type)) item.span else 1;
-                const bytes = self.buf[entries_offset + @as(usize, index) * entry_size ..][0 .. @as(usize, span) * entry_size];
+                const bytes = source[entries_offset + @as(usize, index) * entry_size ..][0 .. @as(usize, span) * entry_size];
                 try self.flash.write(page_offset(to) + entries_offset + @as(u32, count) * entry_size, bytes);
                 for (count..count + span) |entry| {
                     // written = 0b10: clear the low bit of the entry's pair.
@@ -830,8 +862,9 @@ pub fn Storage(comptime Flash: type) type {
         }
 
         /// Repairs the active page at init as ESP-IDF's `Page::mLoadEntryTable`
-        /// does, and finds its first free entry.
-        fn repair_active(self: *Self, page: u8) Err!void {
+        /// does, finds its first free entry, and returns its final chunk
+        /// so blob cleanup can judge indexes affected by the tail check.
+        fn repair_active(self: *Self, page: u8) Err!?Item {
             try self.load(page);
             // ESP-IDF's first free entry is the first one marked empty.
             var next_free: u8 = for (0..entries_per_page) |i| {
@@ -884,8 +917,29 @@ pub fn Storage(comptime Flash: type) type {
                 items[item_count] = index;
                 item_count += 1;
             }
+            // ESP-IDF v5.5.1 nvs_page.cpp:697-709 checks the last item
+            // again with CHUNK_ANY, so a final chunk can erase an earlier
+            // chunk of the key even when their chunk numbers differ.
+            var tail_chunk: ?Item = null;
+            if (item_count > 0) {
+                const last = items[item_count - 1];
+                const tail = self.item_in_buf(last).*;
+                if (tail.type == type_blob_data and last + tail.span == end) {
+                    tail_chunk = tail;
+                    var previous: Iterator = .{ .end = end };
+                    while (previous.next_published(&self.buf)) |earlier| {
+                        if (earlier >= last) break;
+                        const old = self.item_in_buf(earlier).*;
+                        if (old.is(type_blob_data, tail.ns, tail.key_slice())) {
+                            try self.discard_item(page, earlier, old.span);
+                            break;
+                        }
+                    }
+                }
+            }
             self.next_free = next_free;
             self.index_dirty = true;
+            return tail_chunk;
         }
 
         /// Repairs a full or freeing page at init as ESP-IDF's
@@ -992,25 +1046,26 @@ pub fn Storage(comptime Flash: type) type {
         ///     if it does not, every index of the key is, as ESP-IDF's failed
         ///     read does (`Storage::readMultiPageBlob`), and the version 1
         ///     blob is read.
-        ///   - A key without a version 1 blob keeps its indexes whatever
-        ///     their state, and reads `Corrupt` from one that does not read;
-        ///     ESP-IDF erases those too.
+        ///   - An incomplete index of the active page's final chunk key is
+        ///     erased, including one whose old chunk the tail check erased.
+        ///     Other keys without a version 1 blob keep their indexes.
         ///   - Blob chunks that no index claims are erased
         ///     (`Storage::eraseOrphanDataBlobs`).
-        /// This store's own writes leave no incomplete index, reset anywhere:
-        /// chunks are written before their index and erased after it. Only
+        /// Chunks are written before their index and erased after it. Only
         /// ESP-IDF older than v3.3 wrote version 1 blobs, so one is always
         /// older than any index of its key.
-        fn erase_stale_blobs(self: *Self) Err!void {
-            var indexes_judged = false;
+        fn erase_stale_blobs(self: *Self, tail_chunk: ?Item) Err!void {
+            // Besides legacy keys, judge the final chunk's key. Its old
+            // chunk may have been removed on this boot or a previous,
+            // interrupted recovery; the old index must then go too.
+            var indexes_judged = tail_chunk != null;
+            if (indexes_judged) try self.erase_incomplete_indexes(tail_chunk);
             var items = self.scan();
             while (try items.next(self)) |loc| {
                 const legacy = self.item_in_buf(loc.index).*;
                 if (legacy.type != type_blob_legacy) continue;
-                // Judge every index before any version 1 blob goes, but
-                // avoid the repeated scans when there is no version 1 blob.
                 if (!indexes_judged) {
-                    try self.erase_incomplete_indexes();
+                    try self.erase_incomplete_indexes(null);
                     indexes_judged = true;
                 }
                 const key = legacy.key_slice();
@@ -1034,11 +1089,11 @@ pub fn Storage(comptime Flash: type) type {
         }
 
         /// Erases the blob indexes that are not complete (`index_complete`)
-        /// of the keys that have a version 1 blob. The last one first: an
-        /// index's verdict depends only on the indexes before it, which are
+        /// beside a version 1 blob or the active page's final chunk.
+        /// The last one first: an index's verdict depends only on the indexes before it, which are
         /// all still there when it is judged, as ESP-IDF judges every index
         /// before erasing any.
-        fn erase_incomplete_indexes(self: *Self) Err!void {
+        fn erase_incomplete_indexes(self: *Self, tail_chunk: ?Item) Err!void {
             var bound: ?Location = null;
             while (true) {
                 var last: ?Location = null;
@@ -1049,7 +1104,8 @@ pub fn Storage(comptime Flash: type) type {
                 }
                 bound = last orelse return;
                 const index = (try self.item_at(bound.?)).*;
-                if (try self.find(index.ns, type_blob_legacy, index.key_slice(), no_chunk) == null) continue;
+                const tail_key = if (tail_chunk) |tail| index.is(type_blob_index, tail.ns, tail.key_slice()) else false;
+                if (!tail_key and try self.find(index.ns, type_blob_legacy, index.key_slice(), no_chunk) == null) continue;
                 if (!try self.index_complete(bound.?)) try self.discard_item(bound.?.page, bound.?.index, 1);
             }
         }
@@ -1121,6 +1177,7 @@ const TestFlash = struct {
     writes: usize = 0,
     operations: usize = 0,
     page_reads: usize = 0,
+    page_reads_by_page: [max_pages]usize = @splat(0),
     /// False models a reset before the next write/erase changes any bits.
     partial_on_failure: bool = true,
 
@@ -1142,7 +1199,10 @@ const TestFlash = struct {
     }
 
     pub fn read(flash: *TestFlash, offset: u32, dest: []u8) TestFlash.Error!void {
-        if (dest.len == page_size) flash.page_reads += 1;
+        if (dest.len == page_size) {
+            flash.page_reads += 1;
+            flash.page_reads_by_page[offset / page_size] += 1;
+        }
         @memcpy(dest, flash.mem[offset..][0..dest.len]);
     }
 
@@ -1172,6 +1232,58 @@ const TestFlash = struct {
 };
 
 const TestStorage = Storage(*TestFlash);
+
+test "reclaim reads each newer page once regardless of source item count" {
+    var mem: [7 * page_size]u8 = undefined;
+    var flash = test_flash(&mem);
+    var store: TestStorage = undefined;
+    try store.init(&flash, mem.len);
+    const h = try store.open("ns", .read_write);
+    // A match on an older page must not suppress a source item.
+    try append_u32(&store, h.ns, "k11", 99);
+    try store.new_page();
+    const from = store.active.?;
+    for (0..12) |i| {
+        var key_buf: [8]u8 = undefined;
+        try append_u32(&store, h.ns, try std.fmt.bufPrint(&key_buf, "k{d}", .{i}), @intCast(i));
+    }
+    const text = "source payload spans several entries and survives the copy";
+    try h.set_str("text", text);
+    for (0..3) |p| {
+        try store.new_page();
+        // Leave stale source entries published, as interrupted replacement
+        // cleanup can do. Each newer page replaces a different pair.
+        for (0..2) |j| {
+            const i = p * 2 + j;
+            var key_buf: [8]u8 = undefined;
+            try append_u32(&store, h.ns, try std.fmt.bufPrint(&key_buf, "k{d}", .{i}), @intCast(100 + i));
+        }
+    }
+    try store.set_page_state(from, .freeing);
+    try store.new_page();
+    const to = store.active.?;
+    store.cached = null;
+    flash.page_reads = 0;
+    flash.page_reads_by_page = @splat(0);
+    try store.copy_and_erase(from);
+    // One source read plus three newer-page reads, no destination read.
+    // Check each page separately so a repeated read cannot hide a missed one.
+    try testing.expectEqual(@as(usize, 4), flash.page_reads);
+    for (flash.page_reads_by_page[0..7], 0..) |reads, page| {
+        try testing.expectEqual(@as(usize, @intFromBool(page >= from and page < to)), reads);
+    }
+    for (0..12) |i| {
+        var key_buf: [8]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        const copied = try store.find_on_page(to, h.ns, TestStorage.int_type(u32), key, no_chunk, null);
+        try testing.expectEqual(i >= 6, copied != null);
+        if (copied) |index| {
+            try testing.expectEqual(@as(u32, @intCast(i)), std.mem.readInt(u32, store.item_in_buf(index).data[0..4], .little));
+        }
+    }
+    var buf: [100]u8 = undefined;
+    try testing.expectEqualStrings(text, try h.get_str("text", &buf));
+}
 
 test "init judges blob indexes in page list order even with equal sequences" {
     inline for (.{ false, true }) |equal_sequences| {
@@ -3496,13 +3608,8 @@ test "init erases the first older copy of the newest page's last item, as ESP-ID
     // The newest page full, as after a reset before the next page is
     // activated, with or without a page being freed: the older copy goes,
     // unless it is on the page being freed, which is left out of the
-    // search as ESP-IDF's `PageManager::load` leaves it out; that copy
-    // moves with its page to the newest one and both stay, the other read.
-    // With page 0 freeing this is unstable: another init erases n=3 and
-    // reads n=1; even set(n,4) succeeds but then reads n=1 in that session.
-    // Neither writer leaves this state: a replacement is erased before
-    // reclaim starts, and an interrupted copy's destination is active,
-    // not the full newest page constructed here.
+    // search as ESP-IDF's `PageManager::load` leaves it out. Reclaim here
+    // skips that stale copy rather than moving it after the live value.
     for ([_]?u8{ null, 0, 1 }) |freeing| {
         errdefer std.debug.print("page being freed: {?d}\n", .{freeing});
         var mem: [4 * page_size]u8 = undefined;
@@ -3527,7 +3634,7 @@ test "init erases the first older copy of the newest page's last item, as ESP-ID
         try testing.expectEqual(@as(u32, 9), try h.get(u32, "other"));
         const read = (try store.find(h.ns, TestStorage.int_type(u32), "n", no_chunk)).?;
         try testing.expectEqual(@as(u8, 2), read.page);
-        try testing.expectEqual(freeing == 0, try store.find_other(h.ns, TestStorage.int_type(u32), "n", no_chunk, read) != null);
+        try testing.expectEqual(@as(?TestStorage.Location, null), try store.find_other(h.ns, TestStorage.int_type(u32), "n", no_chunk, read));
     }
     // An older item of the key with another type stays, as
     // `Page::findItem` stops at it.
@@ -3783,23 +3890,159 @@ fn check_replaced(mode: OpenMode, before: []const u8, mem: []const u8, old: []co
     }
 }
 
-test "a rewrite's last chunk next to an old chunk keeps the old blob, unlike ESP-IDF" {
-    // ESP-IDF's own writer left this: a 320-byte blob rewritten with 640
-    // bytes on the same page, reset before the new index. ESP-IDF's load
-    // erases the old chunk, because its last-item check (nvs_page.cpp:814-827)
-    // looks the new chunk up with any chunk index, and then reads neither
-    // version (idf_state_tail_chunk_loaded.bin). This store keeps the old one.
-    var mem: [3 * page_size]u8 = @embedFile("nvs_testdata/idf_state_tail_chunk.bin").*;
-    var flash: TestFlash = .{ .mem = &mem };
+/// Source-derived v5.5.1 fixture: nvs_page.cpp:697-709 removes the old
+/// chunk, then nvs_storage.cpp:90-152 removes the incomplete index and
+/// Storage::eraseOrphanDataBlobs removes the unindexed replacement chunk.
+fn check_idf_tail_chunk_loss() !void {
+    var mem: [3 * page_size]u8 = undefined;
+    var flash = test_flash(&mem);
     var store: TestStorage = undefined;
     try store.init(&flash, mem.len);
-    const h = try store.open("fixture", .read_only);
-    var buf: [640]u8 = undefined;
-    const first = idf_state_pattern(320, 0);
-    try testing.expectEqualSlices(u8, &first, try h.get_blob("big", &buf));
-    try testing.expectEqual(@as(u32, 0x0badcafe), try h.get(u32, "before"));
+    const h = try store.open("fixture", .read_write);
+    const old: [320]u8 = @splat(0x11);
+    const new: [640]u8 = @splat(0x22);
+    try h.set(u32, "before", 0x0badcafe);
+    try h.set_blob("big", &old);
+    try append_chunk(&store, h.ns, "big", 0x80, &new);
+    const seed = mem;
+    var probe = seed;
+    var probe_flash: TestFlash = .{ .mem = &probe };
+    try store.init(&probe_flash, probe.len);
+    const operations = probe_flash.operations;
+    // Recovery can itself reset between its bitmap and payload writes.
+    for (0..operations + 1) |cut| {
+        mem = seed;
+        flash = .{ .mem = &mem, .budget = cut };
+        if (cut < operations) {
+            try testing.expectError(error.PowerLoss, store.init(&flash, mem.len));
+        } else try store.init(&flash, mem.len);
+        flash.restore_power();
+        try store.init(&flash, mem.len);
+        var buf: [640]u8 = undefined;
+        try testing.expectError(error.NotFound, h.get_blob("big", &buf));
+        try testing.expectError(error.NotFound, h.blob_len("big"));
+        try testing.expectEqual(@as(u32, 0x0badcafe), try h.get(u32, "before"));
+        try testing.expectEqual(@as(?TestStorage.Location, null), try store.find(h.ns, type_blob_data, "big", 0));
+        try testing.expectEqual(@as(?TestStorage.Location, null), try store.find(h.ns, type_blob_data, "big", 0x80));
+    }
+}
+
+// A full newest page holds n=3 while the freeing page still holds n=1.
+// ESP-IDF v5.5.1 copies the stale item (nvs_pagemanager.cpp:75-79,
+// 113-118; nvs_page.cpp:484-523), then removes only n=3 on set(n,4)
+// (nvs_storage.cpp:581-582). Reclaim here must preserve the live value.
+test "reclaim never resurrects a stale scalar after replacement or reboot" {
+    var mem: [4 * page_size]u8 = undefined;
+    var flash = test_flash(&mem);
+    var store: TestStorage = undefined;
     try store.init(&flash, mem.len);
-    try testing.expectEqualSlices(u8, &first, try (try store.open("fixture", .read_only)).get_blob("big", &buf));
+    const h = try store.open("ns", .read_write);
+    try h.set(u32, "n", 1);
+    try store.new_page();
+    try h.set(u32, "other", 9);
+    try store.new_page();
+    try append_u32(&store, h.ns, "n", 3);
+    try store.set_page_state(2, .full);
+    try store.set_page_state(0, .freeing);
+    const fixture = mem;
+    const before = flash.operations;
+    try store.init(&flash, mem.len);
+    const operations = flash.operations - before;
+    try testing.expectEqual(@as(u32, 3), try h.get(u32, "n"));
+    try h.set(u32, "n", 4);
+    try testing.expectEqual(@as(u32, 4), try h.get(u32, "n"));
+    try store.init(&flash, mem.len);
+    try testing.expectEqual(@as(u32, 4), try h.get(u32, "n"));
+    // A second boot without the intervening set must also keep n=3.
+    mem = fixture;
+    try store.init(&flash, mem.len);
+    try store.init(&flash, mem.len);
+    try testing.expectEqual(@as(u32, 3), try h.get(u32, "n"));
+    try testing.expectEqual(@as(u32, 9), try h.get(u32, "other"));
+
+    // The skipped source must stay skipped when recovery itself is reset,
+    // including a torn destination bitmap or source-sector erase.
+    for ([_]bool{ false, true }) |partial| {
+        for (0..operations) |cut| {
+            errdefer std.debug.print("stale reclaim reset after {d} operations, partial={}\n", .{ cut, partial });
+            mem = fixture;
+            flash = .{ .mem = &mem, .budget = cut, .partial_on_failure = partial };
+            try testing.expectError(error.PowerLoss, store.init(&flash, mem.len));
+            flash.restore_power();
+            try store.init(&flash, mem.len);
+            try testing.expectEqual(@as(u32, 3), try h.get(u32, "n"));
+            try testing.expectEqual(@as(u32, 9), try h.get(u32, "other"));
+            try h.set(u32, "n", 4);
+            try testing.expectEqual(@as(u32, 4), try h.get(u32, "n"));
+            try store.init(&flash, mem.len);
+            try testing.expectEqual(@as(u32, 4), try h.get(u32, "n"));
+        }
+    }
+}
+
+test "v5.5.1 loses a same-page blob rewrite reset before its index" {
+    try check_idf_tail_chunk_loss();
+}
+
+// Source-derived v5.5.1 nvs_pagemanager.cpp:166-178: activation precedes
+// marking the victim FREEING, so a reset can leave an empty destination.
+test "v5.5.1 empty reclaim destination keeps the source before freeing" {
+    var mem: [3 * page_size]u8 = undefined;
+    var flash = test_flash(&mem);
+    var store: TestStorage = undefined;
+    try store.init(&flash, mem.len);
+    const h = try store.open("ns", .read_write);
+    try h.set(u32, "n", 3);
+    try store.new_page();
+    try store.init(&flash, mem.len);
+    try testing.expectEqual(@as(u32, 3), try h.get(u32, "n"));
+    try h.set(u32, "n", 4);
+    try store.init(&flash, mem.len);
+    try testing.expectEqual(@as(u32, 4), try h.get(u32, "n"));
+}
+
+// Source-derived v5.5.1 nvs_pagemanager.cpp:96-126 finishes one FREEING
+// page per boot. The next boot erases the active copy to finish the other.
+test "v5.5.1 two freeing pages complete one per boot" {
+    var mem: [4 * page_size]u8 = undefined;
+    var flash = test_flash(&mem);
+    var store: TestStorage = undefined;
+    try store.init(&flash, mem.len);
+    const h = try store.open("ns", .read_write);
+    try h.set(u32, "n", 1);
+    try store.new_page();
+    try h.set(u32, "other", 9);
+    try store.new_page();
+    try h.set(u32, "last", 7);
+    try store.set_page_state(2, .full);
+    try store.set_page_state(0, .freeing);
+    try store.set_page_state(1, .freeing);
+    try store.init(&flash, mem.len);
+    try testing.expectEqual(PageState.uninitialized, store.pages[0].state);
+    try testing.expectEqual(PageState.freeing, store.pages[1].state);
+    try testing.expectEqual(@as(u32, 1), try h.get(u32, "n"));
+    try h.set(u32, "n", 4);
+    try testing.expectEqual(@as(u32, 4), try h.get(u32, "n"));
+    try store.init(&flash, mem.len);
+    try testing.expectEqual(PageState.uninitialized, store.pages[1].state);
+    try testing.expectError(error.NotFound, store.open("ns", .read_only));
+}
+
+// Source-derived v5.5.1 nvs_pagemanager.cpp:130-132 rejects a writable
+// partition with no reserve page after recovery.
+test "v5.5.1 init requires a free page after recovery" {
+    var mem: [3 * page_size]u8 = undefined;
+    var flash = test_flash(&mem);
+    var store: TestStorage = undefined;
+    try store.init(&flash, mem.len);
+    const h = try store.open("ns", .read_write);
+    try h.set(u32, "n", 1);
+    try store.new_page();
+    try h.set(u32, "other", 9);
+    try store.set_page_state(1, .full);
+    try store.activate(2);
+    try h.set(u32, "last", 7);
+    try testing.expectError(error.NotEnoughSpace, store.init(&flash, mem.len));
 }
 
 /// The blobs blob_fixture.cpp stores under "big": 9000 bytes, then 6000.

@@ -64,8 +64,6 @@ ANY = 0xFF
 # them: the model's switches, and the name each case is counted under.
 CLASSES = {
     "same": "both leave the same bytes and read the same, at every step",
-    "tail chunk": "a chunk before the active page's last item, a chunk of its key, is kept here; "
-                  "ESP-IDF's Page::mLoadEntryTable erases the key's first chunk on that page",
     "last index's version 1 blob": "a version 1 blob on an older page than a blob index of its "
                                    "key that is the newest page's last item: ESP-IDF's "
                                    "PageManager::load erases it, whether or not the index reads; "
@@ -235,6 +233,7 @@ class Model:
     # ----- init -----
 
     def init(self):
+        self.tail_chunk_keys = set()
         for page in self.pages:
             if page.state == "active":
                 self.load_active(page)
@@ -259,12 +258,11 @@ class Model:
         last = page.items[-1]
         if last.index + last.span != page.end:
             return
+        if last.type == BLOB_DATA:
+            self.tail_chunk_keys.add(last.id)
         found = self.page_find(page, last.ns, last.type, last.key)
         if found is not None and found is not last:
-            if self.store:
-                self.used.add("tail chunk")
-            else:
-                self.erase(found)
+            self.erase(found)
 
     def erase_replaced(self):
         """`PageManager::load`: the newest page's last item erases the first
@@ -346,7 +344,7 @@ class Model:
             for page in self.pages:
                 found = self.page_find(page, node.ns, BLOB_INDEX, node.key, ANY, node.start)
                 if found is not None:
-                    if not any(i.id == node.id for i in self.all(BLOB_LEGACY)):
+                    if node.id not in self.tail_chunk_keys and not any(i.id == node.id for i in self.all(BLOB_LEGACY)):
                         self.used.add("damaged index kept")
                     if found is not node:
                         self.used.add("shared start")
@@ -360,7 +358,7 @@ class Model:
         # The last index first: each is judged with all those before it.
         indexes = self.all(BLOB_INDEX)
         for n in reversed(range(len(indexes))):
-            if any(i.id == indexes[n].id for i in legacies) and not self.complete(indexes[:n + 1])[n]:
+            if (indexes[n].id in self.tail_chunk_keys or any(i.id == indexes[n].id for i in legacies)) and not self.complete(indexes[:n + 1])[n]:
                 self.erase(indexes[n])
         for legacy in legacies:
             indexes = [i for i in self.all(BLOB_INDEX) if i.id == legacy.id]

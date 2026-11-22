@@ -214,6 +214,14 @@ fn check_model(store: *Store, work: *const Workload, before: *const Model, actio
                 continue;
             }
             if (!complete and try matches(store, work, key, old)) continue;
+            // v5.5.1 can lose both versions before a same-page rewrite's
+            // index is published (nvs_page.cpp:697-709).
+            if (!complete and key == .blob and old == .blob and action.value == .blob and
+                try matches(store, work, key, .absent))
+            {
+                observed[@backingInt(key)] = .absent;
+                continue;
+            }
         } else if (try matches(store, work, key, old)) continue;
         std.debug.print("model mismatch: key={s}, action={s}, complete={}\n", .{ @tagName(key), @tagName(action.key), complete });
         return error.TestUnexpectedResult;
@@ -301,12 +309,13 @@ fn write_record(mem: []const u8, keys: []const DumpKey, target: usize, prefix: u
 /// `either`.
 fn dump_image(mem: []const u8, work: *const Workload, expected: *const Model, action: Action, either: bool, target: usize, prefix: usize, after: bool, recovered: bool) !void {
     if (options.dump_path.len == 0) return;
-    var bufs: [key_count][2][8]u8 = undefined;
-    var allowed: [key_count][2]?[]const u8 = undefined;
+    var bufs: [key_count][3][8]u8 = undefined;
+    var allowed: [key_count][3]?[]const u8 = undefined;
     var keys: [key_count]DumpKey = undefined;
     for (std.enums.values(Key), 0..) |key, i| {
-        const pair = [2]Value{ if (key == action.key) action.value else expected[i], expected[i] };
-        const count: usize = if (key == action.key and either) 2 else 1;
+        const pair = [3]Value{ if (key == action.key) action.value else expected[i], expected[i], .absent };
+        const lossy = key == .blob and action.value == .blob and expected[i] == .blob;
+        const count: usize = if (key == action.key and either) (if (lossy) @as(usize, 3) else 2) else 1;
         for (pair[0..count], 0..) |value, j| allowed[i][j] = value_bytes(work, key, value, &bufs[i][j]);
         keys[i] = .{
             .ns = namespace(key),
