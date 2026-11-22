@@ -9,8 +9,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const sleep_report = b.option(enum { oled, beacon }, "sleep_report", "C3 sleep reporter on GPIO5/6 (default oled)") orelse .oled;
     const maybe_example = b.option([]const u8, "example", "only build matching examples");
-    const wifi_ssid = b.option([]const u8, "wifi_ssid", "Wi-Fi station SSID for tcp_server and selftest_wifi_lifecycle") orelse "SSID";
-    const wifi_password = b.option([]const u8, "wifi_password", "Wi-Fi station passphrase for tcp_server and selftest_wifi_lifecycle") orelse "";
+    const wifi_ssid = b.option([]const u8, "wifi_ssid", "Wi-Fi station SSID for tcp_server and Wi-Fi self-tests") orelse "SSID";
+    const wifi_password = b.option([]const u8, "wifi_password", "Wi-Fi station passphrase for tcp_server and Wi-Fi self-tests") orelse "";
     // Names of hal.radio.wifi.AuthMethod; the station joins no AP weaker than this.
     const wifi_auth = b.option([]const u8, "wifi_auth", "Weakest AP auth the station accepts, a hal.radio.wifi.AuthMethod name (default: wpa2_personal with a passphrase, none without)") orelse
         if (wifi_password.len != 0) "wpa2_personal" else "none";
@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     const expected_mac_text = b.option([]const u8, "expected_mac", "selftest_c6_core: the board's efuse MAC (aa:bb:cc:dd:ee:ff); unset reports SKIP");
     const ble_scan_seconds = b.option(u32, "ble_scan_seconds", "BLE observer scan duration (1..3600 seconds)") orelse 10;
     if (ble_scan_seconds == 0 or ble_scan_seconds > 3600) @panic("ble_scan_seconds must be in 1..3600");
-    const antenna = b.option(Antenna, "antenna", "Antenna the XIAO ESP32C6 builds of the BLE and 802.15.4 examples select (default internal)") orelse .internal;
+    const antenna = b.option(Antenna, "antenna", "Antenna the XIAO ESP32C6 radio examples select (default internal)") orelse .internal;
     const ble_peer_name = b.option([]const u8, "ble_peer_name", "BLE central peer advertised name") orelse "H2-PEER";
     if (ble_peer_name.len == 0 or ble_peer_name.len > 31) @panic("ble_peer_name must be 1..31 bytes");
     const softap_ssid = b.option([]const u8, "softap_ssid", "SoftAP SSID (1..32 bytes)") orelse "microzig-softap";
@@ -67,9 +67,12 @@ pub fn build(b: *std.Build) void {
     }
 
     const examples: []const Example = &.{
-        .{ .name = "compile_wifi", .file = "src/compile_wifi.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
+        .{ .name = "compile_wifi", .xiao_board = true, .antenna_option = true, .file = "src/compile_wifi.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_ieee802154", .file = "src/selftest_ieee802154.zig", .chips = &.{.esp32_c6}, .antenna_option = true, .features = .{ .image_boot_only = true } },
-        .{ .name = "softap", .file = "src/softap.zig", .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "selftest_wifi_softap_echo", .xiao_board = true, .antenna_option = true, .file = "src/selftest_wifi_softap_echo.zig", .wifi_options = true, .softap_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "selftest_wifi_open_ap", .xiao_board = true, .antenna_option = true, .file = "src/selftest_wifi_open_ap.zig", .wifi_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "selftest_wifi_tx_done", .xiao_board = true, .antenna_option = true, .file = "src/selftest_wifi_tx_done.zig", .wifi_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "softap", .xiao_board = true, .antenna_option = true, .file = "src/softap.zig", .softap_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
         .{ .name = "selftest_lp_irq", .file = "src/selftest_lp_irq.zig", .chips = &.{.esp32_c6}, .lp_image = .irq },
         .{ .name = "selftest_lp_i2c", .file = "src/selftest_lp_i2c.zig", .chips = &.{.esp32_c6}, .lp_image = .i2c },
         .{ .name = "selftest_lp_uart", .file = "src/selftest_lp_uart.zig", .chips = &.{.esp32_c6}, .lp_image = .uart },
@@ -133,11 +136,11 @@ pub fn build(b: *std.Build) void {
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_adc", .file = "src/selftest_adc.zig" },
         .{ .name = "ws2812_blinky", .file = "src/ws2812_blinky.zig" },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "rtos", .file = "src/rtos.zig" },
-        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_wifi_lifecycle", .file = "src/selftest_wifi_lifecycle.zig", .wifi_options = true, .features = .{
+        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_wifi_lifecycle", .xiao_board = true, .antenna_option = true, .file = "src/selftest_wifi_lifecycle.zig", .wifi_options = true, .features = .{
             .flashless = false,
             .lwip = true,
         } },
-        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "tcp_server", .file = "src/tcp_server.zig", .wifi_options = true, .features = .{
+        .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "tcp_server", .xiao_board = true, .antenna_option = true, .file = "src/tcp_server.zig", .wifi_options = true, .features = .{
             .flashless = false,
             .lwip = true,
         } },
@@ -154,11 +157,11 @@ pub fn build(b: *std.Build) void {
             .prefix = "xiao_esp32_c6",
             .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6,
         },
-        // The radio examples again, for the XIAO's rf switch (see ble_bench.run).
+        // The radio examples again, for the XIAO ESP32-C6's rf switch (see ble_bench.run).
         .{ .name = "ble_scan", .file = "src/ble_scan.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
         .{ .name = "ble_peripheral", .file = "src/ble_peripheral.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
         .{ .name = "ble_central", .file = "src/ble_central.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
-        // The radio self-test again, for the XIAO's rf switch (see its main).
+        // The radio self-test again, for the XIAO ESP32-C6's rf switch (see its main).
         .{
             .name = "selftest_ieee802154",
             .file = "src/selftest_ieee802154.zig",
@@ -175,11 +178,13 @@ pub fn build(b: *std.Build) void {
                 continue;
 
         for (std.enums.values(TargetEnum)) |target_enum| {
-            if (example.features.image_boot_only and target_enum != .esp32_c3 and target_enum != .esp32_c6)
+            if (target_enum == .xiao_esp32_c6 and !example.xiao_board)
+                continue;
+            if (example.features.image_boot_only and !target_enum.is_image_boot())
                 continue;
             // C6 lwIP images need flash capacity for the Wi-Fi blobs and TCP/IP stack;
             // build the image-boot target, excluding direct-boot and RAM-only variants.
-            if (example.features.lwip and target_enum.chip() == .esp32_c6 and target_enum != .esp32_c6)
+            if (example.features.lwip and target_enum.chip() == .esp32_c6 and !target_enum.is_image_boot())
                 continue;
 
             if (!example.features.flashless and std.mem.containsAtLeast(u8, @tagName(target_enum), 1, "flashless"))
@@ -253,7 +258,7 @@ pub fn build(b: *std.Build) void {
                 fw.exe.root_module.addOptions("wifi_options", options);
             }
 
-            if (std.mem.eql(u8, example.name, "softap")) {
+            if (example.softap_options) {
                 const options = b.addOptions();
                 options.addOption([]const u8, "ssid", softap_ssid);
                 options.addOption([]const u8, "password", softap_password);
@@ -334,6 +339,14 @@ const TargetEnum = enum {
     esp32_c6,
     esp32_c6_direct_boot,
     esp32_c6_flashless,
+    xiao_esp32_c6,
+
+    fn is_image_boot(target_enum: TargetEnum) bool {
+        return switch (target_enum) {
+            .esp32_c3, .esp32_c6, .xiao_esp32_c6 => true,
+            else => false,
+        };
+    }
 
     fn get_target_desc(target_enum: TargetEnum, mb: *MicroBuild) TargetDescription {
         return switch (target_enum) {
@@ -357,6 +370,10 @@ const TargetEnum = enum {
                 .prefix = "esp32_c6_direct_boot",
                 .target = mb.ports.esp.chips.esp32_c6_direct_boot,
             },
+            .xiao_esp32_c6 => .{
+                .prefix = "xiao_esp32_c6",
+                .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6,
+            },
             .esp32_c6_flashless => .{
                 .prefix = "esp32_c6_flashless",
                 .target = mb.ports.esp.chips.esp32_c6_flashless,
@@ -367,7 +384,7 @@ const TargetEnum = enum {
     fn chip(target_enum: TargetEnum) Chip {
         return switch (target_enum) {
             .esp32_c3, .esp32_c3_direct_boot, .esp32_c3_flashless => .esp32_c3,
-            .esp32_c6, .esp32_c6_direct_boot, .esp32_c6_flashless => .esp32_c6,
+            .esp32_c6, .esp32_c6_direct_boot, .esp32_c6_flashless, .xiao_esp32_c6 => .esp32_c6,
         };
     }
 };
@@ -392,11 +409,15 @@ const Example = struct {
     name: []const u8,
     file: []const u8,
     features: Features = .{},
+    /// Also build the image-boot XIAO ESP32-C6 board target, sharing all example options.
+    xiao_board: bool = false,
     sleep_stage: ?u8 = null,
     /// Receives `-Dexpected_mac` as module `c6_core_options`.
     mac_option: bool = false,
     /// Receives station credentials as module `wifi_options`.
     wifi_options: bool = false,
+    /// Receives the SoftAP SSID and passphrase as module `softap_options`.
+    softap_options: bool = false,
     /// Receives BLE options as `ble_options` and `-Dantenna` as `antenna_options`.
     ble_options: bool = false,
     /// Receives `-Dantenna` as module `antenna_options`.

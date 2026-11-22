@@ -95,6 +95,7 @@ pub fn run(comptime lifecycle_selftest: bool) !void {
 }
 
 fn run_server(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip.c.netif) !void {
+    @import("wifi_antenna.zig").apply();
     try radio.wifi.init(gpa, .{});
     defer radio.wifi.deinit();
 

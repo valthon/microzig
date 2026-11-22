@@ -28,7 +28,9 @@ comptime {
     _ = microzig.export_startup();
 }
 
-pub fn main() void {}
+pub fn main() void {
+    @import("wifi_antenna.zig").apply();
+}
 
 fn on_event(_: wifi.Event) void {}
 fn on_packet_received(comptime _: wifi.Interface, _: []const u8) void {}

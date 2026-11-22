@@ -15,6 +15,16 @@ const log = std.log.scoped(.esp_radio_wifi);
 pub const Options = struct {
     on_event: ?*const fn (e: Event) void = null,
     on_packet_received: ?*const fn (comptime interface: Interface, data: []const u8) void = null,
+    /// Called by the Wi-Fi driver when a transmission completes; `status` is false if it
+    /// failed. `data` is the 802.11 frame as the driver sent it, not the Ethernet frame given
+    /// to `send_packet`: MAC header, the CCMP header on a protected link, LLC/SNAP, payload.
+    /// The station's EAPOL handshake frames arrive here too. `data` ends before the frame
+    /// does: on a WPA2 link a 60-byte Ethernet frame (46-byte payload after a 26-byte QoS
+    /// header, CCMP header and LLC/SNAP) came back as 74 bytes on an ESP32-C3 and 70 on an
+    /// ESP32-C6, so the last 14 (C3) or 18 (C6) payload bytes were not in the slice; 100- and
+    /// 300-byte frames were cut by the same amounts. Payload near the tail is not visible.
+    /// Search for a marker near the start of the payload rather than compute offsets from
+    /// the length.
     on_packet_transmitted: ?*const fn (interface: Interface, data: []const u8, status: bool) void = null,
 };
 
