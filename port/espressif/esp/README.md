@@ -49,7 +49,7 @@ Other results identify their boards and runs below; dates are included where rec
 | `etm` (50 routes; 8 GPIO event/task groups, no interrupt allocation) | no | yes | `selftest_etm` | n/a | 5/5, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `mcpwm` (timer/operator 0, A/B complementary, count-up, symmetric dead time; owns group) | no | yes | `selftest_mcpwm` | n/a | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `radio` (Wi-Fi station)                       | yes | yes | `tcp_server` (image boot)                          | TCP echo  | TCP echo  |
-| `radio.ieee802154` (raw MAC, polling)          | no  | yes | `selftest_ieee802154` (image boot, no wiring)        | n/a       | 3/3, H2 and nRF52840 peers |
+| `radio.ieee802154` (raw MAC, polling)          | no  | yes | `selftest_ieee802154` (image boot, H2 peer, no wiring) | n/a    | 4/4, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 alone and 3 runs with both (2026-11-20) |
 | `rtos`                                        | yes | yes | `rtos`: expected `DONE pass=6 fail=0`, five ordered items + empty-queue timeout | 6/6, 3 runs (24ebc5d1) | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `systimer`                                    | yes | yes | `systimer`: expected `DONE pass=4 fail=0`, four IRQs + three 1 s intervals, TIMG0 reference, +/-100 us | 4/4, 3 runs (2026-11-20) | 4/4, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-20) |
 | custom CPU/APB clocks                         | yes | yes | `custom_clock_config`: expected `DONE pass=3 fail=0`, CPU/APB register readback at 20 MHz + 100 ms ROM busy delay vs systimer, +/-100 us | 3/3, 3 runs (2026-11-20) | 3/3, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-20) |
@@ -231,10 +231,56 @@ discarded; if no valid frame follows before the deadline, the call returns `Crc`
 without bytes instead of `Timeout`. `transmit`
 accepts 3–125 MAC bytes without length/FCS, supports CCA and automatically waits
 for ACK-request frames. Results distinguish TX_DONE, ACK received, no ACK and CCA
-busy. The ACK watchdog follows IDF's 200 ms fallback. `energy_detect` averages
+busy, after the retry policy finishes. `last_tx_attempts` counts actual frame
+transmissions, excluding busy CCAs. `Config.tx` defaults to minBE=3, maxBE=5,
+maxCSMABackoffs=4, maxFrameRetries=3, and an ACK wait bound of 54 symbols
+(864 us), per IEEE 802.15.4-2015 §§6.2.5.1, 6.7.4.3. Each CCA attempt waits a
+uniform random number of 20-symbol (320 us) slots, including the first attempt.
+Busy CCA increases BE up to maxBE; the fifth busy CCA returns CCA_BUSY.
+Only missing ACK spends the frame retry budget (four transmissions total);
+each retransmission restarts CSMA with minBE and preserves the sequence number.
+`use_cca=false` retains immediate transmission for raw diagnostic frames, with
+ACK retries still enabled. Setting maxFrameRetries=0 disables ACK retries.
+Config accepts minBE 0–maxBE, maxBE 3–8, maxCSMABackoffs 0–5,
+maxFrameRetries 0–7, and a nonzero u16 ACK wait in symbols. The ACK software
+bound starts at TX_DONE; the MAC's hardware ACK timeout also applies. Latched
+completion events are consumed before declaring a software timeout, including
+when the calling task resumes after the ACK deadline.
+`energy_detect` averages
 RSSI over 1–65535 us, and `cca` samples for 8 us.
 
-Limits: no Wi-Fi/BLE coexistence scheduler, CSMA backoff/retries, security,
+The C6 public TRM v1.2 does not document the radio MAC register protocol.
+IDF v5.5.1's [raw driver, lines 876–890](https://github.com/espressif/esp-idf/blob/v5.5.1/components/ieee802154/driver/esp_ieee802154_dev.c#L876-L890)
+issues one hardware CCA_TX_START (8 us CCA) or TX_START; its
+[abort handling, lines 613–635](https://github.com/espressif/esp-idf/blob/v5.5.1/components/ieee802154/driver/esp_ieee802154_dev.c#L613-L635)
+reports missing ACK or busy CCA to the upper layer. The
+[OpenThread adapter, lines 354–362](https://github.com/espressif/esp-idf/blob/v5.5.1/components/openthread/src/port/esp_openthread_radio.c#L354-L362)
+advertises hardware ACK timeout but no CSMA-backoff or frame-retry capability.
+We retain hardware CCA, ACK turnaround/filtering and timeout, and implement
+backoff/retries in software. IDF uses a 200 ms software ACK watchdog
+(`esp_ieee802154_dev.c:428`); ours bounds invalid/missing ACK paths at
+macAckWaitDuration instead. No undocumented ACK_TIMEOUT register units are assumed.
+
+IDF pins OpenThread at `b945928d722177cd9caeab2e1025499628c101ef`:
+[`sub_mac.hpp:526–529`](https://github.com/openthread/openthread/blob/b945928d722177cd9caeab2e1025499628c101ef/src/core/mac/sub_mac.hpp#L526-L529)
+uses BE 3–5 and 20-symbol slots;
+[`config/mac.h:50–90`](https://github.com/openthread/openthread/blob/b945928d722177cd9caeab2e1025499628c101ef/src/core/config/mac.h#L50-L90)
+defaults to four CSMA backoffs, but 15 direct/zero indirect frame retries.
+This raw MAC uses the requested IEEE default of three frame retries instead.
+The [IDF entropy adapter, lines 790–794](https://github.com/espressif/esp-idf/blob/v5.5.1/components/openthread/src/port/esp_openthread_radio.c#L790-L794)
+calls esp_fill_random, whose
+[`hw_random.c`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/esp_hw_support/hw_random.c)
+reads the C6 RNG and mixes an asynchronous timer. We use `hal.rng.random_u32`
+directly and mask the low BE bits (a power-of-two range has no modulo bias).
+C6 TRM v1.2 §§26.3–26.4 describe RNG entropy and read-rate limits; the HAL
+ungates RC_FAST/RNG and spaces reads by at least 1 us. It does not enable SAR
+ADC or claim cryptographic entropy from an 802.15.4-only PHY configuration.
+The policy's exponent progression, backoff bounds, retry limits, reset after
+NO_ACK, terminal busy CCA, and early success/error paths are host unit-tested.
+Host completion tests also cover an ACK latched while the task is descheduled
+across the deadline and an expired ACK window without a completion event.
+
+Limits: no Wi-Fi/BLE coexistence scheduler, security,
 enhanced ACK generation, multi-PAN, scheduled operations or sleep retention.
 Wi-Fi initialization in an IEEE802154 image (and IEEE802154 initialization in a
 Wi-Fi image) returns `UnsupportedRadioProtocol`; the default Wi-Fi path retains
@@ -252,68 +298,52 @@ All MAC waits are bounded; a stop timeout resets the MAC to end DMA and marks
 the handle faulted, requiring `deinit`/`init`. No PHY calibration is saved in NVS.
 
 Evidence: host tests for malformed TX headers and power conversion, all eight
-recoverable RX aborts, and a filtered-then-valid frame in one receive window.
-On 2026-11-19, `selftest_ieee802154` ran as an uncommitted build on a
-XIAO ESP32-C6 (rev v0.1), against an ESP32-H2 `ieee802154_cli` peer:
-3/3 self-checks; both ACK-request frames to the H2 acknowledged; 82 of 82 H2
-frames received (40 ACK-request, 40 without, 2 broadcast) and all 40 ACKed.
-That run also counted 1 CRC error (a frame that failed FCS, not one of the 82).
-Against a XIAO nRF52840 (Zephyr 4.5 nRF5 raw driver, standing in for short 0x0001 with the
-H2 receiver off), two runs: all 5 C6 frames received by the nRF each run and 4/4 C6 ACK
-requests acknowledged. The nRF sent 78 ACK-request frames (4 frames over both runs found
-CCA busy at the nRF and were not sent): the C6 received 78 and the nRF saw 77 ACKs; the
-missing one is `-35` at the nRF although `receive` returned that frame, which it does only
-after ACK_TX_DONE. The C6 received 78 of 78 sent no-ACK and 4 of 4 broadcast frames.
-The first of the two runs also counted 1 CRC error; the second counted none.
-One run on an ESP32-C6 Super Mini (rev v0.2, generic C6 image) against the same nRF: all 5
-C6 frames received and 2/2 ACK requests acknowledged; of 39 ACK-request frames the nRF sent,
-the C6 received and acknowledged 38 (the missing one was not received; the run counted 1 CRC
-error, so it may have arrived corrupted), and it received 36 of 36 sent no-ACK and 2 of 2
-broadcast frames.
-A second run set on 2026-11-19 used the same Super Mini ESP32-C6FH4
-(rev v0.2, `esp32_c6` image boot; neither peer run counted a CRC error): 3/3 self-checks with no peer listening. Against the H2, 82 of 82 frames were received at -22 dBm, all 40
-ACK requests were acknowledged, and the C6's two ACK-request frames were
-acknowledged. The H2 received the C6 at -50 dBm; it had received the XIAO board
-build at -48 dBm. Against an nRF52840 Zephyr `nrf_154` peer (short 0x0001):
-the nRF's ACK-request frames to the C6 were acknowledged 39 of 40 times. The C6
-did not log the unacknowledged frame, and logged 80 of the 81 frames the nRF
-sent, at a median of -75 dBm (the nRF reported one more frame as channel busy).
-The C6 counter `rx=81` includes one frame from another network (a foreign
-76-byte broadcast in `hw6-154nrf-sm-n40.log`), in addition to those 80 peer frames.
-The C6's two ACK-request frames to the nRF were acknowledged, and the nRF
-received the C6 at -69 to -71 dBm.
-A third run set on 2026-11-19 used the same Super Mini, `esp32_c6` image boot
-with unmasked 2 ms logger drains (no CRC error in either run): 3/3 self-checks. Against the H2, 82 of 82
-frames received at -21 to -19 dBm, all 40 ACK requests acknowledged, and the
-C6's two ACK-request frames acknowledged. Against the nRF: of 40 ACK-request
-frames, the nRF found the channel busy once (`-16`, not sent), 37 were
-received and acknowledged, and 2 were neither (`-35` at the nRF, not logged by
-the C6); the C6 received 38 of 39 sent no-ACK frames and 2 of 2 broadcasts, at
--84 to -75 dBm (median -79). The nRF received all four C6 frames, both ACK
-requests acknowledged, at -74 to -73 dBm.
+recoverable RX aborts, a filtered-then-valid frame in one receive window, and
+the CSMA/retry policy and ACK completion cases above. On hardware, 2026-11-20,
+image boot, channel 25, `selftest_ieee802154` at +20 dBm against an
+ESP32-H2 `ieee802154_cli` peer at +20 dBm: `DONE pass=4 fail=0` with `peer_ack`
+2/2 in 3 of 3 runs each on the Super Mini ESP32-C6 (generic image) and the XIAO ESP32-C6 (board
+build) alone, and in 3 of 3 runs with both booted at the same moment (6 of 6
+board runs). In each of the 12 board runs the C6 received all 40 ACK-request and
+40 no-ACK frames from the H2, and the H2 counted 40 of 40 ACKs. Two of the 48
+C6 transmissions in those runs took a second attempt.
 
-The uncommitted run has no verified equivalence to this tree. The second set
-ran on an earlier version; radio/HAL guards and dependencies, antenna selection, logger
-and LP_FAST startup changed since. The third set ran on an earlier version;
-logger and LP_FAST startup changed since. The changes since are built only /
-unit-tested; these counts do not establish radio behavior in this tree.
+`selftest_ieee802154` builds the C6 image-boot target and the XIAO ESP32-C6 board
+target; on a XIAO ESP32-C6 use the board build, which powers the rf switch (about 20 dB);
+`-Dantenna=external` selects the U.FL connector (default `internal`). The board's
+`antenna.apply` moved the rf switch in a `xiao_esp32_c6_ble_scan` run (see the BLE
+evidence). The self-test transmits at +20 dBm to match the H2 peer; at 0 dBm the C6's
+auto-ACKs reach that peer about 20 dB below its own frames.
+The self-test derives its short address from the factory MAC's final
+two bytes, `(mac[4] << 8) | mac[5]`. Values 0x0001 (test peer), 0x0003 (nRF
+default), 0xfffe and 0xffff are remapped by XOR with 0x8000. Its extended
+address inserts ff:fe between MAC bytes 2 and 3, then reverses the eight bytes
+into the HAL's wire order. The boot line `ADDRESS channel=25 pan=0x1234
+short=0xHHHH extended_wire=<16 hex digits>` announces the configured addresses.
+Before testing two C6s together, the host must verify their printed shorts
+differ; 16-bit truncation cannot guarantee uniqueness. If equal, do not run
+them together. Peer MPDUs address the printed short, low byte first (bytes 5/6
+in a PAN-compressed short-address frame).
 
-`selftest_ieee802154` builds the C6 image-boot target and the XIAO ESP32C6 board
-target; on a XIAO use the board build, which powers the rf switch (about 20 dB);
-`-Dantenna=external` selects the U.FL connector (default `internal`);
-external selection is **built only**, with no hardware run (`antenna-ext.log` is empty).
-Its NOTE constants select channel 25, PAN 0x1234, local short address 0x0002 and H2 peer 0x0001.
-Configure the H2 IDF `ieee802154_cli` and nRF52840 Zephyr raw shell on that
-channel/PAN with distinct addresses. The test first checks energy-detect
+Configure exactly one ACK peer on channel 25 / PAN 0x1234, filtered RX with
+auto-ACK, short 0x0001, before resetting the C6. When using nRF instead of H2,
+disable H2 RX and set `wpan filter 0x1234 0x0001`, `wpan promisc off`, and
+`wpan rx on` (its boot default is short 0x0003 and promiscuous RX).
+The test first checks energy-detect
 completion and a broadcast TX without ACK or CCA (no peer or quiet channel
 required). It then listens promiscuously for five seconds and prints each
 received frame as `FRAME len=.. lqi=.. rssi=.. <hex>` (MAC bytes without FCS).
 Next it sends fixed data frames with/without ACK request to 0x0001, including
 CCA, plus a broadcast, printing `TX_DONE`, `ACK_RECEIVED`, `NO_ACK` or `CCA_BUSY`.
-It then receives with filtering/legacy auto-ACK enabled. Self-test case lines
-and `SELFTEST ieee802154 DONE pass=N fail=M` appear after 1.5 s and repeat every
-three seconds, with peer RX/CRC/ACK/CCA/error counters. Missing peers do not fail
-the radio-only cases. The test reports only between 500 ms receive windows, so
+It then receives with filtering/legacy auto-ACK enabled; send peer ACK-request
+frames to the printed C6 address after its outgoing set finishes.
+Radio-only case lines appear after 1.5 s. `DONE` is withheld until the outgoing
+set finishes (or a fatal setup failure). The fourth case, `peer_ack`, requires
+**2/2 ACK_REQUEST frames acknowledged**, seq 0x21 and 0x22 both using default
+unslotted CSMA-CA and ACK retries. Final NO_ACK, CCA_BUSY or TX error on either fails that case;
+missing peers fail it too. Success is `SELFTEST ieee802154 DONE pass=4 fail=0`.
+Reports repeat every three seconds with peer RX/CRC/ACK/CCA/error counters.
+The test reports only between 500 ms receive windows, so
 a report can slip by up to 0.5 s and the interval between reports is 3 to 3.5 s.
 The last promiscuous window may start just before the five seconds end, so the
 promiscuous phase can overrun by up to 0.5 s.
