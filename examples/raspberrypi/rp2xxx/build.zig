@@ -7,6 +7,12 @@ const MicroBuild = microzig.MicroBuild(.{
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
+    const protocol_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/esp_peer/protocol.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    b.step("test", "Test the ESP peer protocol").dependOn(&b.addRunArtifact(protocol_tests).step);
     const maybe_example = b.option([]const u8, "example", "only build matching examples");
 
     const mz_dep = b.dependency("microzig", .{});
@@ -49,6 +55,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const specific_examples: []const Example = &.{
+        .{ .target = pico2_w_ram, .name = "pico2_w_ram_esp_peer", .file = "src/esp_peer.zig" },
+        .{ .target = pico2_w_ram, .name = "pico2_w_ram_i2c_slave_peer", .file = "src/i2c_slave_peer.zig" },
         // RaspberryPi Boards:
         .{ .target = raspberrypi.pico, .name = "pico_board_blinky", .file = "src/board_blinky.zig" },
         .{ .target = raspberrypi.pico, .name = "pico_random", .file = "src/rp2040_only/random.zig" },

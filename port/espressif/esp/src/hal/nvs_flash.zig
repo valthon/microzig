@@ -25,8 +25,7 @@ pub const PartitionFlash = struct {
 /// read-only or unknown flags, and geometries the store cannot represent.
 /// Never formats a partition or writes outside the named partition range.
 pub fn open(device: flash.Flash, name: []const u8) Error!PartitionFlash {
-    const partitions = try table.read(device);
-    const p = partitions.find_data(.nvs, name) orelse return error.NotFound;
+    const p = try table.find_data(device, .nvs, name) orelse return error.NotFound;
     if (p.flags != 0 or p.size % nvs.page_size != 0 or
         p.size < 3 * nvs.page_size or p.size > nvs.max_pages * nvs.page_size) return error.UnsupportedPartition;
     return .{ .region = try device.data_region(p.offset, p.size) };

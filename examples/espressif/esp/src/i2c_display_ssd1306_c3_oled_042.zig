@@ -43,7 +43,7 @@ const i2c_timeout: Duration = .from_ms(100);
 /// Size and position of the panel's visible window inside the 128x64 frame.
 const panel_width = 72;
 const panel_height = 40;
-const panel_x = 27;
+const panel_x = 28; // first visible column of the 72x40 panel
 const panel_y = 24;
 
 comptime {

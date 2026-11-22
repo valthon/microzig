@@ -16,6 +16,7 @@ const radio = @import("../radio.zig");
 const osi = @import("osi.zig");
 const clocks = @import("../analog/esp32_c6.zig");
 const time = @import("../time.zig");
+const rng = @import("../rng.zig");
 const mac = microzig.chip.peripherals.IEEE802154;
 const Opcode = microzig.chip.types.peripherals.IEEE802154.Opcode;
 
@@ -35,6 +36,7 @@ pub const Config = struct {
     auto_ack: bool = true,
     cca_threshold: i8 = -75,
     cca_mode: enum(u2) { carrier = 0, energy = 1, carrier_or_energy = 2, carrier_and_energy = 3 } = .energy,
+    tx: TxConfig = .{},
 };
 
 pub const Error = error{
@@ -46,6 +48,7 @@ pub const Error = error{
     InvalidFrame,
     UnsupportedFrame,
     InvalidDuration,
+    InvalidTxConfig,
     Timeout,
     Crc,
     RxAborted,
@@ -54,7 +57,8 @@ pub const Error = error{
     CcaFailed,
 };
 pub const InitError = radio.InitError || Error;
-pub const TxResult = enum { tx_done, ack_received, no_ack, cca_busy };
+pub const TxResult = frames.tx.Result;
+pub const TxConfig = frames.tx.Config;
 pub const Energy = struct { rssi: i8, busy: bool };
 pub const Frame = rx.Frame;
 
@@ -78,6 +82,9 @@ pub const Radio = struct {
     rx_dma: [128]u8 align(4) = @splat(0),
     tx_dma: [128]u8 align(4) = @splat(0),
     faulted: bool = false,
+    /// Actual frame transmissions in the latest transmit call, excluding busy
+    /// CCAs. Reset after frame validation; at most max_frame_retries + 1.
+    last_tx_attempts: u8 = 0,
 
     /// Initialize in place; do not copy or move the handle until deinit.
     pub fn init(self: *Radio, allocator: std.mem.Allocator, config: Config) InitError!void {
@@ -139,10 +146,13 @@ pub const Radio = struct {
 
     /// MAC bytes include FCF/sequence/address/payload, exclude length and FCS.
     /// Hardware inserts the FCS. ACK-request frames wait for a matching legacy
-    /// ACK (IDF's 200 ms software watchdog); there are no retries or CSMA backoff.
+    /// ACK. Unslotted CSMA-CA is used when use_cca is true; missing ACKs retry
+    /// with the same sequence number. Config.tx bounds both procedures. Returns
+    /// the final outcome; last_tx_attempts excludes unsuccessful CCAs.
     pub fn transmit(self: *Radio, frame: []const u8, use_cca: bool) Error!TxResult {
         try self.check();
         try frames.validate_tx(frame);
+        self.last_tx_attempts = 0;
         const ack = frame[0] & 0x20 != 0;
         configure_mac(self.config);
         // ACK reception must use the hardware TX->RX transition, even if the
@@ -151,46 +161,21 @@ pub const Radio = struct {
         self.tx_dma[0] = @intCast(frame.len + 2);
         @memcpy(self.tx_dma[1..][0..frame.len], frame);
         @memset(self.tx_dma[1 + frame.len ..][0..2], 0);
+        var io: TxIo = .{ .device = self, .frame = frame };
+        return frames.tx.transmit(&io, self.config.tx, use_cca);
+    }
+
+    fn transmit_once(self: *Radio, frame: []const u8, use_cca: bool) Error!TxResult {
+        const ack = frame[0] & 0x20 != 0;
+        // Re-arm TX/ACK DMA for every retry, as IDF dev.c:859-874 tx_init does.
         mac.TXDMA_ADDR.write(.{ .TXDMA_ADDR = @intFromPtr(&self.tx_dma) });
         mac.RXDMA_ADDR.write(.{ .RXDMA_ADDR = @intFromPtr(&self.rx_dma) });
         clear_events(Event.all);
         mac.ED_SCAN_DURATION.modify(.{ .ED_SCAN_DURATION = 8 });
         command(if (use_cca) .cca_tx_start else .tx_start);
         defer self.stop();
-        var deadline = now() + 10_000;
-        var sent = false;
-        while (now() < deadline) {
-            const events = mac.EVENT_STATUS.read().EVENT_STATUS;
-            const reason = mac.TX_STATUS.read().TX_ABORT_STATUS;
-            clear_events(events);
-            if (events & Event.ack_rx_done != 0 and ack) {
-                asm volatile ("fence iorw, iorw" ::: .{ .memory = true });
-                // The MAC filters ACK type/sequence and FCS. Check DMA too so
-                // a stale or malformed packet cannot be reported as success.
-                if (dma_load(&self.rx_dma, 0) & 0x7f != 5 or
-                    dma_load(&self.rx_dma, 1) & 7 != 2 or
-                    dma_load(&self.rx_dma, 3) != frame[2]) return error.InvalidFrame;
-                return .ack_received;
-            }
-            if (events & Event.tx_abort != 0) {
-                switch (reason) {
-                    16 => return .no_ack,
-                    25 => return .cca_busy,
-                    24 => return error.CcaFailed,
-                    // IDF leaves invalid ACKs pending until its watchdog fires.
-                    2...9 => {},
-                    else => return error.TxAborted,
-                }
-            }
-            if (events & Event.tx_done != 0 and !sent) {
-                if (!ack) return .tx_done;
-                sent = true;
-                deadline = now() + 200_000;
-            }
-            std.atomic.spinLoopHint();
-        }
-        if (sent and ack) return .no_ack;
-        return error.Timeout;
+        var io: TxCompletionIo = .{ .device = self, .sequence = frame[2] };
+        return frames.tx.wait_for_completion(&io, ack, self.config.tx.ack_wait_symbols);
     }
 
     /// Average RSSI (dBm) plus CCA decision. Duration is microseconds; like
@@ -250,6 +235,67 @@ pub const Radio = struct {
     }
 };
 
+const TxCompletionIo = struct {
+    device: *Radio,
+    sequence: u8,
+
+    pub fn now(_: *TxCompletionIo) u64 {
+        return time.get_time_since_boot().to_us();
+    }
+
+    pub fn poll(_: *TxCompletionIo) frames.tx.Events {
+        const events = mac.EVENT_STATUS.read().EVENT_STATUS;
+        const reason = mac.TX_STATUS.read().TX_ABORT_STATUS;
+        clear_events(events);
+        return .{
+            .done = events & Event.tx_done != 0,
+            .ack_done = events & Event.ack_rx_done != 0,
+            .abort = if (events & Event.tx_abort != 0) reason else null,
+        };
+    }
+
+    pub fn mark_sent(self: *TxCompletionIo) void {
+        self.device.last_tx_attempts += 1;
+    }
+
+    pub fn validate_ack(self: *TxCompletionIo) error{InvalidFrame}!void {
+        asm volatile ("fence iorw, iorw" ::: .{ .memory = true });
+        // The MAC filters ACK type/sequence and FCS. Check DMA too so
+        // a stale or malformed packet cannot be reported as success.
+        if (dma_load(&self.device.rx_dma, 0) & 0x7f != 5 or
+            dma_load(&self.device.rx_dma, 1) & 7 != 2 or
+            dma_load(&self.device.rx_dma, 3) != self.sequence) return error.InvalidFrame;
+    }
+
+    pub fn spin(_: *TxCompletionIo) void {
+        std.atomic.spinLoopHint();
+    }
+};
+
+const TxIo = struct {
+    device: *Radio,
+    frame: []const u8,
+
+    pub fn random(_: *TxIo) u32 {
+        // IDF v5.5.1 esp_openthread_radio.c:790-794 supplies entropy through
+        // esp_fill_random; esp_hw_support/hw_random.c:55-104 reads the C6 RNG.
+        // Our HAL uses that peripheral directly (C6 TRM v1.2 §§26.3-26.4).
+        return rng.random_u32();
+    }
+
+    pub fn wait(_: *TxIo, us: u32) void {
+        time.sleep_us(us);
+    }
+
+    pub fn attempt(self: *TxIo, use_cca: bool) Error!TxResult {
+        const result = try self.device.transmit_once(self.frame, use_cca);
+        // stop() can reset a stuck MAC in transmit_once's defer. Never retry
+        // or report success with that reset configuration.
+        if (self.device.faulted) return error.Faulted;
+        return result;
+    }
+};
+
 const RxIo = struct {
     device: *Radio,
 
@@ -304,6 +350,7 @@ fn release_owner() void {
 
 fn validate_config(config: Config) Error!void {
     if (config.channel < 11 or config.channel > 26) return error.InvalidChannel;
+    try config.tx.validate();
 }
 
 fn configure_mac(config: Config) void {

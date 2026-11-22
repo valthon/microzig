@@ -8,6 +8,24 @@ const key = 0x50d83aa1;
 const swd_key = key;
 
 pub const Rtc = struct {
+    /// The default HAL init sequence calls this after clock/time initialization,
+    /// before starting USB users, to recover USJ after RWDT core reset (0x09,
+    /// C6 TRM v1.2 Table 8.1-1). USJ loses its connection after this reset.
+    /// With HAL_Options.recover_usb_at_startup
+    /// disabled, call it manually at that point if recovery is needed.
+    /// Other reset causes and application-disabled USB pads are left alone.
+    ///
+    /// Use CONF0's independent pull override and pad controls (§32.7 reg 32.3)
+    /// through the existing soft reconnect, including its 10 ms detach.
+    /// This discards pending transfers; the host must follow re-enumeration.
+    pub fn recover_usb_at_startup() void {
+        switch (microzig.chip.peripherals.LP_CLKRST.RESET_CAUSE.read().RESET_CAUSE) {
+            0x09 => {},
+            else => return,
+        }
+        _ = @import("../usb_serial_jtag.zig").reconnect(.{});
+    }
+
     /// RWDT uses RTC_SLOW_CLK directly and has no configuration-update latch.
     pub fn configure(stages: [4]RtcStage) void {
         rtc.WPROTECT.write(.{ .WDT_WKEY = key });
@@ -23,6 +41,11 @@ pub const Rtc = struct {
             .WDT_STG2 = @backingInt(stages[2].action),
             .WDT_STG3 = @backingInt(stages[3].action),
             .WDT_PROCPU_RESET_EN = 1,
+            // Match ESP-IDF v5.5.1 components/hal/wdt_hal_iram.c:57-58:
+            // 7 selects 3.2 us CPU/core reset pulses. C6 TRM v1.2 §15.6,
+            // Register 15.1 RTC_WDT_CONFIG0_REG (LP_WDT.CONFIG0).
+            .WDT_SYS_RESET_LENGTH = 7,
+            .WDT_CPU_RESET_LENGTH = 7,
         });
         rtc.FEED.write(.{ .RTC_WDT_FEED = 1 });
         rtc.CONFIG0.modify(.{ .WDT_EN = 1 });

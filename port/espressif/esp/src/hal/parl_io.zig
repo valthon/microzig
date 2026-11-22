@@ -40,6 +40,10 @@ pub fn Port(comptime channel: u2) type {
         const dma = gdma.Channel(channel);
         /// Finite TX, RX or duplex frame. Each buffer must be word-aligned and
         /// 4..65532 bytes, a multiple of four. Pins remain routed after return.
+        /// TX cleanup gates the clock and clears START (C6 TRM v1.2 §38.6.2,
+        /// steps 14–15); it does not disable pad outputs. For a bidirectional
+        /// peer, the caller must apply(.{}) to every TX pad immediately on
+        /// return, including errors. RX-only setup never enables pad outputs.
         /// RX without rx_valid uses software enable; the sender must start later.
         /// Every TX stretches the clock during setup: allow about 2 ms at a
         /// 40 MHz XTAL plus frame time in timeout_us (the whole-call budget).
@@ -104,7 +108,6 @@ pub fn Port(comptime channel: u2) type {
             }
             if (tx) {
                 for (config.tx_data, 0..) |pin, i| output(pin, @fromBackingInt(@as(u8, @intCast(47 + i))));
-                output(config.tx_clock.?, gpio.OutputSignal.parl_tx_clk);
                 if (config.tx_valid) |pin| output(pin, .parl_data15);
                 hw.TX_CFG0.modify(.{ .TX_BYTELEN = @as(u16, @intCast(buffers.tx.?.len)), .TX_BUS_WID_SEL = @backingInt(config.width), .TX_HW_VALID_EN = @as(u1, @intFromBool(config.tx_valid != null)), .TX_GATING_EN = 0, .TX_SMP_EDGE_SEL = 0, .TX_BIT_UNPACK_ORDER = 0 });
                 hw.TX_CFG1.modify(.{ .TX_IDLE_VALUE = 0 });
@@ -115,6 +118,11 @@ pub fn Port(comptime channel: u2) type {
                 // §38.5.2, §38.6: prime TX with a running core clock, then
                 // stop it before arming RX. Without valid gating, any idle
                 // clock edges would otherwise be sampled as frame data.
+                // Stretch the clock before routing it to the pad, so a
+                // receiver sees only the gating edges, not a burst lasting
+                // as long as the wait above (longer from a cold cache).
+                pcr.PARL_CLK_TX_CONF.modify(.{ .PARL_CLK_TX_DIV_NUM = 0xffff });
+                output(config.tx_clock.?, gpio.OutputSignal.parl_tx_clk);
                 try stop_tx_clock_low(config.tx_clock.?, config.clock_divider, deadline);
             }
             if (rx) {
@@ -123,10 +131,16 @@ pub fn Port(comptime channel: u2) type {
                 if (config.rx_valid) |pin| input(pin, .parl_data15);
                 hw.RX_CFG0.modify(.{ .RX_DATA_BYTELEN = @as(u16, @intCast(buffers.rx.?.len)), .RX_BUS_WID_SEL = @backingInt(config.width), .RX_EOF_GEN_SEL = 0, .RX_SMP_MODE_SEL = @as(u2, if (config.rx_valid != null) 0 else 2), .RX_SW_EN = 1, .RX_LEVEL_SUBMODE_SEL = 0, .RX_CLK_EDGE_SEL = 1, .RX_BIT_PACK_ORDER = 0 });
                 hw.RX_CFG1.modify(.{ .RX_TIMEOUT_EN = 0, .RX_EXT_EN_SEL = 15, .RX_REG_UPDATE = 1 });
+                // Keep the internal clock running through configuration CDC
+                // (C6 TRM v1.2 §38.5.2, Register 38.2). Waiting here after
+                // switching to an idle external clock would prevent arming.
                 while (hw.RX_CFG1.read().RX_REG_UPDATE != 0) {
                     if (deadline.is_reached_by(time.get_time_since_boot())) return error.Timeout;
                 }
                 dma.start(.rx, 9, lists.rx);
+                // §38.5.2: gate, assert START, ungate, then let the peer send.
+                // No external edge is required before transfer reaches its
+                // bounded completion wait, so an idle-low peer can start later.
                 pcr.PARL_CLK_RX_CONF.modify(.{ .PARL_CLK_RX_EN = 0, .PARL_CLK_RX_SEL = 3, .PARL_CLK_RX_DIV_NUM = 0 });
                 hw.RX_CFG0.modify(.{ .RX_START = 1 });
                 pcr.PARL_CLK_RX_CONF.modify(.{ .PARL_CLK_RX_EN = 1 });

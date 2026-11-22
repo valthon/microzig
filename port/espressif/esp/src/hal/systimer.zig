@@ -96,6 +96,8 @@ pub const Unit = enum(u1) {
         LOAD.write(.{ .TIMER_UNIT0_LOAD = 1 });
     }
 
+    /// Requires an active unit with its bus/function clocks enabled and reset
+    /// released (apply(.enabled) or apply(.disabled_if_cpu_stalled) first).
     pub fn read(self: Unit) u52 {
         const OP: @TypeOf(&SYSTIMER.UNIT0_OP) = switch (self) {
             .unit0 => &SYSTIMER.UNIT0_OP,
@@ -110,7 +112,13 @@ pub const Unit = enum(u1) {
             .unit1 => @ptrCast(&SYSTIMER.UNIT1_VALUE_HI),
         };
 
-        // Set the "update" bit and wait for acknowledgment
+        // Match ESP-IDF v5.5.1 systimer_hal_get_counter_value: snapshot, then
+        // poll VALUE_VALID without a software timeout. C3 TRM v1.4 §10.4.1 and
+        // C6 TRM v1.2 §13.4.1 specify that UPDATE latches the count and asserts
+        // VALUE_VALID; §§10.5.1/13.5.1 prescribe this poll. With the clocks and
+        // unit active, this is a hardware handshake, not a wait for the count
+        // to advance or an external event. Neither TRM specifies a cycle limit;
+        // disabling its clocks/resetting it during read violates the precondition.
         OP.modify(.{ .TIMER_UNIT0_UPDATE = 1 });
         while (OP.read().TIMER_UNIT0_VALUE_VALID != 1) {}
 
