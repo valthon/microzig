@@ -264,4 +264,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_dma_tests = b.addRunArtifact(dma_tests);
     test_step.dependOn(&run_dma_tests.step);
+
+    const usb_core = b.createModule(.{
+        .root_source_file = b.path("../../../core/src/microzig.zig"),
+        .target = b.graph.host,
+    });
+    const usb_test_microzig = b.createModule(.{
+        .root_source_file = b.path("src/usb_test_microzig.zig"),
+        .imports = &.{.{ .name = "usb", .module = usb_core }},
+    });
+    const usb_tests = b.addTest(.{
+        .name = "usb-hal-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/usb_tests.zig"),
+            .target = b.graph.host,
+            .imports = &.{.{ .name = "microzig", .module = usb_test_microzig }},
+        }),
+    });
+    const run_usb_tests = b.addRunArtifact(usb_tests);
+    test_step.dependOn(&run_usb_tests.step);
 }

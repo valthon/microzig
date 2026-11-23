@@ -342,10 +342,13 @@ pub fn Polled(comptime setup: Setup, comptime cfg: Config) type {
             .ep_readv = ep_readv,
             .ep_listen = ep_listen,
             .ep_open = ep_open,
+            .ep_close_all = ep_close_all,
+            .control_out_data = true,
             .set_address = set_address,
         };
 
         endpoints: PerEndpointArray(cfg.max_endpoints_count),
+        control: usb.ControlRequest = .{},
         pma_next: u16, // next free PMA offset
         interface: usb.DeviceInterface,
 
@@ -407,6 +410,7 @@ pub fn Polled(comptime setup: Setup, comptime cfg: Config) type {
         }
 
         fn on_bus_reset_local(self: *Self) void {
+            self.control = .{};
             // Clear state
             inline for (0..cfg.max_endpoints_count) |i| {
                 self.endpoints[i][@backingInt(types.Dir.out)].rx_armed = false;
@@ -531,15 +535,16 @@ pub fn Polled(comptime setup: Setup, comptime cfg: Config) type {
             Pma.read_bytes(rx_addr, &self.staging_buf, 8);
             const setup_pkt: types.SetupPacket = @bitCast(self.staging_buf[0..8].*);
 
-            // After SETUP, hardware forces STAT_TX=NAK, STAT_RX=NAK and
-            // clears DTOG_TX/DTOG_RX. We set RX to VALID so EP0 can
-            // receive the status stage or data stage.
-            Epr.set_stat_rx(ep, .valid);
+            // CH32FV2x_V3x RM v2.2, 21.2.2, Control Transfer: SETUP forces NAK in both
+            // directions and DATA1. Keep RX at NAK until software prepares the stage.
+            Epr.set_stat_rx(ep, .nak);
 
             const st_in = self.st(.ep0, .in);
             st_in.tx_busy = false;
 
+            self.control.setup(&setup_pkt);
             controller.on_setup_req(&self.interface, &setup_pkt);
+            if (self.control.needs_stall()) self.stall_control();
         }
 
         fn handle_out(self: *Self, ep: u4, controller: anytype) void {
@@ -552,10 +557,11 @@ pub fn Polled(comptime setup: Setup, comptime cfg: Config) type {
                 const n: usize = @min(@as(usize, len), 64);
                 Pma.read_bytes(rx_addr, &self.staging_buf, n);
                 st_out.rx_last_len = @intCast(n);
-                // Re-arm EP0 RX
-                Btable.set_rx_count(0, 64);
-                Epr.set_stat_rx(0, .valid);
-                self.call_on_buffer(.out, 0, controller);
+                Epr.set_stat_rx(0, .nak);
+                if (self.control.out_packet()) {
+                    self.call_on_buffer(.out, 0, controller);
+                    if (self.control.needs_stall()) self.stall_control();
+                }
                 return;
             }
 
@@ -600,6 +606,30 @@ pub fn Polled(comptime setup: Setup, comptime cfg: Config) type {
         fn set_address(_: *usb.DeviceInterface, addr: u7) void {
             log.debug("set_address to {}", .{addr});
             USB_PERIPH.DADDR.write(.{ .EF = 1, .ADD = addr });
+        }
+
+        fn stall_control(self: *Self) void {
+            // USB 2.0, 9.2.7 / 8.5.3.4; CH32FV2x_V3x RM v2.2,
+            // 21.3.6, USBD_EPRx, STAT_TX/RX.
+            self.control = .{};
+            Epr.set_stat_tx(0, .stall);
+            Epr.set_stat_rx(0, .stall);
+        }
+
+        fn ep_close_all(itf: *usb.DeviceInterface) void {
+            const self: *Self = @fieldParentPtr("interface", itf);
+            // CH32FV2x_V3x RM v2.2, 21.3.6, USBD_EPRx: STAT_TX/RX Disabled
+            // prevents transactions on the old configuration.
+            for (1..cfg.max_endpoints_count) |i| {
+                const ep: u4 = @intCast(i);
+                Epr.set_stat_tx(ep, .disabled);
+                Epr.set_stat_rx(ep, .disabled);
+                Epr.clear_ctr_tx(ep);
+                Epr.clear_ctr_rx(ep);
+                self.st(@fromBackingInt(ep), .in).tx_busy = false;
+                self.st(@fromBackingInt(ep), .out).rx_armed = false;
+                self.st(@fromBackingInt(ep), .out).rx_last_len = 0;
+            }
         }
 
         fn ep_open(itf: *usb.DeviceInterface, desc_ptr: *const descriptor.Endpoint) void {
@@ -668,10 +698,34 @@ pub fn Polled(comptime setup: Setup, comptime cfg: Config) type {
                     Epr.configure(ep_i, ep_type, .nak, .nak);
                 }
 
-                // Set the appropriate direction to desired state
+                // Set the appropriate direction to desired state.
+                // The host can configure again without a bus reset (SET_CONFIGURATION), so an
+                // endpoint may be opened while a packet from its previous configuration is still
+                // armed. The NAK withdraws that packet; the software state has to follow, or
+                // the next ep_listen panics and the next ep_writev refuses the data.
+                // The data toggle goes back to DATA0 as well: SET_CONFIGURATION resets it on
+                // the host's side (USB 2.0, 9.1.1.5), and `Epr.configure` above clears it only
+                // the first time the endpoint is opened.
+                // That packet may also have completed already without `poll` having seen it:
+                // `poll` takes one endpoint per call, lowest number first, so the request on
+                // EP0 that leads here is handled before a completion pending on this
+                // endpoint. Clear the completion flag: left set, it would be taken for the
+                // new configuration's first packet, which `handle_in` would then withdraw
+                // and report sent, and `handle_out` would report with the old length.
                 switch (e.dir) {
-                    .out => Epr.set_stat_rx(ep_i, .nak),
-                    .in => Epr.set_stat_tx(ep_i, .nak),
+                    .out => {
+                        Epr.set_stat_rx(ep_i, .nak);
+                        Epr.clear_dtog_rx(ep_i);
+                        Epr.clear_ctr_rx(ep_i);
+                        out_st.rx_armed = false;
+                        out_st.rx_last_len = 0;
+                    },
+                    .in => {
+                        Epr.set_stat_tx(ep_i, .nak);
+                        Epr.clear_dtog_tx(ep_i);
+                        Epr.clear_ctr_tx(ep_i);
+                        in_st.tx_busy = false;
+                    },
                 }
             }
         }
@@ -683,6 +737,9 @@ pub fn Polled(comptime setup: Setup, comptime cfg: Config) type {
             if (ep_num == .ep0) {
                 const st0 = self.st(.ep0, .out);
                 st0.rx_limit = @intCast(len);
+                self.control.listen();
+                Btable.set_rx_count(0, @intCast(@min(len, 64)));
+                Epr.set_stat_rx(0, .valid);
                 return;
             }
 
@@ -752,6 +809,14 @@ pub fn Polled(comptime setup: Setup, comptime cfg: Config) type {
             if (st_in.tx_busy) {
                 log.warn("ep_writev called while {} IN endpoint busy, returning 0", .{ep_num});
                 return 0;
+            }
+
+            if (ep_num == .ep0) {
+                self.control.reply();
+                if (self.control.direction == .in) {
+                    Btable.set_rx_count(0, 64);
+                    Epr.set_stat_rx(0, .valid);
+                }
             }
 
             // Gather vector data into staging buffer
