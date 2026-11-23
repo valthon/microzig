@@ -35,8 +35,14 @@ pub const ManagementRequestType = enum(u8) {
     _,
 };
 
-/// Line coding structure for SetLineCoding/GetLineCoding requests
+/// Line coding structure for SetLineCoding/GetLineCoding requests: 7 bytes on the wire
+/// (USB CDC PSTN 1.2, section 6.3.11).
 pub const LineCoding = extern struct {
+    comptime {
+        std.debug.assert(@alignOf(@This()) == 1);
+        std.debug.assert(@sizeOf(@This()) == 7);
+    }
+
     pub const StopBits = enum(u8) { @"1" = 0, @"1.5" = 1, @"2" = 2, _ };
     pub const Parity = enum(u8) {
         none = 0,
@@ -47,7 +53,7 @@ pub const LineCoding = extern struct {
         _,
     };
 
-    bit_rate: usb.types.LeInt(u32),
+    bit_rate: usb.types.LeInt(u32) align(1),
     stop_bits: StopBits,
     parity: Parity,
     data_bits: u8,
@@ -190,12 +196,32 @@ pub const Runtime = struct {
         log.debug("cdc setup: {any} {} {}", .{ mgmt_request, setup.length.native(), setup.value.native() });
 
         return switch (mgmt_request) {
-            .SetLineCoding => usb.ack, // we should handle data phase somehow to read sent line_coding
+            .SetLineCoding => usb.ack, // The data stage is delivered to class_data.
             .GetLineCoding => std.mem.asBytes(&self.line_coding),
             .SetControlLineState => usb.ack,
             .SendBreak => usb.ack,
             else => usb.nak,
         };
+    }
+
+    /// The longest data stage of a request this driver takes: SET_LINE_CODING's 7 bytes.
+    pub const class_data_len = @sizeOf(LineCoding);
+
+    /// The data stage of a request `class_request` accepted, on a device that hands it over
+    /// (`usb.DeviceInterface.VTable.control_out_data`); returns whether the request is still
+    /// accepted. On any other device the request has its answer before the data arrives, and
+    /// `line_coding` keeps its initial value whatever the host sets.
+    pub fn class_data(self: *@This(), setup: *const usb.types.SetupPacket, data: []const u8) bool {
+        const mgmt_request: ManagementRequestType = @fromBackingInt(setup.request);
+        switch (mgmt_request) {
+            .SetLineCoding => {
+                if (data.len != @sizeOf(LineCoding)) return false;
+                @memcpy(std.mem.asBytes(&self.line_coding), data);
+                return true;
+            },
+            // The other requests that are accepted carry no data this driver has a use for.
+            else => return true,
+        }
     }
 
     pub fn on_rx(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
@@ -288,4 +314,25 @@ pub fn driver_info(
             .ep_in = .bulk(alloc.next_ep(.in), device_capabilities.max_packet_size),
         },
     };
+}
+
+test "GET_LINE_CODING replies with the 7-byte line coding structure" {
+    var cdc: Runtime = undefined;
+    cdc.line_coding = .init;
+    // The controller truncates a reply to wLength, so a host asking for more than 7 bytes
+    // receives everything `class_request` returns.
+    const setup: usb.types.SetupPacket = .{
+        .request_type = .{ .recipient = .interface, .type = .class, .direction = .in },
+        .request = @backingInt(ManagementRequestType.GetLineCoding),
+        .value = .from(0),
+        .index = .from(0),
+        .length = .from(0xFFFF),
+    };
+    // dwDTERate 115200 little-endian, bCharFormat 0 (1 stop bit), bParityType 0 (none),
+    // bDataBits 8.
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x00, 0xC2, 0x01, 0x00, 0, 0, 8 },
+        cdc.class_request(&setup).?,
+    );
 }

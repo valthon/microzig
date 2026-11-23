@@ -38,6 +38,11 @@ pub const AssertOptions = struct {};
 
 pub fn assert(expr: bool, opts: AssertOptions) void {
     _ = opts;
+    // Host unit tests have no firmware configuration module.
+    if (builtin.is_test) {
+        std.debug.assert(expr);
+        return;
+    }
     if (!config.asserts)
         return;
 
@@ -201,6 +206,8 @@ fn microzig_main() callconv(.c) noreturn {
 }
 
 test {
+    // Import USB directly: core also tests the heap, which needs the umm module.
+    _ = @import("core/usb.zig");
     _ = utilities;
     _ = Allocator;
 }
