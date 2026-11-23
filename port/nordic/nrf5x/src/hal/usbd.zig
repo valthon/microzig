@@ -136,12 +136,16 @@ pub const USBD = struct {
         .control_out_data = true,
     };
 
+    /// Mask and clear the USBD interrupt in the NVIC: a bootloader may leave it enabled.
+    /// An application using the USBD interrupt enables it after `init`.
+    ///
     /// Nothing here touches USBPULLUP, EPINEN or EPOUTEN. They are among the registers that
     /// "cannot be accessed" while the peripheral "is not enabled (using the ENABLE register)
     /// and ready (signalled by the READY bit in EVENTCAUSE after a USBEVENT event)"
     /// (nRF52840 PS v1.1, 6.35.12), and it is disabled here. `poll` writes them when READY
     /// has come.
     pub fn init() Self {
+        cpu.interrupt.disable(.USBD);
         peripherals.USBD.ENABLE.write_raw(0);
         peripherals.USBD.EVENTCAUSE.write_raw(0xFFFFFFFF); // W1C all
         peripherals.USBD.EPSTATUS.write_raw(0xFFFFFFFF); // W1C all
@@ -159,6 +163,7 @@ pub const USBD = struct {
             peripherals.USBD.EPOUT[i].PTR.write_raw(0);
             peripherals.USBD.EPOUT[i].MAXCNT.write_raw(0);
         }
+        cpu.interrupt.clear_pending(.USBD);
         return .{
             .interface = .{ .vtable = &vtable },
         };
@@ -1081,6 +1086,21 @@ pub const testing = if (@import("builtin").is_test) struct {
             try std.testing.expectEqualSlices(u8, "x", io.in_packet[0..io.in_len]);
             try std.testing.expect(!dev.dma.faulted);
         }
+    }
+    pub fn init_interrupt() !void {
+        const io = microzig.testing_io;
+        io.reset();
+        io.irq_enabled = true;
+        io.irq_pending = true;
+        var dev = USBD.init();
+        try std.testing.expect(!io.irq_enabled);
+        try std.testing.expect(!io.irq_pending);
+
+        dev.out.arrived(1);
+        USBD.ep_listen(&dev.interface, .ep1, 64);
+        try std.testing.expect(!io.irq_pending);
+        try std.testing.expect(!io.irq_enabled);
+        try std.testing.expect(dev.out.report(1));
     }
     pub fn late_listen() !void {
         const io = microzig.testing_io;

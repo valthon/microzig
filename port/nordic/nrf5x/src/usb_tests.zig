@@ -1,3 +1,7 @@
+test "init masks and clears a bootloader's USBD interrupt before late OUT listen" {
+    try @import("hal/usbd.zig").testing.init_interrupt();
+}
+
 test "late OUT listen pends the previously enabled USBD interrupt" {
     try @import("hal/usbd.zig").testing.late_listen();
 }

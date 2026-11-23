@@ -27,6 +27,9 @@ pub const cpu = struct {
         pub fn set_pending(_: enum { USBD }) void {
             testing_io.irq_pending = true;
         }
+        pub fn clear_pending(_: enum { USBD }) void {
+            testing_io.irq_pending = false;
+        }
     };
 };
 pub const testing_io = struct {
