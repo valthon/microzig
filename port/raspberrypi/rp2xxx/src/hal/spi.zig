@@ -58,11 +58,12 @@ pub const Config = struct {
 };
 
 pub const instance = struct {
-    pub const SPI0: SPI = @as(SPI, @fromBackingInt(0));
-    pub const SPI1: SPI = @as(SPI, @fromBackingInt(1));
     pub fn num(instance_number: u1) SPI {
-        return @as(SPI, @fromBackingInt(instance_number));
+        return @fromBackingInt(instance_number);
     }
+
+    pub const SPI0 = num(0);
+    pub const SPI1 = num(1);
 };
 
 pub const ConfigError = error{
@@ -315,7 +316,7 @@ pub const SPI = enum(u1) {
     pub fn writev_blocking(spi: SPI, comptime PacketType: type, src_vec: []const []const PacketType) void {
         comptime validate_bitwidth(PacketType);
 
-        var src_iter = microzig.utilities.SliceVector([]const u8).init(src_vec).iterator();
+        var src_iter = microzig.utilities.SliceVector([]const PacketType).init(src_vec).iterator();
 
         _ = spi.prime_tx_fifo(PacketType, &src_iter);
 

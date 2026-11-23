@@ -252,25 +252,18 @@ fn nvic_all_off() void {
 // ---------------------------------------------------------------- USB
 
 const USB_Device = hal.usb.Polled(.{});
-const USB_Serial = usb.drivers.CDC;
+const USB_Serial = usb.drivers.CDC.Runtime;
 var usb_device: USB_Device = undefined;
 var usb_ready = false;
 var usb_controller: usb.DeviceController(.{
-    .bcd_usb = USB_Device.max_supported_bcd_usb,
     .device_triple = .unspecified,
-    .vendor = USB_Device.default_vendor_id,
-    .product = USB_Device.default_product_id,
     .bcd_device = .v1_00,
     .serial = "PIOSELFTEST",
-    .max_supported_packet_size = USB_Device.max_supported_packet_size,
-    .configurations = &.{.{
-        .attributes = .{ .self_powered = false },
-        .max_current_ma = 100,
-        .Drivers = struct { serial: USB_Serial },
-    }},
-}, .{.{
-    .serial = .{ .itf_notifi = "PIO selftest", .itf_data = "PIO selftest data" },
-}}) = .init;
+    .device_capabilities = USB_Device.device_capabilities,
+}, &.{usb.Configuration(
+    .{ .attributes = .{ .self_powered = false }, .max_current_ma = 100 },
+    .{ .serial = usb.drivers.CDC{ .itf_notifi_str = "PIO selftest", .itf_data_str = "PIO selftest data" } },
+)}) = .init;
 
 fn serial() ?*USB_Serial {
     return if (usb_controller.drivers()) |d| &d.serial else null;

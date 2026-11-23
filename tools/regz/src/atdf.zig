@@ -24,7 +24,7 @@ const Context = struct {
     db: *Database,
     arena: std.heap.ArenaAllocator,
     interrupt_groups: std.StringHashMapUnmanaged(std.ArrayList(InterruptGroupEntry)) = .empty,
-    inferred_register_group_offsets: std.AutoArrayHashMapUnmanaged(StructID, u64) = .{},
+    inferred_register_group_offsets: std.array_hash_map.Auto(StructID, u64) = .{},
 
     fn init(db: *Database) Context {
         return Context{

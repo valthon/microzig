@@ -67,6 +67,7 @@ pub fn build(b: *Build) void {
             .exclude_dirs = &.{b.path("tools/sorcerer")},
         });
         builder.addRule(.{ .builtin = .no_hidden_allocations }, .{});
+        builder.addRule(.{ .builtin = .no_deprecated }, .{});
         builder.addRule(.{ .builtin = .require_fmt }, .{});
         break :step builder.build();
     });

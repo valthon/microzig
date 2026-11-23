@@ -159,7 +159,7 @@ pub fn load_into_db(db: *Database, io: std.Io, path: []const u8, device: ?[]cons
         chip_files.deinit(allocator);
     }
 
-    var register_files: std.StringArrayHashMapUnmanaged(std.json.Parsed(std.json.Value)) = .empty;
+    var register_files: std.array_hash_map.String(std.json.Parsed(std.json.Value)) = .empty;
     defer {
         for (register_files.values()) |*value|
             value.deinit();
@@ -239,7 +239,7 @@ pub fn load_into_db(db: *Database, io: std.Io, path: []const u8, device: ?[]cons
 
         try handle_extends(allocator, &register_file.value);
 
-        const register_name = try allocator.dupe(u8, entry.name[0 .. entry.name.len - std.fs.path.extension(entry.name).len]);
+        const register_name = try allocator.dupe(u8, entry.name[0 .. entry.name.len - std.Io.Dir.path.extension(entry.name).len]);
         try register_files.put(allocator, register_name, register_file);
     }
 
@@ -251,7 +251,7 @@ pub fn load_into_db(db: *Database, io: std.Io, path: []const u8, device: ?[]cons
             .name = name,
         });
 
-        var enums: std.StringArrayHashMapUnmanaged(Database.EnumID) = .empty;
+        var enums: std.array_hash_map.String(Database.EnumID) = .empty;
         defer enums.deinit(allocator);
 
         for (register_file.value.object.keys(), register_file.value.object.values()) |key, obj| {
@@ -488,7 +488,7 @@ pub fn load_into_db(db: *Database, io: std.Io, path: []const u8, device: ?[]cons
                                     const bit_offset = non_contiguous_offset.object.get("start").?.integer;
                                     const bit_size = non_contiguous_offset.object.get("end").?.integer - bit_offset + 1;
 
-                                    const enum_id = null; //These can't handle the ENUM size but it will still be avaiable to use.
+                                    const enum_id = null; //These can't handle the ENUM size but it will still be available to use.
 
                                     var array_count: ?u16 = null;
                                     var array_stride: ?u8 = null;
@@ -544,11 +544,11 @@ pub fn load_into_db(db: *Database, io: std.Io, path: []const u8, device: ?[]cons
                 .idx = interrupt.number,
             });
 
-            if (std.mem.indexOf(u8, interrupt.name, "FPU")) |_| {
+            if (std.mem.find(u8, interrupt.name, "FPU")) |_| {
                 has_fpu = true;
             }
 
-            if (std.mem.indexOf(u8, interrupt.name, "DMA")) |_| {
+            if (std.mem.find(u8, interrupt.name, "DMA")) |_| {
                 dma_channel_count += 1;
             }
         }
@@ -594,7 +594,7 @@ fn handle_extends(gpa: std.mem.Allocator, root_json: *std.json.Value) !void {
             var arr: std.json.ObjectMap = .empty;
             defer arr.deinit(gpa);
 
-            // Get child value and kind holder of inherting items
+            // Get child value and kind holder of inheriting items
             var child = root_json.object.get(item_name).?;
             const list_name = get_section(item_name);
 
@@ -659,7 +659,7 @@ fn get_parent(gpa: std.mem.Allocator, json_data: *std.json.Value, child_full_nam
 
 /// In the json data
 /// blocks inherit their "items"
-/// fieldsets inherit their "feilds"
+/// fieldsets inherit their "fields"
 /// This picks the appropriate item based on its name.
 fn get_section(child_full_name: []const u8) []const u8 {
     const Item_t = struct {

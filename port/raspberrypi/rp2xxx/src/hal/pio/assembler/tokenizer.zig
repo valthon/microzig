@@ -995,14 +995,14 @@ pub fn Tokenizer(chip: Chip) type {
             // delay brackets permit an unparenthesized expression.
             var contents = Self.init(self.source[0 .. self.index - 1]);
             contents.index = arg.start + 1;
-            const idxl = try contents.keyword("y", diags);
-            const idx: Value = if (idxl) .{ .integer = 0 } else try contents.get_value(diags);
+            const idxi = !try contents.keyword("y", diags);
+            const idx: Value = if (idxi) try contents.get_value(diags) else .{ .integer = 0 };
             try contents.skip_arg_space(&contents.index, diags);
             if (contents.index != contents.source.len) {
                 diags.* = Diagnostics.init(contents.index, "expected ']' after RX FIFO index", .{});
                 return error.InvalidExpression;
             }
-            return .{ .idxl = idxl, .idx = idx };
+            return .{ .idxi = idxi, .idx = idx };
         }
 
         fn get_movrx(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
@@ -1017,7 +1017,7 @@ pub fn Tokenizer(chip: Chip) type {
             try self.optional_comma(diags);
             if (!try self.keyword("rxfifo", diags)) return error.InvalidSource;
             const index = try self.get_fifo_index(diags);
-            return .{ .movfromrx = .{ .idxl = index.idxl, .idx = index.idx } };
+            return .{ .movfromrx = .{ .idxi = index.idxi, .idx = index.idx } };
         }
 
         fn get_irq(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
@@ -1404,12 +1404,14 @@ pub fn Token(comptime chip: Chip) type {
                 };
             };
 
+            /// `idxi`: index by the immediate `idx` (true, `rxfifo[n]`) or by Y (false,
+            /// `rxfifo[y]`); the IdxI bit of RP2350 datasheet 11.4.8.1 and 11.4.9.1.
             pub const MovToRx = struct {
-                idxl: bool,
+                idxi: bool,
                 idx: Value,
             };
             pub const MovFromRx = struct {
-                idxl: bool,
+                idxi: bool,
                 idx: Value,
             };
 

@@ -46,7 +46,7 @@ pub const Error = drivers.I2C_Device.Error || error{
 
 /// Create an I2C instance from a peripheral number (0 or 1).
 pub fn num(n: u1) I2C {
-    return @as(I2C, @fromBackingInt(n));
+    return @fromBackingInt(n);
 }
 
 pub const I2C = enum(u1) {
@@ -326,7 +326,7 @@ pub const I2C = enum(u1) {
                     .LASTTX_STOP = .Disabled,
                 });
 
-            // We always have to START, but if we are not on tthe firstt chunk, we also have to resume
+            // We always have to START, but if we are not on the first chunk, we also have to resume
             regs.TASKS_STARTTX.write(.{ .TASKS_STARTTX = .Trigger });
             if (i != 0)
                 regs.TASKS_RESUME.write(.{ .TASKS_RESUME = .Trigger });

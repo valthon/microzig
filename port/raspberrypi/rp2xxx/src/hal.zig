@@ -1,6 +1,7 @@
 const builtin = @import("builtin");
 const microzig = @import("microzig");
 const SIO = microzig.chip.peripherals.SIO;
+const SYSINFO = microzig.chip.peripherals.SYSINFO;
 
 pub const adc = @import("hal/adc.zig");
 pub const bootmeta = @import("hal/bootmeta.zig");
@@ -69,7 +70,7 @@ pub const HAL_Options = switch (compatibility.chip) {
 
 /// A default clock configuration with sensible defaults that will work
 /// for the majority of use cases. Use this unless you have a specific
-/// clock configuration use case that this wont work for (for instance a custom
+/// clock configuration use case that this won't work for (for instance a custom
 /// board that does NOT use an external oscillator XOSC as the clock source).
 ///
 /// Users will have to provide their own init() function to override init() below
@@ -137,6 +138,32 @@ pub inline fn enable_dcp() void {
 
 pub fn get_cpu_id() u32 {
     return SIO.CPUID.read().CPUID;
+}
+
+pub const ChipId = packed struct(u32) {
+    /// The stop bit that terminates the JEP-106 manufacturer code.
+    stop_bit: bool,
+
+    /// JEP-106 manufacturer code.
+    manufacturer: enum(u11) {
+        RaspberryPiFoundation = 0x493,
+        _,
+    },
+
+    /// JEP-106 part number.
+    part: enum(u16) {
+        RP2040 = 0x0002,
+        RP2350 = 0x0004,
+        _,
+    },
+
+    /// Chip revision (2 for RP2040 B2, 3 for RP2350 A3, etc).
+    revision: u4,
+};
+
+/// Reads the `SYSINFO.CHIP_ID` register.
+pub fn get_chip_id() ChipId {
+    return @bitCast(SYSINFO.CHIP_ID.raw);
 }
 
 var board_id: ?[8]u8 = null;

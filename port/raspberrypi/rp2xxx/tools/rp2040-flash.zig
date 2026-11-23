@@ -230,8 +230,8 @@ fn auto_detect_pico(allocator: std.mem.Allocator) !?[]const u8 {
                 path: []const u8,
             };
 
-            var picos = std.array_list.Managed(Device).init(allocator);
-            defer picos.deinit();
+            var picos: std.ArrayList(Device) = .empty;
+            defer picos.deinit(allocator);
 
             var base_dir = try std.fs.openIterableDirAbsolute("/sys/block/", .{});
             defer base_dir.close();
@@ -243,7 +243,7 @@ fn auto_detect_pico(allocator: std.mem.Allocator) !?[]const u8 {
                 defer device_dir.close();
 
                 const H = struct {
-                    fn is_pico_device(dir: std.fs.Dir, allo: std.mem.Allocator) !?[]const u8 {
+                    fn is_pico_device(dir: std.fs.Dir, alloc: std.mem.Allocator) !?[]const u8 {
                         // "/sys/block/*/removable" => "1"
                         // "/sys/block/*/device/model" => "RP2"
                         // "/sys/block/*/device/vendor" => "RPI"
@@ -264,7 +264,7 @@ fn auto_detect_pico(allocator: std.mem.Allocator) !?[]const u8 {
 
                         const device_id = std.mem.trim(u8, try dir.readFile("dev", &buffer), "\r\n\t ");
 
-                        return try std.fs.path.join(allo, &.{
+                        return try std.Io.Dir.path.join(allo, &.{
                             "/dev/block", device_id,
                         });
                     }
@@ -278,7 +278,7 @@ fn auto_detect_pico(allocator: std.mem.Allocator) !?[]const u8 {
                 };
 
                 if (maybe_device) |device_path| {
-                    try picos.append(Device{
+                    try picos.append(allocator, .{
                         .name = try allocator.dupe(u8, entry.name),
                         .path = device_path,
                     });

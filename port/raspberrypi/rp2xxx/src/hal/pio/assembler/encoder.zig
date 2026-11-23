@@ -541,13 +541,13 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
                 .movtorx => |mov| .{
                     .movtorx = .{
                         .idx = try self.evaluate(u3, program.*, mov.idx, token_index, diags),
-                        .idxl = @intFromBool(!mov.idxl),
+                        .idxi = @intFromBool(mov.idxi),
                     },
                 },
                 .movfromrx => |mov| .{
                     .movfromrx = .{
                         .idx = try self.evaluate(u3, program.*, mov.idx, token_index, diags),
-                        .idxl = @intFromBool(!mov.idxl),
+                        .idxi = @intFromBool(mov.idxi),
                     },
                 },
                 .irq => |irq| blk: {
@@ -603,7 +603,7 @@ pub fn Encoder(comptime chip: Chip, comptime options: Options) type {
 
             if (program.side_set) |side_set| {
                 if (!side_set.optional and token.side_set == null) {
-                    diags.* = Diagnostics.init(token_index, "'side' must be specified for this instruction because 'opt' was not specied in the .side_set directive", .{});
+                    diags.* = Diagnostics.init(token_index, "'side' must be specified for this instruction because 'opt' was not specified in the .side_set directive", .{});
                     return error.InvalidSideSet;
                 }
             } else {
@@ -969,14 +969,16 @@ pub fn Instruction(comptime chip: Chip) type {
         };
 
         // RP2350 only, but we need them for the switch case
+        // IdxI (bit 3): 1 indexes the RX FIFO registers by `idx`, 0 by Y (RP2350 datasheet
+        // 11.4.8.1, 11.4.9.1).
         pub const MovToRx = packed struct(u8) {
             idx: u3,
-            idxl: u1,
+            idxi: u1,
             _reserved0: u4 = 1,
         };
         pub const MovFromRx = packed struct(u8) {
             idx: u3,
-            idxl: u1,
+            idxi: u1,
             _reserved0: u4 = 9,
         };
 
