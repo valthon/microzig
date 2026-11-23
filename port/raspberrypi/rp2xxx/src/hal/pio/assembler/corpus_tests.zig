@@ -23,7 +23,7 @@ fn check_case(comptime chip: Chip, comptime case: corpus.Case) !void {
     // accepted oracle result but enforce the RP2350-only hardware contract.
     if (case.requires_v1 and case.version == 0) {
         try std.testing.expect(result.output == null);
-        try std.testing.expect(std.mem.indexOf(u8, result.diagnostic.?.message.slice(), "PIO version 1") != null);
+        try std.testing.expect(std.mem.find(u8, result.diagnostic.?.message.slice(), "PIO version 1") != null);
         return;
     }
     if (case.words) |expected| {

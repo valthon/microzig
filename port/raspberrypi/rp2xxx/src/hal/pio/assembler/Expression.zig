@@ -123,7 +123,7 @@ const Parser = struct {
 
     fn read(self: *Parser) ParseError!LexToken {
         while (self.cursor < self.source.len) {
-            if (std.mem.indexOfScalar(u8, " \t\r", self.source[self.cursor]) != null) {
+            if (std.mem.findScalar(u8, " \t\r", self.source[self.cursor]) != null) {
                 self.cursor += 1;
             } else if (lexer.comment_end(self.source, self.cursor)) |end| {
                 self.cursor = end;

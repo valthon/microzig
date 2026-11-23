@@ -58,7 +58,7 @@ pub const Mask = enum(chip_specific.PinMask) {
 
 pub fn num(n: u5) Pin {
     std.debug.assert(n < pin_count);
-    return @as(Pin, @fromBackingInt(n));
+    return @fromBackingInt(n);
 }
 
 pub const Pin = enum(u5) {

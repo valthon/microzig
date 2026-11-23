@@ -9,7 +9,7 @@ fn reject(comptime chip: Chip, comptime source: []const u8, comptime message: []
         _ = assembler.assemble_impl(chip, source, &diagnostic, .{}) catch break :blk diagnostic.?;
         @compileError("expected rejection: " ++ source);
     };
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message.slice(), message) != null);
+    try std.testing.expect(std.mem.find(u8, diagnostic.message.slice(), message) != null);
     try std.testing.expect(diagnostic.index <= source.len);
 }
 

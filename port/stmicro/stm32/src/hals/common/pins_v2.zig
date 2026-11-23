@@ -232,7 +232,7 @@ pub const Output_GPIO = struct {
 };
 
 pub const AlternateFunction = struct {
-    // Empty on perpose it should not be used as a GPIO.
+    // Empty on Interrupt it should not be used as a GPIO.
 };
 
 const Analog = struct {
@@ -315,7 +315,7 @@ pub fn Pins(comptime config: GlobalConfiguration) type {
 
     var field_names: [count][]const u8 = undefined;
     var field_types: [count]type = undefined;
-    var field_attrs: [count]std.builtin.Type.Struct.FieldAttributes = undefined;
+    var field_attrs: [count]std.lang.Type.Struct.FieldAttributes = undefined;
     var i: usize = 0;
     for (@typeInfo(GlobalConfiguration).@"struct".field_names, @typeInfo(GlobalConfiguration).@"struct".field_types) |port_field_name, port_field_type| {
         if (port_field_type != ?PortConfiguration) {

@@ -77,6 +77,8 @@ const EP_Config = struct {
 /// not touch the oscillator either); it logs a warning if the oscillator is not running
 /// when it connects the pull-up.
 pub const USBD = struct {
+    const Self = @This();
+
     power: PowerState = .detached,
     /// A timed-out DMA still owns its buffer and anomaly 199 workaround. Only a system
     /// reset may recover this instance; no further peripheral tasks or buffer reuse.
@@ -96,7 +98,7 @@ pub const USBD = struct {
     /// A packet was handed to data IN endpoint n and the host has not taken it yet.
     in_busy: [NUM_EP]bool = @splat(false),
     /// Accepted into bufs_in, but not loaded because waking timed out.
-    in_pending: [NUM_EP]?usb.types.Len = @splat(null),
+    in_pending: [NUM_EP]?usb.types.PacketLength = @splat(null),
     /// The bus is suspended and the peripheral has been put in its low power mode (see
     /// `enter_low_power`). Tasks and the registers of 6.35.12 are then out of reach. `poll`
     /// clears it when it sees the host on the bus again.
@@ -111,10 +113,17 @@ pub const USBD = struct {
 
     interface: usb.DeviceInterface,
 
-    pub const max_supported_packet_size = MAX_PACKET_SIZE;
-    pub const max_supported_bcd_usb: usb.types.Version = .v1_10;
-    pub const default_vendor_id: usb.Config.IdStringPair = .{ .id = 0x1209, .str = "pid.codes" };
-    pub const default_product_id: usb.Config.IdStringPair = .{ .id = 0x0001, .str = "nRF5x test device" };
+    pub const device_capabilities: usb.DeviceCapabilities = .{
+        .max_supported_bcd_usb = .v1_10,
+        .max_packet_size0 = MAX_PACKET_SIZE,
+        .max_packet_size = MAX_PACKET_SIZE,
+        .default_vendor = .{ .id = 0x1209, .str = "pid.codes" },
+        .default_product = .{ .id = 0x0001, .str = "nRF5x test device" },
+    };
+
+    comptime {
+        usb.validate_device(Self);
+    }
 
     const vtable: usb.DeviceInterface.VTable = .{
         .ep_writev = ep_writev,
@@ -127,8 +136,9 @@ pub const USBD = struct {
         .control_out_data = true,
     };
 
-    const Self = @This();
-
+    /// Mask and clear the USBD interrupt in the NVIC: a bootloader may leave it enabled.
+    /// An application using the USBD interrupt enables it after `init`.
+    ///
     /// Nothing here touches USBPULLUP, EPINEN or EPOUTEN. They are among the registers that
     /// "cannot be accessed" while the peripheral "is not enabled (using the ENABLE register)
     /// and ready (signalled by the READY bit in EVENTCAUSE after a USBEVENT event)"
@@ -137,8 +147,9 @@ pub const USBD = struct {
     pub fn init() Self {
         // The EasyDMA registers, against the register table (nRF52840 PS v1.1, 6.35.13). A
         // buffer pointer written anywhere else leaves the endpoint's real PTR as it was
-        // found, and a transfer then copies to or from wherever that points.
-        comptime {
+        // found, and a transfer then copies to or from wherever that points. Host tests
+        // run on a mock register block with its own layout.
+        comptime if (!@import("builtin").is_test) {
             const Regs = @TypeOf(peripherals.USBD.*);
             std.debug.assert(@offsetOf(Regs, "EPIN") == 0x600);
             std.debug.assert(@offsetOf(Regs, "ISOIN") == 0x6A0);
@@ -146,8 +157,9 @@ pub const USBD = struct {
             std.debug.assert(@offsetOf(Regs, "ISOOUT") == 0x7A0);
             std.debug.assert(@sizeOf(@TypeOf(peripherals.USBD.EPIN[0])) == 0x14);
             std.debug.assert(@sizeOf(@TypeOf(peripherals.USBD.EPOUT[0])) == 0x14);
-        }
+        };
 
+        cpu.interrupt.disable(.USBD);
         peripherals.USBD.ENABLE.write_raw(0);
         peripherals.USBD.EVENTCAUSE.write_raw(0xFFFFFFFF); // W1C all
         peripherals.USBD.EPSTATUS.write_raw(0xFFFFFFFF); // W1C all
@@ -165,6 +177,7 @@ pub const USBD = struct {
             peripherals.USBD.EPOUT[i].PTR.write_raw(0);
             peripherals.USBD.EPOUT[i].MAXCNT.write_raw(0);
         }
+        cpu.interrupt.clear_pending(.USBD);
         return .{
             .interface = .{ .vtable = &vtable },
         };
@@ -732,7 +745,7 @@ pub const USBD = struct {
         itf: *usb.DeviceInterface,
         ep_num: usb.types.Endpoint.Num,
         data: []const []const u8,
-    ) usb.types.Len {
+    ) usb.types.PacketLength {
         const self: *Self = @fieldParentPtr("interface", itf);
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled and !self.dma.faulted) cpu.interrupt.enable(.USBD);
@@ -789,7 +802,7 @@ pub const USBD = struct {
             scratch_slice = scratch_slice[len..];
         }
 
-        const len: usb.types.Len = @intCast(scratch_cap - scratch_slice.len);
+        const len: usb.types.PacketLength = @intCast(scratch_cap - scratch_slice.len);
 
         // A driver may write while the bus is suspended. The task that starts the copy
         // cannot be triggered in low power mode (6.35.12), so the peripheral is woken for
@@ -831,7 +844,7 @@ pub const USBD = struct {
         return len;
     }
 
-    fn load_in(self: *Self, i: u4, len: usb.types.Len) bool {
+    fn load_in(self: *Self, i: u4, len: usb.types.PacketLength) bool {
         // Prepare DMA transfer
         peripherals.USBD.EPIN[i].PTR.write_raw(@intFromPtr(&self.bufs_in[i]));
         peripherals.USBD.EPIN[i].MAXCNT.write_raw(len);
@@ -870,7 +883,7 @@ pub const USBD = struct {
         itf: *usb.DeviceInterface,
         ep_num: usb.types.Endpoint.Num,
         data: []const []u8,
-    ) usb.types.Len {
+    ) usb.types.PacketLength {
         var total_len: usize = data[0].len;
         for (data[1..]) |d| total_len += d.len;
         log.debug("ep_readv {t}: ({} bytes)", .{ ep_num, total_len });
@@ -907,7 +920,7 @@ pub const USBD = struct {
     fn ep_listen(
         itf: *usb.DeviceInterface,
         ep_num: usb.types.Endpoint.Num,
-        len: usb.types.Len,
+        len: usb.types.PacketLength,
     ) void {
         const self: *Self = @fieldParentPtr("interface", itf);
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
@@ -1013,11 +1026,11 @@ pub const USBD = struct {
 
 pub const testing = if (@import("builtin").is_test) struct {
     const cdc_desc = blk: {
-        var alloc: usb.DescriptorAllocator = .init(false);
-        break :blk usb.drivers.CDC.Descriptor.create(&alloc, 64, .{}).descriptor;
+        var alloc: usb.DescriptorAllocator = .init(false, &.{});
+        break :blk (usb.drivers.CDC{}).driver_info(.{ .max_packet_size0 = 64, .max_packet_size = 64 }, &alloc).descriptor;
     };
     const CdcController = struct {
-        cdc: usb.drivers.CDC = undefined,
+        cdc: usb.drivers.CDC.Runtime = undefined,
         pub fn on_bus_reset(_: *@This(), _: *usb.DeviceInterface) void {}
         pub fn on_setup_req(_: *@This(), _: *usb.DeviceInterface, _: *const usb.types.SetupPacket) void {}
         pub fn on_buffer(ctl: *@This(), _: *usb.DeviceInterface, comptime ep: usb.types.Endpoint) void {
@@ -1033,7 +1046,7 @@ pub const testing = if (@import("builtin").is_test) struct {
         var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
         var ctl: CdcController = .{};
         var storage: [128]u8 = undefined;
-        ctl.cdc.init(&cdc_desc, &dev.interface, &storage);
+        ctl.cdc.init(.{}, &cdc_desc, &dev.interface, &storage);
         const n = @backingInt(cdc_desc.ep_out.endpoint.num);
         peripherals.USBD.SIZE.EPOUT[n].raw = @intCast(io.out_packet.len);
         dev.out.arrived(n);
@@ -1062,7 +1075,7 @@ pub const testing = if (@import("builtin").is_test) struct {
             var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected, .low_power = true };
             var ctl: CdcController = .{};
             var storage: [128]u8 = undefined;
-            ctl.cdc.init(&cdc_desc, &dev.interface, &storage);
+            ctl.cdc.init(.{}, &cdc_desc, &dev.interface, &storage);
             const n = @backingInt(cdc_desc.ep_in.endpoint.num);
             peripherals.USBD.EPINEN.raw = @as(u32, 1) << n;
             const payload: [64]u8 = @splat(0x5a);
@@ -1078,7 +1091,7 @@ pub const testing = if (@import("builtin").is_test) struct {
             peripherals.USBD.EVENTCAUSE.raw = CAUSE_RESUME;
             dev.poll(&ctl);
             try std.testing.expectEqualSlices(u8, payload[0..len], io.in_packet[0..io.in_len]);
-            try std.testing.expectEqual(@as(?usb.types.Len, null), dev.in_pending[n]);
+            try std.testing.expectEqual(@as(?usb.types.PacketLength, null), dev.in_pending[n]);
             peripherals.USBD.EVENTS_EPDATA.raw = 1;
             peripherals.USBD.EPDATASTATUS.raw = @as(u32, 1) << n;
             dev.poll(&ctl);
@@ -1087,6 +1100,21 @@ pub const testing = if (@import("builtin").is_test) struct {
             try std.testing.expectEqualSlices(u8, "x", io.in_packet[0..io.in_len]);
             try std.testing.expect(!dev.dma.faulted);
         }
+    }
+    pub fn init_interrupt() !void {
+        const io = microzig.testing_io;
+        io.reset();
+        io.irq_enabled = true;
+        io.irq_pending = true;
+        var dev = USBD.init();
+        try std.testing.expect(!io.irq_enabled);
+        try std.testing.expect(!io.irq_pending);
+
+        dev.out.arrived(1);
+        USBD.ep_listen(&dev.interface, .ep1, 64);
+        try std.testing.expect(!io.irq_pending);
+        try std.testing.expect(!io.irq_enabled);
+        try std.testing.expect(dev.out.report(1));
     }
     pub fn late_listen() !void {
         const io = microzig.testing_io;
@@ -1121,7 +1149,7 @@ pub const testing = if (@import("builtin").is_test) struct {
         try std.testing.expect(dev.low_power);
         try std.testing.expect(!dev.dma.faulted);
         try std.testing.expect(dev.in_busy[1]);
-        try std.testing.expectEqual(@as(?usb.types.Len, 6), dev.in_pending[1]);
+        try std.testing.expectEqual(@as(?usb.types.PacketLength, 6), dev.in_pending[1]);
         try std.testing.expectEqual(0, peripherals.USBD.EPIN[1].PTR.raw);
         try std.testing.expectEqual(0, peripherals.USBD.TASKS_STARTEPIN[1].raw);
         // A later successful wake can still establish readiness, without quarantine.

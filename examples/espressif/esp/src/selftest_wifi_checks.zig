@@ -202,7 +202,7 @@ fn on_packet_transmitted(iface: radio.wifi.Interface, data: []const u8, status: 
     // Ethernet offsets of `frame` do not apply. Find the marker instead; that also
     // skips unrelated traffic such as the EAPOL handshake.
     if (iface != .sta) return;
-    const at = std.mem.indexOf(u8, data, marker) orelse return;
+    const at = std.mem.find(u8, data, marker) orelse return;
     if (at + marker.len >= data.len) return;
     const seq = data[at + marker.len];
     if (seq >= frame_count) return;

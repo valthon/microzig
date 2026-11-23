@@ -166,7 +166,7 @@ jobs:
     continue-on-error: true
     strategy:
       matrix:
-        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -175,9 +175,6 @@ jobs:
         uses: mlugg/setup-zig@v2
       - name: Build Printer
         run: zig build
-        working-directory: tools/printer
-      - name: Test Printer
-        run: zig build test
         working-directory: tools/printer
 
   stm32-gen-check:

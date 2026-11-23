@@ -36,7 +36,7 @@ fn report(
 ) void {
     var buffer: [256]u8 = undefined;
     // Start on a fresh line even if the previous attempt delivered a fragment.
-    const line = std.fmt.bufPrint(&buffer, "\r\n" ++ format ++ "\r\n", args) catch
+    const line = std.mem.print(&buffer, "\r\n" ++ format ++ "\r\n", args) catch
         "\r\nSELFTEST systimer report: FAIL formatting overflow\r\n";
     var polls_left: usize = 1_000_000;
     var offset: usize = 0;

@@ -491,7 +491,7 @@ fn legacy_dump_keys(keys: []DumpKey, values: [][4]u8, allowed_u32: [][1]?[]const
     const fixed = [_]struct { []const u8, u32 }{ .{ "before", 0x0badcafe }, .{ "after", 0xfeedf00d } };
     var count: usize = 0;
     for (0..fixed.len + fillers) |i| {
-        const name: []const u8 = if (i < fixed.len) fixed[i][0] else try std.fmt.bufPrint(&names[i], "k{d}", .{i - fixed.len});
+        const name: []const u8 = if (i < fixed.len) fixed[i][0] else try std.mem.print(&names[i], "k{d}", .{i - fixed.len});
         std.mem.writeInt(u32, &values[i], if (i < fixed.len) fixed[i][1] else @intCast(i - fixed.len), .little);
         allowed_u32[i] = .{&values[i]};
         keys[count] = .{ .ns = "fixture", .name = name, .idf_type = 0x04, .allowed = &allowed_u32[i] };
@@ -520,7 +520,7 @@ fn replay_legacy(comptime case: LegacyCase, mode: nvs.OpenMode) !usize {
     var name: [8]u8 = undefined;
     if (case.fill) {
         while (store.active == null or format.entries_per_page - @as(usize, store.next_free) > 3) : (fillers += 1) {
-            try h.set(u32, try std.fmt.bufPrint(&name, "k{d}", .{fillers}), fillers);
+            try h.set(u32, try std.mem.print(&name, "k{d}", .{fillers}), fillers);
         }
     }
     const seed = base;
@@ -581,7 +581,7 @@ fn replay_legacy(comptime case: LegacyCase, mode: nvs.OpenMode) !usize {
             try testing.expectEqual(@as(usize, @intFromBool(kept_old)), legacy_items(&mem));
             try testing.expectEqual(@as(u32, 0x0badcafe), try r.get(u32, "before"));
             try testing.expectEqual(@as(u32, 0xfeedf00d), try r.get(u32, "after"));
-            for (0..fillers) |i| try testing.expectEqual(@as(u32, @intCast(i)), try r.get(u32, try std.fmt.bufPrint(&name, "k{d}", .{i})));
+            for (0..fillers) |i| try testing.expectEqual(@as(u32, @intCast(i)), try r.get(u32, try std.mem.print(&name, "k{d}", .{i})));
             const chosen = [_]?[]const u8{if (kept_old) old else new};
             try write_record(&mem, try legacy_dump_keys(&keys, &values, &allowed, &names, fillers, &chosen), target, prefix, after, true);
 

@@ -78,19 +78,15 @@ var meter_hz: u32 = 0;
 const USB_Device = hal.usb.Polled(.{});
 var usb_device: USB_Device = undefined;
 var usb_controller: usb.DeviceController(.{
-    .bcd_usb = USB_Device.max_supported_bcd_usb,
     .device_triple = .unspecified,
-    .vendor = USB_Device.default_vendor_id,
-    .product = .{ .id = USB_Device.default_product_id.id, .str = "MicroZig ESP peer" },
+    .product = .{ .id = USB_Device.device_capabilities.default_product.?.id, .str = "MicroZig ESP peer" },
     .bcd_device = .v1_00,
     .serial = "ESPPEER",
-    .max_supported_packet_size = USB_Device.max_supported_packet_size,
-    .configurations = &.{.{
-        .attributes = .{ .self_powered = false },
-        .max_current_ma = 100,
-        .Drivers = struct { serial: usb.drivers.CDC },
-    }},
-}, .{.{ .serial = .{ .itf_notifi = "ESP peer", .itf_data = "ESP peer data" } }}) = .init;
+    .device_capabilities = USB_Device.device_capabilities,
+}, &.{usb.Configuration(
+    .{ .attributes = .{ .self_powered = false }, .max_current_ma = 100 },
+    .{ .serial = usb.drivers.CDC{ .itf_notifi_str = "ESP peer", .itf_data_str = "ESP peer data" } },
+)}) = .init;
 pub const panic = microzig.panic;
 pub const std_options = microzig.std_options(.{});
 pub const microzig_options: microzig.Options = .{
@@ -152,7 +148,7 @@ var console_head: usize = 0;
 var console_len: usize = 0;
 fn emit(comptime fmt: []const u8, args: anytype) void {
     var buffer: [512]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, fmt ++ "\r\n", args) catch {
+    const text = std.mem.print(&buffer, fmt ++ "\r\n", args) catch {
         errors += 1;
         return;
     };

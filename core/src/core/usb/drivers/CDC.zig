@@ -2,11 +2,13 @@ const std = @import("std");
 const microzig = @import("../../../microzig.zig");
 const assert = microzig.assert;
 
-const mem = @import("../../mem.zig");
-const EndianInt = mem.EndianInt;
-
 const usb = @import("../../usb.zig");
 const log = std.log.scoped(.usb_cdc);
+
+const Driver = @This();
+
+itf_notifi_str: []const u8 = "",
+itf_data_str: []const u8 = "",
 
 /// CDC PSTN Subclass Management Element Requests
 pub const ManagementRequestType = enum(u8) {
@@ -51,7 +53,7 @@ pub const LineCoding = extern struct {
         _,
     };
 
-    bit_rate: EndianInt(u32, .little) align(1),
+    bit_rate: usb.types.LeInt(u32) align(1),
     stop_bits: StopBits,
     parity: Parity,
     data_bits: u8,
@@ -78,264 +80,269 @@ pub const Descriptor = extern struct {
     itf_data: desc.Interface,
     ep_out: desc.Endpoint,
     ep_in: desc.Endpoint,
+};
 
-    const Strings = struct {
-        itf_notifi: []const u8 = "",
-        itf_data: []const u8 = "",
+pub const Runtime = struct {
+    device: *usb.DeviceInterface,
+    descriptor: *const Descriptor,
+    line_coding: LineCoding align(4),
+    notifi_ready: std.atomic.Value(bool),
+
+    rx_data: []u8,
+    rx_seek: usb.types.PacketLength,
+    rx_end: usb.types.PacketLength,
+    rx_ready: std.atomic.Value(bool),
+
+    tx_data: []u8,
+    tx_end: usb.types.PacketLength,
+    tx_ready: std.atomic.Value(bool),
+    /// A full packet needs a short packet to terminate the host's bulk transfer
+    /// (USB 2.0, 5.8.3). Foreground writes can cancel this when more data is queued;
+    /// the completion handler claims it before submitting the terminating ZLP.
+    tx_zlp_pending: std.atomic.Value(bool),
+
+    pub fn available(self: *@This()) usb.types.PacketLength {
+        return self.rx_end - self.rx_seek;
+    }
+
+    pub fn read(self: *@This(), dst: []u8) usize {
+        const len = @min(dst.len, self.rx_end - self.rx_seek);
+        @memcpy(dst[0..len], self.rx_data[self.rx_seek..][0..len]);
+        self.rx_seek += len;
+
+        if (self.available() > 0) return len;
+
+        // request more data
+        if (self.rx_ready.load(.seq_cst)) {
+            const ep_out = self.descriptor.ep_out.endpoint.num;
+            self.rx_ready.store(false, .seq_cst);
+            self.rx_end = self.device.ep_readv(ep_out, &.{self.rx_data});
+            self.rx_seek = 0;
+            self.device.ep_listen(ep_out, @intCast(self.rx_data.len));
+        }
+
+        return len;
+    }
+
+    pub fn write(self: *@This(), data: []const u8) usize {
+        const len = @min(self.tx_data.len - self.tx_end, data.len);
+
+        // Only an accepted byte can continue the preceding full packet. An empty write
+        // or one refused because the buffer is full must not suppress its termination.
+        if (len != 0) self.tx_zlp_pending.store(false, .seq_cst);
+        @memcpy(self.tx_data[self.tx_end..][0..len], data[0..len]);
+        self.tx_end += @intCast(len);
+
+        if (self.tx_end == self.tx_data.len)
+            _ = self.flush();
+
+        return len;
+    }
+
+    /// Flushes tx buffer. Returns true if there is no more buffered data.
+    pub fn flush(self: *@This()) bool {
+        if (self.tx_end == 0)
+            return true;
+
+        if (!self.tx_ready.load(.seq_cst))
+            return false;
+        self.tx_ready.store(false, .seq_cst);
+        // Publish before ep_writev: a HAL may report completion before that call returns.
+        self.tx_zlp_pending.store(self.tx_end == self.tx_data.len, .seq_cst);
+
+        // The IN endpoint is idle here and `tx_data` is one max-size packet (`init` checked that),
+        // so the endpoint takes all of it. `tx_ready` is true only after `init`, when the
+        // controller opens the endpoint and `ep_open` leaves it idle, or after the HAL reported
+        // the previous packet sent. A HAL that returns short from `ep_writev` because its endpoint
+        // is still busy has broken that; the tail would be dropped, so stop here in the builds
+        // that check (`microzig.assert`). The others carry on without the tail.
+        assert(self.tx_end == self.device.ep_writev(
+            self.descriptor.ep_in.endpoint.num,
+            &.{self.tx_data[0..self.tx_end]},
+        ), .{});
+        self.tx_end = 0;
+        return true;
+    }
+
+    // *** USB driver interface below ***
+
+    // Called when the host selects a configuration.
+    pub fn init(
+        self: *Runtime,
+        _: Driver,
+        descriptor: *const Descriptor,
+        device: *usb.DeviceInterface,
+        data: []u8,
+    ) void {
+        const len_half = @divExact(data.len, 2);
+        // `driver_info` asks for two max-size packets (`Alloc`). `ep_readv` needs a buffer that
+        // fits a whole packet, and `flush` relies on a tx buffer of one packet.
+        assert(len_half == descriptor.ep_in.max_packet_size.native(), .{});
+        assert(len_half == descriptor.ep_out.max_packet_size.native(), .{});
+        self.* = .{
+            .device = device,
+            .descriptor = descriptor,
+            .line_coding = .init,
+            .notifi_ready = .init(true),
+
+            // `init` provides a data buffer, which we split in half for rx and tx data.
+            .rx_data = data[0..len_half],
+            .rx_seek = 0,
+            .rx_end = 0,
+            .rx_ready = .init(false),
+
+            .tx_data = data[len_half..],
+            .tx_end = 0,
+            .tx_ready = .init(true),
+            .tx_zlp_pending = .init(false),
+        };
+        device.ep_listen(descriptor.ep_out.endpoint.num, @intCast(self.rx_data.len));
+    }
+
+    // These field names are matched (at comptime) to the field names in the descriptor returned from
+    // `create` when binding the endpoints.
+    pub const handlers: usb.DriverHandlers(Descriptor, @This()) = .{
+        .ep_notifi = on_notifi_ready,
+        .ep_out = on_rx,
+        .ep_in = on_tx_ready,
     };
 
-    /// This function is used during descriptor creation. Endpoint and interface numbers are
-    /// allocated through the `alloc` parameter. Third argument can be of any type, it's passed
-    /// by the user when creating the device controller type. If multiple instances of a driver
-    /// are used, this function is called for each, with different arguments. Passing arguments
-    /// through this function is preferred to making the whole driver generic.
-    pub fn create(
-        alloc: *usb.DescriptorAllocator,
-        max_supported_packet_size: usb.types.Len,
-        strings: Strings,
-    ) usb.DescriptorCreateResult(@This()) {
-        // Endpoint and interface numbers are allocated through the `alloc` parameter,
-        // so that multiple instances of this driver can coexist.
-        const itf_notifi = alloc.next_itf();
-        const itf_data = alloc.next_itf();
-        return .{
-            .descriptor = .{
-                .itf_assoc = .{
-                    .first_interface = itf_notifi,
-                    .interface_count = 2,
-                    .function_class = 2,
-                    .function_subclass = 2,
-                    .function_protocol = 0,
-                    .function = 0,
-                },
-                .itf_notifi = .{
-                    .interface_number = itf_notifi,
-                    .alternate_setting = 0,
-                    .num_endpoints = 1,
-                    .interface_triple = .from(.CDC, .Abstract, .NoneRequired),
-                    .interface_s = alloc.string(strings.itf_notifi),
-                },
-                .cdc_header = .{ .bcd_cdc = .from(1, 20) },
-                .cdc_call_mgmt = .{
-                    .capabilities = .none,
-                    .data_interface = itf_data,
-                },
-                .cdc_acm = .{
-                    .capabilities = .{
-                        .comm_feature = false,
-                        .send_break = false,
-                        // Line coding requests get sent regardless of this bit
-                        .line_coding = true,
-                        .network_connection = false,
-                    },
-                },
-                .cdc_union = .{
-                    .master_interface = itf_notifi,
-                    .slave_interface_0 = itf_data,
-                },
-                // High-speed interrupt intervals are encoded as
-                // 2^(bInterval - 1) microframes, while full-speed intervals
-                // are expressed directly in milliseconds. Keep the intended
-                // polling period at 16 ms for both speeds.
-                .ep_notifi = .interrupt(
-                    alloc.next_ep(.in),
-                    8,
-                    if (max_supported_packet_size > 64) 8 else 16,
-                ),
-                .itf_data = .{
-                    .interface_number = itf_data,
-                    .alternate_setting = 0,
-                    .num_endpoints = 2,
-                    .interface_triple = .from(.CDC_Data, .Unused, .NoneRequired),
-                    .interface_s = alloc.string(strings.itf_data),
-                },
-                .ep_out = .bulk(alloc.next_ep(.out), max_supported_packet_size),
-                .ep_in = .bulk(alloc.next_ep(.in), max_supported_packet_size),
-            },
-            .alloc_bytes = 2 * max_supported_packet_size,
+    /// Handle class-specific SETUP requests where recipient=Interface
+    /// Called by DeviceController when the interface number matches this driver.
+    pub fn class_request(self: *@This(), setup: *const usb.types.SetupPacket) ?[]const u8 {
+        const mgmt_request: ManagementRequestType = @fromBackingInt(setup.request);
+        log.debug("cdc setup: {any} {} {}", .{ mgmt_request, setup.length.native(), setup.value.native() });
+
+        return switch (mgmt_request) {
+            .SetLineCoding => usb.ack, // The data stage is delivered to class_data.
+            .GetLineCoding => std.mem.asBytes(&self.line_coding),
+            .SetControlLineState => usb.ack,
+            .SendBreak => usb.ack,
+            else => usb.nak,
         };
     }
-};
 
-// These field names are matched (at comptime) to the field names in the descriptor returned from
-// `create` when binding the endpoints.
-pub const handlers: usb.DriverHandlers(@This()) = .{
-    .ep_notifi = on_notifi_ready,
-    .ep_out = on_rx,
-    .ep_in = on_tx_ready,
-};
+    /// The longest data stage of a request this driver takes: SET_LINE_CODING's 7 bytes.
+    pub const class_data_len = @sizeOf(LineCoding);
 
-device: *usb.DeviceInterface,
-descriptor: *const Descriptor,
-line_coding: LineCoding align(4),
-notifi_ready: std.atomic.Value(bool),
-
-rx_data: []u8,
-rx_seek: usb.types.Len,
-rx_end: usb.types.Len,
-rx_ready: std.atomic.Value(bool),
-
-tx_data: []u8,
-tx_end: usb.types.Len,
-tx_ready: std.atomic.Value(bool),
-/// A full packet needs a short packet to terminate the host's bulk transfer
-/// (USB 2.0, 5.8.3). Foreground writes can cancel this when more data is queued;
-/// the completion handler claims it before submitting the terminating ZLP.
-tx_zlp_pending: std.atomic.Value(bool),
-
-pub fn available(self: *@This()) usb.types.Len {
-    return self.rx_end - self.rx_seek;
-}
-
-pub fn read(self: *@This(), dst: []u8) usize {
-    const len = @min(dst.len, self.rx_end - self.rx_seek);
-    @memcpy(dst[0..len], self.rx_data[self.rx_seek..][0..len]);
-    self.rx_seek += len;
-
-    if (self.available() > 0) return len;
-
-    // request more data
-    if (self.rx_ready.load(.seq_cst)) {
-        const ep_out = self.descriptor.ep_out.endpoint.num;
-        self.rx_ready.store(false, .seq_cst);
-        self.rx_end = self.device.ep_readv(ep_out, &.{self.rx_data});
-        self.rx_seek = 0;
-        self.device.ep_listen(ep_out, @intCast(self.rx_data.len));
+    /// The data stage of a request `class_request` accepted, on a device that hands it over
+    /// (`usb.DeviceInterface.VTable.control_out_data`); returns whether the request is still
+    /// accepted. On any other device the request has its answer before the data arrives, and
+    /// `line_coding` keeps its initial value whatever the host sets.
+    pub fn class_data(self: *@This(), setup: *const usb.types.SetupPacket, data: []const u8) bool {
+        const mgmt_request: ManagementRequestType = @fromBackingInt(setup.request);
+        switch (mgmt_request) {
+            .SetLineCoding => {
+                if (data.len != @sizeOf(LineCoding)) return false;
+                @memcpy(std.mem.asBytes(&self.line_coding), data);
+                return true;
+            },
+            // The other requests that are accepted carry no data this driver has a use for.
+            else => return true,
+        }
     }
 
-    return len;
-}
+    pub fn on_rx(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
+        if (self.rx_ready.load(.seq_cst))
+            log.warn("{s}({t}) called before buffer was consumed", .{ "on_rx", ep_num });
+        self.rx_ready.store(true, .seq_cst);
+    }
 
-pub fn write(self: *@This(), data: []const u8) usize {
-    const len = @min(self.tx_data.len - self.tx_end, data.len);
+    pub fn on_tx_ready(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
+        if (self.tx_ready.load(.seq_cst))
+            log.warn("{s}({t}) called before buffer was consumed", .{ "on_tx_ready", ep_num });
+        if (self.tx_zlp_pending.swap(false, .seq_cst)) {
+            // USB 2.0, 5.8.3: terminate a max-packet-aligned bulk transfer whose length
+            // is not known to the host. Keep ownership until the ZLP's own completion;
+            // otherwise a foreground flush could overwrite it with the next payload.
+            assert(0 == self.device.ep_writev(ep_num, &.{""}), .{});
+            return;
+        }
+        self.tx_ready.store(true, .seq_cst);
+    }
 
-    // Only an accepted byte can continue the preceding full packet. An empty write
-    // or one refused because the buffer is full must not suppress its termination.
-    if (len != 0) self.tx_zlp_pending.store(false, .seq_cst);
-    @memcpy(self.tx_data[self.tx_end..][0..len], data[0..len]);
-    self.tx_end += @intCast(len);
+    pub fn on_notifi_ready(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
+        if (self.notifi_ready.load(.seq_cst))
+            log.warn("{s}({t}) called before buffer was consumed", .{ "on_notifi_ready", ep_num });
+        self.notifi_ready.store(true, .seq_cst);
+    }
+};
 
-    if (self.tx_end == self.tx_data.len)
-        _ = self.flush();
-
-    return len;
-}
-
-/// Flushes tx buffer. Returns true if there is no more buffered data.
-pub fn flush(self: *@This()) bool {
-    if (self.tx_end == 0)
-        return true;
-
-    if (!self.tx_ready.load(.seq_cst))
-        return false;
-    self.tx_ready.store(false, .seq_cst);
-    // Publish before ep_writev: a HAL may report completion before that call returns.
-    self.tx_zlp_pending.store(self.tx_end == self.tx_data.len, .seq_cst);
-
-    // The IN endpoint is idle here and `tx_data` is one max-size packet (`init` checked that), so
-    // the endpoint takes all of it. `tx_ready` is true only after `init`, when the controller
-    // opens the endpoint and `ep_open` leaves it idle, or after the HAL reported the previous
-    // packet sent. A HAL that returns short from `ep_writev` because its endpoint is still busy
-    // has broken that; the tail would be dropped, so stop here in the builds that check
-    // (`microzig.assert`). The others carry on without the tail.
-    assert(self.tx_end == self.device.ep_writev(
-        self.descriptor.ep_in.endpoint.num,
-        &.{self.tx_data[0..self.tx_end]},
-    ), .{});
-    self.tx_end = 0;
-    return true;
-}
-
-// Called when the host selects a configuration.
-pub fn init(self: *@This(), desc: *const Descriptor, device: *usb.DeviceInterface, data: []u8) void {
-    const len_half = @divExact(data.len, 2);
-    // `Descriptor.create` asks for two max-size packets. `ep_readv` needs a buffer that fits a
-    // whole packet, and `flush` relies on a tx buffer of one packet.
-    assert(len_half == desc.ep_in.max_packet_size.native(), .{});
-    assert(len_half == desc.ep_out.max_packet_size.native(), .{});
-    self.* = .{
-        .device = device,
-        .descriptor = desc,
-        .line_coding = .init,
-        .notifi_ready = .init(true),
-
-        // `init` provides a data buffer, which we split in half for rx and tx data.
-        .rx_data = data[0..len_half],
-        .rx_seek = 0,
-        .rx_end = 0,
-        .rx_ready = .init(false),
-
-        .tx_data = data[len_half..],
-        .tx_end = 0,
-        .tx_ready = .init(true),
-        .tx_zlp_pending = .init(false),
-    };
-    device.ep_listen(desc.ep_out.endpoint.num, @intCast(self.rx_data.len));
-}
-
-/// Handle class-specific SETUP requests where recipient=Interface
-/// Called by DeviceController when the interface number matches this driver.
-pub fn class_request(self: *@This(), setup: *const usb.types.SetupPacket) ?[]const u8 {
-    const mgmt_request: ManagementRequestType = @fromBackingInt(setup.request);
-    log.debug("cdc setup: {any} {} {}", .{ mgmt_request, setup.length.native(), setup.value.native() });
-
-    return switch (mgmt_request) {
-        // The line coding itself is the data stage, which `class_data` is given.
-        .SetLineCoding => usb.ack,
-        .GetLineCoding => std.mem.asBytes(&self.line_coding),
-        .SetControlLineState => usb.ack,
-        .SendBreak => usb.ack,
-        else => usb.nak,
-    };
-}
-
-/// The longest data stage of a request this driver takes: SET_LINE_CODING's 7 bytes.
-pub const class_data_len = @sizeOf(LineCoding);
-
-/// The data stage of a request `class_request` accepted, on a device that hands it over
-/// (`usb.DeviceInterface.VTable.control_out_data`); returns whether the request is still
-/// accepted. On any other device the request has its answer before the data arrives, and
-/// `line_coding` keeps its initial value whatever the host sets.
-pub fn class_data(self: *@This(), setup: *const usb.types.SetupPacket, data: []const u8) bool {
-    const mgmt_request: ManagementRequestType = @fromBackingInt(setup.request);
-    switch (mgmt_request) {
-        .SetLineCoding => {
-            if (data.len != @sizeOf(LineCoding)) return false;
-            @memcpy(std.mem.asBytes(&self.line_coding), data);
-            return true;
+/// This function is used during descriptor creation. Endpoint and interface numbers are
+/// allocated through the `alloc` parameter. Third argument can be of any type, it's passed
+/// by the user when creating the device controller type. If multiple instances of a driver
+/// are used, this function is called for each, with different arguments. Passing arguments
+/// through this function is preferred to making the whole driver generic.
+pub fn driver_info(
+    self: Driver,
+    comptime device_capabilities: usb.DeviceCapabilities,
+    alloc: *usb.DescriptorAllocator,
+) usb.DriverInfo(Descriptor) {
+    // Endpoint and interface numbers are allocated through the `alloc` parameter,
+    // so that multiple instances of this driver can coexist.
+    const itf_notifi = alloc.next_itf();
+    const itf_data = alloc.next_itf();
+    return .{
+        .Runtime = Runtime,
+        .Alloc = [2 * device_capabilities.max_packet_size]u8,
+        .descriptor = .{
+            .itf_assoc = .{
+                .first_interface = itf_notifi,
+                .interface_count = 2,
+                .function_class = 2,
+                .function_subclass = 2,
+                .function_protocol = 0,
+                .function = 0,
+            },
+            .itf_notifi = .{
+                .interface_number = itf_notifi,
+                .alternate_setting = 0,
+                .num_endpoints = 1,
+                .interface_triple = .from(.CDC, .Abstract, .NoneRequired),
+                .interface_s = alloc.string(self.itf_notifi_str),
+            },
+            .cdc_header = .{ .bcd_cdc = .from(1, 20) },
+            .cdc_call_mgmt = .{
+                .capabilities = .none,
+                .data_interface = itf_data,
+            },
+            .cdc_acm = .{
+                .capabilities = .{
+                    .comm_feature = false,
+                    .send_break = false,
+                    // Line coding requests get sent regardless of this bit
+                    .line_coding = true,
+                    .network_connection = false,
+                },
+            },
+            .cdc_union = .{
+                .master_interface = itf_notifi,
+                .slave_interface_0 = itf_data,
+            },
+            // High-speed interrupt intervals are encoded as
+            // 2^(bInterval - 1) microframes, while full-speed intervals
+            // are expressed directly in milliseconds. Keep the intended
+            // polling period at 16 ms for both speeds.
+            .ep_notifi = .interrupt(
+                alloc.next_ep(.in),
+                8,
+                if (device_capabilities.max_packet_size > 64) 8 else 16,
+            ),
+            .itf_data = .{
+                .interface_number = itf_data,
+                .alternate_setting = 0,
+                .num_endpoints = 2,
+                .interface_triple = .from(.CDC_Data, .Unused, .NoneRequired),
+                .interface_s = alloc.string(self.itf_data_str),
+            },
+            .ep_out = .bulk(alloc.next_ep(.out), device_capabilities.max_packet_size),
+            .ep_in = .bulk(alloc.next_ep(.in), device_capabilities.max_packet_size),
         },
-        // The other requests that are accepted carry no data this driver has a use for.
-        else => return true,
-    }
-}
-
-pub fn on_rx(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
-    if (self.rx_ready.load(.seq_cst))
-        log.warn("{s}({t}) called before buffer was consumed", .{ "on_rx", ep_num });
-    self.rx_ready.store(true, .seq_cst);
-}
-
-pub fn on_tx_ready(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
-    if (self.tx_ready.load(.seq_cst))
-        log.warn("{s}({t}) called before buffer was consumed", .{ "on_tx_ready", ep_num });
-    if (self.tx_zlp_pending.swap(false, .seq_cst)) {
-        // USB 2.0, 5.8.3: terminate a max-packet-aligned bulk transfer whose length
-        // is not known to the host. Keep ownership until the ZLP's own completion;
-        // otherwise a foreground flush could overwrite it with the next payload.
-        assert(0 == self.device.ep_writev(ep_num, &.{""}), .{});
-        return;
-    }
-    self.tx_ready.store(true, .seq_cst);
-}
-
-pub fn on_notifi_ready(self: *@This(), ep_num: usb.types.Endpoint.Num) void {
-    if (self.notifi_ready.load(.seq_cst))
-        log.warn("{s}({t}) called before buffer was consumed", .{ "on_notifi_ready", ep_num });
-    self.notifi_ready.store(true, .seq_cst);
+    };
 }
 
 test "GET_LINE_CODING replies with the 7-byte line coding structure" {
-    var cdc: @This() = undefined;
+    var cdc: Runtime = undefined;
     cdc.line_coding = .init;
     // The controller truncates a reply to wLength, so a host asking for more than 7 bytes
     // receives everything `class_request` returns.
@@ -376,7 +383,7 @@ const TestDevice = struct {
         .set_address = set_address,
     };
 
-    fn ep_writev(itf: *usb.DeviceInterface, _: usb.types.Endpoint.Num, data: []const []const u8) usb.types.Len {
+    fn ep_writev(itf: *usb.DeviceInterface, _: usb.types.Endpoint.Num, data: []const []const u8) usb.types.PacketLength {
         const self: *TestDevice = @fieldParentPtr("interface", itf);
         std.debug.assert(self.packet_len == null);
         var len: usize = 0;
@@ -391,10 +398,10 @@ const TestDevice = struct {
         return @intCast(len);
     }
 
-    fn ep_readv(_: *usb.DeviceInterface, _: usb.types.Endpoint.Num, _: []const []u8) usb.types.Len {
+    fn ep_readv(_: *usb.DeviceInterface, _: usb.types.Endpoint.Num, _: []const []u8) usb.types.PacketLength {
         return 0;
     }
-    fn ep_listen(_: *usb.DeviceInterface, _: usb.types.Endpoint.Num, _: usb.types.Len) void {}
+    fn ep_listen(_: *usb.DeviceInterface, _: usb.types.Endpoint.Num, _: usb.types.PacketLength) void {}
     fn ep_open(_: *usb.DeviceInterface, _: *const usb.descriptor.Endpoint) void {}
     fn set_address(_: *usb.DeviceInterface, _: u7) void {}
 
@@ -409,12 +416,12 @@ const TestDevice = struct {
     }
 };
 
-const CDC = @This();
+const CDC = Runtime;
 
-fn test_descriptor(comptime packet_size: usb.types.Len) Descriptor {
+fn test_descriptor(comptime packet_size: usb.types.PacketLength) Descriptor {
     return comptime blk: {
-        var alloc: usb.DescriptorAllocator = .init(false);
-        break :blk Descriptor.create(&alloc, packet_size, .{}).descriptor;
+        var alloc: usb.DescriptorAllocator = .init(false, &.{});
+        break :blk (Driver{}).driver_info(.{ .max_packet_size0 = 64, .max_packet_size = packet_size }, &alloc).descriptor;
     };
 }
 
@@ -424,7 +431,7 @@ test "full CDC packets terminate with a ZLP before making the endpoint writable"
         var storage: [2 * packet_size]u8 = undefined;
         var dev: TestDevice = .{ .max_packet_size = packet_size };
         var cdc: CDC = undefined;
-        cdc.init(&desc, &dev.interface, &storage);
+        cdc.init(.{}, &desc, &dev.interface, &storage);
         const payload: [packet_size]u8 = @splat(0xa5);
         try std.testing.expectEqual(payload.len, cdc.write(&payload));
         try std.testing.expect(cdc.flush()); // auto-flush already submitted the full packet
@@ -456,7 +463,7 @@ test "CDC queued data continues a transfer and terminates its final full packet"
     var storage: [128]u8 = undefined;
     var dev: TestDevice = .{ .max_packet_size = 64 };
     var cdc: CDC = undefined;
-    cdc.init(&desc, &dev.interface, &storage);
+    cdc.init(.{}, &desc, &dev.interface, &storage);
     const payload: [128]u8 = @splat(0x42);
     try std.testing.expectEqual(64, cdc.write(payload[0..64]));
     try std.testing.expectEqual(64, cdc.write(payload[64..]));
@@ -476,7 +483,7 @@ test "CDC 1 KiB stream written one packet at a time is delivered without another
     var storage: [128]u8 = undefined;
     var dev: TestDevice = .{ .max_packet_size = 64 };
     var cdc: CDC = undefined;
-    cdc.init(&desc, &dev.interface, &storage);
+    cdc.init(.{}, &desc, &dev.interface, &storage);
     var payload: [1024]u8 = undefined;
     for (&payload, 0..) |*byte, i| byte.* = @truncate(i);
     for (0..16) |i| {
@@ -498,7 +505,7 @@ test "CDC short final packets end transfers without an extra ZLP" {
         var storage: [128]u8 = undefined;
         var dev: TestDevice = .{ .max_packet_size = 64 };
         var cdc: CDC = undefined;
-        cdc.init(&desc, &dev.interface, &storage);
+        cdc.init(.{}, &desc, &dev.interface, &storage);
         var payload: [127]u8 = undefined;
         for (&payload, 0..) |*byte, i| byte.* = @truncate(i);
         var written: usize = 0;

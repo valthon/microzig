@@ -345,8 +345,8 @@ fn usb_test(hz: u48, host: bool, attachment: *usj.Attachment) noreturn {
         var ack: [12]u8 = undefined;
         const nonce = hal.rng.random_u32();
         // Fixed formats occupy 20 and 12 bytes respectively.
-        const line = std.fmt.bufPrint(&nonce_line, "USJ nonce={x:0>8}\r\n", .{nonce}) catch unreachable;
-        const expected = std.fmt.bufPrint(&ack, "ACK {x:0>8}", .{nonce}) catch unreachable;
+        const line = std.mem.print(&nonce_line, "USJ nonce={x:0>8}\r\n", .{nonce}) catch unreachable;
+        const expected = std.mem.print(&ack, "ACK {x:0>8}", .{nonce}) catch unreachable;
         results[base + 2] = .{ .name = "cdc_in", .ok = receive(expected, line) };
     }
     const names = [_][]const u8{

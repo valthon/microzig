@@ -285,7 +285,7 @@ fn find_payload(backend: hal.nvs_flash.PartitionFlash, payload: []const u8) Erro
     while (offset < partition_size) : (offset += hal.nvs.page_size) {
         const page = actual[0..hal.nvs.page_size];
         try backend.read(offset, page);
-        if (std.mem.indexOf(u8, page, payload)) |pos| {
+        if (std.mem.find(u8, page, payload)) |pos| {
             return offset + @as(u32, @intCast(pos));
         }
     }

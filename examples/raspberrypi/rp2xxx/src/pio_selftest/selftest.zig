@@ -252,25 +252,18 @@ fn nvic_all_off() void {
 // ---------------------------------------------------------------- USB
 
 const USB_Device = hal.usb.Polled(.{});
-const USB_Serial = usb.drivers.CDC;
+const USB_Serial = usb.drivers.CDC.Runtime;
 var usb_device: USB_Device = undefined;
 var usb_ready = false;
 var usb_controller: usb.DeviceController(.{
-    .bcd_usb = USB_Device.max_supported_bcd_usb,
     .device_triple = .unspecified,
-    .vendor = USB_Device.default_vendor_id,
-    .product = USB_Device.default_product_id,
     .bcd_device = .v1_00,
     .serial = "PIOSELFTEST",
-    .max_supported_packet_size = USB_Device.max_supported_packet_size,
-    .configurations = &.{.{
-        .attributes = .{ .self_powered = false },
-        .max_current_ma = 100,
-        .Drivers = struct { serial: USB_Serial },
-    }},
-}, .{.{
-    .serial = .{ .itf_notifi = "PIO selftest", .itf_data = "PIO selftest data" },
-}}) = .init;
+    .device_capabilities = USB_Device.device_capabilities,
+}, &.{usb.Configuration(
+    .{ .attributes = .{ .self_powered = false }, .max_current_ma = 100 },
+    .{ .serial = usb.drivers.CDC{ .itf_notifi_str = "PIO selftest", .itf_data_str = "PIO selftest data" } },
+)}) = .init;
 
 fn serial() ?*USB_Serial {
     return if (usb_controller.drivers()) |d| &d.serial else null;
@@ -282,7 +275,7 @@ var line_buf: [256]u8 = undefined;
 /// reading cannot wedge the test (the watchdog would otherwise end it).
 fn emit(comptime fmt: []const u8, args: anytype) void {
     const s = serial() orelse return;
-    var tx = std.fmt.bufPrint(&line_buf, fmt ++ "\r\n", args) catch line_buf[0..0];
+    var tx = std.mem.print(&line_buf, fmt ++ "\r\n", args) catch line_buf[0..0];
     const start = now_us();
     while (tx.len > 0 and now_us() - start < 500_000) {
         tx = tx[s.write(tx)..];
@@ -312,7 +305,7 @@ const Result = struct { outcome: Outcome, detail: []const u8 };
 var detail_buf: [200]u8 = undefined;
 
 fn result(outcome: Outcome, comptime fmt: []const u8, args: anytype) Result {
-    return .{ .outcome = outcome, .detail = std.fmt.bufPrint(&detail_buf, fmt, args) catch "detail too long" };
+    return .{ .outcome = outcome, .detail = std.mem.print(&detail_buf, fmt, args) catch "detail too long" };
 }
 fn pass(comptime fmt: []const u8, args: anytype) Result {
     return result(.PASS, fmt, args);

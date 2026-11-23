@@ -490,12 +490,12 @@ pub fn Tokenizer(chip: Chip) type {
             while (self.peek()) |c| {
                 if (c != ' ' and c != '\t' and c != '\r') break;
                 var blank_end = self.index;
-                while (blank_end < self.source.len and std.mem.indexOfScalar(u8, " \t\r", self.source[blank_end]) != null) : (blank_end += 1) {}
+                while (blank_end < self.source.len and std.mem.findScalar(u8, " \t\r", self.source[blank_end]) != null) : (blank_end += 1) {}
                 // NON_WS includes CR in lexer.ll. If it matches more than
                 // the blank rule, flex chooses it (e.g. a language "1\r").
                 if (c == '\r') {
                     var text_end = self.index;
-                    while (text_end < self.source.len and std.mem.indexOfScalar(u8, " \t\n\"=", self.source[text_end]) == null) : (text_end += 1) {}
+                    while (text_end < self.source.len and std.mem.findScalar(u8, " \t\n\"=", self.source[text_end]) == null) : (text_end += 1) {}
                     if (text_end > blank_end) break;
                 }
                 self.index = blank_end;
@@ -508,8 +508,8 @@ pub fn Tokenizer(chip: Chip) type {
                 return .{ .tag = .assign, .str = self.source[start..self.index], .index = start };
             }
             if (first == '"') {
-                const line_end = if (std.mem.indexOfScalar(u8, self.source[start..], '\n')) |end| start + end else self.source.len;
-                const close = std.mem.lastIndexOfScalar(u8, self.source[start + 1 .. line_end], '"') orelse {
+                const line_end = if (std.mem.findScalar(u8, self.source[start..], '\n')) |end| start + end else self.source.len;
+                const close = std.mem.findScalarLast(u8, self.source[start + 1 .. line_end], '"') orelse {
                     diags.* = Diagnostics.init(start, "unterminated .lang_opt string", .{});
                     return error.InvalidExpression;
                 };
@@ -517,7 +517,7 @@ pub fn Tokenizer(chip: Chip) type {
                 return .{ .tag = .string, .str = self.source[start..self.index], .index = start };
             }
             while (self.peek()) |c| {
-                if (std.mem.indexOfScalar(u8, " \t\n\"=", c) != null) break;
+                if (std.mem.findScalar(u8, " \t\n\"=", c) != null) break;
                 self.consume(1);
             }
             const str = self.source[start..self.index];
@@ -995,14 +995,14 @@ pub fn Tokenizer(chip: Chip) type {
             // delay brackets permit an unparenthesized expression.
             var contents = Self.init(self.source[0 .. self.index - 1]);
             contents.index = arg.start + 1;
-            const idxl = try contents.keyword("y", diags);
-            const idx: Value = if (idxl) .{ .integer = 0 } else try contents.get_value(diags);
+            const idxi = !try contents.keyword("y", diags);
+            const idx: Value = if (idxi) try contents.get_value(diags) else .{ .integer = 0 };
             try contents.skip_arg_space(&contents.index, diags);
             if (contents.index != contents.source.len) {
                 diags.* = Diagnostics.init(contents.index, "expected ']' after RX FIFO index", .{});
                 return error.InvalidExpression;
             }
-            return .{ .idxl = idxl, .idx = idx };
+            return .{ .idxi = idxi, .idx = idx };
         }
 
         fn get_movrx(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
@@ -1017,7 +1017,7 @@ pub fn Tokenizer(chip: Chip) type {
             try self.optional_comma(diags);
             if (!try self.keyword("rxfifo", diags)) return error.InvalidSource;
             const index = try self.get_fifo_index(diags);
-            return .{ .movfromrx = .{ .idxl = index.idxl, .idx = index.idx } };
+            return .{ .movfromrx = .{ .idxi = index.idxi, .idx = index.idx } };
         }
 
         fn get_irq(self: *Self, diags: *?Diagnostics) TokenizeError!Token(chip).Instruction.Payload {
@@ -1404,12 +1404,14 @@ pub fn Token(comptime chip: Chip) type {
                 };
             };
 
+            /// `idxi`: index by the immediate `idx` (true, `rxfifo[n]`) or by Y (false,
+            /// `rxfifo[y]`); the IdxI bit of RP2350 datasheet 11.4.8.1 and 11.4.9.1.
             pub const MovToRx = struct {
-                idxl: bool,
+                idxi: bool,
                 idx: Value,
             };
             pub const MovFromRx = struct {
-                idxl: bool,
+                idxi: bool,
                 idx: Value,
             };
 

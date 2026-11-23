@@ -145,7 +145,7 @@ comptime {
     // Every mask field must be backed by a mapping, otherwise setting it would silently do
     // nothing.
     @setEvalBranchQuota(@typeInfo(PeripheralMask).@"struct".field_names.len * mappings.len * 16);
-    for (std.meta.fieldNames(PeripheralMask)) |field| {
+    for (@typeInfo(PeripheralMask).@"struct".field_names) |field| {
         for (mappings) |mapping| {
             if (std.mem.eql(u8, mapping.field, field)) break;
         } else @compileError("no PCR mapping for peripheral mask field \"" ++ field ++ "\"");

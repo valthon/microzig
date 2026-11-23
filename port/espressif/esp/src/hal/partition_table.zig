@@ -183,7 +183,7 @@ test "streamed lookup validates entries and checksum after the match" {
     try t.expectEqual(null, try find_data(device, .nvs, "nvs"));
     for (0..max_entries) |i| {
         var name: [16]u8 = undefined;
-        const label = try std.fmt.bufPrint(&name, "part{d}", .{i});
+        const label = try std.mem.print(&name, "part{d}", .{i});
         test_entry(raw[i * 32 ..], 1, @intCast(0x9000 + i * 4096), 4096, label);
     }
     var table = try read(device);

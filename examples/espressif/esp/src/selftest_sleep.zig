@@ -235,7 +235,7 @@ fn display_error(err: (oled.Error || error{NoSpaceLeft})) void {
 fn draw_code(code: u8) !void {
     counts(check_pass, check_fail);
     var buffer: [12]u8 = undefined;
-    try oled.line(0, try std.fmt.bufPrint(&buffer, "S{d} SLEEP", .{build_stage}), false);
+    try oled.line(0, try std.mem.print(&buffer, "S{d} SLEEP", .{build_stage}), false);
     const step: []const u8 = switch (code) {
         1 => "BOOT",
         2 => "CALIBRATED",
@@ -262,8 +262,8 @@ fn draw_code(code: u8) !void {
     else
         step;
     try oled.line(1, failed_step, false);
-    try oled.line(2, try std.fmt.bufPrint(&buffer, "CODE={X:0>2}", .{code}), false);
-    try oled.line(3, try std.fmt.bufPrint(&buffer, "P={d} F={d}", .{ display_pass, display_fail }), false);
+    try oled.line(2, try std.mem.print(&buffer, "CODE={X:0>2}", .{code}), false);
+    try oled.line(3, try std.mem.print(&buffer, "P={d} F={d}", .{ display_pass, display_fail }), false);
     const final = code == 0x63 or code == 0x64;
     try oled.line(4, if (final) (if (code == 0x63 and !display_failed) "PASS" else "FAIL") else "", final);
     display_final = final;
@@ -978,8 +978,8 @@ fn stage_six() noreturn {
         var nonce_line: [24]u8 = undefined;
         var ack: [12]u8 = undefined;
         const nonce = hal.rng.random_u32();
-        const line = std.fmt.bufPrint(&nonce_line, "USJ nonce={x:0>8}\r\n", .{nonce}) catch unreachable;
-        const expected_ack = std.fmt.bufPrint(&ack, "ACK {x:0>8}", .{nonce}) catch unreachable;
+        const line = std.mem.print(&nonce_line, "USJ nonce={x:0>8}\r\n", .{nonce}) catch unreachable;
+        const expected_ack = std.mem.print(&ack, "ACK {x:0>8}", .{nonce}) catch unreachable;
         results[base + 2].nonce = nonce;
         results[base + 2].passed = exchange(line, expected_ack);
         var completed_pass: usize = 0;

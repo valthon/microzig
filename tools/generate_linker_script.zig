@@ -57,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
             if (region.name) |name| {
                 region_name.* = try allocator.dupe(u8, name);
             } else {
-                region_name.* = try std.fmt.allocPrint(allocator, "{s}{}", .{
+                region_name.* = try allocator.print("{s}{}", .{
                     @tagName(region.tag),
                     counters[@backingInt(region.tag)],
                 });
@@ -248,7 +248,7 @@ pub fn main(init: std.process.Init) !void {
             \\
         , .{
             if (!parsed_args.ram_image)
-                try std.fmt.allocPrint(allocator, "{s} AT> {s}", .{ ram_region_name, flash_region_name })
+                try allocator.print("{s} AT> {s}", .{ ram_region_name, flash_region_name })
             else
                 ram_region_name,
             ram_region_name,
@@ -264,7 +264,7 @@ pub fn main(init: std.process.Init) !void {
             if (region.tag != .ram) continue;
             try writer.interface.print(
                 "  microzig_stack_free_start_{d} = {s};\n  microzig_stack_free_end_{d} = ORIGIN({s}) + LENGTH({s});\n",
-                .{ ram_index, if (ram_index == 0) "microzig_heap_start" else try std.fmt.allocPrint(allocator, "ORIGIN({s})", .{name}), ram_index, name, name },
+                .{ ram_index, if (ram_index == 0) "microzig_heap_start" else try allocator.print("ORIGIN({s})", .{name}), ram_index, name, name },
             );
             ram_index += 1;
         }

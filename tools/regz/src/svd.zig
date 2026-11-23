@@ -19,8 +19,8 @@ const log = std.log.scoped(.svd);
 const Context = struct {
     db: *Database,
     arena: ArenaAllocator,
-    register_props: std.AutoArrayHashMapUnmanaged(RegisterPropertiesParent, RegisterProperties) = .{},
-    derived_peripherals: std.AutoArrayHashMapUnmanaged(xml.Node, []const u8) = .{},
+    register_props: std.array_hash_map.Auto(RegisterPropertiesParent, RegisterProperties) = .{},
+    derived_peripherals: std.array_hash_map.Auto(xml.Node, []const u8) = .{},
 
     fn deinit(ctx: *Context) void {
         ctx.register_props.deinit(ctx.db.gpa);
@@ -535,7 +535,7 @@ fn load_enumerated_value(ctx: *Context, node: xml.Node, enum_id: EnumID) !void {
             if (value_str.len == 0) return error.EnumFieldMalformed;
             if (value_str[0] == '#') {
                 if (value_str.len <= 1) return error.EnumFieldMalformed;
-                // A preceeding '#' indicates binary format per spec
+                // A preceding '#' indicates binary format per spec
                 break :v try std.fmt.parseInt(u32, value_str[1..], 2);
             } else {
                 break :v try std.fmt.parseInt(u32, value_str, 0);
@@ -569,7 +569,7 @@ pub const Revision = struct {
         if (!std.mem.startsWith(u8, str, "r"))
             return error.Malformed;
 
-        const p_index = std.mem.indexOf(u8, str, "p") orelse return error.Malformed;
+        const p_index = std.mem.find(u8, str, "p") orelse return error.Malformed;
         return Revision{
             .release = try std.fmt.parseInt(u64, str[1..p_index], 10),
             .part = try std.fmt.parseInt(u64, str[p_index + 1 ..], 10),
@@ -640,7 +640,7 @@ test "svd.Revision.parse" {
 
 // dimElementGroup specifies the number of array elements (dim), the
 // address offset between to consecutive array elements and an a comma
-// seperated list of strings being used for identifying each element in
+// separated list of strings being used for identifying each element in
 // the array -->
 const DimElements = struct {
     dim: u64,
@@ -679,7 +679,7 @@ const DimElements = struct {
             var ret: std.ArrayList([]const u8) = .empty;
             defer ret.deinit(gpa);
 
-            if (std.mem.indexOf(u8, list.pattern, "-")) |dash_idx| {
+            if (std.mem.find(u8, list.pattern, "-")) |dash_idx| {
                 const begin_str = list.pattern[0..dash_idx];
                 const end_str = list.pattern[dash_idx + 1 ..];
 
