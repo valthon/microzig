@@ -108,6 +108,6 @@ pub fn integer(str: []const u8) error{InvalidInteger}!i32 {
 /// Comments are whitespace; their contents do not contain grammar tokens.
 pub fn comment_end(source: []const u8, start: usize) ?usize {
     if (!std.mem.startsWith(u8, source[start..], "/*")) return null;
-    const end = std.mem.indexOf(u8, source[start + 2 ..], "*/") orelse return source.len;
+    const end = std.mem.find(u8, source[start + 2 ..], "*/") orelse return source.len;
     return start + 2 + end + 2;
 }

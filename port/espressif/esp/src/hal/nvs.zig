@@ -211,7 +211,7 @@ pub fn Storage(comptime Flash: type) type {
                 const data = try self.item_data(loc);
                 // ESP-IDF stores the terminating zero with the string.
                 if (data.len == 0 or data[data.len - 1] != 0 or
-                    std.mem.indexOfScalar(u8, data[0 .. data.len - 1], 0) != null) return error.Corrupt;
+                    std.mem.findScalar(u8, data[0 .. data.len - 1], 0) != null) return error.Corrupt;
                 const str = data[0 .. data.len - 1];
                 if (str.len > dest.len) return error.BufferTooSmall;
                 @memcpy(dest[0..str.len], str);
@@ -222,7 +222,7 @@ pub fn Storage(comptime Flash: type) type {
                 const self = handle.storage;
                 try handle.check_writable(key);
                 if (value.len >= max_str_len) return error.ValueTooLong;
-                if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidName;
+                if (std.mem.findScalar(u8, value, 0) != null) return error.InvalidName;
 
                 const maybe_old = try self.find(handle.ns, null, key, no_chunk);
                 if (maybe_old) |old| {
@@ -396,7 +396,7 @@ pub fn Storage(comptime Flash: type) type {
 
         fn check_name(name: []const u8) Error!void {
             if (name.len == 0 or name.len > max_key_len) return error.InvalidName;
-            if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidName;
+            if (std.mem.findScalar(u8, name, 0) != null) return error.InvalidName;
         }
 
         fn int_type(comptime T: type) u8 {
@@ -795,7 +795,7 @@ pub fn Storage(comptime Flash: type) type {
             try self.load(from);
             self.reclaim_buf = self.buf;
             const source = &self.reclaim_buf;
-            var replaced: std.StaticBitSet(entries_per_page) = .empty;
+            var replaced: std.bit_set.Static(entries_per_page) = .empty;
             var list: [max_pages]u8 = undefined;
             const pages = self.page_list(&list);
             // PageManager::load (v5.5.1 nvs_pagemanager.cpp:75-79)
@@ -1131,7 +1131,7 @@ pub fn Storage(comptime Flash: type) type {
         fn index_complete(self: *Self, loc: Location) Err!bool {
             const blob = (try self.item_at(loc)).*;
             const own = index_range(blob.data[5]);
-            var earlier: std.StaticBitSet(256) = .empty;
+            var earlier: std.bit_set.Static(256) = .empty;
             var chunks: usize = 0;
             var size: usize = 0;
             // The indexes before it, then the chunks.
@@ -1245,7 +1245,7 @@ test "reclaim reads each newer page once regardless of source item count" {
     const from = store.active.?;
     for (0..12) |i| {
         var key_buf: [8]u8 = undefined;
-        try append_u32(&store, h.ns, try std.fmt.bufPrint(&key_buf, "k{d}", .{i}), @intCast(i));
+        try append_u32(&store, h.ns, try std.mem.print(&key_buf, "k{d}", .{i}), @intCast(i));
     }
     const text = "source payload spans several entries and survives the copy";
     try h.set_str("text", text);
@@ -1256,7 +1256,7 @@ test "reclaim reads each newer page once regardless of source item count" {
         for (0..2) |j| {
             const i = p * 2 + j;
             var key_buf: [8]u8 = undefined;
-            try append_u32(&store, h.ns, try std.fmt.bufPrint(&key_buf, "k{d}", .{i}), @intCast(100 + i));
+            try append_u32(&store, h.ns, try std.mem.print(&key_buf, "k{d}", .{i}), @intCast(100 + i));
         }
     }
     try store.set_page_state(from, .freeing);
@@ -1274,7 +1274,7 @@ test "reclaim reads each newer page once regardless of source item count" {
     }
     for (0..12) |i| {
         var key_buf: [8]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        const key = try std.mem.print(&key_buf, "k{d}", .{i});
         const copied = try store.find_on_page(to, h.ns, TestStorage.int_type(u32), key, no_chunk, null);
         try testing.expectEqual(i >= 6, copied != null);
         if (copied) |index| {
@@ -1327,7 +1327,7 @@ test "blob-heavy init page reads stay within the pre-regression cost" {
         const h = try store.open("ns", .read_write);
         for (0..blobs) |i| {
             var key_buf: [15]u8 = undefined;
-            const key = try std.fmt.bufPrint(&key_buf, "b{d}", .{i});
+            const key = try std.mem.print(&key_buf, "b{d}", .{i});
             try h.set_blob(key, &@as([20]u8, @splat(0x11)));
         }
         flash.page_reads = 0;
@@ -1609,7 +1609,7 @@ test "full scalar partition reclaims erased space without losing surviving keys"
     // Namespace + 251 distinct keys fills both usable pages.
     for (0..251) |n| {
         var key: [15]u8 = undefined;
-        try h.set(u16, try std.fmt.bufPrint(&key, "k{d}", .{n}), @intCast(n));
+        try h.set(u16, try std.mem.print(&key, "k{d}", .{n}), @intCast(n));
     }
     try testing.expectError(error.NotEnoughSpace, h.set(u16, "overflow", 999));
     try h.erase_key("k0");
@@ -1625,7 +1625,7 @@ test "full scalar partition reclaims erased space without losing surviving keys"
     try testing.expectEqual(@as(u16, 42), try after.get(u16, "replacement"));
     for (3..251) |n| {
         var key: [15]u8 = undefined;
-        try testing.expectEqual(@as(u16, @intCast(n)), try after.get(u16, try std.fmt.bufPrint(&key, "k{d}", .{n})));
+        try testing.expectEqual(@as(u16, @intCast(n)), try after.get(u16, try std.mem.print(&key, "k{d}", .{n})));
     }
 }
 
@@ -1766,7 +1766,7 @@ fn prepare_reclaim(flash: *TestFlash) !u32 {
     while (store.next_free < entries_per_page) : (scratch += 1) try h.set(u32, "scratch", scratch);
     for (0..entries_per_page) |i| {
         var key: [15]u8 = undefined;
-        try h.set(u32, try std.fmt.bufPrint(&key, "k{d}", .{i}), @intCast(i));
+        try h.set(u32, try std.mem.print(&key, "k{d}", .{i}), @intCast(i));
     }
     try testing.expectEqual(@as(usize, 1), store.count_free());
     try testing.expectEqual(@as(u8, entries_per_page), store.next_free);
@@ -1785,7 +1785,7 @@ fn check_reclaim_keys(flash: *TestFlash, scratch: u32) !void {
     try testing.expectEqualSlices(u8, &(@as([70]u8, @splat(0x5a))), try h.get_blob("blob", &buf));
     for (0..entries_per_page) |i| {
         var key: [15]u8 = undefined;
-        try testing.expectEqual(@as(u32, @intCast(i)), try h.get(u32, try std.fmt.bufPrint(&key, "k{d}", .{i})));
+        try testing.expectEqual(@as(u32, @intCast(i)), try h.get(u32, try std.mem.print(&key, "k{d}", .{i})));
     }
 }
 
@@ -2087,7 +2087,7 @@ fn check_idf_page_reclaim(image: *const [page_size]u8, purge: IdfPurge) !void {
     const filler = try store.open("filler", .read_write);
     for (0..entries_per_page - 1) |i| {
         var key: [15]u8 = undefined;
-        try filler.set(u16, try std.fmt.bufPrint(&key, "k{d}", .{i}), @intCast(i));
+        try filler.set(u16, try std.mem.print(&key, "k{d}", .{i}), @intCast(i));
     }
     try testing.expectEqual(@as(u8, entries_per_page), store.next_free);
     try store.new_page();
@@ -2099,7 +2099,7 @@ fn check_idf_page_reclaim(image: *const [page_size]u8, purge: IdfPurge) !void {
     const after = try store.open("filler", .read_only);
     for (0..entries_per_page - 1) |i| {
         var key: [15]u8 = undefined;
-        try testing.expectEqual(@as(u16, @intCast(i)), try after.get(u16, try std.fmt.bufPrint(&key, "k{d}", .{i})));
+        try testing.expectEqual(@as(u16, @intCast(i)), try after.get(u16, try std.mem.print(&key, "k{d}", .{i})));
     }
     const h = try store.open("fixture", .read_write);
     try h.set(u32, "after_reclaim", 99);
@@ -2278,7 +2278,7 @@ test "an interrupted erase never leaves payload marked written behind an erased 
     try h.set(u32, "untouched", 7);
     for (0..12) |i| {
         var key: [15]u8 = undefined;
-        try h.set(u8, try std.fmt.bufPrint(&key, "k{d}", .{i}), @intCast(i));
+        try h.set(u8, try std.mem.print(&key, "k{d}", .{i}), @intCast(i));
     }
     // The chunk's header is entry 14 and its payload 15 to 17: the range
     // crosses from the first bitmap word into the second at entry 16.
@@ -2577,7 +2577,7 @@ test "a version 1 blob next to a complete blob index of its key is erased at ini
     var name: [8]u8 = undefined;
     var keys: u32 = 0;
     while (store.pages[0].state != .uninitialized) : (keys += 1) {
-        try h.set(u32, try std.fmt.bufPrint(&name, "k{d}", .{keys}), keys);
+        try h.set(u32, try std.mem.print(&name, "k{d}", .{keys}), keys);
     }
     try testing.expectEqual(@as(u32, 119), keys);
     try check_idf_legacy(&store, &idf_legacy_second);
@@ -4151,7 +4151,7 @@ test "ESP-IDF multi-page blobs can be rewritten, erased and reclaimed" {
         var keys: u32 = 0;
         while (true) : (keys += 1) {
             var key: [15]u8 = undefined;
-            h.set(u32, try std.fmt.bufPrint(&key, "k{d}", .{keys}), keys) catch |err| switch (err) {
+            h.set(u32, try std.mem.print(&key, "k{d}", .{keys}), keys) catch |err| switch (err) {
                 error.NotEnoughSpace => break,
                 else => return err,
             };
@@ -4168,7 +4168,7 @@ test "ESP-IDF multi-page blobs can be rewritten, erased and reclaimed" {
         try check_idf_blob(&store, current);
         for (0..keys) |i| {
             var key: [15]u8 = undefined;
-            const filler = try std.fmt.bufPrint(&key, "k{d}", .{i});
+            const filler = try std.mem.print(&key, "k{d}", .{i});
             try testing.expectEqual(@as(u32, @intCast(i)), try h.get(u32, filler));
             try h.erase_key(filler);
         }

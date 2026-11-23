@@ -354,7 +354,7 @@ pub fn default_shift_config(comptime chip: Chip, defaults: ProgramConfig) ShiftO
 
 pub fn apply_exec_overrides(defaults: anytype, overrides: anytype) @TypeOf(defaults) {
     var result = defaults;
-    inline for (comptime std.meta.fieldNames(@TypeOf(overrides))) |field| {
+    inline for (comptime @typeInfo(@TypeOf(overrides)).@"struct".field_names) |field| {
         if (@field(overrides, field)) |value| @field(result, field) = value;
     }
     return result;

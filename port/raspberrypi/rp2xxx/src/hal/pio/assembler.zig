@@ -157,8 +157,8 @@ pub fn assemble_impl(comptime chip: Chip, comptime source: []const u8, diags: *?
 
 fn format_compile_error(comptime message: []const u8, comptime source: []const u8, comptime index: u32) []const u8 {
     const caret = @min(index, source.len);
-    const start = if (std.mem.lastIndexOfScalar(u8, source[0..caret], '\n')) |newline| newline + 1 else 0;
-    const end = if (std.mem.indexOfScalar(u8, source[caret..], '\n')) |newline| caret + newline else source.len;
+    const start = if (std.mem.findScalarLast(u8, source[0..caret], '\n')) |newline| newline + 1 else 0;
+    const end = if (std.mem.findScalar(u8, source[caret..], '\n')) |newline| caret + newline else source.len;
     const line_str = source[start..end];
     const column = caret - start;
 
@@ -264,7 +264,7 @@ test "full instruction memory mask" {
 }
 test "format compile error at empty input and after blank lines" {
     const empty = comptime format_compile_error("missing value", "", 0);
-    try std.testing.expect(std.mem.indexOf(u8, empty, "^\nmissing value") != null);
+    try std.testing.expect(std.mem.find(u8, empty, "^\nmissing value") != null);
     const after_blank = comptime format_compile_error("bad", "\n\n nop\n", 3);
-    try std.testing.expect(std.mem.indexOf(u8, after_blank, " nop\n ^\n bad") != null);
+    try std.testing.expect(std.mem.find(u8, after_blank, " nop\n ^\n bad") != null);
 }

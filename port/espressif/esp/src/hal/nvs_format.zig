@@ -197,7 +197,7 @@ pub fn scan_span(page: *const [page_size]u8, index: usize) ?u8 {
 pub fn valid_header(page: *const [page_size]u8, index: usize) bool {
     const item = item_at(page, index);
     if (!item.crc_ok() or item_span(page, index) == null or item.ns == 255) return false;
-    const key_len = std.mem.indexOfScalar(u8, &item.key, 0) orelse return false;
+    const key_len = std.mem.findScalar(u8, &item.key, 0) orelse return false;
     if (key_len == 0) return false;
     if (item.ns == 0 and (item.type != type_u8 or item.data[0] == 0 or item.data[0] == 255)) return false;
     switch (item.type) {
@@ -389,10 +389,10 @@ test "page index resolves bucket collisions and finds the first duplicate, as ES
     var keys: [2][16]u8 = @splat(@splat(0));
     for (0..129) |n| {
         var key: [16]u8 = @splat(0);
-        const name = try std.fmt.bufPrint(&key, "key{d}", .{n});
+        const name = try std.mem.print(&key, "key{d}", .{n});
         const bucket = PageIndex.hash(1, name) % 128;
         if (seen[bucket]) |previous| {
-            _ = try std.fmt.bufPrint(&keys[0], "key{d}", .{previous});
+            _ = try std.mem.print(&keys[0], "key{d}", .{previous});
             keys[1] = key;
             break;
         }

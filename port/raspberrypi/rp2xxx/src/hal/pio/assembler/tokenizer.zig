@@ -490,12 +490,12 @@ pub fn Tokenizer(chip: Chip) type {
             while (self.peek()) |c| {
                 if (c != ' ' and c != '\t' and c != '\r') break;
                 var blank_end = self.index;
-                while (blank_end < self.source.len and std.mem.indexOfScalar(u8, " \t\r", self.source[blank_end]) != null) : (blank_end += 1) {}
+                while (blank_end < self.source.len and std.mem.findScalar(u8, " \t\r", self.source[blank_end]) != null) : (blank_end += 1) {}
                 // NON_WS includes CR in lexer.ll. If it matches more than
                 // the blank rule, flex chooses it (e.g. a language "1\r").
                 if (c == '\r') {
                     var text_end = self.index;
-                    while (text_end < self.source.len and std.mem.indexOfScalar(u8, " \t\n\"=", self.source[text_end]) == null) : (text_end += 1) {}
+                    while (text_end < self.source.len and std.mem.findScalar(u8, " \t\n\"=", self.source[text_end]) == null) : (text_end += 1) {}
                     if (text_end > blank_end) break;
                 }
                 self.index = blank_end;
@@ -508,8 +508,8 @@ pub fn Tokenizer(chip: Chip) type {
                 return .{ .tag = .assign, .str = self.source[start..self.index], .index = start };
             }
             if (first == '"') {
-                const line_end = if (std.mem.indexOfScalar(u8, self.source[start..], '\n')) |end| start + end else self.source.len;
-                const close = std.mem.lastIndexOfScalar(u8, self.source[start + 1 .. line_end], '"') orelse {
+                const line_end = if (std.mem.findScalar(u8, self.source[start..], '\n')) |end| start + end else self.source.len;
+                const close = std.mem.findScalarLast(u8, self.source[start + 1 .. line_end], '"') orelse {
                     diags.* = Diagnostics.init(start, "unterminated .lang_opt string", .{});
                     return error.InvalidExpression;
                 };
@@ -517,7 +517,7 @@ pub fn Tokenizer(chip: Chip) type {
                 return .{ .tag = .string, .str = self.source[start..self.index], .index = start };
             }
             while (self.peek()) |c| {
-                if (std.mem.indexOfScalar(u8, " \t\n\"=", c) != null) break;
+                if (std.mem.findScalar(u8, " \t\n\"=", c) != null) break;
                 self.consume(1);
             }
             const str = self.source[start..self.index];
