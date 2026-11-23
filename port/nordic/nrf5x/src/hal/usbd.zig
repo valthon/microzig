@@ -1049,7 +1049,8 @@ pub const testing = if (@import("builtin").is_test) struct {
     }
     pub fn cdc_in_wake_timeout() !void {
         const io = microzig.testing_io;
-        // A short and a full packet: either is sent whole once the wake succeeds.
+        // A short and a full packet: either is sent whole once the wake succeeds. (The
+        // later write of "x" cancels the full packet's ZLP, so no ZLP is checked here.)
         for ([_]usize{ 11, 64 }) |len| {
             io.reset();
             var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected, .low_power = true };
