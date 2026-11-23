@@ -3,7 +3,7 @@ const usb = @import("../usb.zig");
 
 const assert = std.debug.assert;
 const descriptor = usb.descriptor;
-const SFAttributes = std.builtin.Type.Struct.FieldAttributes;
+const SFAttributes = std.lang.Type.Struct.FieldAttributes;
 
 pub const Options = struct {
     attributes: descriptor.Configuration.Attributes,

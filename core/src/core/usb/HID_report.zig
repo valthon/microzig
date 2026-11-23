@@ -1,6 +1,6 @@
 const std = @import("std");
 const usb = @import("../usb.zig");
-const SFAttributes = std.builtin.Type.Struct.FieldAttributes;
+const SFAttributes = std.lang.Type.Struct.FieldAttributes;
 
 const Report = @This();
 

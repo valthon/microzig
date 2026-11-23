@@ -86,7 +86,7 @@ pub fn DriverInfo(Descriptor: type) type {
         /// will be passed to driver's init function.
         Alloc: type = void,
         /// Field attributes of `Alloc`
-        alloc_attrs: std.builtin.Type.Struct.FieldAttributes = .{},
+        alloc_attrs: std.lang.Type.Struct.FieldAttributes = .{},
         Runtime: type,
         descriptor: Descriptor,
     };
