@@ -256,6 +256,8 @@ pub fn validate_device(Device: type) void {
 /// One without the other is a compile error. `class_data` is called only on a device that
 /// hands the data stage over (`DeviceInterface.VTable.control_out_data`). On any other the
 /// request has its answer when `class_request` returns, and the driver never sees the data.
+/// On a device that hands it over, accepted writes to drivers without `class_data` have
+/// their data discarded before the status stage (USB 2.0, 8.5.3).
 pub fn DeviceController(options: Options, Configurations: []const type) type {
     // Currently only a single configuration is supported.
     std.debug.assert(Configurations.len == 1);
@@ -352,6 +354,8 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
         /// Pending control write, its received length, and its bounded data buffer.
         rx_setup: ?types.SetupPacket,
         rx_len: usize,
+        /// The accepting driver has no `class_data`; receive without storing the data.
+        rx_discard: bool,
         rx_data: [control_out_max]u8,
 
         /// Initial values
@@ -362,6 +366,7 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
             .tx_zlp = false,
             .rx_setup = null,
             .rx_len = 0,
+            .rx_discard = false,
             .rx_data = undefined,
             .driver_data = null,
             .driver_alloc = undefined,
@@ -395,9 +400,8 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
             };
             if (ret) |data| {
                 if (data.len == 0) {
-                    // A driver that takes the data of this request gets it before the host
-                    // gets its answer: the first packet is let in, and `on_buffer` goes on
-                    // from there.
+                    // Receive the data before status, even if the driver leaves it unseen
+                    // (USB 2.0, 8.5.3). `on_buffer` handles the following packets.
                     if (self.rx_setup != null)
                         device_itf.ep_listen(.ep0, device_descriptor.max_packet_size0)
                     else
@@ -534,20 +538,19 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
                     if (self.driver_data) |*data| {
                         const Driver = @FieldType(configurations[0].RuntimeData, drv);
                         const ret = @field(data, drv).class_request(setup);
-                        // The driver accepted a request whose data the host has yet to send,
-                        // and it takes such data (`class_data`): the request is answered
-                        // when the data is here. Only with a device that hands the data
-                        // over; with any other the request is accepted now, unseen.
-                        if (comptime @hasDecl(Driver, "class_data")) {
-                            const accepted = if (ret) |reply| reply.len == 0 else false;
-                            if (accepted and device_itf.vtable.control_out_data and
-                                setup.request_type.direction == .out and setup.length.native() != 0)
-                            {
+                        // Accepted control writes need a data stage before status, whether
+                        // the driver takes the data or leaves it to be discarded.
+                        const accepted = if (ret) |reply| reply.len == 0 else false;
+                        if (accepted and device_itf.vtable.control_out_data and
+                            setup.request_type.direction == .out and setup.length.native() != 0)
+                        {
+                            if (comptime @hasDecl(Driver, "class_data")) {
                                 // More than the driver has room for is refused.
                                 if (setup.length.native() > Driver.class_data_len) return nak;
-                                self.rx_setup = setup.*;
-                                self.rx_len = 0;
                             }
+                            self.rx_setup = setup.*;
+                            self.rx_len = 0;
+                            self.rx_discard = !@hasDecl(Driver, "class_data");
                         }
                         return ret;
                     }
@@ -563,8 +566,9 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
         }
 
         /// A packet of the data stage of the control write in `rx_setup` has arrived. With
-        /// the last one the driver is given the data and decides the answer: accepted, the
-        /// request gets its status stage, and refused it is left for the device to stall.
+        /// the last one the driver is given the data and decides the answer, or the data
+        /// is discarded for a driver without `class_data`. Accepted, the request gets its
+        /// status stage, and refused it is left for the device to stall.
         ///
         /// The data stage ends with the last byte of wLength or with a packet shorter than
         /// the endpoint's maximum (USB 2.0, 5.5.3). A host that sends more than wLength
@@ -579,14 +583,15 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
                 self.rx_setup = null;
                 return;
             }
-            @memcpy(self.rx_data[self.rx_len..][0..len], packet[0..len]);
+            if (!self.rx_discard)
+                @memcpy(self.rx_data[self.rx_len..][0..len], packet[0..len]);
             self.rx_len += len;
             if (self.rx_len < wanted and len == packet.len) {
                 device_itf.ep_listen(.ep0, device_descriptor.max_packet_size0);
                 return;
             }
             self.rx_setup = null;
-            if (self.control_out_deliver(&setup, self.rx_data[0..self.rx_len]))
+            if (self.rx_discard or self.control_out_deliver(&setup, self.rx_data[0..self.rx_len]))
                 device_itf.ep_ack(.ep0);
         }
 
@@ -1094,6 +1099,137 @@ fn test_data_request(request: u8, length: u16) types.SetupPacket {
         .index = .from(0),
         .length = .from(length),
     };
+}
+
+const TestDiscardController = DeviceController(test_options(), &.{test_configuration(.{
+    .hid = drivers.HID_Interrupt{
+        .subclass = .Boot,
+        .protocol = .NoneRequired,
+        .poll_interval = 10,
+        .report = HID_report.Finalized.boot_keyboard,
+    },
+})});
+
+test "SET_REPORT without class_data drains one packet before status" {
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_control_out } };
+    var ctl: TestDiscardController = .init;
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    const written = dev.written;
+    const listened = dev.listened;
+
+    ctl.on_setup_req(&dev.interface, &test_data_request(0x09, 8));
+    try std.testing.expectEqual(written, dev.written);
+    try std.testing.expectEqual(listened + 1, dev.listened);
+    dev.rx_packet = &@as([8]u8, @splat(0x42));
+    ctl.on_buffer(&dev.interface, .out(.ep0));
+    try std.testing.expectEqual(written + 1, dev.written);
+    try std.testing.expectEqual(0, dev.last_written_len);
+    try std.testing.expectEqual(listened + 1, dev.listened);
+}
+
+test "discarding SET_REPORT does not discard another interface's class_data" {
+    const Controller = DeviceController(test_options(), &.{test_configuration(.{
+        .hid = drivers.HID_Interrupt{
+            .subclass = .Boot,
+            .protocol = .NoneRequired,
+            .poll_interval = 10,
+            .report = HID_report.Finalized.boot_keyboard,
+        },
+        .data = TestDataDriver{},
+    })});
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_control_out } };
+    var ctl: Controller = .init;
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    const driver = &ctl.drivers().?.data;
+    const written = dev.written;
+    const listened = dev.listened;
+
+    var report = test_data_request(0x09, 8);
+    report.index = .from(Controller.config_descriptor.drv.hid.interface.interface_number);
+    ctl.on_setup_req(&dev.interface, &report);
+    try std.testing.expectEqual(written, dev.written);
+    try std.testing.expectEqual(listened + 1, dev.listened);
+    dev.rx_packet = &@as([8]u8, @splat(0x42));
+    ctl.on_buffer(&dev.interface, .out(.ep0));
+    try std.testing.expectEqual(written + 1, dev.written);
+    try std.testing.expectEqual(0, dev.last_written_len);
+    ctl.on_buffer(&dev.interface, .in(.ep0));
+
+    const bytes = [_]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD };
+    var request = test_data_request(1, bytes.len);
+    request.index = .from(Controller.config_descriptor.drv.data.itf.interface_number);
+    ctl.on_setup_req(&dev.interface, &request);
+    try std.testing.expectEqual(written + 1, dev.written);
+    try std.testing.expectEqual(listened + 2, dev.listened);
+    try std.testing.expectEqual(null, driver.data_len);
+    dev.rx_packet = &bytes;
+    ctl.on_buffer(&dev.interface, .out(.ep0));
+    try std.testing.expectEqual(written + 2, dev.written);
+    try std.testing.expectEqual(0, dev.last_written_len);
+    try std.testing.expectEqual(bytes.len, driver.data_len);
+    try std.testing.expectEqualSlices(u8, &bytes, driver.data[0..driver.data_len.?]);
+}
+
+test "SET_REPORT without class_data drains multiple packets before status" {
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_control_out } };
+    var ctl: TestDiscardController = .init;
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    const written = dev.written;
+    const listened = dev.listened;
+
+    ctl.on_setup_req(&dev.interface, &test_data_request(0x09, 130));
+    try std.testing.expectEqual(written, dev.written);
+    try std.testing.expectEqual(listened + 1, dev.listened);
+    for (0..2) |i| {
+        dev.rx_packet = &@as([64]u8, @splat(0x42));
+        ctl.on_buffer(&dev.interface, .out(.ep0));
+        try std.testing.expectEqual(written, dev.written);
+        try std.testing.expectEqual(listened + i + 2, dev.listened);
+    }
+    dev.rx_packet = &.{ 0x42, 0x42 };
+    ctl.on_buffer(&dev.interface, .out(.ep0));
+    try std.testing.expectEqual(written + 1, dev.written);
+    try std.testing.expectEqual(0, dev.last_written_len);
+    try std.testing.expectEqual(listened + 3, dev.listened);
+}
+
+test "a new SETUP abandons a partially discarded SET_REPORT" {
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_control_out } };
+    var ctl: TestDiscardController = .init;
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    const before = dev.written;
+    ctl.on_setup_req(&dev.interface, &test_data_request(0x09, 130));
+    dev.rx_packet = &@as([64]u8, @splat(0x42));
+    ctl.on_buffer(&dev.interface, .out(.ep0));
+    try std.testing.expectEqual(before, dev.written);
+
+    ctl.on_setup_req(&dev.interface, &test_get_descriptor(0x0100, 18));
+    const written = dev.written;
+    const listened = dev.listened;
+    ctl.on_buffer(&dev.interface, .out(.ep0));
+    try std.testing.expectEqual(written, dev.written);
+    try std.testing.expectEqual(listened, dev.listened);
+
+    // A subsequent write counts from zero, rather than resuming the abandoned one.
+    ctl.on_setup_req(&dev.interface, &test_data_request(0x09, 8));
+    try std.testing.expectEqual(written, dev.written);
+    try std.testing.expectEqual(listened + 1, dev.listened);
+    dev.rx_packet = &@as([8]u8, @splat(0x24));
+    ctl.on_buffer(&dev.interface, .out(.ep0));
+    try std.testing.expectEqual(written + 1, dev.written);
+    try std.testing.expectEqual(0, dev.last_written_len);
+}
+
+test "SET_REPORT without class_data keeps immediate status on a legacy HAL" {
+    var dev: TestDevice = .{};
+    var ctl: TestDiscardController = .init;
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    const written = dev.written;
+    const listened = dev.listened;
+    ctl.on_setup_req(&dev.interface, &test_data_request(0x09, 130));
+    try std.testing.expectEqual(written + 1, dev.written);
+    try std.testing.expectEqual(0, dev.last_written_len);
+    try std.testing.expectEqual(listened, dev.listened);
 }
 
 test "SET_LINE_CODING reaches the CDC driver on a device that hands over the data stage" {
