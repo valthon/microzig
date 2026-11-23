@@ -192,7 +192,7 @@ pub fn build(b: *std.Build) void {
             if (!example.features.flashless and std.mem.containsAtLeast(u8, @tagName(target_enum), 1, "flashless"))
                 continue;
 
-            if (std.mem.indexOfScalar(Chip, example.chips, target_enum.chip()) == null)
+            if (std.mem.findScalar(Chip, example.chips, target_enum.chip()) == null)
                 continue;
 
             const target_desc = target_enum.get_target_desc(mb);

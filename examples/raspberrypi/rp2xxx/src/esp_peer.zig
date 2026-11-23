@@ -148,7 +148,7 @@ var console_head: usize = 0;
 var console_len: usize = 0;
 fn emit(comptime fmt: []const u8, args: anytype) void {
     var buffer: [512]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, fmt ++ "\r\n", args) catch {
+    const text = std.mem.print(&buffer, fmt ++ "\r\n", args) catch {
         errors += 1;
         return;
     };

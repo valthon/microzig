@@ -34,7 +34,7 @@ pub fn main() void {
         if (byte[0] == '\n') {
             received_line = true;
             var response: [64]u8 = undefined;
-            const line = std.fmt.bufPrint(&response, "ECHO {d} {x:0>8}\r\n", .{ len, crc.final() }) catch unreachable;
+            const line = std.mem.print(&response, "ECHO {d} {x:0>8}\r\n", .{ len, crc.final() }) catch unreachable;
             // A closed host must not stall RX forever. A timeout can mean partial TX.
             _ = usj.write_blocking(line, Deadline.init_relative(hal.time.get_time_since_boot(), .from_ms(1000))) catch {};
             crc = std.hash.Crc32.init();
