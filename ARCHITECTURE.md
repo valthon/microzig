@@ -190,7 +190,13 @@ conversion step (e.g. to _uf2_ or _bin_) and copies the result to _zig-out/firmw
   patches. Don't edit generated register code in your local build, and don't edit the _svd_ files.
   Add patches in the port's _patches/_ directory to make corrections.
 - **No global mutable state in libraries.** Embedded code uses explicit initialization and passed
-  handles.
+  handles. A narrow exception permits one synchronized routing pointer in a port HAL
+  when a vendor C callback ABI has no context argument and the peripheral has a single
+  owner. The caller still explicitly initializes a stationary handle that owns all queues
+  and operation state; a second owner is rejected, and teardown must prevent outstanding
+  completions from reaching a subsequent owner. This is not an exception for global
+  allocators or general library state. ESP-NOW and IEEE 802.15.4 radio callbacks use this
+  context-free singleton routing pattern.
 - **Memory regions are the port's responsibility.** Core and drivers don't assume any particular
   memory layout.
 

@@ -17,6 +17,7 @@ const efuse = @import("efuse.zig");
 pub const bluetooth = @import("radio/bluetooth.zig");
 const osi = @import("radio/osi.zig");
 const timer = @import("radio/timer.zig");
+pub const espnow = @import("radio/espnow.zig");
 pub const wifi = @import("radio/wifi.zig");
 pub const ieee802154 = if (compatibility.chip == .esp32_c6) @import("radio/ieee802154.zig") else void;
 

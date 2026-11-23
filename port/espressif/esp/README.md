@@ -49,6 +49,7 @@ Other results identify their boards and runs below; dates are included where rec
 | `etm` (50 routes; 8 GPIO event/task groups, no interrupt allocation) | no | yes | `selftest_etm` | n/a | 5/5, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `mcpwm` (timer/operator 0, A/B complementary, count-up, symmetric dead time; owns group) | no | yes | `selftest_mcpwm` | n/a | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `radio` (Wi-Fi station)                       | yes | yes | `tcp_server`, `selftest_wifi_*` (image boot)       | see "Wi-Fi station and RTOS" | see "Wi-Fi station and RTOS" |
+| `radio.espnow` (ESP-NOW, polling) | yes | yes | `selftest_espnow`, two boards, same image, no AP; expected `DONE pass=9 fail=0` | 6/6 runs with a C6 peer, `DONE pass=9 fail=0` (2026-11-23) | 11/11 runs on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-23); see "ESP-NOW (C3 and C6)" |
 | `radio.ieee802154` (raw MAC, polling)          | no  | yes | `selftest_ieee802154` (image boot, H2 peer, no wiring) | n/a    | 4/4, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 alone and 3 runs with both (2026-11-20) |
 | `rtos`                                        | yes | yes | `rtos`: expected `DONE pass=6 fail=0`, five ordered items + empty-queue timeout | 6/6, 3 runs (24ebc5d1) | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `systimer`                                    | yes | yes | `systimer`: expected `DONE pass=4 fail=0`, four IRQs + three 1 s intervals, TIMG0 reference, +/-100 us | 4/4, 3 runs (2026-11-20) | 4/4, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-20) |
@@ -2139,3 +2140,139 @@ order in `nvs.zig` and `nvs_storage.cpp`, not tested.
   damaged item headers are compared with ESP-IDF by the crash replay's
   cross-check and the `idf_state_*` and damaged-header fixtures only, two
   pages with one sequence number by a unit test only.
+
+
+### ESP-NOW (C3 and C6)
+
+`hal.radio.espnow` uses the already-linked `libespnow` from pinned
+`esp-wifi-sys` revision `7623c8d746b55cd8d9f7473359069aef381b7d3b`.
+The reference is [ESP-IDF v5.5.1 esp_now.h](https://github.com/espressif/esp-idf/blob/v5.5.1/components/esp_wifi/include/esp_now.h)
+and the [v5.5.1 ESP-NOW guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32c6/api-reference/network/esp_now.html)
+(sections Security, Initialization and Deinitialization, Add Paired Device,
+Send/Receiving ESP-NOW Data, and Config ESP-NOW Power-saving Parameter).
+The C bindings supply the receive-info and send-info callback ABI from that header.
+
+Start an enabled Wi-Fi station or SoftAP interface first, with RTOS and the radio
+interrupt installed as in the Wi-Fi examples. An AP connection is unnecessary.
+`Session.init` returns `WifiNotStarted` until a start event arrives,
+`UnsupportedRadioProtocol` in an IEEE 802.15.4 image, and produces a compile error
+in exclusive BLE mode. Use one stationary, caller-owned `Session`, from one task;
+do not move/copy it, call the vendor ESP-NOW API directly, or stop/reconfigure
+Wi-Fi while it owns the radio. `deinit` precedes Wi-Fi stop/deinit, discards the
+queues, and removes the vendor peer table. It returns `Busy` without changing
+ownership or callbacks while a send awaits completion; it cannot cancel that send.
+An already completed delivery may be discarded without polling it.
+
+```zig
+const espnow = hal.radio.espnow;
+var session: espnow.Session = .{}; // keep at this address until deinit
+try session.init();
+try session.add_peer(.{ .address = espnow.broadcast, .channel = 1 });
+try session.send(espnow.broadcast, "hello");
+// In the application loop (sleep/yield between polls as appropriate):
+if (try session.poll_delivery()) |status| {
+    std.log.info("ESP-NOW delivery: {t}", .{status});
+}
+var frame: espnow.Frame = undefined;
+if (try session.poll_receive(&frame)) {
+    // frame.source, frame.destination, optional frame.rssi, frame.payload()
+}
+// Eventually: try session.deinit();
+```
+
+The wrapper allocates nothing in send, receive, or polling. Vendor buffer management
+can return `OutOfMemory`; Wi-Fi/ESP-NOW initialization still uses the vendor heap.
+The session reserves eight 1470-byte receive slots (about 12 KiB including metadata).
+Callbacks copy their transient metadata and payload under a critical section.
+`poll_receive` copies one frame into caller storage. Overflow drops the **newest**
+frame, preserving FIFO order; `dropped_frames` is a saturating counter, reset on init.
+Oversized incoming frames are also dropped and counted. RSSI is optional because
+`rx_ctrl` may be null; the C3/C6 v5.5.1 `wifi_pkt_rx_ctrl_t` starts with signed
+`rssi:8`, which the adapter reads even though Translate-C leaves the bitfields opaque.
+
+`send` accepts one explicit destination, including the broadcast address. It
+returns a Zig error for submission failure. One send may be outstanding;
+`Busy` persists until `poll_delivery` consumes its separate success/failure slot.
+Receive overflow cannot discard a delivery status. The payload may be reused once
+`send` returns. A successful delivery is a MAC acknowledgement, not proof of
+application receipt or successful decryption; add application acknowledgements
+when needed. Poll from a task with an application deadline. If it expires, keep the
+session at its original address and Wi-Fi running: `deinit` returns `Busy` until
+the completion arrives. Continue polling later, then retry teardown if needed.
+If completion never arrives, the radio cannot safely be reused through this API;
+reset the device for recovery. The pinned esp-wifi-sys `7623c8d` blob's `mt_deinit`
+unregisters callbacks, but `ppUnregisterTxCallback` does not drain transmissions,
+so unregistering is not a cancellation boundary.
+
+Peer operations are `add_peer`, `modify_peer`, `remove_peer`, `get_peer`,
+`has_peer`, and `peer_count` (total/encrypted). The blob owns the authoritative
+table; the wrapper keeps no second copy. Each peer selects `.sta` or `.ap` and
+channel 0 (current) or 1–14 (must match the interface channel and country policy).
+Add the broadcast peer before broadcasting. There are at most 20 peers; encrypted
+capacity follows `wifi.init_config.espnow_max_encrypt_num`, currently the pinned
+SDK's `CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM` (7 on C3/C6). The header's legacy
+`ESP_NOW_MAX_ENCRYPT_PEER_NUM` macro says 6; the wrapper leaves capacity enforcement
+to the blob and propagates `PeerTableFull`.
+
+`set_pmk` takes a 16-byte primary master key. `Peer.lmk` takes an optional 16-byte
+local master key: null disables encryption, a key enables it. Both ends need a
+peer entry with matching LMKs for encrypted unicast. Broadcast encryption is
+rejected. The PMK protects LMKs; applications should provision their own keys.
+`Session.version` records the blob's version; `max_payload_len` and
+`payload_limit(version)` give 250 bytes for v1 or 1470 for v2. Unknown versions
+return `UnsupportedVersion`; empty or oversized sends return `InvalidArgument`.
+A local v2 maximum does not establish a remote peer's capability; keep payloads
+at most 250 bytes for v1 interoperability.
+
+`set_wake_window(u16)` forwards the header's millisecond wake window setting.
+It does not enable modem sleep or establish a wake interval. Other power controls
+remain in Wi-Fi; C6 modem sleep is unsupported by this port, as documented above.
+No additional ESP-NOW power knob is exposed by this wrapper.
+
+#### Two-board self-test
+
+From `examples/espressif/esp`, build with
+`zig build -Doptimize=ReleaseSmall -Dexample=selftest_espnow`.
+Image-boot outputs are `esp32_c3_selftest_espnow.bin`,
+`esp32_c6_selftest_espnow.bin`, and `xiao_esp32_c6_selftest_espnow.bin`, plus ELFs.
+Use the XIAO board image for its RF switch; `-Dantenna=internal` is the default,
+`-Dantenna=external` selects U.FL. Flash the same test to exactly two boards
+(chip-specific binary when mixing C3/C6), boot them within ten seconds, and read
+both USB Serial/JTAG consoles. No wiring or access point is required.
+
+Discovery broadcasts on channel 1. The lower factory station MAC coordinates
+phase changes over broadcast; the other keeps announcing until phase 1 proves
+that the coordinator heard it. Discovery allows 22 seconds, including the ten-second
+boot gap. Phase requests retry for up to eight seconds, and data/echo exchanges
+retry for up to four seconds. Duplicate data requests are echoed again; the follower
+stays available for eight seconds after the final phase to repeat a lost ACK.
+The mismatched-key probe is sent once in each direction. Each board checks
+init, peer add/duplicate/query/modify/count/remove, broadcast receipt,
+MAC-delivery failure to an absent locally administered peer, unicast delivery and
+application echo, matching-key encrypted unicast and echo, mismatched-key
+non-delivery in both directions during a bounded 1.8-second observation,
+byte-for-byte maximum payload and echo, and deinit. Encrypted counts and key
+round-trips are checked. Demo keys are compiled into this test only.
+The two devices must report the same ESP-NOW version to exercise that version's
+maximum. Receiver evidence, rather than MAC status, scores the mismatched-key
+check. Both the leader and follower must pass; either console alone is insufficient.
+
+The run has a 55-second deadline from each board's entry to main. Results repeat
+for late USB attachment, with one `SELFTEST espnow <check>: PASS|FAIL` line per
+check and `SELFTEST espnow DONE pass=9 fail=0` on success. Reset both boards for
+another run. Host tests exercise FIFO/overflow, send reservations and completions,
+peer bookkeeping via a deterministic blob substitute, lifecycle rollback,
+argument validation and error mapping. The standalone host test
+`zig test examples/espressif/esp/src/selftest_espnow_protocol.zig` exercises
+rendezvous with either boot order, a ten-second gap and dropped announcements
+and phase requests. Cross-compilation is build evidence only.
+
+| `selftest_espnow` pairing (2026-11-23) | Runs | Result |
+| --- | --- | --- |
+| Super Mini ESP32-C6 rev v0.2 + XIAO ESP32-C6 rev v0.1, booted together | 3 | `DONE pass=9 fail=0` on both boards |
+| Same pair, second board booted 8 s after the first (each board first once) | 2 | `DONE pass=9 fail=0` on both boards |
+| ESP32-C3 rev v0.4 + Super Mini ESP32-C6 (C3 follower) | 3 | `DONE pass=9 fail=0` on both boards |
+| ESP32-C3 rev v0.4 + XIAO ESP32-C6 (C3 leader) | 3 | `DONE pass=9 fail=0` on both boards |
+
+All runs used the image-boot builds (`esp32_c3_`, `esp32_c6_` and `xiao_esp32_c6_selftest_espnow.bin`,
+internal antenna) behind the ESP-IDF bootloader.
