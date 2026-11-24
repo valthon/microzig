@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "selftest_ieee802154", .file = "src/selftest_ieee802154.zig", .chips = &.{.esp32_c6}, .antenna_option = true, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_wifi_softap_echo", .xiao_board = true, .antenna_option = true, .file = "src/selftest_wifi_softap_echo.zig", .wifi_options = true, .softap_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
         .{ .name = "selftest_wifi_open_ap", .xiao_board = true, .antenna_option = true, .file = "src/selftest_wifi_open_ap.zig", .wifi_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        .{ .name = "selftest_wifi_modes", .xiao_board = true, .antenna_option = true, .file = "src/selftest_wifi_modes.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_wifi_tx_done", .xiao_board = true, .antenna_option = true, .file = "src/selftest_wifi_tx_done.zig", .wifi_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
         .{ .name = "softap", .xiao_board = true, .antenna_option = true, .file = "src/softap.zig", .softap_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
         .{ .name = "selftest_lp_irq", .file = "src/selftest_lp_irq.zig", .chips = &.{.esp32_c6}, .lp_image = .irq },

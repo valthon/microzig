@@ -954,6 +954,9 @@ DHCP server); `tcp_server` counts the AP's first TCP connection after each boot 
   boots.
 - XIAO ESP32-C6 board build, 2026-11-20: `tcp_server` 3 of 3 boots;
   `selftest_wifi_lifecycle` 8/8 in 3 of 3 boots.
+- With the status-error and `semphr_take` fixes, 2026-11-24, ReleaseSmall: `tcp_server`
+  1 of 1 boot each on the C3, the Super Mini ESP32-C6 and the XIAO ESP32-C6 (board
+  build), each started once the Pico listed `stations=0`.
 
 A watchdog reset sends no deauthentication, so the AP keeps the old association: a station
 booted again at once leases and listens, but its TCP connections time out until the AP
@@ -974,19 +977,33 @@ the Pico 2 W above):
 
 - `wifi_tx_done`: `pass=3 fail=0` with `sent=10 callbacks=10` in 3 of 3 boots each on
   the C3, the Super Mini ESP32-C6 and the XIAO ESP32-C6 (board build), each boot started once the Pico listed
-  `stations=0`.
+  `stations=0`. Again with the status-error and `semphr_take` fixes (2026-11-24,
+  ReleaseSmall): `pass=3 fail=0` with `sent=10 callbacks=10 failed=0` in 1 of 1 boot on
+  each of the three boards.
 - `wifi_open_ap` against an open Pico AP: `pass=3 fail=0` in 3 of 3 boots each on the
-  C3, Super Mini ESP32-C6 and XIAO ESP32-C6 (board build).
+  C3, Super Mini ESP32-C6 and XIAO ESP32-C6 (board build); again with the status-error
+  and `semphr_take` fixes (2026-11-24, ReleaseSmall) in 1 of 1 boot on each of the three
+  boards.
 - `wifi_softap_echo`: `pass=13 fail=0`, with the station's lease and `echoed=2570` in the
   AP's log, in 3 of 3 boots for each pairing: C3 AP with Super Mini ESP32-C6 or XIAO ESP32-C6 (generic image)
   station, Super Mini ESP32-C6 or XIAO ESP32-C6 (generic image) AP with C3 station, XIAO ESP32-C6 board-build AP with
   Super Mini ESP32-C6 station, and Super Mini ESP32-C6 AP with XIAO ESP32-C6 board-build station. Boards not taking
   part were stopped before each boot.
+- `wifi_modes` (2026-11-24): `pass=11 fail=0` in 1 of 1 boot on each of the C3,
+  the Super Mini ESP32-C6 and the XIAO ESP32-C6 (board build), in ReleaseSafe and in
+  ReleaseSmall. In all six boots `set_protocol` in the null mode and `disconnect` and
+  `connect` in the null and AP-only modes returned `error.WifiMode`, `get_mode` returned
+  `.none` after `init`, and `WifiNotInitialized` after `deinit`. Before the fixes,
+  ReleaseSafe builds panicked with `invalid enum value` at `get_mode` after `init`; with
+  that case and `set_protocol` skipped, `disconnect` without a station returned success,
+  and with only the `semphr_take` fix it panicked with `esp wifi returned unexpected error
+  code`.
 
 | Image / suite | Expected result | Peer setup and checks |
 | --- | --- | --- |
 | `selftest_wifi_tx_done` / `wifi_tx_done` | `pass=3 fail=0` | AP matching `-Dwifi_ssid`, `-Dwifi_password`, `-Dwifi_auth`; start, join, TX-done. No DHCP or PC needed. Sends ten 60-byte broadcast Ethernet frames with experimental EtherType 0x88b5 and unique sequence tags. Requires a successful callback for every queued frame, found by its tag inside the 802.11 frame the callback returns (not the Ethernet frame sent); prints sent, distinct callback and failed-status counts. Duplicate callbacks cannot cover a missing frame. |
 | `selftest_wifi_open_ap` / `wifi_open_ap` | `pass=3 fail=0` | Open AP matching `-Dwifi_ssid`, with no protected AP of that SSID in range. Build the station with `-Dwifi_auth=wpa2_personal` and a dummy test `-Dwifi_password` of at least eight bytes. Checks start, scan presence, rejection. Requires an incompatible-security/auth-threshold disconnect (IDF reasons 210/211), no association throughout 30 seconds, and 210/211 still the last reason at the end. Missing AP, other disconnect reasons, or unprotected station configuration fail. |
+| `selftest_wifi_modes` / `wifi_modes` | `pass=11 fail=0` | No peer. Checks `get_mode` is `.none` after `init`, `set_protocol` in that mode, and `disconnect` and `connect` without a station (null mode, then a hidden demo AP), return `error.WifiMode`, `start` works with no interface, `stop`, and that `deinit` leaves Wi-Fi uninitialized. |
 | `selftest_wifi_softap_echo` / `wifi_softap_echo` | `pass=13 fail=0` | Run `softap` on the other chip first; matching `-Dsoftap_ssid` and `-Dsoftap_password` on both builds (demo defaults work). Checks start, join, DHCP, then ten 257-byte binary payload echoes at `192.168.4.1:7`. Handles partial writes and split/chained receives; checks lengths and every byte. No PC joined to the AP needed. |
 
 Build from `examples/espressif/esp` using the pinned Zig. These commands use only
@@ -999,6 +1016,7 @@ zig build -Doptimize=ReleaseSmall -Dexample=selftest_wifi_open_ap \
   -Dwifi_ssid=bench-open -Dwifi_password=example-passphrase -Dwifi_auth=wpa2_personal
 zig build -Doptimize=ReleaseSmall -Dexample=softap
 zig build -Doptimize=ReleaseSmall -Dexample=selftest_wifi_softap_echo
+zig build -Doptimize=ReleaseSmall -Dexample=selftest_wifi_modes
 ```
 
 Outputs are `esp32_c3_<image>` and `esp32_c6_<image>` under

@@ -50,7 +50,8 @@ pub const Code = enum(i32) {
     /// Generic failure, e.g. from scan start (C6 libnet80211.a
     /// esp_wifi_scan_start+0x15e) and from esp_supplicant_init when
     /// esp_supplicant_common_init fails (esp-wifi-sys libwpa_supplicant.a
-    /// esp_supplicant_common_init+0x32).
+    /// esp_supplicant_common_init+0x32). wifi.zig's `disconnect` maps the
+    /// one from a mode without a station to `error.WifiMode`.
     esp_fail = -1,
 
     /// Out of memory

@@ -297,6 +297,8 @@ pub fn apply(config: Config) ConfigError!void {
 }
 
 pub const WifiMode = enum(u32) {
+    /// No interface. `init` selects it, and `start` succeeds in it.
+    none = c.WIFI_MODE_NULL,
     sta = c.WIFI_MODE_STA,
     ap = c.WIFI_MODE_AP,
     ap_sta = c.WIFI_MODE_APSTA,
@@ -431,6 +433,9 @@ pub fn set_protocol(protocols: []const Protocol) InternalError!void {
     }
 
     const mode = try get_mode();
+    // With no interface in the mode there is nothing to configure, as `connect`
+    // without a station.
+    if (mode == .none) return error.WifiMode;
     if (mode.is_sta()) {
         try c_err(c.esp_wifi_set_protocol(c.WIFI_IF_STA, combined));
     }
@@ -465,14 +470,24 @@ pub fn stop() InternalError!void {
     try c_err(c.esp_wifi_stop());
 }
 
-/// Non-blocking.
+/// Non-blocking. Without a station in the mode this returns `error.WifiMode`.
 pub fn connect() InternalError!void {
     try c_err(c.esp_wifi_connect_internal());
 }
 
-/// Non-blocking.
+/// Non-blocking. Without a station in the mode this returns `error.WifiMode`.
 pub fn disconnect() InternalError!void {
-    try c_err(c.esp_wifi_disconnect_internal());
+    const status = c.esp_wifi_disconnect_internal();
+    // connect answers a mode without a station with ESP_ERR_WIFI_MODE
+    // (wifi_connect_process+0x12..0x16, +0x5c..0x5e), but disconnect answers the
+    // same test with bare ESP_FAIL (wifi_disconnect_process+0x1e..0x24, +0x3e;
+    // C3 and C6 libnet80211.a). ESP_FAIL also comes from a station whose
+    // ieee80211_sta_disconnect fails (_do_wifi_disconnect+0xa2..0xa6), so the
+    // mode decides; esp_wifi_get_mode reads the byte both processes test.
+    // The mode is read after the call, so a set_mode racing this disconnect on
+    // another task can swap error.WifiMode and error.WifiOther.
+    if (status == c.ESP_FAIL and !(try get_mode()).is_sta()) return error.WifiMode;
+    try c_err(status);
 }
 
 pub const EventType = enum(i32) {
