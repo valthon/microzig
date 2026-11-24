@@ -141,8 +141,8 @@ The external `eof_num` case checks 64 received bytes, echoed data and guards.
 
 The USB Serial/JTAG logger waits for the host with the caller's interrupt
 state: it masks interrupts only to claim the writer and update its counters,
-never while waiting. Each writer drain (64 bytes) waits at most 2 ms for the
-host. Callers with interrupts masked and ordinary interrupt
+never while waiting. Each writer drain (at most 64 bytes) waits at most 2 ms for
+the host. Callers with interrupts masked and ordinary interrupt
 handlers (identified by a nonzero priority threshold) share one 2 ms deadline
 per line, plus formatting and FIFO writes. A line that starts while another
 is being written (from an interrupt handler or a preempting task) is dropped
@@ -156,11 +156,36 @@ effort. `write_blocking` confirms host consumption, but its caller must quiesce
 logging first; masking interrupts cannot exclude a preempted logger owner.
 The same limitation applies throughout `Disconnect.begin`/`finish`.
 This logger is host-tested; on hardware it ran on a XIAO ESP32-C6 (rev v0.1),
-2026-11-19, with `selftest_wifi_lifecycle` (logger: same code as this tree):
+2026-11-19, with `selftest_wifi_lifecycle` (before the packet-bounded drain change):
 10 of 10 watchdog boots with the port opened 40 s late gave USB output, each
-starting with an `at most 25 lines` report. With this logger, `selftest_usj`
+starting with an `at most 25 lines` report. Before the packet-bounded drain change, `selftest_usj`
 (RAM image, host echo script) passed 9/9 echo cases on the C3, Super Mini ESP32-C6 and
 XIAO ESP32-C6, 3 runs each, at 24ebc5d1 (2026-11-19). Radio evidence is documented in "BLE bench examples" and "IEEE 802.15.4 raw MAC (C6)".
+
+An argument longer than the buffer is written in packet-sized drains, each
+with its own 2 ms timeout unless the caller needs the shared line deadline.
+A single drain covering the buffered prefix and the whole argument would
+truncate a long string whenever the host takes more than 2 ms to read two
+packets. The host tests drive the real Writer, logger formatting and packet
+loop through a deterministic FIFO/clock seam (hosted tests only), covering
+boundary lengths, vectors/splats, `bytesToHex` slices, raw `{x}`, timeout
+accounting/recovery, the shared deadline, and a large writer that drains in
+place and gets its full buffer back after a failed drain. When a reservation
+needs room, the writer sends packets until the unsent bytes are no more than
+the sent prefix before moving them down: in the host test, 64 successive
+64-byte reservations on a full 4 KiB writer move 4,096 bytes, where moving
+after every packet moved 258,048.
+
+`selftest_usj_log` (C3 and C6; `-Dexample=selftest_usj_log`) logs seven
+`FIELD` lines of 31, 32, 63, 64, 65, 100 and 200 ASCII `h` characters and one
+`HEX` line with the lowercase hex of bytes 0 through 31. Each payload is
+followed by `len=<decimal> crc32=<eight hex digits>` of the logged text (for
+`HEX`, the 64 hex characters: `len=64`)
+(CRC-32/ISO-HDLC, `std.hash.Crc32`), then `SELFTEST usj_log DONE`. Open USB
+within the three-second startup delay or reset with the port open. On the
+ESP32-C3, Super Mini ESP32-C6 (rev v0.2) and XIAO ESP32-C6 (rev v0.1), all
+eight payloads matched their length and CRC, with no loss report
+(2026-11-23).
 
 On an ESP32-C6, SERIAL_IN_EP_DATA_FREE can read 0 at boot with nothing
 committed: IN_EP1_ST (C6 TRM v1.2 register 32.19) idle and the host's IN
@@ -173,7 +198,7 @@ WR_DONE when a wait times out, on every line dropped while stalled, and once
 before the first write after boot. A host that reads the buffer between the
 DATA_FREE read and WR_DONE receives a zero-length packet, which CDC ACM
 ignores. The boot-time release is included in the tested XIAO ESP32-C6 logger above
-(same code as this tree).
+(the packet-bounded drain change does not touch it).
 
 PARL_IO stretches every TX setup clock to factor 65535 before gating it low,
 and routes the clock to its pad only after stretching, so a receiver sees
