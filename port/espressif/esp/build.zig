@@ -431,6 +431,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(ble_host_tests).step);
+    const ble_bond_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/radio/ble/smp_bond_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    ble_bond_tests.root_module.addImport("nvs", b.createModule(.{
+        .root_source_file = b.path("src/hal/nvs.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    test_step.dependOn(&b.addRunArtifact(ble_bond_tests).step);
 
     // Tests in a separate imported module need their own test artifact.
     const interrupt_tests = b.addTest(.{

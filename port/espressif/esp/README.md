@@ -1888,9 +1888,9 @@ The controller and allocator must stay at stable addresses for the whole boot.
 The controller is a singleton with one connection. There is no shutdown/restart
 API; a failed startup requires reboot. Controller tasks, NPL objects and PHY
 tracking use the supplied allocator for this boot lifetime. NPL callouts use
-millisecond resolution; modem sleep and pairing/secure-connections crypto are
-disabled. This does not implement SMP or bonding. The controller's LP timer divider
-stays at 399; IDF's `bt.c` uses 4 on chip revisions above v0.0 under
+millisecond resolution; modem sleep remains disabled. The Zig host implements
+LE Secure Connections and bonding as described below. The controller's LP timer
+divider stays at 399; IDF's `bt.c` uses 4 on chip revisions above v0.0 under
 `SOC_BLE_USE_WIFI_PWR_CLK_WORKAROUND`.
 
 `send_command` takes an HCI command header and parameters; `send_acl` takes the
@@ -1936,10 +1936,210 @@ and `subscribe`. It does not assume peer handles. Discovery supports 16-bit
 service/characteristic UUIDs and skips unrelated 128-bit UUID entries. The
 host uses ATT MTU 23, one connection and one ATT bearer; values longer than 20
 bytes, queued/reliable writes, dynamic L2CAP channels, extended advertising,
-privacy/resolving lists, pairing/SMP, encryption and bonding are unsupported.
-Pairing requests receive Pairing Not Supported. Connection-parameter update
+controller privacy/resolving lists are unsupported. Security is opt-in; without
+`configure_security`, pairing requests receive Pairing Not Supported and no
+encryption is initiated. Connection-parameter update
 requests on LE signaling are rejected, retaining the negotiated interval.
 Notification payloads and counts are available in the host state.
+
+### Pairing, encryption and bonds (SMP)
+
+`bluetooth.host.smp` implements the fixed L2CAP SMP channel (CID 6), LE Secure
+Connections in both roles, Just Works, Numeric Comparison and 20-round Passkey
+Entry. It requires 128-bit encryption keys. Legacy pairing (SC bit clear) is
+rejected with Pairing Failed / Pairing Not Supported (0x05); there is no silent
+legacy fallback. OOB, debug keys, CTKD, signing, keypress notifications and
+pairing over an already encrypted link are unsupported. Unsupported OOB or
+unavailable required authentication returns Authentication Requirements (0x03).
+A failed or timed-out procedure requires disconnect before retrying. A 30 s
+SMP timeout poisons that SMP bearer until reconnect. One procedure runs per
+connection. Before it starts, with or without a restored bond, a Pairing
+Request to the peripheral starts pairing and retires the restored key, and a
+Security Request to the central starts encryption with a restored key that
+meets the required authentication, otherwise pairing (reserved bonding flags
+abort). Once it completes, a Security Request to the central is ignored. A
+peer's Pairing Failed is ignored in both cases. Any other SMP PDU while no
+procedure is outstanding is answered with Pairing Failed and the session keeps
+its keys and state: Pairing Not Supported for a Pairing Request to a completed
+peripheral, Invalid Parameters for a wrong length, otherwise Command Not
+Supported (reason codes: Core v5.4 Vol 3 Part H §3.5.5).
+
+Configure before connecting, after `host.initialize()`:
+
+```zig
+const smp = bluetooth.host.smp;
+// Keep storage, adapter and all callback contexts alive for the whole session.
+var adapter: smp.bonds.Nvs(hal.nvs_flash.Store.Handle) = .{
+    .handle = try storage.open("ble_bonds", .read_write_purge),
+};
+try host.configure_security(.{
+    .crypto = bluetooth.security_crypto,
+    .store = adapter.interface(),
+    .irk = local_irk, // Generate once, persist separately in NVS, reuse on reboot.
+});
+// Central: uses a bond if present, otherwise pairs. Peripheral: requests security.
+try host.secure();
+```
+
+`storage` is an initialized `hal.nvs_flash.Store` on a validated named partition
+(see NVS above). Store errors propagate as `StorageFailed`; a missing record is
+normal. A completed bond is saved once, from the next `poll()`/`secure()`: if the
+save fails or is refused, that call returns `StorageFailed`, the link stays
+encrypted but unbonded, and later polls process packets normally. If loading
+the peer's bond fails at connection, the connection event returns
+`StorageFailed` and that connection requires authenticated pairing (fail closed:
+the unreadable record may be an authenticated bond). The adapter atomically replaces one versioned NVS blob holding at most
+eight bonds. It requires a purging handle, never evicts a peer implicitly, and
+reports full/corrupt/unwritable storage as `StorageFailed`. Records contain LTK,
+authentication status, peer connection address, identity address and IRK. Local
+IRK is application-owned; omitting it disables local identity distribution.
+An authenticated bond cannot be replaced by an unauthenticated bond without
+explicit removal. A save checks every record whose connection or identity
+address matches either address of the new bond; if any is authenticated and the
+new bond is not, the save is refused. A save that would merge two
+authenticated bonds (its addresses match two different authenticated records)
+is refused too, and neither record changes. Otherwise the first match is
+replaced and other matches are purged, so no older record can shadow it in a
+load. Flash encryption is not supplied by this adapter.
+
+In Secure Connections the LTK is derived with f5 on both sides, **not sent in
+Encryption Information / Master Identification PDUs**. Only negotiated identity
+keys are sent, over the encrypted link, responder first. HCI LE Enable
+Encryption (formerly LE Start Encryption), LTK Request/Reply/Negative Reply,
+Encryption Change and Encryption Key Refresh Complete drive the link state.
+Secure Connections uses zero Rand/EDIV; other requests get a negative reply.
+`host.security` exposes encrypted/authenticated/bonded state and pairing count.
+A peripheral loads a bond on connection and answers the controller's LTK
+request; a central calls `secure()` to re-encrypt without another SMP exchange.
+The adapter also resolves a peer's RPA with stored IRKs using ah; local addresses
+remain public, and controller resolving lists/local privacy are not enabled.
+The application remains responsible for discovering/connecting to that peer.
+When no security procedure is outstanding, a peer Security Request reuses a
+cached key only if it satisfies the requested authentication. A MITM request
+upgrades a Just Works bond through fresh authenticated pairing; unavailable IO
+authentication fails closed. Crossing requests during pairing or pending
+encryption are ignored, preserving the outstanding procedure's requirements,
+key material and timeout.
+
+Use `host.remove_bond(peer_address)` to purge a bond by connection address,
+identity address or matching RPA. Removing a bond does not terminate the current
+encrypted link; disconnect afterwards. If only one side removes it, the next
+encryption attempt fails (`SecurityFailed`, controller error or disconnect).
+There is no automatic re-pairing on missing keys. Remove the remaining side's
+bond, disconnect and call `secure()` on a fresh connection to pair explicitly.
+
+For authenticated pairing, supply `io`, `io_fn`, `io_context` and set
+`require_authenticated = true`. The IO hook receives `.display` (fresh six-digit
+passkey, a notification; the answer is ignored), `.compare` (six-digit number:
+answer `.accept` or `.reject`) or `.input` (answer `.passkey` 0..999999 or
+`.reject`). Format six digits including leading zeros. The hook runs on the host
+task, must not block and cannot call back into the host. Answer `.pending` while
+the user decides; the host keeps exchanging packets and asks again on every
+`poll()` (at most 20 ms apart while an answer is outstanding, including inside
+`secure()`). The peer may need this side's next PDU before its user sees
+anything: a Numeric Comparison responder's Pairing Random, or a keyboard
+peripheral's Pairing Response, after which the display central chooses the
+passkey (Core v5.4 Vol 3 Part H §§2.3.5.6.2–2.3.5.6.3). That reply is queued
+before the hook is first asked and transmitted after the hook returns, so the
+prompt may appear before the peer has received it. A responder holds an early
+DHKey Check until its user accepts (§2.3.5.6.5). The 30 s SMP timeout (§3.4)
+keeps running while an answer is pending. If the procedure ends before an asked
+`.compare` or `.input` is answered (SMP timeout, the peer's Pairing Failed, a
+local abort, an encryption failure or disconnect), the hook receives one
+`.cancel` and is not asked that request again: take the prompt down and
+discard input typed for it. A request asked after an answer or a `.cancel` is
+a new one. `.display` has no withdrawal; follow `host.security` for the
+procedure's outcome.
+The IO-capability table chooses Numeric Comparison or Passkey Entry; unavailable
+required authentication fails closed. Just Works encrypts without MITM
+protection and never grants authenticated ATT permissions.
+
+Each server attribute has `server.permissions[handle - 1]`:
+`.open` (default), `.encrypted` or `.authenticated`. For example, set
+`host.server.?.permissions[bluetooth.host.gatt.value_handle - 1] = .encrypted`
+after `advertise()`. Reads, Read Blob, Read By Type and writes enforce permissions
+before accessing the value. Insufficient encryption returns ATT 0x0f;
+insufficient authentication returns 0x05 (Core Vol 3 Part F §3.2.5).
+Write Commands remain response-free and cannot change a protected value.
+Encryption loss/disconnect immediately revoke access. Notification permissions
+are also checked before emission; discovery of handles and UUIDs remains open.
+A frame waiting for ACL credits keeps the security it needs: identity keys
+(only sent over the link encrypted with the new key, §2.4.3.2), and ATT
+responses or notifications carrying a protected attribute's value. Such a
+frame fits in one ACL fragment; after the credit wait, before the frame is
+handed to the controller, the host rechecks the link and, if encryption or
+authentication was lost during the wait, withholds it
+(`host.withheld_protected` counts them). A withheld ATT response is replaced
+by an Error Response naming the strictest protected attribute it would have
+disclosed (0x0f, or 0x05 for an authenticated attribute); for Read By Type or
+Read By Group Type a new request could instead list the open entries before
+that attribute. Either way the peer's request is still answered
+(Vol 3 Part F §3.3.3); a notification needs no answer and is dropped. Encryption
+loss also drops queued SMP PDUs other than Pairing Failed.
+
+Crypto choices: `smp_hardware.zig` uses `hal.ecc` P-256 verify-and-multiply on C6
+for fresh public keys and ECDH, with hardware point validation and bounded waits.
+`hal.ecc` holds an ownership flag, not a critical section, during the
+calculation: controller interrupts stay enabled through each P-256 multiply,
+and a concurrent ECC caller receives `error.Busy` (pairing then fails with
+`CryptoFailed`).
+Private scalars exclude zero, out-of-range values and the debug scalar. Entropy
+comes from `hal.rng` through `osi.rand`. C6 TRM v1.2 §26.4 requires an active
+SAR ADC or radio ADC for true randomness (see `hal.rng`). ESP-IDF v5.5.1's
+[Random Number Generation](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32c6/api-reference/system/random.html)
+page for the ESP32-C6 states: "The hardware RNG produces true random numbers so
+long as one or more of the following conditions are met: RF subsystem is
+enabled. i.e., Wi-Fi or Bluetooth or 802.15.4 Thread/Zigbee are enabled. [...]
+If none of the above conditions are true, the output of the RNG should be
+considered as pseudo-random only." SMP draws randomness only on a live
+connection, after `Controller.enable` has run IDF's BLE PHY bring-up
+(`register_chipv7_phy`, full calibration) with modem sleep disabled; this
+relies on IDF's documented "Bluetooth enabled" condition and has not been
+measured on our boards. The 802.15.4 raw MAC above still makes no entropy claim
+for its own hand-ported PHY configuration.
+AES-CMAC, f4/f5/f6/g2 and ah use `std.crypto` AES-128/CMAC: this reuses the standard
+CMAC construction and portable host-test implementation without repeatedly
+masking interrupts and acquiring the hardware AES peripheral for small blocks.
+The SMP engine explicitly converts between big-endian crypto inputs (Appendix D)
+and little-endian SMP/HCI fields. Secrets are wiped on failure/disconnect;
+constant-time MAC comparison is used. Host-side copies are wiped after use: the
+TX frame queue and its stack copies, the HCI command buffer (LE Enable
+Encryption and LTK Reply carry the LTK), the SMP send queue and popped PDUs, the
+reassembled L2CAP SDU and the received transport packet. The controller's own
+buffers and the RTOS queue slots in `bluetooth.Controller` still hold transient
+copies until reused. The existing `hal.ecc` driver makes no
+fault-resistance or constant-time hardware claim.
+
+Controller source/settings are pinned to ESP-IDF **v5.5.1**:
+
+- [`bt.c`, `esp_ecc_gen_key_pair`, `esp_ecc_gen_dh_key`, `s_ext_funcs`,
+  `ble_sm_alg_gen_key_pair`, `ble_sm_alg_gen_dhkey`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/bt/controller/esp32c6/bt.c):
+  IDF's wrappers gate ECC with `CONFIG_BT_LE_SM_LEGACY || CONFIG_BT_LE_SM_SC`.
+  Our `ExtFuncs.ecc_key/ecc_dh` are real C6 hardware implementations with the
+  same little-endian ABI. Legacy pairing
+  remains disabled in the host. Host SMP computes ECDH directly; it does not
+  require HCI Read Local P-256 Public Key / Generate DHKey.
+- [`esp_bt_cfg.h`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/bt/controller/esp32c6/esp_bt_cfg.h)
+  and [`esp_bt.h`, `esp_bt_controller_config_t`, `BT_CONTROLLER_INIT_CONFIG_DEFAULT`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/bt/include/esp32c6/include/esp_bt.h):
+  this ABI has no runtime pairing/SC enable field. No invented config bit or blob
+  rebuild is needed. Existing `vhci_enabled = 1`, one connection, ACL buffers,
+  3000 authentication-payload timeout and no modem sleep are retained.
+- Host HCI event masks now include Encryption Change, Encryption Key Refresh
+  Complete and LE LTK Request. These are HCI settings, not `esp_bt_cfg.h` fields;
+  see [Core v5.4 Vol 4 Part E](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html)
+  §§7.3.1, 7.8.1, 7.8.24–7.8.26 and §§7.7.8, 7.7.39, 7.7.65.5.
+
+Evidence: host tests exercise both roles, all three methods, twenty passkey
+rounds, IO hooks that answer only after the peer's display (Numeric Comparison
+responder, keyboard peripheral or central, early DHKey Check), encryption loss
+during an ACL credit wait with identity keys or a protected read response queued,
+identity distribution, timeout, malformed/unsupported pairing, confirm
+mismatch, DHKey-check failure, HCI encryption/key refresh, LTK replies/negative
+replies, and SMP ACL fragmentation under credit pressure. Crypto results match
+[Core v5.4 Vol 3 Part H Appendix D](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host/security-manager-specification.html):
+AES-CMAC (all four vectors), f4, f5, f6, g2 and ah. Bond tests use the actual
+`hal.nvs.Storage` against in-memory flash, reopen after writes/removal, verify
+purging and error propagation, and resolve a changed RPA.
 
 Central connection creation matches ESP-IDF v5.5.1's pinned NimBLE
 [`ble_gap_conn_params_dflt`](https://github.com/espressif/esp-nimble/blob/b45dcedcafb7888174c3567002c36b342ec0b723/nimble/host/src/ble_gap.c)

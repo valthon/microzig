@@ -8,6 +8,25 @@ pub const mtu = 23;
 pub const value_handle = 6;
 pub const notify_handle = 8;
 pub const cccd_handle = 9;
+pub const Permission = enum { open, encrypted, authenticated };
+/// The strictest attribute permission a response discloses, kept so the host
+/// can withhold the response if the link loses that security before it is
+/// sent.
+pub const Disclosure = struct {
+    permission: Permission = .open,
+    /// The request opcode and the attribute that set `permission`.
+    request: u8 = 0,
+    handle: u16 = 0,
+    /// The Error Response (Core v5.4 Vol 3 Part F §3.4.1.1) that answers the
+    /// request instead: it names the strictest protected attribute the response
+    /// would have disclosed, with the code `permission_error` uses for that
+    /// permission. A multi-entry response (Read By Type, Read By Group Type)
+    /// may list open entries before it, which a new request would still return.
+    pub fn refusal(self: Disclosure) [5]u8 {
+        const code: u8 = if (self.permission == .authenticated) 0x05 else 0x0f;
+        return .{ 1, self.request, @truncate(self.handle), @truncate(self.handle >> 8), code };
+    }
+};
 const types = [_]u16{ 0x2800, 0x2803, 0x2a00, 0x2800, 0x2803, 0xfff1, 0x2803, 0xfff2, 0x2902 };
 pub const Server = struct {
     name: [20]u8 = @splat(0),
@@ -16,6 +35,12 @@ pub const Server = struct {
     value_len: u8 = 0,
     subscribed: bool = false,
     counter: u32 = 0,
+    permissions: [9]Permission = @splat(.open),
+    encrypted: bool = false,
+    authenticated: bool = false,
+    /// What the last `respond()` returned. The host sends that response only
+    /// while the link still meets `disclosure.permission`.
+    disclosure: Disclosure = .{},
 
     pub fn init(name: []const u8) wire.Error!Server {
         if (name.len == 0 or name.len > 20) return error.InvalidName;
@@ -27,6 +52,17 @@ pub const Server = struct {
     pub fn disconnected(self: *Server) void {
         self.subscribed = false;
         self.counter = 0;
+        self.encrypted = false;
+        self.authenticated = false;
+    }
+    /// Core Vol 3 Part F §3.2.5: authenticated access requires both encryption
+    /// and MITM authentication. Just Works never grants authenticated access.
+    pub fn permission_error(self: *const Server, handle: u16) ?u8 {
+        if (handle == 0 or handle > self.permissions.len) return null;
+        const permission = self.permissions[handle - 1];
+        if (permission == .authenticated and !self.authenticated) return 0x05;
+        if (permission != .open and !self.encrypted) return 0x0f;
+        return null;
     }
 
     fn value_of(self: *const Server, handle: u16, out: *[20]u8) ?[]const u8 {
@@ -61,6 +97,12 @@ pub const Server = struct {
             else => return null,
         }
     }
+    fn disclose(self: *Server, op: u8, handle: u16) void {
+        const permission = self.permissions[handle - 1];
+        if (@backingInt(permission) > @backingInt(self.disclosure.permission)) {
+            self.disclosure = .{ .permission = permission, .request = op, .handle = handle };
+        }
+    }
     fn failure(out: *[mtu]u8, op: u8, handle: u16, code: u8) []const u8 {
         out[0] = 1;
         out[1] = op;
@@ -72,12 +114,14 @@ pub const Server = struct {
     /// Writes and subscription updates occur only after the entire PDU validates.
     /// An ATT command never has a response, including malformed commands.
     pub fn respond(self: *Server, req: []const u8, out: *[mtu]u8) []const u8 {
+        self.disclosure = .{};
         if (req.len == 0) return out[0..0];
         const op = req[0];
         const handle: u16 = if (req.len >= 3) read16(req[1..3]) else 0;
         if (req.len > mtu) return if (op & 0x40 != 0) out[0..0] else failure(out, op, handle, 4);
         if (op == 0x52 or op == 0x12) {
             if (req.len < 3) return if (op == 0x52) out[0..0] else failure(out, op, handle, 4);
+            if (self.permission_error(handle)) |code| return if (op == 0x52) out[0..0] else failure(out, op, handle, code);
             var code: u8 = 0;
             if (handle == value_handle) {
                 @memcpy(self.value[0 .. req.len - 3], req[3..]);
@@ -102,11 +146,13 @@ pub const Server = struct {
         if (op == 0x0a or op == 0x0c) {
             if (req.len != (if (op == 0x0a) @as(usize, 3) else 5)) return failure(out, op, handle, 4);
             if (handle == 0 or handle > types.len) return failure(out, op, handle, 1);
+            if (self.permission_error(handle)) |code| return failure(out, op, handle, code);
             var tmp: [20]u8 = undefined;
             const value = self.value_of(handle, &tmp) orelse return failure(out, op, handle, 2);
             const offset: usize = if (op == 0x0c) read16(req[3..5]) else 0;
             if (offset > value.len) return failure(out, op, handle, 7);
             const len = @min(value.len - offset, mtu - 1);
+            self.disclose(op, handle);
             out[0] = op + 1;
             @memcpy(out[1..][0..len], value[offset..][0..len]);
             return out[0 .. len + 1];
@@ -141,6 +187,11 @@ pub const Server = struct {
                 for ([_]u16{ 1, 4 }, [_]u16{ 3, 9 }, [_]u16{ 0x1800, 0xfff0 }) |start, last, uuid| {
                     if (start < handle or start > end) continue;
                     if (op == 6 and read16(req[7..9]) != uuid) continue;
+                    if (self.permission_error(start)) |code| {
+                        if (len == (if (op == 0x10) @as(usize, 2) else 1)) return failure(out, op, start, code);
+                        break;
+                    }
+                    self.disclose(op, start);
                     write16(out[len..], start);
                     write16(out[len + 2 ..], last);
                     if (op == 0x10) write16(out[len + 4 ..], uuid);
@@ -157,6 +208,10 @@ pub const Server = struct {
         var h = handle;
         while (h <= @min(end, types.len)) : (h += 1) {
             if (types[h - 1] != typ) continue;
+            if (self.permission_error(h)) |code| {
+                if (len == 2) return failure(out, op, h, code);
+                break;
+            }
             var tmp: [20]u8 = undefined;
             const value = self.value_of(h, &tmp) orelse {
                 if (len == 2) return failure(out, op, h, 2);
@@ -166,6 +221,7 @@ pub const Server = struct {
             if (width != 0 and width != count + 2) break;
             width = count + 2;
             if (len + width > mtu) break;
+            self.disclose(op, h);
             write16(out[len..], h);
             @memcpy(out[len + 2 ..][0..count], value[0..count]);
             len += width;
@@ -204,4 +260,32 @@ test "ATT invalid requests do not modify values or subscription" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 8, 1, 0, 1 }, server.respond(&.{ 8, 1, 0, 0, 0, 3, 0x28 }, &out));
     server.disconnected();
     try std.testing.expect(!server.subscribed);
+}
+
+test "ATT encrypted and authenticated permissions cover reads, blob, by-type and writes" {
+    var s = try Server.init("secure");
+    var out: [mtu]u8 = undefined;
+    s.permissions[value_handle - 1] = .encrypted;
+    const requests = .{ &[_]u8{ 0x0a, 6, 0 }, &[_]u8{ 0x0c, 6, 0, 0, 0 }, &[_]u8{ 8, 1, 0, 9, 0, 0xf1, 0xff }, &[_]u8{ 0x12, 6, 0, 7 } };
+    inline for (requests) |req| {
+        try std.testing.expectEqual(@as(u8, 0x0f), s.respond(req, &out)[4]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), s.respond(&.{ 0x52, 6, 0, 9 }, &out).len);
+    try std.testing.expectEqual(@as(u8, 0), s.value_len);
+    try std.testing.expectEqual(Permission.open, s.disclosure.permission);
+    s.encrypted = true;
+    try std.testing.expectEqual(@as(u8, 0x0b), s.respond(&.{ 0x0a, 6, 0 }, &out)[0]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0x0a, 6, 0, 0x0f }, &s.disclosure.refusal());
+    // Read By Type for 0xfff1: only the value at 6 matches, and it is protected.
+    try std.testing.expectEqual(@as(u8, 9), s.respond(&.{ 8, 1, 0, 9, 0, 0xf1, 0xff }, &out)[0]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 8, 6, 0, 0x0f }, &s.disclosure.refusal());
+    try std.testing.expectEqual(@as(u8, 0x13), s.respond(&.{ 0x12, 6, 0, 7 }, &out)[0]);
+    try std.testing.expectEqual(Permission.open, s.disclosure.permission);
+    s.permissions[value_handle - 1] = .authenticated;
+    try std.testing.expectEqual(@as(u8, 5), s.respond(&.{ 0x0a, 6, 0 }, &out)[4]);
+    s.authenticated = true;
+    try std.testing.expectEqual(@as(u8, 0x0d), s.respond(&.{ 0x0c, 6, 0, 0, 0 }, &out)[0]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0x0c, 6, 0, 0x05 }, &s.disclosure.refusal());
+    s.disconnected();
+    try std.testing.expectEqual(@as(u8, 5), s.respond(&.{ 0x0a, 6, 0 }, &out)[4]);
 }

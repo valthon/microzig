@@ -16,6 +16,9 @@ pub const Error = error{
     InvalidName,
     Busy,
     NoBuffer,
+    CryptoFailed,
+    SecurityFailed,
+    StorageFailed,
 };
 pub const PacketKind = enum { event, acl };
 pub const Packet = struct {
