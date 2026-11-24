@@ -1,6 +1,8 @@
 //! ESP32-C6 TRM v1.2 §§20.3.2–20.7. Affine points only; verification is
 //! curve membership, not signature verification. Thread context only.
-//! Synchronous calls mask interrupts. No constant-time or fault resistance claim.
+//! One caller owns the accelerator at a time; a concurrent caller gets
+//! error.Busy. Interrupts stay enabled while the hardware calculates.
+//! No constant-time or fault resistance claim.
 const std = @import("std");
 const microzig = @import("microzig");
 const system = @import("system.zig");
@@ -11,7 +13,7 @@ const ECC = microzig.chip.peripherals.ECC;
 const CPU = microzig.chip.peripherals.ECC_CPU;
 const PCR = microzig.chip.peripherals.PCR;
 const word_suffixes = .{ "0", "1", "2", "3", "4", "5", "6", "7" };
-pub const Error = error{ Timeout, InvalidPoint, InvalidScalar };
+pub const Error = error{ Timeout, InvalidPoint, InvalidScalar, Busy };
 pub const Curve = enum(u1) {
     p192 = 0,
     p256 = 1,
@@ -64,9 +66,28 @@ pub fn multiply(comptime curve: Curve, scalar: [curve.byte_length()]u8, point: P
 fn Result(comptime curve: Curve) type {
     return struct { valid: bool, point: Point(curve) };
 }
-fn calculate(comptime curve: Curve, point: Point(curve), scalar: ?[curve.byte_length()]u8) Error!Result(curve) {
+// Only this driver touches ECC, ECC_MEM and their PCR clock/reset/power
+// registers (ECC_CONF, ECC_PD_CTRL), so ownership of the accelerator needs no
+// critical section across the calculation. The completion poll reads the raw
+// CALC_DONE status with its interrupt disabled; that status does not depend on
+// the CPU's interrupt mask. A P-256 multiply therefore no longer delays the
+// radio controller's interrupts; a preempting task that also calls this
+// driver receives error.Busy instead of waiting.
+var owned: bool = false;
+fn acquire() Error!void {
     const cs = microzig.interrupt.enter_critical_section();
     defer cs.leave();
+    if (owned) return error.Busy;
+    owned = true;
+}
+fn release() void {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    owned = false;
+}
+fn calculate(comptime curve: Curve, point: Point(curve), scalar: ?[curve.byte_length()]u8) Error!Result(curve) {
+    try acquire();
+    defer release();
     system.enable_clocks_and_release_reset(.{ .crypto_ecc = true });
     PCR.ECC_PD_CTRL.modify(.{ .ECC_MEM_PD = 0, .ECC_MEM_FORCE_PD = 0 });
     system.peripheral_reset(.{ .crypto_ecc = true });
