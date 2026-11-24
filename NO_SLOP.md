@@ -112,7 +112,13 @@ These are what keep MicroZig portable. A change that breaks one is a design defe
 - **Ports are self-contained.**
 - **Core is port-agnostic.** It receives chip, HAL, and board configuration through comptime imports injected by the build system.
 - **Register definitions are generated** (§2.2).
-- **No global mutable state in libraries** (§2.4).
+- **No global mutable state in libraries** (§2.4), except the narrow context-free C
+  callback ABI exception in `ARCHITECTURE.md`: a port HAL may keep one synchronized
+  routing pointer for a singleton peripheral. Explicit initialization, a stationary
+  caller-owned handle holding queues and operation state, second-owner rejection, and
+  teardown that prevents old completions reaching a new owner are required. ESP-NOW
+  and IEEE 802.15.4 radio callbacks use this pattern. Global allocators and general
+  library state remain prohibited.
 - **Memory regions are the port's responsibility.** Core and drivers don't assume a memory layout.
 
 ---

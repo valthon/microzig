@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     }) });
-    const test_step = b.step("test", "Test the DHCP server and systimer interval checks");
+    const test_step = b.step("test", "Test DHCP, systimer intervals, and ESP-NOW rendezvous");
     test_step.dependOn(&b.addRunArtifact(dhcp_tests).step);
     const systimer_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/systimer.zig"),
@@ -47,6 +47,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(systimer_tests).step);
+    const espnow_protocol_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/selftest_espnow_protocol.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(espnow_protocol_tests).step);
     const expected_mac: ?u48 = if (expected_mac_text) |text| parse_mac(text) orelse
         std.process.fatal("-Dexpected_mac={s}: expected six hex bytes separated by ':'", .{text}) else null;
 
@@ -67,6 +73,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const examples: []const Example = &.{
+        .{ .name = "selftest_espnow", .file = "src/selftest_espnow.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .xiao_board = true, .antenna_option = true, .features = .{ .image_boot_only = true } },
         .{ .name = "compile_wifi", .xiao_board = true, .antenna_option = true, .file = "src/compile_wifi.zig", .chips = &.{ .esp32_c3, .esp32_c6 }, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_ieee802154", .file = "src/selftest_ieee802154.zig", .chips = &.{.esp32_c6}, .antenna_option = true, .features = .{ .image_boot_only = true } },
         .{ .name = "selftest_wifi_softap_echo", .xiao_board = true, .antenna_option = true, .file = "src/selftest_wifi_softap_echo.zig", .wifi_options = true, .softap_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },

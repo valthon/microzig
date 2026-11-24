@@ -414,6 +414,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(partition_tests).step);
     test_step.dependOn(&unit_tests_run.step);
 
+    const espnow_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/hal/radio/espnow_session.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(espnow_tests).step);
+
     const ble_host_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/hal/radio/ble/host.zig"),

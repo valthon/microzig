@@ -740,8 +740,8 @@ var ap_state: std.atomic.Value(ApState) = .init(.none);
 fn update_sta_state(event: EventType) void {
     const new_sta_state: StaState = switch (event) {
         .StaStart => .started,
-        .StaConnected, .ApStaconnected => .connected,
-        .StaDisconnected, .ApStadisconnected => .disconnected,
+        .StaConnected => .connected,
+        .StaDisconnected => .disconnected,
         .StaStop => .stopped,
         else => return,
     };
@@ -751,10 +751,14 @@ fn update_sta_state(event: EventType) void {
 fn update_ap_state(event: EventType) void {
     const new_ap_state: ApState = switch (event) {
         .ApStart => .started,
-        .StaStop => .stopped,
+        .ApStop => .stopped,
         else => return,
     };
     ap_state.store(new_ap_state, .monotonic);
+}
+
+pub fn get_ap_state() ApState {
+    return ap_state.load(.monotonic);
 }
 
 pub fn get_sta_state() StaState {
