@@ -1,11 +1,13 @@
 //! ESP32-C6 BLE controller/HCI, paired with the pinned ESP-IDF v5.5.1 blobs.
 //! One controller per boot; storage and allocator must outlive it. No modem
-//! sleep, pairing, or concurrent Wi-Fi. See the port README for evidence.
+//! sleep or concurrent Wi-Fi. See the port README for evidence.
 const std = @import("std");
 const microzig = @import("microzig");
 const c = @import("esp-wifi-driver");
 const abi = @import("ble/abi.zig");
 const npl = @import("ble/npl.zig");
+pub const security_crypto = @import("ble/smp_hardware.zig").crypto;
+const security_hardware = @import("ble/smp_hardware.zig");
 const radio = @import("../radio.zig");
 const rtos = @import("../rtos.zig");
 const osi = @import("osi.zig");
@@ -222,18 +224,12 @@ const ext_funcs: abi.ExtFuncs = .{
     .task_delete = osi.task_delete,
     .assert = controller_assert,
     .random = osi.rand,
-    .ecc_key = no_ecc_key,
-    .ecc_dh = no_ecc_dh,
+    .ecc_key = security_hardware.controller_key,
+    .ecc_dh = security_hardware.controller_dh,
     .reset_modem = reset_modem,
 };
 const coex_funcs: abi.CoexFuncs = .{ .set = no_coex, .clear = no_coex };
 fn no_coex(_: u32, _: u32) callconv(.c) void {}
-fn no_ecc_key(_: [*]u8, _: [*]u8) callconv(.c) c_int {
-    return -1;
-}
-fn no_ecc_dh(_: [*]const u8, _: [*]const u8, _: [*]const u8, _: [*]u8) callconv(.c) c_int {
-    return -1;
-}
 fn controller_assert(_: u32, _: [*:0]const u8, _: u32, _: u32) callconv(.c) void {
     @panic("BLE controller assertion");
 }
