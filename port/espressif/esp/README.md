@@ -51,6 +51,7 @@ Other results identify their boards and runs below; dates are included where rec
 | `radio` (Wi-Fi station)                       | yes | yes | `tcp_server`, `selftest_wifi_*` (image boot)       | see "Wi-Fi station and RTOS" | see "Wi-Fi station and RTOS" |
 | `radio.espnow` (ESP-NOW, polling) | yes | yes | `selftest_espnow`, two boards, same image, no AP; expected `DONE pass=9 fail=0` | 6/6 runs with a C6 peer, `DONE pass=9 fail=0` (2026-11-23) | 11/11 runs on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-23); see "ESP-NOW (C3 and C6)" |
 | `radio.ieee802154` (raw MAC, polling)          | no  | yes | `selftest_ieee802154` (image boot, H2 peer, no wiring) | n/a    | 4/4, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 alone and 3 runs with both (2026-11-20) |
+| `radio.ieee802154` frame security (levels 1–7), enhanced ACKs | no | yes | `selftest_ieee802154_sec` (image boot, two C6 boards, no wiring); expected `DONE pass=11 fail=0` | n/a | 11/11 on both Super Mini ESP32-C6 and XIAO ESP32-C6, 3 runs booted together and 2 with an 8 s stagger (each board first once); ESP32-H2 (ESP-IDF v5.5.1) received the version-2 enhanced ACK (`Rx ack 10 bytes`) |
 | `rtos`                                        | yes | yes | `rtos`: expected `DONE pass=6 fail=0`, five ordered items + empty-queue timeout | 6/6, 3 runs (24ebc5d1) | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `systimer`                                    | yes | yes | `systimer`: expected `DONE pass=4 fail=0`, four IRQs + three 1 s intervals, TIMG0 reference, +/-100 us | 4/4, 3 runs (2026-11-20) | 4/4, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-20) |
 | custom CPU/APB clocks                         | yes | yes | `custom_clock_config`: expected `DONE pass=3 fail=0`, CPU/APB register readback at 20 MHz + 100 ms ROM busy delay vs systimer, +/-100 us | 3/3, 3 runs (2026-11-20) | 3/3, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-20) |
@@ -356,8 +357,12 @@ each retransmission restarts CSMA with minBE and preserves the sequence number.
 ACK retries still enabled. Setting maxFrameRetries=0 disables ACK retries.
 Config accepts minBE 0–maxBE, maxBE 3–8, maxCSMABackoffs 0–5,
 maxFrameRetries 0–7, and a nonzero u16 ACK wait in symbols. The ACK software
-bound starts at TX_DONE; the MAC's hardware ACK timeout also applies. Latched
-completion events are consumed before declaring a software timeout, including
+bound starts at TX_DONE; the MAC's hardware ACK timeout also applies.
+For version-2 transmissions both software and hardware default to 108 symbols
+(1728 µs), matching ESP-IDF v5.5.1. Version 0/1 retains the configured software
+wait and a 108-symbol hardware floor. A peer with ACKs longer than that window
+needs an explicitly larger `ack_wait_symbols`; the driver never widens it itself.
+Latched completion events are consumed before declaring a software timeout, including
 when the calling task resumes after the ACK deadline.
 `energy_detect` averages
 RSSI over 1–65535 us, and `cca` samples for 8 us.
@@ -372,7 +377,8 @@ advertises hardware ACK timeout but no CSMA-backoff or frame-retry capability.
 We retain hardware CCA, ACK turnaround/filtering and timeout, and implement
 backoff/retries in software. IDF uses a 200 ms software ACK watchdog
 (`esp_ieee802154_dev.c:428`); ours bounds invalid/missing ACK paths at
-macAckWaitDuration instead. No undocumented ACK_TIMEOUT register units are assumed.
+the legacy ACK wait or the enhanced completion floor above instead. No
+undocumented ACK_TIMEOUT register units are assumed.
 
 IDF pins OpenThread at `b945928d722177cd9caeab2e1025499628c101ef`:
 [`sub_mac.hpp:526–529`](https://github.com/openthread/openthread/blob/b945928d722177cd9caeab2e1025499628c101ef/src/core/mac/sub_mac.hpp#L526-L529)
@@ -393,14 +399,14 @@ NO_ACK, terminal busy CCA, and early success/error paths are host unit-tested.
 Host completion tests also cover an ACK latched while the task is descheduled
 across the deadline and an expired ACK window without a completion event.
 
-Limits: no Wi-Fi/BLE coexistence scheduler, security,
-enhanced ACK generation, multi-PAN, scheduled operations or sleep retention.
+Limits: no Wi-Fi/BLE coexistence scheduler, multi-PAN, scheduled operations
+or sleep retention.
 Wi-Fi initialization in an IEEE802154 image (and IEEE802154 initialization in a
 Wi-Fi image) returns `UnsupportedRadioProtocol`; the default Wi-Fi path retains
 its existing behavior. Selecting both `hal.radio.ble` and `.ieee802154` is a
-compile error in either init. Outgoing frames are legacy version 0/1 only; received
-2015 frames may be inspected but receive no enhanced ACK. Promiscuous RX never
-auto-ACKs. Polling has no background queue: the MAC is idle between calls and
+compile error in either init. Legacy version 0/1 and 2015 version 2 frames are
+supported; version 2 ACK generation is opt-in (see "Frame security and enhanced
+ACKs" below). Promiscuous RX never auto-ACKs. Polling has no background queue: the MAC is idle between calls and
 frames arriving while the application prints or transmits can be missed.
 Every `receive` ends with a stop, so keep windows long and the gaps between them
 short; yield between windows so the PHY tracking task runs. With 10 ms windows
@@ -420,6 +426,343 @@ build) alone, and in 3 of 3 runs with both booted at the same moment (6 of 6
 board runs). In each of the 12 board runs the C6 received all 40 ACK-request and
 40 no-ACK frames from the H2, and the H2 counted 40 of 40 ACKs. Two of the 48
 C6 transmissions in those runs took a second attempt.
+
+#### Frame security and enhanced ACKs
+
+`ieee802154.security` implements the auxiliary security header, key identifier
+modes 0–3, security levels 1–7 for frame versions 1/2, and explicit 32-bit
+frame counters, per IEEE 802.15.4-2015 §9. Supply `Config.security = &context`,
+where `security.Context` borrows a stationary `[]Key`, `[]Replay`, and optional
+`[]const Peer` (PAN/short to extended-address mappings). Extended-address
+sources need no peer mapping. Identifiers match mode, index, and the mode's
+4/8 key-source octets; mode 0 selects the implicit key. Duplicate key
+identifiers and duplicate AES key material are rejected (separate counters for
+the same AES key could reuse a nonce). Keep table order and key material stable
+for the lifetime of its replay state. This is a raw MAC key table, not a key
+negotiation or device-admission service.
+
+For `transmit`, set the FCF security bit and include an encoded
+`security.Auxiliary` followed by plaintext; omit MIC/FCS. Its supplied counter
+is replaced by `Key.reserve()`. Reserve is shared by outgoing data and enhanced
+ACKs; retries preserve the reserved counter and sequence. The output including
+MIC must fit 125 MAC octets; the caller buffer is never changed. `receive`
+decrypts before returning (verifying the MIC at levels that carry one), removes
+MIC/FCS, and retains the original auxiliary header. Use
+`header.parse(frame.bytes()).payload_offset` to find plaintext, after checking
+`Frame.protection`: `.unsecured` (security bit clear), `.authenticated` (MIC
+verified, decrypted) and `.decrypted_unauthenticated` (level 4 under
+`accept_unauthenticated`: decrypted, but no MIC, so nothing vouches for it)
+frames hold plaintext there; `.raw_secured` ones (promiscuous, below) hold
+ciphertext and MIC. Without `Config.security`, a secured frame returns
+`UnknownKey` rather than unauthenticated bytes. With `Config.promiscuous`,
+`receive` is a capture path instead: every frame, secured or not, is returned
+exactly as received (auxiliary header, ciphertext and MIC; FCS removed),
+whether or not a security context is configured, and receive never verifies it,
+decrypts it, or touches replay slots or key counters. Such frames are
+unauthenticated, and `Frame.protection` is `.raw_secured` for them. The rule is
+`header.deliver`, host-tested. `last_ack` holds the received ACK, also without
+MIC/FCS; for a secured ACK, `protection` is set the same way
+(`header.receive_ack`). A secured version-2 exchange requires the matching
+security level/key identifier in its ACK.
+
+Transmit CCM* at levels 5–7, including secured enhanced ACKs, uses the C6 MAC's
+security engine. Programming order follows IDF v5.5.1
+[`esp_ieee802154_sec.c:16–29`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/ieee802154/driver/esp_ieee802154_sec.c#L16-L29)
+and [`ieee802154_common_ll.h:442–468`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/hal/include/hal/ieee802154_common_ll.h#L442-L468):
+extended nonce address, key, security payload offset, then security enable
+immediately before transmission. The offset **excludes PHR**, as
+[`frame.c:269–292`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/ieee802154/driver/esp_ieee802154_frame.c#L269-L292)
+shows; legacy command identifiers remain clear/authenticated. TX_DONE or abort
+clears `SEC_EN` before ACK reception, following IDF `event_end_process`. The
+public `esp_ieee802154_set_transmit_security` API does not enumerate supported
+levels, and the MAC engine did not produce valid MIC-only (1–3) or
+encryption-only (4) frames on the Super Mini ESP32-C6 or XIAO ESP32-C6, so
+levels 1–4 are secured in software with `SEC_EN=0`: data frames use software
+AES, MIC-only enhanced ACKs use the CPU AES accelerator (below).
+
+IDF exposes no receive decrypt/authenticate operation, so RX uses bounded CCM*
+over `std.crypto.core.aes.Aes128`, also exercised on the host, without
+acquiring the AES peripheral. The nonce reverses the wire-order source
+extended address, appends the big-endian counter, then the security level.
+Levels 1–3 authenticate the clear MAC bytes as associated data; level 4
+encrypts without authentication.
+
+Receive checks run in the order of the incoming frame security procedure
+(IEEE 802.15.4-2015 §9.2.4, with §9.2.5 security level checking). The
+standard's text was not available to this port; the steps below are cited as
+two public implementations perform them: Linux
+[`net/mac802154/llsec.c` v6.12 `mac802154_llsec_decrypt`, lines 1025–1052](https://github.com/torvalds/linux/blob/v6.12/net/mac802154/llsec.c#L1025-L1052)
+and OpenThread
+[`src/core/mac/mac.cpp` `Mac::ProcessReceiveSecurity`, lines 1665–1773 at 938d74cf](https://github.com/openthread/openthread/blob/938d74cf766a4bbe88ec73155ebd508caf270b23/src/core/mac/mac.cpp#L1665-L1773).
+
+1. A set security bit with level 0 is not a security level:
+   `UnsupportedFrame`.
+2. Security level policy: level 4 is the only level without a MIC, so anyone
+   can send one, with any counter, without the key. It is rejected with
+   `ImproperSecurityLevel` unless `Context.accept_unauthenticated` is set
+   (default false). Linux checks the level against a configured set
+   (llsec.c:1030); OpenThread accepts only level 5 (mac.cpp:1675).
+   The policy also applies to received ACKs, so with it off a version-2
+   level-4 transmit that requests an ACK cannot succeed (`last_ack_error` is
+   `ImproperSecurityLevel`).
+3. Counter 0xffffffff is rejected with `InvalidCounter` (llsec.c:1039), and
+   `Key.reserve` never sends it (llsec.c:756 on transmit): `next_counter`
+   reaching 0xffffffff returns `CounterExhausted`.
+4. Key lookup (`UnknownKey`), sender lookup (`UnknownPeer`), then the counter
+   must exceed the last committed one for that sender and key (`Replay`), and
+   a sender with no slot for that key needs a free one (`ReplayTableFull`).
+5. Unsecure (decrypt/verify). Only then is the replay slot committed, as
+   OpenThread does after `ProcessReceiveAesCcm` (mac.cpp:1734, then 1746/1748). Linux
+   commits before decrypting (llsec.c:1044, 1052); this port does not.
+
+Replay slots are per extended sender and key and never evicted. A new sender
+gets `ReplayTableFull` when no slot is free. That check runs before the MIC
+(step 4), so the sender is still unverified: the error says only that a frame
+claimed a new sender, not that the sender holds the key. Nothing is committed.
+Authentication failure returns no plaintext and changes no state. A frame
+accepted under `accept_unauthenticated` (level 4) is checked against the
+committed counter read-only and **never** creates or advances a slot: it has
+no replay protection of its own, and cannot move the state authenticated
+traffic depends on. Do not treat level 4 as proof of sender identity or
+integrity. The same checks apply to received enhanced ACKs. A CRC-valid
+duplicate of an accepted frame can still receive an ACK, so a sender whose ACK
+was lost and retries is acknowledged; `receive` then returns `Replay`.
+
+The caller **must persist** transmit-counter reservations and receive replay
+state across resets before reusing a key; reservation stops after 0xfffffffe
+and returns `CounterExhausted` rather than wrapping. The library provides no NVS
+persistence or key rotation. Its only receive security policy is the level-4
+switch above: unsecured frames (security bit clear) remain allowed, and
+accepted secured levels are 1–3 and 5–7, plus 4 when opted in. `transmit_wire` accepts a
+complete pre-secured MPDU for diagnostics/interop without changing counter/MIC;
+its caller owns nonce uniqueness. Do not use it instead of `transmit` in an
+application that expects automatic counter allocation.
+
+Set `Config.enhanced_ack = true` and install
+`.interrupt29 = hal.radio.ieee802154.interrupt_handler` in `microzig_options`;
+`init` returns `MissingAckInterrupt` otherwise. Legacy applications need no new
+handler. Only IEEE802154 images selecting this handler contain the turnaround
+ISR; Wi-Fi/BLE routes and handlers are unchanged. The driver maps ZB_MAC to
+interrupt29 only during an enhanced-ACK receive, at **priority 15**,
+level-triggered, then unmaps/disables it before returning. The application
+still uses synchronous polling APIs. The ISR only snapshots events, builds and
+arms the ACK and its security for RX_DONE, and publishes completion; it never
+allocates, logs, decrypts incoming data, or updates replay slots. The sequence
+follows IDF v5.5.1
+[`dev.c:isr_handle_rx_done`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/ieee802154/driver/esp_ieee802154_dev.c#L438-L495):
+`ieee802154_inner_enh_ack_generator` → TXDMA address → security update →
+`ieee802154_ll_enhack_generate_done_notify`. As in IDF, it runs for every
+ACK-requested version-2 frame, secured or not; unsecured requests disable
+`SEC_EN` and use no security context. IDF's
+[`ack.c`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/ieee802154/driver/esp_ieee802154_ack.c)
+manages the pending bit/table, not CCM*: the application supplies the
+enhanced-ACK generator. The hardware owns the 12-symbol (192 µs at 2.4 GHz)
+turnaround in IEEE §6.7.4; the ISR issues no software TX_START. The
+generator's decision (`ieee802154/ack_request.zig`, host-tested) either
+refuses a request having reserved nothing, or reserves exactly one counter
+for the ACK it builds. For a secured request it runs steps 1–4 above except
+the replay check, plus the MIC length check, before reserving: no security
+context (`UnknownKey`), level not accepted, counter 0xffffffff, unknown key,
+no source address or an unknown short source (`UnknownPeer`), a frame too
+short for its MIC (`InvalidFrame`), in the order the task-level check uses.
+It then refuses a request it cannot answer (an ACK frame, a
+sequence-suppressed request without a source) and a key whose counters are
+exhausted (`CounterExhausted`), still before reserving. The ACK builder also
+refuses an ACK that would not fit, a guard that cannot trigger with the
+limits in force: the largest ACK is 122 of 125 octets. A refused request gets no
+ACK, stops RX as IDF does, and `receive` returns the refusal error. For a
+secured request refused by the incoming-security checks this is the error
+the task-level check would return. Three cases differ: a key whose counters
+are exhausted drops even a genuine authenticated frame
+(`CounterExhausted`); a secured ACK-type frame with the ACK request bit set
+returns `InvalidFrame` where the task would parse and authenticate it; and
+an unsecured version-2 ACK request that fails to parse (for example an
+unterminated header IE list) or cannot be answered also gets no ACK and
+`receive` returns `InvalidFrame` or `UnsupportedFrame`, where without
+enhanced ACKs the same frame is delivered. Failure to generate the ACK after
+the reservation (`CryptoTimeout` from the AES accelerator), or an ACK-phase
+abort, returns `AckTransmitFailed`; expiry without completion returns
+`Timeout`. Legacy ACK generation/pending handling remains in the existing
+hardware/polling path.
+
+For level 1–3 ACKs, CCM* uses the C6 AES accelerator in Typical AES mode,
+following [ESP32-C6 TRM v1.2 Chapter 19, §§19.4.2–19.4.3](https://www.espressif.com/sites/default/files/documentation/esp32-c6_technical_reference_manual_en.pdf).
+The key/mode are loaded once per ACK, retained across blocks, then wiped/reset
+on every exit. An ACK carries no payload, so a MIC-only ACK needs only B0, its
+length-prefixed associated-data blocks and S0, independently of MIC length.
+Each transform has a fixed 256-status-read bound; a stuck accelerator returns
+`CryptoTimeout` and stops generation. Level 4 ACKs have neither payload nor MIC
+and need no crypto. `hal.aes` masks interrupts throughout its operations, so
+the ACK ISR cannot interrupt its key/block state. Other direct AES users and DS
+must remain idle throughout enhanced-ACK receive.
+
+Enhanced ACKs echo sequence suppression and use a fresh local counter and the
+matching level/key identifier if the received frame was secured. ACKs with a
+sequence number omit both addresses and PAN IDs; sequence-suppressed ACKs carry
+the received source as destination (IEEE 802.15.4-2015 §7.3.2, enhanced
+acknowledgment frame format). `Config.ack_header_ies` optionally borrows a
+complete header-IE byte string ending with a zero-length HT2 terminator, its
+only terminator (at most 80 IE octets). HT1 is refused (`InvalidFrame`): it
+announces payload IEs, and the generator copies the list verbatim and appends
+none (Wireshark `packet-ieee802154.c` sets `payload_ie_present` only after
+HT1; IDF's frame parser and OpenThread's builder use HT2 to end the header
+before the payload). With enhanced ACKs enabled, at most 16 keys and 16 peers
+are allowed, to bound interrupt work. ACK generation precedes task-level
+receive authentication, as in IDF's generator path; it is not an application
+delivery receipt.
+
+Residual: like IDF's generator, the ISR does not verify the request's MIC
+before the 192 µs turnaround, so a forged request at an accepted level, with a
+known key identifier, a counter below 0xffffffff and a sender that is either a
+known short address or any extended address (the peer table is not consulted
+for an extended source),
+still gets a secured ACK, and each one consumes one transmit counter of that
+key (`Key.reserve` is shared with data). Skipped counters do not desynchronize
+peers, which accept any larger counter; they only bring `CounterExhausted`
+closer. The replay check is left to the task, so a replayed genuine request
+also consumes one: refusing duplicates would leave a sender whose ACK was
+lost, and which retries, unacknowledged. The smallest request that reserves a
+counter has a 2-octet frame control field, a short source, a 5-octet
+auxiliary header (key identifier mode 0), a 4-octet MIC and no payload: 14
+octets with a sequence number (12-octet ACK) or 13 without (13-octet ACK, which
+carries the source back), as the host test "smallest requests that reserve a
+counter" builds them. Each forged request therefore costs at least both frames
+with a 2-octet FCS and 6 PHY octets each, plus the 192 µs turnaround: 1536 µs
+at 250 kb/s (32 µs per octet), so exhausting 2^32−1 counters takes at least
+76.35 days of continuous forged traffic. With `accept_unauthenticated`, a
+level-4 request has no MIC: 1280 µs and 63.63 days. These figures are
+computed from the frame sizes, not measured, and do not assume the MAC's
+address filter drops frames without a destination address. Monitor
+`next_counter` and rotate the key before it runs out.
+
+The initiator programs `ACK_TIMEOUT` before each attempt (including retries).
+[IDF v5.5.1 `esp_ieee802154.c:esp_ieee802154_set_ack_timeout`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/ieee802154/esp_ieee802154.c#L217-L230)
+rounds microseconds up to 16-µs register units; its getter multiplies by 16.
+The [public API](https://github.com/espressif/esp-idf/blob/v5.5.1/components/ieee802154/include/esp_ieee802154.h)
+documents the reset/default as 108 units = 1728 µs, which this driver keeps for
+version 2 in hardware and software. IDF's
+[`dev.c:isr_handle_tx_done`](https://github.com/espressif/esp-idf/blob/v5.5.1/components/ieee802154/driver/esp_ieee802154_dev.c)
+adds a separate 200-ms software watchdog; it cannot extend the hardware's ACK
+timeout. With five header-IE octets and key identifier mode 1, the unsecured
+ACK is 8 MAC octets and levels 1–7 produce 18/22/30/14/18/22/30 MAC octets
+(without FCS). At
+250 kb/s the largest takes `12 + 2*(6 + 30 + 2) = 88` symbols including
+turnaround, six PHY octets and FCS: 1408 µs, inside the 1728 µs window (a
+size calculation, host-tested). A full 127-octet PSDU would take 278 symbols
+and cannot finish within 108; as in IDF, a peer that sends such ACKs needs an
+explicitly larger window (`Config.tx.ack_wait_symbols`).
+
+`Frame.ack_transmitted` requires ACK_TX_DONE for that reception, not merely
+RX_DONE. `Config.ack_diagnostics` (off by default) additionally records each
+generated enhanced ACK in `Radio.last_ack_tx`: received level and counter, ACK
+counter and length, any generation error, and the first terminal event
+(ACK_TX_DONE or RX_ABORT, or a stop). `Ack.transmitted()` is true only for an
+ACK_TX_DONE without RX_ABORT; generate-done notification alone does not count.
+
+The task keeps the `Radio`, configuration, IE storage, and key table stationary
+throughout each receive. Configuration changes and key reservations in TX run
+while the MAC IRQ is unmapped. The ISR reserves ACK counters only during RX,
+and only for requests `ack_request.prepare` accepts;
+`receiving` and event-register snapshots are accessed with interrupts masked.
+Atomic `pending_events` and `ack_failed` transfer completions to the task. RX
+DMA is not rearmed until the task consumes the frame, and ACK DMA is separate
+from task TX DMA. Keep all other interrupt handlers and interrupt-masked
+sections shorter than turnaround; the driver cannot meet the deadline if the
+application masks interrupts for longer. Do not perform concurrent flash
+erases/cache-disabling operations.
+
+Format limits: standard frame types 0–3, explicit counters only (no ASN
+nonce/counter suppression), no anonymous secured sources, and explicitly
+terminated header-IE lists. Legacy beacon encryption/superframe parsing is not
+implemented. Security configuration is optional; legacy unsecured TX/RX/ACK
+behavior is retained when it is absent.
+
+Source caveat: the public
+[ESP32-C6 TRM v1.2](https://www.espressif.com/sites/default/files/documentation/esp32-c6_technical_reference_manual_en.pdf)
+has **no IEEE 802.15.4 MAC chapter or security/ACK register specification**.
+Its §§8.2.4.4 and 12.4.2.5 cover the clock/power routing used here; MAC behavior
+above is sourced from the pinned IDF driver.
+
+Host tests include the published IEEE 802.15.4-2006 Annex C.2.1 beacon MIC and
+C.2.3 command-encryption vectors, as reproduced in OpenThread's
+[`test_aes.cpp`](https://github.com/openthread/openthread/blob/main/tests/unit/test_aes.cpp),
+plus independent Python cryptography AESCCM/ECB vectors for all seven levels
+(partial AD blocks, MIC-only empty message, M=0 CTR), software TX/ACK sealing
+including empty ACK payloads, `SEC_EN` cleared at TX_DONE before ACK
+validation, wrong keys/tampered MICs, auxiliary headers/truncation, every key
+identifier mode, counter exhaustion, replay rejection without state changes on
+failed authentication, `ReplayTableFull` for a new sender before its MIC is
+checked (a bad MIC gets the same error and commits nothing), a forged
+level-4 frame with counter 0xffffffff followed by a valid frame from the same
+sender (still accepted), level-4 rejection by
+default and opted-in level-4 frames never creating or advancing a slot,
+counter 0xffffffff rejected at a MIC level, enhanced-ACK requests refused
+before any counter is reserved (each refusal and its error, including a
+sequence-suppressed request without a source and a request with no source)
+and admitted ones reserving exactly one counter carried by the ACK,
+enhanced ACK construction/addressing/IEs/sequence
+suppression, complete secured/IE-bearing ACK reception at 1024 µs, a large ACK
+requiring an explicitly extended wait, bounded missing enhanced ACKs, unsecured
+H2 ACK bytes, ACK size budgets at every level, TX-ACK evidence (RX alone fails),
+and legacy RX/ACK tests. Run `zig build test` in this port.
+
+Two-board test: build in `examples/espressif/esp` with
+`zig build -Doptimize=ReleaseSmall -Dexample=selftest_ieee802154_sec`, then flash
+**the same** `esp32_c6_selftest_ieee802154_sec.bin` image-boot artifact to a
+Super Mini ESP32-C6 and a XIAO ESP32-C6. Leave GPIO3/14 unconnected: the image
+powers/selects the XIAO ESP32-C6 internal RF switch on both boards. Boot both
+within 10 s; channel 25, PAN 0x3254, public test key c0…cf, identifier mode
+1/index 1. Discovery uses full extended addresses, and their numeric order
+assigns roles (`ROLE coordinator` or `ROLE responder`). No H2 or wiring is
+needed. Its context sets `accept_unauthenticated` for the level-4 check.
+Eleven PASS/FAIL lines cover delivery/decryption at levels 1–7,
+enhanced ACKs (secured when data is secured) with header IEs, legacy unsecured
+ACKs, tampered MIC rejection, and replay rejection. The responder's level 1–7,
+`enhanced_ack` and `legacy_ack` checks require an ACK actually transmitted
+(`Frame.ack_transmitted`, and for enhanced ACKs `Ack.transmitted()`) as well as
+the expected received security level; RX_DONE alone cannot pass them. Both
+boards emit `SELFTEST ieee802154_sec DONE pass=11 fail=0` on success, within a
+45 s deadline after each boot (55 s from the first boot with a 10 s stagger).
+Per-stage diagnostics print TX input/DMA bytes, software-derived expected wire
+output, raw RX/ACK bytes (including MIC), decrypted data, auxiliary
+header/counter/key identifier, MIC verification outcome, event bits, numeric
+TX/RX abort reasons, the `ACK-TX transmitted=...` record, and
+delivery/response/ACK decisions. Hardware TX DMA is labelled separately: it may
+contain the plaintext and reserved MIC rather than the on-air output. No
+logging runs in the ISR. Raw snapshots are taken before authentication, so
+failed MICs and replay rejection remain inspectable. MIC `not_checked` means an
+earlier error prevented verification; level 4 reports `absent`. The
+key/counters are test-only and deliberately reset on every boot.
+
+ESP32-H2 interop (enhanced ACK only): an ESP32-H2 running ESP-IDF v5.5.1's
+`ieee802154_cli` console can inject version-2 frames with `tx` and prints the
+ACK it receives. Its console has no key provisioning or decryption, so this
+exercises the unsecured enhanced ACK, not frame security. `tx` takes the MPDU
+octets followed by two placeholder FCS octets, which the H2 radio overwrites.
+On the H2, run `channel -s 25`, then:
+
+1. Boot one C6. Send discovery from a synthetic lower extended address
+   `0100000000000000`: MPDU `41d8005432ffff01000000000000004d5a53434800`, four
+   times about 0.7 s apart. The C6 prints `ROLE responder local=<C6>`; use that
+   extended wire address as `<C6>` below.
+2. Send the control MPDU `41dc005432<C6>01000000000000004d5a53434307`; this
+   selects the `enhanced_ack` check.
+3. Run `promisc -d` on the H2 before the ACK-requested frame. IDF
+   `esp_ieee802154_set_promiscuous` disables RX auto-ACK while promiscuous, and
+   `dev.c:isr_handle_tx_done` then skips the ACK wait, so a promiscuous H2
+   never reports the ACK. Leave the ACK timeout at its default 108 symbols.
+   Send `21ec015432<C6>01000000000000004d5a53434407`. The H2 prints
+   `Rx ack 10 bytes`: FCF version 2, sequence 1, no addresses, and the
+   configured header IE/HT2 (`022201010fee803f`, plus FCS), with no
+   `Failure reason: 3`. The C6 prints `ACK-TX transmitted=true` with
+   `finish_events` containing ACK_TX_DONE (bit 2), then `enhanced_ack: PASS`.
+   The remaining self-test checks are not exercised by this run and report FAIL.
+
+Evidence: on hardware, image boot, `selftest_ieee802154_sec` passed 11/11 on
+both the Super Mini ESP32-C6 and the XIAO ESP32-C6 in 3 runs booted together
+and 2 runs with boots staggered by 8 s (each board booting first once). With
+the procedure above, an ESP32-H2 (ESP-IDF v5.5.1) received the C6's version-2
+enhanced ACK (`Rx ack 10 bytes`).
 
 `selftest_ieee802154` builds the C6 image-boot target and the XIAO ESP32-C6 board
 target; on a XIAO ESP32-C6 use the board build, which powers the rf switch (about 20 dB);

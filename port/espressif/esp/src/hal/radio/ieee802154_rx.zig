@@ -1,6 +1,7 @@
 //! Polling RX flow from ESP-IDF v5.5.1 esp_ieee802154_dev.c:
 //! isr_handle_rx_phase_rx_abort -> NEEDS_NEXT_OPT -> enable_rx.
 const std = @import("std");
+const Protection = @import("ieee802154/security.zig").Protection;
 
 pub const Error = error{ InvalidDuration, InvalidFrame, Timeout, Crc, RxAborted, AckTransmitFailed };
 pub const Frame = struct {
@@ -9,6 +10,16 @@ pub const Frame = struct {
     len: u7,
     rssi: i8,
     lqi: u8,
+    /// Observed ACK_TX_DONE for this reception, not merely RX_DONE.
+    ack_transmitted: bool = false,
+    /// Whether `bytes()` is verified plaintext. Test it before applying
+    /// `header.parse(...).payload_offset`: `.unsecured` (no auxiliary
+    /// header), `.authenticated` (MIC verified and removed, payload
+    /// decrypted) and `.decrypted_unauthenticated` (level 4: decrypted, no
+    /// MIC, so not proof of sender or integrity) frames hold a payload at
+    /// that offset; `.raw_secured` holds ciphertext+MIC. The receive path
+    /// sets one of the decrypted values or leaves the as-received value.
+    protection: Protection,
 
     pub fn bytes(self: *const Frame) []const u8 {
         return self.data[0..self.len];
@@ -19,6 +30,7 @@ pub const Events = struct {
     abort: ?u5 = null,
     done: bool = false,
     ack_done: bool = false,
+    ack_failed: bool = false,
 };
 
 /// The hardware adapter supplies time, event snapshots, RX_START, volatile
@@ -28,9 +40,11 @@ pub fn receive(io: anytype, timeout_us: u32) Error!Frame {
     const deadline = io.now() + timeout_us;
     io.start();
     var received = false;
+    var ack_transmitted = false;
     var crc_seen = false;
     while (io.now() < deadline) {
         const events = io.poll();
+        if (events.ack_failed) return error.AckTransmitFailed;
         if (events.abort) |reason| {
             switch (reason) {
                 // SFD timeout, CRC, invalid length, filter failure, no RSS,
@@ -39,6 +53,7 @@ pub fn receive(io: anytype, timeout_us: u32) Error!Frame {
                 2...9 => {
                     crc_seen = crc_seen or reason == 3;
                     received = false;
+                    ack_transmitted = false;
                     io.start();
                     // Discard completion bits/data belonging to the aborted
                     // frame. Restart never extends the caller's deadline.
@@ -48,14 +63,17 @@ pub fn receive(io: anytype, timeout_us: u32) Error!Frame {
             }
         }
         if (events.done) received = true;
+        ack_transmitted = ack_transmitted or events.ack_done;
         if (received) {
             const len = io.load(0) & 0x7f;
             if (len < 5) return error.InvalidFrame;
-            const needs_ack = io.auto_ack() and io.load(1) & 0x20 != 0 and io.load(2) & 0x30 <= 0x10;
-            if (needs_ack and events.done) io.set_pending();
-            if (!needs_ack or events.ack_done) {
+            const needs_ack = io.auto_ack() and io.load(1) & 0x20 != 0 and (io.load(2) & 0x30 <= 0x10 or (io.load(2) & 0x30 == 0x20 and io.enhanced_ack()));
+            if (needs_ack and events.done and io.load(2) & 0x30 <= 0x10) io.set_pending();
+            if (!needs_ack or ack_transmitted) {
                 var result: Frame = .{
                     .data = undefined,
+                    .ack_transmitted = needs_ack and ack_transmitted,
+                    .protection = .of_wire(io.load(1)),
                     .len = @intCast(len - 2),
                     .rssi = @bitCast(io.load(len - 1)),
                     .lqi = io.load(len),
@@ -76,6 +94,7 @@ const Mock = struct {
     starts: usize = 0,
     active: bool = false,
     ack_enabled: bool = false,
+    enhanced_enabled: bool = false,
     pending_writes: usize = 0,
     frame: [6]u8 = .{ 5, 1, 0, 42, 0xd6, 99 },
 
@@ -102,6 +121,10 @@ const Mock = struct {
         return self.ack_enabled;
     }
 
+    fn enhanced_ack(self: *Mock) bool {
+        return self.enhanced_enabled;
+    }
+
     fn set_pending(self: *Mock) void {
         self.pending_writes += 1;
     }
@@ -113,6 +136,12 @@ const Mock = struct {
     fn spin(_: *Mock) void {}
 };
 
+test "RX frames report the security bit they arrived with" {
+    const events = [_]Events{.{ .done = true }};
+    var io: Mock = .{ .events = &events, .frame = .{ 5, 9, 0, 42, 0xd6, 99 } };
+    try std.testing.expectEqual(Protection.raw_secured, (try receive(&io, 10)).protection);
+}
+
 test "each recoverable RX abort restarts stopped MAC before next valid frame" {
     for (2..10) |reason| {
         const events = [_]Events{ .{ .abort = @intCast(reason) }, .{ .done = true } };
@@ -123,6 +152,7 @@ test "each recoverable RX abort restarts stopped MAC before next valid frame" {
         try std.testing.expectEqualSlices(u8, &.{ 1, 0, 42 }, frame.bytes());
         try std.testing.expectEqual(@as(i8, -42), frame.rssi);
         try std.testing.expectEqual(@as(u8, 99), frame.lqi);
+        try std.testing.expectEqual(Protection.unsecured, frame.protection);
     }
 }
 
@@ -173,4 +203,34 @@ test "legacy auto-ACK still waits for completion and reports ACK-phase abort" {
     failed.frame[1] |= 0x20;
     try std.testing.expectError(error.AckTransmitFailed, receive(&failed, 4));
     try std.testing.expectEqual(@as(usize, 1), failed.starts);
+}
+
+test "enhanced ACK completion and generator failure are handed to polling" {
+    const events = [_]Events{ .{ .done = true }, .{ .ack_done = true } };
+    var io: Mock = .{ .events = &events, .ack_enabled = true, .enhanced_enabled = true };
+    io.frame[1] |= 0x20;
+    io.frame[2] = 0x20;
+    _ = try receive(&io, 4);
+    try std.testing.expectEqual(@as(usize, 2), io.index);
+    try std.testing.expectEqual(@as(usize, 0), io.pending_writes);
+    const failed = [_]Events{.{ .done = true, .ack_failed = true }};
+    io = .{ .events = &failed };
+    try std.testing.expectError(error.AckTransmitFailed, receive(&io, 4));
+}
+
+test "unsecured v2 reception alone cannot count as transmitted ACK" {
+    const events = [_]Events{.{ .done = true }};
+    var io: Mock = .{ .events = &events, .ack_enabled = true, .enhanced_enabled = true };
+    io.frame[1] = 0x21; // ACK request, security disabled.
+    io.frame[2] = 0x20;
+    try std.testing.expectError(error.Timeout, receive(&io, 4));
+    const completed = [_]Events{ .{ .done = true }, .{ .ack_done = true } };
+    io = .{ .events = &completed, .ack_enabled = true, .enhanced_enabled = true };
+    io.frame[1] = 0x21;
+    io.frame[2] = 0x20;
+    try std.testing.expect((try receive(&io, 4)).ack_transmitted);
+    io = .{ .events = &events, .ack_enabled = true, .enhanced_enabled = false };
+    io.frame[1] = 0x21;
+    io.frame[2] = 0x20;
+    try std.testing.expect(!(try receive(&io, 4)).ack_transmitted);
 }
