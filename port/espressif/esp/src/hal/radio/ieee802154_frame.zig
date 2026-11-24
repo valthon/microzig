@@ -1,10 +1,12 @@
 //! Legacy MAC header validation and C6 power conversion, ESP-IDF v5.5.1
 //! esp_ieee802154_frame.c, esp_ieee802154_pib.c and ieee802154_ll.h.
 const std = @import("std");
+pub const header = @import("ieee802154/header.zig");
 pub const tx = @import("ieee802154_tx.zig");
 
 test {
     _ = tx;
+    _ = header;
 }
 
 pub fn validate_tx(frame: []const u8) error{ InvalidFrame, UnsupportedFrame }!void {
