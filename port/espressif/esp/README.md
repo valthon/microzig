@@ -120,6 +120,22 @@ use pyserial and require explicit serial-port arguments:
   Require
   `SELFTEST twai DONE pass=12 fail=0` (C3) or `pass=24 fail=0` (both C6
   controllers), plus host exit 0.
+- `python ble_smp_user.py --reset-wdt --board <port>=<log> --board <port>=<log>`
+  is the user of two `selftest_ble_smp` boards built with an authenticated
+  `-Dsmp_method` (see BLE SMP below). It logs both consoles and types `yes`
+  into each board only after both have shown equal comparison numbers, and
+  types a passkey into one board only after the other has displayed it.
+  With `--reset-wdt` both boards must be in ROM download mode; it starts them
+  with an RTC watchdog system reset, and exits 3 before capturing if either
+  reset fails. Exit 0 means both printed `DONE pass=N fail=0` after their
+  second boot's `phase=1` line in this capture, exit 1 that either did not
+  (exit 2 is a usage error). A `DONE` counts only after the board's phase
+  line (`SELFTEST ble_smp phase=N`), which each boot prints after starting
+  the controller and, in auto mode, about 6 s of role discovery; if a first
+  boot fails before that line, the capture runs to `--max-seconds`. A later
+  phase line discards an earlier `DONE`, and a partial line is dropped when
+  a port is lost or reopened. `test_ble_smp_user.py` beside it tests this
+  with fake ports (`python3 -I -m unittest discover -s <dir> -p 'test_*.py'`).
 
 C3-only modules produce an explicit compile error on the C6. The C3 I2C master ran on hardware
 through the `i2c_display_ssd1306_c3_oled_042` example. The C6 LEDC blocking fade helper takes a
@@ -2140,6 +2156,105 @@ replies, and SMP ACL fragmentation under credit pressure. Crypto results match
 AES-CMAC (all four vectors), f4, f5, f6, g2 and ah. Bond tests use the actual
 `hal.nvs.Storage` against in-memory flash, reopen after writes/removal, verify
 purging and error propagation, and resolve a changed RPA.
+
+`esp32_c6_selftest_ble_smp` is an image-boot, two-board test. Flash **the same
+image** and a valid partition table with a writable named `nvs` partition on both
+boards; boot them within 3 s. No wiring. The image holds GPIO3/14 low to power
+and select the XIAO's internal RF path (the same assignments as the XIAO board
+module / [Seeed hardware overview](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/));
+leave those pins unconnected on the Super Mini. The lower public address becomes
+central after both advertise/scan. It checks encrypted-only ATT refusal before
+pairing, Just Works encryption, read access afterwards and both stored bonds;
+then checkpoints the result in `smp_selftest`, software-resets both boards and
+re-encrypts from NVS without pairing. It removes the peripheral's bond, checks
+clean encryption failure, removes the remaining bond and pairs on another
+connection. `smp_bonds` holds its test bonds; other namespaces are untouched.
+A phase marker resumes the second boot; successful completion clears it.
+Keep USB Serial/JTAG capture through both boots. Failures also print `diag`
+lines with the current step, connection handle/completion status/disconnect
+reason, SMP state, encryption/authentication/bond flags, raw HCI encryption
+status/enabled byte, and the last ATT RX/TX PDUs and counts. TX records a queued
+PDU, not peer acknowledgement. The last transport packet's type, length and
+first eight header bytes help identify failures before ATT decoding; for an ACL
+continuation fragment only its 4-byte HCI header is kept, so no SMP payload or
+key material is logged. Deadline diagnostics copy the fields with scheduling
+excluded, then log with interrupts restored. The copy is best-effort: the host
+task may have been preempted midway through updating several fields, so
+fields can mix two consecutive host states. Peripheral wait steps identify
+which central action it awaits. Unexpected read errors retain their original
+Zig error rather than being replaced by `Mismatch`.
+
+After automatic role discovery, both boards stop scanning and discovery
+advertising. The peripheral configures its encrypted-only GATT permission
+before advertising `MZ-SMP-READY`. The central waits for a fresh readiness
+report from the selected peer before initiating.
+
+The self-test allows three total attempts per connection, with a 250 ms backoff
+only for HCI `0x3e` (Connection Failed to be Established) at Connection Complete
+or during the initial ATT probe. ESP-IDF v5.5.1 NimBLE enables connection
+reattempts by default on C6 and sets `CONFIG_BT_NIMBLE_MAX_CONN_REATTEMPT` to 3
+([components/bt/host/nimble/Kconfig.in:574–585](https://github.com/espressif/esp-idf/blob/v5.5.1/components/bt/host/nimble/Kconfig.in#L574-L585)).
+The self-test counts the initial attempt toward its limit to fit the per-boot
+deadline. Each retry reports the failed step and HCI status or disconnect
+reason. After the probe succeeds, subsequent failures end the test.
+
+Use `-Dsmp_role=auto|central|peripheral` (default `auto`). Forced roles skip the
+six-second discovery. Build from `examples/espressif/esp`:
+
+```sh
+zig build -Doptimize=ReleaseSmall -Dexample=selftest_ble_smp -Dsmp_role=peripheral
+# Flash the XIAO, then build/flash the Super Mini central separately:
+zig build -Doptimize=ReleaseSmall -Dexample=selftest_ble_smp -Dsmp_role=central -Dsmp_peer_address=aa:bb:cc:dd:ee:ff
+```
+
+`-Dsmp_method=just_works|numeric_comparison|passkey_peripheral_input|passkey_central_input`
+(default `just_works`; build both boards with the same value) selects the
+pairing method through the IO capabilities: DisplayYesNo on both sides, or
+DisplayOnly against KeyboardOnly with the named side typing. Authenticated
+methods require MITM, check that pairing, re-encryption and both stored bonds
+are authenticated, and print `SELFTEST ble_smp io compare=NNNNNN`,
+`io display=NNNNNN` or `io input` on USB Serial/JTAG. Answer each prompt with
+a line on that board's console: `yes`/`no`, or the six digits the other board
+displayed. Both pairings of a run (first boot and after bond removal) prompt.
+A prompt the board withdraws prints `io cancel`; input already received for it
+is discarded.
+`tools/bench/ble_smp_user.py` (above) answers like such a user.
+
+Use the peripheral's printed public address for `smp_peer_address`; it is optional
+in forced mode. Both boards must run this self-test protocol. Start forced-role
+runs with fresh `smp_selftest` and `smp_bonds` namespaces on both boards. Auto mode still requires
+booting both boards within 3 s.
+
+Discovery uses nonconnectable undirected advertisements (`ADV_NONCONN_IND`) so
+both boards can elect their roles before either accepts a connection. Readiness
+uses connectable undirected advertisements (`ADV_IND`). Each phase accepts only
+its own report type and requires experimental manufacturer ID `0xffff`, magic
+`MZSM`, a four-byte random boot nonce and the corresponding readiness byte.
+The name is diagnostic only. Auto mode elects using public addresses and retains
+the discovery peer's address, exact type and boot nonce for the rest of the boot.
+The central rescans before every initiation and requires a fresh ready report
+with that identity. Forced mode accepts this payload (optionally also constrained
+to `smp_peer_address`, which denotes a public address), then pins its address,
+type and nonce for subsequent reconnects. A peer reset during a boot is rejected;
+restart both tests. The discriminator prevents accidental bench-peer selection,
+not deliberate impersonation. AD payloads include the full diagnostic name.
+
+The connection probe checks the open FFF1 declaration at handle 5 (value
+handle 6), then requires ATT `0x0f` (Insufficient Encryption) when reading handle
+6. A foreign declaration or unexpected access reports `WrongSelftestGatt`
+before security starts. Host tests cover the role handoff, permission setup,
+peer selection, HCI initiation parameters, fragmented ATT refusal decoding and
+retry limits.
+
+Each check prints PASS/FAIL;
+final output is `SELFTEST ble_smp DONE pass=N fail=0` (central N=10, peripheral
+N=7). Each boot has a 40 s failure-report deadline, for a total below 90 s.
+
+On hardware on 2026-11-24, a Super Mini ESP32-C6 and a XIAO ESP32-C6 with forced roles
+and erased `nvs` before each run, `ble_smp_user.py` answering: each of the four `-Dsmp_method`
+values passed 2/2 runs with each board as central (16 runs, `DONE pass=10 fail=0` on the central
+and `pass=7 fail=0` on the peripheral). In each of the 16 Passkey Entry pairings the harness typed
+the passkey only after it had read the other board's `io display` line.
 
 Central connection creation matches ESP-IDF v5.5.1's pinned NimBLE
 [`ble_gap_conn_params_dflt`](https://github.com/espressif/esp-nimble/blob/b45dcedcafb7888174c3567002c36b342ec0b723/nimble/host/src/ble_gap.c)

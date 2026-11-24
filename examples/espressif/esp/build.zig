@@ -1,6 +1,9 @@
 const std = @import("std");
 const microzig = @import("microzig");
 
+const SmpRole = @import("src/selftest_ble_smp_connection.zig").Role;
+const SmpMethod = @import("src/selftest_ble_smp_connection.zig").Method;
+
 const MicroBuild = microzig.MicroBuild(.{
     .esp = true,
 });
@@ -23,6 +26,11 @@ pub fn build(b: *std.Build) void {
     const ble_scan_seconds = b.option(u32, "ble_scan_seconds", "BLE observer scan duration (1..3600 seconds)") orelse 10;
     if (ble_scan_seconds == 0 or ble_scan_seconds > 3600) @panic("ble_scan_seconds must be in 1..3600");
     const antenna = b.option(Antenna, "antenna", "Antenna the XIAO ESP32C6 radio examples select (default internal)") orelse .internal;
+    const smp_role = b.option(SmpRole, "smp_role", "SMP self-test role (default auto)") orelse .auto;
+    const smp_method = b.option(SmpMethod, "smp_method", "SMP self-test pairing method (default just_works)") orelse .just_works;
+    const smp_peer_text = b.option([]const u8, "smp_peer_address", "SMP peer public address (aa:bb:cc:dd:ee:ff)");
+    const smp_peer_address: ?u48 = if (smp_peer_text) |text| parse_mac(text) orelse
+        std.process.fatal("invalid smp_peer_address: expected aa:bb:cc:dd:ee:ff", .{}) else null;
     const ble_peer_name = b.option([]const u8, "ble_peer_name", "BLE central peer advertised name") orelse "H2-PEER";
     if (ble_peer_name.len == 0 or ble_peer_name.len > 31) @panic("ble_peer_name must be 1..31 bytes");
     const softap_ssid = b.option([]const u8, "softap_ssid", "SoftAP SSID (1..32 bytes)") orelse "microzig-softap";
@@ -53,6 +61,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(espnow_protocol_tests).step);
+    const smp_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/selftest_ble_smp_connection.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(smp_tests).step);
     const expected_mac: ?u48 = if (expected_mac_text) |text| parse_mac(text) orelse
         std.process.fatal("-Dexpected_mac={s}: expected six hex bytes separated by ':'", .{text}) else null;
 
@@ -153,6 +167,7 @@ pub fn build(b: *std.Build) void {
             .lwip = true,
         } },
         .{ .name = "selftest_ble_hci", .file = "src/selftest_ble_hci.zig", .chips = &.{.esp32_c6}, .features = .{ .image_boot_only = true } },
+        .{ .name = "selftest_ble_smp", .file = "src/selftest_ble_smp.zig", .chips = &.{.esp32_c6}, .features = .{ .image_boot_only = true } },
         .{ .name = "ble_scan", .file = "src/ble_scan.zig", .chips = &.{.esp32_c6}, .ble_options = true, .features = .{ .image_boot_only = true } },
         .{ .name = "ble_peripheral", .file = "src/ble_peripheral.zig", .chips = &.{.esp32_c6}, .ble_options = true, .features = .{ .image_boot_only = true } },
         .{ .name = "ble_central", .file = "src/ble_central.zig", .chips = &.{.esp32_c6}, .ble_options = true, .features = .{ .image_boot_only = true } },
@@ -255,6 +270,13 @@ pub fn build(b: *std.Build) void {
                 const options = b.addOptions();
                 options.addOption(?u48, "expected_mac", expected_mac);
                 fw.exe.root_module.addOptions("c6_core_options", options);
+            }
+            if (std.mem.eql(u8, example.name, "selftest_ble_smp")) {
+                const options = b.addOptions();
+                options.addOption(SmpRole, "role", smp_role);
+                options.addOption(SmpMethod, "method", smp_method);
+                options.addOption(?u48, "peer_address", smp_peer_address);
+                fw.exe.root_module.addOptions("smp_options", options);
             }
             if (example.ble_options) add_ble_options(b, fw, ble_scan_seconds, ble_peer_name);
             if (example.ble_options or example.antenna_option) add_antenna_option(b, fw, antenna);
