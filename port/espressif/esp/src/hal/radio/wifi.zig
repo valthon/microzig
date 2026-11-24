@@ -8,6 +8,7 @@ const time = microzig.drivers.time;
 
 const radio = @import("../radio.zig");
 const osi = @import("osi.zig");
+const wifi_status = @import("wifi_status.zig");
 const compatibility = @import("../compatibility.zig");
 
 const log = std.log.scoped(.esp_radio_wifi);
@@ -1150,107 +1151,26 @@ var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
     break :osi_funcs f;
 };
 
-pub const InternalError = error{
-    OutOfMemory,
-    InvalidArg,
-    Timeout,
-    WouldBlock,
-    WifiNotInitialized,
-    WifiNotStarted,
-    WifiNotStopped,
-    WifiNotConnected,
-    WifiInvalid_MAC,
-    WifiInvalid_SSID,
-    WifiInvalidPassword,
-    WifiOther,
-};
+pub const InternalError = wifi_status.Error;
 
-pub fn c_err(raw_err_code: i32) InternalError!void {
-    const InternalWifiErrorCode = enum(i32) {
-        /// Out of memory
-        esp_err_no_mem = 0x101,
+/// Any code other than ESP_OK is an error; see `wifi_status.check`.
+pub const c_err = wifi_status.check;
 
-        /// Invalid argument
-        esp_err_invalid_arg = 0x102,
-
-        /// Wi_fi driver was not installed by esp_wifi_init
-        esp_err_wifi_not_init = 0x3001,
-
-        /// Wi_fi driver was not started by esp_wifi_start
-        esp_err_wifi_not_started = 0x3002,
-
-        /// Wi_fi driver was not stopped by esp_wifi_stop
-        esp_err_wifi_not_stopped = 0x3003,
-
-        /// Wi_fi interface error
-        esp_err_wifi_if = 0x3004,
-
-        /// Wi_fi mode error
-        esp_err_wifi_mode = 0x3005,
-
-        /// Wi_fi internal state error
-        esp_err_wifi_state = 0x3006,
-
-        /// Wi_fi internal control block of station or soft-AP error
-        esp_err_wifi_conn = 0x3007,
-
-        /// Wi_fi internal NVS module error
-        esp_err_wifi_nvs = 0x3008,
-
-        /// MAC address is invalid
-        esp_err_wifi_mac = 0x3009,
-
-        /// SSID is invalid
-        esp_err_wifi_ssid = 0x300A,
-
-        /// Password is invalid
-        esp_err_wifi_password = 0x300B,
-
-        /// Timeout error
-        esp_err_wifi_timeout = 0x300C,
-
-        /// Wi_fi is in sleep state(RF closed) and wakeup fail
-        esp_err_wifi_wake_fail = 0x300D,
-
-        /// The caller would block
-        esp_err_wifi_would_block = 0x300E,
-
-        /// Station still in disconnect status
-        esp_err_wifi_not_connect = 0x300F,
-
-        /// Failed to post the event to Wi_fi task
-        esp_err_wifi_post = 0x3012,
-
-        /// Invalid Wi_fi state when init/deinit is called
-        esp_err_wifi_init_state = 0x3013,
-
-        /// Returned when Wi_fi is stopping
-        esp_err_wifi_stop_state = 0x3014,
-
-        /// The Wi_fi connection is not associated
-        esp_err_wifi_not_assoc = 0x3015,
-
-        /// The Wi_fi TX is disallowed
-        esp_err_wifi_tx_disallow = 0x3016,
-    };
-
-    if (raw_err_code != c.ESP_OK) {
-        const err_code = std.enums.fromInt(InternalWifiErrorCode, raw_err_code) orelse
-            @panic("esp wifi returned unexpected error code");
-        log.debug("internal wifi error occurred: {t}", .{err_code});
-        return switch (err_code) {
-            .esp_err_no_mem => error.OutOfMemory,
-            .esp_err_wifi_timeout => error.Timeout,
-            .esp_err_wifi_would_block => error.WouldBlock,
-            .esp_err_wifi_not_init => error.WifiNotInitialized,
-            .esp_err_wifi_not_started => error.WifiNotStarted,
-            .esp_err_wifi_not_connect => error.WifiNotConnected,
-            .esp_err_wifi_not_stopped => error.WifiNotStopped,
-            .esp_err_wifi_mac => error.WifiInvalid_MAC,
-            .esp_err_wifi_ssid => error.WifiInvalid_SSID,
-            .esp_err_wifi_password => error.WifiInvalidPassword,
-            else => error.WifiOther,
+// wifi_status cannot import the headers (its host tests run without them), so
+// its codes are checked against them here.
+comptime {
+    assert(c.ESP_OK == 0);
+    @setEvalBranchQuota(10_000);
+    for (std.enums.values(wifi_status.Code)) |code| {
+        const tag = @tagName(code);
+        const macro = upper: {
+            var buf: [tag.len]u8 = undefined;
+            _ = std.ascii.upperString(&buf, tag);
+            const name = buf;
+            break :upper &name;
         };
+        if (@field(c, macro) != @backingInt(code))
+            @compileError("wifi_status.Code." ++ tag ++ " differs from " ++ macro);
     }
 }
 

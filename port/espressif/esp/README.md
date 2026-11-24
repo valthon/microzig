@@ -961,8 +961,9 @@ drops that association (2 to 58 s with the Pico).
 
 On the C3, a diagnostic build without static RX management buffers (`rx_mgmt_buf_type`,
 the IDF default) failed the first TCP connection in 8 of 8 boots: its ARP requests got no
-802.11 ACK from about 20 s after boot and Wi-Fi TX later returned `WifiOther`. A diagnostic
-build with static RX management buffers passed 4 of 5 boots.
+802.11 ACK from about 20 s after boot and Wi-Fi TX later returned `WifiOther` (which then
+covered every listed Wi-Fi code without its own error). A diagnostic build with static RX
+management buffers passed 4 of 5 boots.
 
 #### Wi-Fi self-tests (C3 and C6)
 
