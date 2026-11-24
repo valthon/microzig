@@ -130,6 +130,7 @@ pub fn build(b: *std.Build) void {
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_rmt", .file = "src/selftest_rmt.zig" },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_timers", .file = "src/selftest_timers.zig" },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_rwdt", .file = "src/selftest_rwdt.zig", .features = .{ .flashless = false } },
+        .{ .name = "selftest_usj_log", .file = "src/selftest_usj_log.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_usj", .file = "src/selftest_usj.zig" },
         .{ .name = "systimer", .file = "src/systimer.zig", .chips = &.{ .esp32_c3, .esp32_c6 } },
         .{ .chips = &.{ .esp32_c3, .esp32_c6 }, .name = "selftest_twai", .file = "src/selftest_twai.zig" },

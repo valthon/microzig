@@ -3,8 +3,13 @@ const microzig = @import("microzig");
 // Both generated chip maps call this USB_DEVICE. EP1/EP1_CONF are described
 // in C6 TRM v1.2 §32.7, registers 32.1/32.2 (FIFO protocol: §32.3.2).
 const USB_SERIAL_JTAG = microzig.chip.peripherals.USB_DEVICE;
+const builtin = @import("builtin");
+const host_test = builtin.is_test and builtin.target.os.tag != .freestanding;
+const test_host = @import("usb_serial_jtag/test_host.zig");
 const time = @import("time.zig");
 const Deadline = microzig.drivers.time.Deadline;
+const tx_clock = if (host_test) test_host else time;
+const log_interrupt = if (host_test) test_host.interrupt else microzig.interrupt;
 const log_state = @import("usb_serial_jtag/state.zig");
 
 /// Destructive C3 reconnect experiment: discards pending CDC/JTAG transfers and
@@ -304,17 +309,20 @@ pub fn reconnect(options: ReattachOptions) ?bool {
 
 /// Returns `false` if data can be sent.
 pub fn tx_fifo_full() bool {
+    if (host_test) return test_host.full();
     return USB_SERIAL_JTAG.EP1_CONF.read().SERIAL_IN_EP_DATA_FREE == 0;
 }
 
 /// Call this after you are done writing data. After `tx_fifo_full()` returns false
 /// you can start sending more data.
 pub fn tx_fifo_flush() void {
+    if (host_test) return test_host.flush();
     USB_SERIAL_JTAG.EP1_CONF.write(.{ .WR_DONE = 1 });
 }
 
 /// Writes one byte to the fifo.
 pub fn tx_fifo_write(byte: u8) void {
+    if (host_test) return test_host.write(byte);
     USB_SERIAL_JTAG.EP1.write(.{
         .RDWR_BYTE = byte,
     });
@@ -358,7 +366,7 @@ const TxWait = struct {
         return tx_fifo_full();
     }
     pub fn expired(self: *TxWait) bool {
-        return self.deadline.is_reached_by(time.get_time_since_boot());
+        return self.deadline.is_reached_by(tx_clock.get_time_since_boot());
     }
     pub fn release_stuck(_: *TxWait) void {
         release_stuck_tx();
@@ -389,7 +397,7 @@ var boot_tx_checked = false;
 /// Before the first write after boot, release an IN buffer that was already
 /// stuck at boot (see release_stuck_tx), so that write is not lost to it.
 fn release_stuck_tx_at_boot() void {
-    const cs = microzig.interrupt.enter_critical_section();
+    const cs = log_interrupt.enter_critical_section();
     defer cs.leave();
     if (boot_tx_checked) return;
     boot_tx_checked = true;
@@ -419,43 +427,71 @@ pub fn write_blocking(data: []const u8, deadline: Deadline) error{Timeout}!usize
 }
 
 /// Buffered writer with bounded host-consumption waits. Inspect err after WriteFailed.
-/// Each drain gets one timeout, or the shared `deadline` when set; no failed
-/// bytes are retained for a later message.
+/// Each drain sends at most one 64-byte packet and gets one timeout, or the
+/// shared `deadline` when set. A reservation that needs room sends packets the
+/// same way until the moved bytes fit in the sent prefix. No failed bytes are
+/// retained for a later message.
 pub const Writer = struct {
     interface: std.Io.Writer,
+    storage: []u8,
     timeout: microzig.drivers.time.Duration = .from_ms(100),
     /// When set, every drain uses this deadline instead of `timeout`.
     deadline: ?Deadline = null,
     err: ?error{Timeout} = null,
 
     pub fn init(buffer: []u8) Writer {
-        return .{ .interface = .{ .buffer = buffer, .vtable = &.{ .drain = drain } } };
+        return .{
+            .interface = .{ .buffer = buffer, .vtable = &.{ .drain = drain, .rebase = rebase } },
+            .storage = buffer,
+        };
+    }
+
+    /// Discards buffered bytes and restores the full buffer that drains shorten.
+    pub fn discard(self: *Writer) void {
+        self.interface.buffer = self.storage;
+        self.interface.end = 0;
+    }
+
+    fn send_packet(self: *Writer, bytes: []const u8) std.Io.Writer.Error!usize {
+        const deadline = self.deadline orelse Deadline.init_relative(tx_clock.get_time_since_boot(), self.timeout);
+        self.err = null;
+        return write_blocking(bytes[0..@min(64, bytes.len)], deadline) catch |err| {
+            self.discard();
+            self.err = err;
+            return error.WriteFailed;
+        };
+    }
+
+    fn rebase(w: *std.Io.Writer, preserve: usize, capacity: usize) std.Io.Writer.Error!void {
+        const self: *Writer = @alignCast(@fieldParentPtr("interface", w));
+        // Send until the reservation fits and the bytes to move are no more
+        // than the sent prefix they move into, so relocation stays linear in
+        // bytes sent; only the `preserve` bytes may be moved unsent.
+        while (w.end > preserve) {
+            const consumed = w.buffer.ptr - self.storage.ptr;
+            if (self.storage.len - w.end >= capacity and w.end <= consumed) break;
+            const n = try self.send_packet(w.buffer[0 .. w.end - preserve]);
+            w.buffer = w.buffer[n..];
+            w.end -= n;
+        }
+        @memmove(self.storage[0..w.end], w.buffered());
+        w.buffer = self.storage;
     }
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Writer = @alignCast(@fieldParentPtr("interface", w));
-        const deadline = self.deadline orelse Deadline.init_relative(time.get_time_since_boot(), self.timeout);
-        self.err = null;
-        const buffered = w.buffer[0..w.end];
-        w.end = 0;
-        _ = write_blocking(buffered, deadline) catch |err| {
-            self.err = err;
-            return error.WriteFailed;
-        };
-        var n: usize = 0;
-        for (data[0 .. data.len - 1]) |bytes| {
-            n += write_blocking(bytes, deadline) catch |err| {
-                self.err = err;
-                return error.WriteFailed;
-            };
+        if (w.end != 0) {
+            const n = try self.send_packet(w.buffered());
+            w.end -= n;
+            w.buffer = if (w.end == 0) self.storage else w.buffer[n..];
+            return 0; // Only bytes consumed from data count toward the result.
         }
-        for (0..splat) |_| {
-            n += write_blocking(data[data.len - 1], deadline) catch |err| {
-                self.err = err;
-                return error.WriteFailed;
-            };
+        for (data, 0..) |bytes, i| {
+            if (i == data.len - 1 and splat == 0) break;
+            if (bytes.len == 0) continue;
+            return self.send_packet(bytes);
         }
-        return n;
+        return 0;
     }
 };
 
@@ -486,17 +522,18 @@ pub const logger = struct {
     pub fn prepare_panic() void {
         microzig.cpu.interrupt.disable_interrupts();
         state.takeover(&writer.interface.end);
+        writer.discard();
     }
 
     fn count_dropped() void {
-        const cs = microzig.interrupt.enter_critical_section();
+        const cs = log_interrupt.enter_critical_section();
         defer cs.leave();
         state.count_dropped();
     }
 
     /// Owner only: discards the line and counts it.
     fn drop_line() void {
-        writer.interface.end = 0;
+        writer.discard();
         state.host_stalled = true;
         count_dropped();
     }
@@ -513,15 +550,14 @@ pub const logger = struct {
             else => " (" ++ @tagName(scope) ++ "): ",
         };
 
-        const masked_by_caller = !microzig.interrupt.globally_enabled() or
-            microzig.cpu.interrupt.get_priority_threshold() != .zero;
+        const masked_by_caller = if (host_test) test_host.masked else !microzig.interrupt.globally_enabled() or microzig.cpu.interrupt.get_priority_threshold() != .zero;
         const unreported = claim: {
-            const cs = microzig.interrupt.enter_critical_section();
+            const cs = log_interrupt.enter_critical_section();
             defer cs.leave();
             break :claim state.claim() orelse return;
         };
         defer {
-            const cs = microzig.interrupt.enter_critical_section();
+            const cs = log_interrupt.enter_critical_section();
             defer cs.leave();
             state.release();
         }
@@ -532,7 +568,7 @@ pub const logger = struct {
         // 326 us per line); 50 us dropped most lines while the host read.
         writer.timeout = .from_ms(2);
         writer.deadline = if (masked_by_caller)
-            Deadline.init_relative(time.get_time_since_boot(), writer.timeout)
+            Deadline.init_relative(tx_clock.get_time_since_boot(), writer.timeout)
         else
             null;
 
@@ -555,13 +591,13 @@ pub const logger = struct {
                 return;
             };
             // Lines dropped by other contexts meanwhile stay counted.
-            const cs = microzig.interrupt.enter_critical_section();
+            const cs = log_interrupt.enter_critical_section();
             defer cs.leave();
             state.confirm_report(unreported);
         }
         state.host_stalled = false;
 
-        const current_time = time.get_time_since_boot();
+        const current_time = tx_clock.get_time_since_boot();
         const seconds = current_time.to_us() / std.time.us_per_s;
         const microseconds = current_time.to_us() % std.time.us_per_s;
 
@@ -574,3 +610,235 @@ pub const logger = struct {
         };
     }
 };
+
+test "logger strings crossing the line buffer keep their fields" {
+    if (!host_test) return error.SkipZigTest;
+    inline for (.{ 31, 32, 63, 64, 65, 100, 200 }) |len| {
+        test_host.reset();
+        test_host.latency_us = 1100;
+        logger.state = .{};
+        logger.writer.discard();
+        const field: [len]u8 = @splat('h');
+        logger.log(.info, .default, "FIELD {s} END", .{&field});
+        try std.testing.expect(std.mem.indexOf(u8, test_host.output(), comptime std.fmt.comptimePrint("FIELD {s} END\r\n", .{field})) != null);
+        try std.testing.expectEqual(@as(usize, 0), logger.state.dropped_lines);
+    }
+}
+
+fn reset_test_logger() void {
+    test_host.reset();
+    logger.state = .{};
+    logger.writer.discard();
+}
+
+test "logger named and temporary bytesToHex slices and raw hex" {
+    if (!host_test) return error.SkipZigTest;
+    inline for (.{ 0, 1100 }) |latency_us| {
+        reset_test_logger();
+        test_host.latency_us = latency_us;
+        var raw: [32]u8 = undefined;
+        for (&raw, 0..) |*byte, i| byte.* = @intCast(i);
+        const expected = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        const hex = std.fmt.bytesToHex(raw, .lower);
+        logger.log(.info, .default, "NAMED {s} END", .{hex[0..]});
+        logger.log(.info, .default, "TEMP {s} END", .{std.fmt.bytesToHex(raw, .lower)[0..]});
+        logger.log(.info, .default, "CHUNKS {s}{s} END", .{ hex[0..32], hex[32..64] });
+        logger.log(.info, .default, "RAW {x} END", .{&raw});
+        inline for (.{ "NAMED ", "TEMP ", "CHUNKS ", "RAW " }) |prefix| {
+            try std.testing.expect(std.mem.indexOf(u8, test_host.output(), prefix ++ expected ++ " END\r\n") != null);
+        }
+        try std.testing.expectEqual(@as(usize, 0), logger.state.dropped_lines);
+    }
+}
+
+test "Writer drain accounts only input bytes and handles vectors and splats" {
+    if (!host_test) return error.SkipZigTest;
+    inline for (.{ 0, 1, 64, 100 }) |capacity| {
+        test_host.reset();
+        test_host.latency_us = 1100;
+        var buffer: [capacity]u8 = undefined;
+        var writer = Writer.init(&buffer);
+        writer.timeout = .from_ms(2);
+        try writer.interface.writeAll("buffered");
+        var vec: [3][]const u8 = .{ "", "head", "ab" };
+        try writer.interface.writeSplatAll(&vec, 40);
+        var zero: [2][]const u8 = .{ "tail", "excluded" };
+        try writer.interface.writeSplatAll(&zero, 0);
+        try writer.interface.flush();
+        var expected: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&expected);
+        try w.writeAll("bufferedhead");
+        for (0..40) |_| try w.writeAll("ab");
+        try w.writeAll("tail");
+        try std.testing.expectEqualStrings(w.buffered(), test_host.output());
+        try std.testing.expectEqual(@as(usize, 0), writer.interface.end);
+        try std.testing.expectEqual(@as(?error{Timeout}, null), writer.err);
+    }
+    test_host.reset();
+    var buffer: [64]u8 = undefined;
+    var writer = Writer.init(&buffer);
+    try writer.interface.writeAll("prefix");
+    // The return count excludes buffer bytes, including when only those drain.
+    const consumed = try Writer.drain(&writer.interface, &.{"field"}, 1);
+    try std.testing.expect(consumed <= "field".len);
+    try writer.interface.writeAll("field"[consumed..]);
+    try writer.interface.flush();
+    try std.testing.expectEqualStrings("prefixfield", test_host.output());
+}
+
+test "logger counts a timeout and reports it before the next line" {
+    if (!host_test) return error.SkipZigTest;
+    inline for (.{ 1, 2 }) |stalled_packet| {
+        reset_test_logger();
+        test_host.latency_us = 100;
+        test_host.stall_packet = stalled_packet;
+        const field: [200]u8 = @splat('h');
+        logger.log(.info, .default, "FIELD {s} END", .{&field});
+        try std.testing.expectEqual(@as(usize, 1), logger.state.dropped_lines);
+        try std.testing.expectEqual(@as(usize, 0), logger.writer.interface.end);
+        try std.testing.expectEqual(error.Timeout, logger.writer.err.?);
+        // Host resumes and consumes the already committed fragment.
+        test_host.advance(20_000);
+        test_host.stall_packet = null;
+        logger.log(.info, .default, "RECOVERED", .{});
+        try std.testing.expect(std.mem.indexOf(u8, test_host.output(), "lost at most 1 lines since last confirmed report]\r\n") != null);
+        try std.testing.expect(std.mem.endsWith(u8, test_host.output(), "RECOVERED\r\n"));
+        try std.testing.expectEqual(@as(usize, 0), logger.state.dropped_lines);
+    }
+}
+
+test "masked logger keeps one deadline for the entire line" {
+    if (!host_test) return error.SkipZigTest;
+    reset_test_logger();
+    test_host.masked = true;
+    test_host.latency_us = 1100;
+    const field: [200]u8 = @splat('h');
+    logger.log(.info, .default, "FIELD {s} END", .{&field});
+    try std.testing.expectEqual(@as(usize, 1), logger.state.dropped_lines);
+    try std.testing.expectEqual(@as(usize, 0), logger.writer.interface.end);
+    try std.testing.expectEqual(error.Timeout, logger.writer.err.?);
+}
+
+test "write_blocking accepts driver deadlines on the host" {
+    if (!host_test) return error.SkipZigTest;
+    test_host.reset();
+    try std.testing.expectEqual(0, try write_blocking("", .no_deadline));
+    const deadline: microzig.drivers.time.Deadline = .init_absolute(.from_us(1000));
+    try std.testing.expectEqual(1, try write_blocking("x", deadline));
+}
+
+test "draining a large buffer bounds bytes relocated" {
+    if (!host_test) return error.SkipZigTest;
+    test_host.reset();
+    var payload: [4096]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @truncate(i / 64);
+    var buffer: [payload.len]u8 = undefined;
+    var writer = Writer.init(&buffer);
+    try writer.interface.writeAll(&payload);
+    var relocated: usize = 0;
+    while (writer.interface.end != 0) {
+        const before = writer.interface.buffered();
+        const sent = test_host.output().len;
+        try std.testing.expectEqual(0, try Writer.drain(&writer.interface, &.{""}, 1));
+        const n = test_host.output().len - sent;
+        try std.testing.expectEqual(64, n);
+        const pending = writer.interface.buffered();
+        // A pending suffix at a new address has been copied.
+        if (pending.ptr != before[n..].ptr) relocated += pending.len;
+    }
+    try std.testing.expectEqualSlices(u8, &payload, test_host.output());
+    try std.testing.expect(relocated <= payload.len);
+}
+
+test "repeated reservations on a full writer bound bytes relocated" {
+    if (!host_test) return error.SkipZigTest;
+    test_host.reset();
+    var initial: [4096]u8 = undefined;
+    for (&initial, 0..) |*byte, i| byte.* = @truncate(i / 64);
+    var buffer: [initial.len]u8 = undefined;
+    var writer = Writer.init(&buffer);
+    try writer.interface.writeAll(&initial);
+    var relocated: usize = 0;
+    for (0..64) |i| {
+        const before = writer.interface.buffered();
+        const sent = test_host.output().len;
+        const reserved = if (i % 2 == 0) try writer.interface.writableSlice(64) else blk: {
+            const greedy = try writer.interface.writableSliceGreedy(64);
+            writer.interface.advance(64);
+            break :blk greedy[0..64];
+        };
+        @memset(reserved, @intCast(0x80 + i));
+        const n = test_host.output().len - sent;
+        const pending = writer.interface.buffered()[0 .. before.len - n];
+        // A pending suffix at a new address has been copied.
+        if (pending.ptr != before[n..].ptr) relocated += pending.len;
+    }
+    const sent_while_reserving = test_host.output().len;
+    try writer.interface.flush();
+    try std.testing.expectEqualSlices(u8, &initial, test_host.output()[0..initial.len]);
+    for (0..64) |i| {
+        const expected: [64]u8 = @splat(@intCast(0x80 + i));
+        try std.testing.expectEqualSlices(u8, &expected, test_host.output()[initial.len + 64 * i ..][0..64]);
+    }
+    try std.testing.expectEqual(initial.len + 64 * 64, test_host.output().len);
+    // Every relocated byte moves into a prefix sent since the last compaction.
+    try std.testing.expect(relocated <= sent_while_reserving);
+}
+
+test "Writer rebase preserves the suffix after a partial drain" {
+    if (!host_test) return error.SkipZigTest;
+    test_host.reset();
+    var buffer: [256]u8 = undefined;
+    var writer = Writer.init(&buffer);
+    var payload: [buffer.len]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @intCast(i);
+    try writer.interface.writeAll(&payload);
+    try std.testing.expectEqual(0, try Writer.drain(&writer.interface, &.{""}, 1));
+    const reserved = try writer.interface.writableSlicePreserve(16, 240);
+    @memset(reserved, 'x');
+    try writer.interface.flush();
+    try std.testing.expectEqualSlices(u8, &payload, test_host.output()[0..payload.len]);
+    const expected: [240]u8 = @splat('x');
+    try std.testing.expectEqualSlices(u8, &expected, test_host.output()[payload.len..]);
+    try std.testing.expectEqual(buffer.len, writer.interface.buffer.len);
+}
+
+test "Writer restores its full buffer after a failed partial drain" {
+    if (!host_test) return error.SkipZigTest;
+    test_host.reset();
+    var buffer: [256]u8 = undefined;
+    var writer = Writer.init(&buffer);
+    writer.timeout = .from_ms(2);
+    const first: [buffer.len]u8 = @splat('a');
+    try writer.interface.writeAll(&first);
+    try std.testing.expectEqual(0, try Writer.drain(&writer.interface, &.{""}, 1));
+    try std.testing.expect(writer.interface.buffer.len < buffer.len);
+    test_host.stall_packet = 2;
+    try std.testing.expectError(error.WriteFailed, writer.interface.flush());
+    try std.testing.expectEqual(error.Timeout, writer.err.?);
+    try std.testing.expectEqual(@as(usize, 0), writer.interface.end);
+    try std.testing.expectEqual(@as([*]u8, &buffer), writer.interface.buffer.ptr);
+    try std.testing.expectEqual(buffer.len, writer.interface.buffer.len);
+    // The host consumes the committed packet; the next line goes out whole.
+    test_host.advance(20_000);
+    test_host.stall_packet = null;
+    const sent = test_host.output().len;
+    const line: [200]u8 = @splat('b');
+    try writer.interface.writeAll(&line);
+    try writer.interface.flush();
+    try std.testing.expectEqual(@as(?error{Timeout}, null), writer.err);
+    try std.testing.expect(std.mem.endsWith(u8, test_host.output()[sent..], &line));
+}
+
+test "dropping a logger line restores its full buffer" {
+    if (!host_test) return error.SkipZigTest;
+    reset_test_logger();
+    // As left by a drain that sent part of the buffered bytes.
+    logger.writer.interface.buffer = logger.writer.storage[16..];
+    logger.writer.interface.end = 8;
+    logger.drop_line();
+    try std.testing.expectEqual(@as(usize, 0), logger.writer.interface.end);
+    try std.testing.expectEqual(logger.writer.storage.ptr, logger.writer.interface.buffer.ptr);
+    try std.testing.expectEqual(logger.writer.storage.len, logger.writer.interface.buffer.len);
+    reset_test_logger();
+}

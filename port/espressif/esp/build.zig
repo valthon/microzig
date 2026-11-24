@@ -351,6 +351,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const host_microzig = b.createModule(.{
+        .root_source_file = b.path("src/hal/usb_serial_jtag/test_microzig.zig"),
+    });
+    host_microzig.addImport("drivers", b.createModule(.{
+        .root_source_file = b.path("../../../drivers/src/root.zig"),
+    }));
+    unit_tests.root_module.addImport("microzig", host_microzig);
     unit_tests.root_module.addImport("interrupt-encoding", b.createModule(.{
         .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
     }));
