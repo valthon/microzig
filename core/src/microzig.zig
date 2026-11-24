@@ -57,29 +57,42 @@ pub fn assert(expr: bool, opts: AssertOptions) void {
     }
 }
 
-/// The microzig default panic handler. Will disable interrupts and loop endlessly.
+/// Whether the panic handler reports through `std.log`. A firmware that does not set its
+/// `logFn` (see `std_options`) gets `std.log.defaultLog`, which writes to stderr through
+/// `std.Options.debug_io`. Unless the root declares `std_options_debug_io`, that is a
+/// `std.Io.Threaded`, which does not compile for a freestanding target, so such a firmware
+/// panics without a report.
+const panic_logs = builtin.os.tag != .freestanding or
+    std.options.logFn != std.log.defaultLog or
+    @hasDecl(root, "std_options_debug_io");
+
+/// The microzig default panic handler. Reports the panic through `std.log` when `std.log` can
+/// run (see `panic_logs`), then disables interrupts and loops endlessly.
 pub const panic = std.debug.FullPanic(struct {
     pub fn panic_fn(message: []const u8, first_trace_address: ?usize) noreturn {
         // A port may need to abandon an interrupted logger before fatal output.
         // This hook must mask interrupts and must only be used on fatal paths.
         if (@hasDecl(cpu, "prepare_panic")) cpu.prepare_panic();
-        std.log.err("panic: {s}", .{message});
 
-        var trace_index: usize = 0;
-        if (@errorReturnTrace()) |trace| trace_index = utilities.dump_error_trace(trace);
+        if (panic_logs) {
+            std.log.err("panic: {s}", .{message});
 
-        // Skip if we can't use fp based stack tracing.
-        if (options.panic_stack_trace) {
-            var it: utilities.StackIterator = .init(first_trace_address orelse @returnAddress(), null);
-            while (it.next()) |address| : (trace_index += 1) {
-                utilities.dump_trace_line(trace_index, address);
+            var trace_index: usize = 0;
+            if (@errorReturnTrace()) |trace| trace_index = utilities.dump_error_trace(trace);
+
+            // Skip if we can't use fp based stack tracing.
+            if (options.panic_stack_trace) {
+                var it: utilities.StackIterator = .init(first_trace_address orelse @returnAddress(), null);
+                while (it.next()) |address| : (trace_index += 1) {
+                    utilities.dump_trace_line(trace_index, address);
+                }
             }
         }
 
         // Attach a breakpoint. this might trigger another panic internally, so
         // only do that if requested.
         if (options.breakpoint_in_panic) {
-            std.log.info("triggering breakpoint...", .{});
+            if (panic_logs) std.log.info("triggering breakpoint...", .{});
             @breakpoint();
         }
 
