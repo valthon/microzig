@@ -6,12 +6,12 @@
 //! uses its own USB supply; no supply wire between boards. The banks
 //! can remain connected together; unused lines are inputs with no pulls.
 //! C6 L0..7=GP8..15, CLK=GP16, VAL=GP17; C3 L0..3=GP0..3.
-//! UART: L0 peer TX -> ESP RX, L1 peer RX <- ESP TX. SPI: L0 MISO,
+//! UART: L0 peer TX -> ESP RX, L1 peer RX <- ESP TX (pulled up). SPI: L0 MISO,
 //! L1 MOSI, L2 SCLK, L3 CS (mode 0, MSB first, 1 MHz). I2S: L0 ESP DIN,
 //! L1 ESP DOUT, L2 BCK, L3 WS (Philips stereo, 1 MHz BCK).
 //! RMT: L1 capture, L0 replay. PARL: L0..7 bidirectional data,
 //! CLK clock, VAL valid. LP UART: L4 TX -> ESP GPIO4 RX,
-//! L5 RX <- ESP GPIO5 TX, 115200 8N1. I2C: L6 SDA, L7 SCL,
+//! L5 RX <- ESP GPIO5 TX (pulled up), 115200 8N1. I2C: L6 SDA, L7 SCL,
 //! target 0x42 at 100 kHz, internal pulls; optional 4.7 kohm to 3V3.
 //! I2C pointer byte selects a register, subsequent bytes auto-increment;
 //! STOP retains the pointer, 0xf2 reads 0xa5, 0xf3 reads version 1.
@@ -49,7 +49,8 @@
 //!   and idle-high gaps. RMT reports absolute widths instead of a bit clock.
 //!   Status also repeats the UART parity and RMT width verdicts, preserving
 //!   results when the host script closes and reopens the CDC port.
-//! * edges are observed transition counts, not a glitch analyzer. Serial DMA
+//! * edges are observed transition counts, not a glitch analyzer, counted from
+//!   the pad state after mode entry has configured the peer's pads. Serial DMA
 //!   samples data/WS on each rising clock; PARL samples data/VAL every falling
 //!   clock. Raw pad rise/fall latches diagnose activity before capture and in
 //!   UART/I2C modes; multiple edges between services coalesce. Clock counts
@@ -443,8 +444,6 @@ fn select(new_mode: protocol.Mode, new_bank: protocol.Bank) !void {
     frames = 0;
     bytes = 0;
     errors = 0;
-    edges = @splat(0);
-    last_pads = microzig.chip.peripherals.SIO.GPIO_IN.raw >> @intCast(base());
     previous.clear();
     phase = .{};
     parity_reported = false;
@@ -457,14 +456,22 @@ fn select(new_mode: protocol.Mode, new_bank: protocol.Bank) !void {
     serial_timing = .{};
     checking_rearm = false;
     rmt_high_since = null;
-    observed_edges();
-    edges = @splat(0);
+    // UART and LP UART: the peer's TX pad; the next pad is its RX.
+    const uart_tx: u6 = if (mode == .lpuart) 12 else base();
+    if (mode == .uart or mode == .lpuart) {
+        // pads_input() leaves RX with no pull, and while the ESP is in
+        // reset or download mode nothing drives its TX, so the RX line
+        // floats and can sit low. An enabled PL011 reports a line held low
+        // for a full word as a break (RP2350 DS §12.1.8 UARTDR BE). Pull RX
+        // to the idle mark now; it settles during the 10 ms meter
+        // calibration before the receiver is enabled.
+        hal.gpio.num(uart_tx + 1).set_pull(.up);
+    }
     if (mode == .spi or mode == .i2s or mode == .parl or mode == .lpuart or mode == .uart) try calibrate_meter();
     switch (mode) {
         .uart, .lpuart => {
-            const tx: u6 = if (mode == .lpuart) 12 else base();
-            hal.gpio.num(tx).set_function(.uart);
-            hal.gpio.num(tx + 1).set_function(.uart);
+            hal.gpio.num(uart_tx).set_function(.uart);
+            hal.gpio.num(uart_tx + 1).set_function(.uart);
             uart().get_regs().UARTLCR_H.modify(.{ .FEN = 0 });
             try set_uart();
             try arm_uart_meter();
@@ -479,6 +486,11 @@ fn select(new_mode: protocol.Mode, new_bank: protocol.Bank) !void {
         .idle => {},
         else => try arm(),
     }
+    // Mode entry moves the peer's own pads (UART TX to idle high, pulls,
+    // PIO outputs). Count edges and sample-level changes from that state.
+    last_pads = microzig.chip.peripherals.SIO.GPIO_IN.raw >> @intCast(base());
+    observed_edges();
+    edges = @splat(0);
 }
 fn record_hz(hz: u32, expected: u32) void {
     if (!clock_available or @abs(@as(i64, hz) - expected) * @as(u64, expected_hz) >= @abs(@as(i64, worst_hz) - expected_hz) * @as(u64, expected)) {
