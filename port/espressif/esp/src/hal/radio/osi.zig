@@ -346,6 +346,12 @@ pub fn semphr_delete(ptr: ?*anyopaque) callconv(.c) void {
     gpa.destroy(@as(*rtos.Semaphore, @ptrCast(@alignCast(ptr))));
 }
 
+/// Returns 1 (pdTRUE) when taken and 0 (pdFALSE) on timeout, as xSemaphoreTake
+/// in IDF v5.5.1 esp_coex/esp32c6/esp_coex_adapter.c:87-94 (esp32c3 alike).
+/// Linked callers compare the result with 1: ieee80211_ioctl reads an
+/// ioctl's result only then, and otherwise returns 0 (C3 and C6 libnet80211.a
+/// ieee80211_ioctl+0x1b8..0x1be), and wps_post_block returns -1 instead of
+/// the posted request's result (libwpa_supplicant.a wps_post_block+0x38..0x3e).
 pub fn semphr_take(ptr: ?*anyopaque, tick: u32) callconv(.c) i32 {
     log.debug("semphr_take {?} {}", .{ ptr, tick });
 
@@ -357,10 +363,10 @@ pub fn semphr_take(ptr: ?*anyopaque, tick: u32) callconv(.c) i32 {
     };
     sem.take_with_timeout(timeout) catch {
         log.debug(">>>> return from semaphore take with timeout: {*}", .{sem});
-        return 1;
+        return 0;
     };
 
-    return 0;
+    return 1;
 }
 
 pub fn semphr_give(ptr: ?*anyopaque) callconv(.c) i32 {
