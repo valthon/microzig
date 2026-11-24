@@ -302,10 +302,45 @@ fn clocks_enable() void {
         .CLK_LP_TIMER_SEL_OSC_FAST = 0,
         .CLK_LP_TIMER_SEL_XTAL = 1,
         .CLK_LP_TIMER_SEL_XTAL32K = 0,
-        .CLK_LP_TIMER_DIV_NUM = 399,
+        .CLK_LP_TIMER_DIV_NUM = lp_timer_divider(chip_revision()),
     });
     p.MODEM_SYSCON.MODEM_RST_CONF.modify(.{ .RST_BTMAC = 1, .RST_BTMAC_APB = 1, .RST_BLE_TIMER = 1, .RST_MODEM_SEC = 1 });
     p.MODEM_SYSCON.MODEM_RST_CONF.modify(.{ .RST_BTMAC = 0, .RST_BTMAC_APB = 0, .RST_BLE_TIMER = 0, .RST_MODEM_SEC = 0 });
+}
+/// Controller LP timer rate; config() reports it as rtc_freq (IDF v5.5.1
+/// components/bt/controller/esp32c6/bt.c:469 s_bt_lpclk_freq, bt.c:965-966).
+const lp_timer_hz = 100_000;
+/// BLE LP timer XTAL input: the 40 MHz crystal on revision 0, 500 kHz on
+/// later revisions (IDF v5.5.1 bt.c:466-467 MAIN_XTAL_FREQ_HZ{,_WORKROUND}).
+const lp_timer_xtal_hz_rev0 = 40_000_000;
+const lp_timer_xtal_hz_workaround = 500_000;
+comptime {
+    // IDF refuses an LP clock rate that does not divide the input
+    // (bt.c:693-695); a truncated divider would misreport rtc_freq.
+    if (lp_timer_xtal_hz_rev0 % lp_timer_hz != 0 or lp_timer_xtal_hz_workaround % lp_timer_hz != 0)
+        @compileError("lp_timer_hz must divide both BLE LP timer XTAL inputs");
+}
+/// IDF v5.5.1 bt.c:612-628 esp_bt_rtc_slow_clk_select, main XTAL source:
+/// revision 0 divides the 40 MHz crystal; later revisions feed the BLE LP
+/// timer's XTAL input at 500 kHz (the Wi-Fi power clock workaround,
+/// components/soc/esp32c6/include/soc/soc_caps.h:640). The Wi-Fi power clock
+/// that workaround needs on those revisions
+/// (components/esp_hw_support/modem_clock.c:451-458) is enabled by
+/// analog.radio_init.
+fn lp_timer_divider(revision: u32) u12 {
+    return if (revision == 0)
+        lp_timer_xtal_hz_rev0 / lp_timer_hz - 1
+    else
+        lp_timer_xtal_hz_workaround / lp_timer_hz - 1;
+}
+/// IDF efuse_hal_chip_revision = major * 100 + minor. Field positions from
+/// IDF v5.5.1 components/efuse/esp32c6/esp_efuse_table.csv:167-168:
+/// WAFER_VERSION_MINOR is EFUSE_BLK1 bit 114, 4 bits; WAFER_VERSION_MAJOR is
+/// EFUSE_BLK1 bit 118, 2 bits.
+fn chip_revision() u32 {
+    const efuse = @import("../efuse.zig");
+    return @as(u32, efuse.read(.{ .block = 1, .bit_offset = 118, .bit_length = 2 })) * 100 +
+        efuse.read(.{ .block = 1, .bit_offset = 114, .bit_length = 4 });
 }
 fn reset_modem(opts: u8, start: u8) callconv(.c) void {
     if (opts != 5 or start == 0) return;
@@ -362,7 +397,7 @@ fn config() abi.Config {
     cfg.ble_ll_sync_cnt = 1;
     cfg.ble_ll_rsp_dup_list_count = 20;
     cfg.ble_ll_adv_dup_list_count = 20;
-    cfg.rtc_freq = 100_000; // XTAL 40 MHz / 400, bt.c default LP clock
+    cfg.rtc_freq = lp_timer_hz;
     cfg.ble_ll_sca = 60;
     // IDF v5.5.1 Kconfig BT_LE_DFT_TX_POWER_LEVEL_DBM defaults to +9 dBm for both fields
     // (esp_bt.h BT_CONTROLLER_INIT_CONFIG_DEFAULT). Zeroed, they meant 0 dBm, and peers often
@@ -390,11 +425,7 @@ fn config() abi.Config {
     cfg.cca_rssi_thresh = 196;
     cfg.ble_scan_classify_filter_enable = 1;
     cfg.main_xtal_freq = 40;
-    // IDF efuse_hal_chip_revision = major * 100 + minor; C6 TRM §6
-    // EFUSE_RD_MAC_SPI_SYS_3 contains WAFER_VERSION_{MAJOR,MINOR}.
-    const efuse = @import("../efuse.zig");
-    cfg.version_num = @as(u32, efuse.read(.{ .block = 1, .bit_offset = 118, .bit_length = 2 })) * 100 +
-        efuse.read(.{ .block = 1, .bit_offset = 114, .bit_length = 4 });
+    cfg.version_num = chip_revision();
     cfg.cpu_freq_mhz = 160;
     cfg.csa2_select = 1;
     cfg.scan_backoff_upperlimitmax = 256;
