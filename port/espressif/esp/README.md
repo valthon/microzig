@@ -2293,8 +2293,9 @@ API; a failed startup requires reboot. Controller tasks, NPL objects and PHY
 tracking use the supplied allocator for this boot lifetime. NPL callouts use
 millisecond resolution; modem sleep remains disabled. The Zig host implements
 LE Secure Connections and bonding as described below. The controller's LP timer
-divider stays at 399; IDF's `bt.c` uses 4 on chip revisions above v0.0 under
-`SOC_BLE_USE_WIFI_PWR_CLK_WORKAROUND`.
+runs at 100 kHz; as in IDF's `bt.c` (612-628) its divider is 399 on chip
+revision v0.0 and 4 on later revisions, which clock it from the 500 kHz Wi-Fi
+power clock (`SOC_BLE_USE_WIFI_PWR_CLK_WORKAROUND`).
 
 `send_command` takes an HCI command header and parameters; `send_acl` takes the
 ACL header and payload. Neither includes an H4 packet-type byte. Both copy their
