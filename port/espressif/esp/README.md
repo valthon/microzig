@@ -50,6 +50,7 @@ Other results identify their boards and runs below; dates are included where rec
 | `mcpwm` (timer/operator 0, A/B complementary, count-up, symmetric dead time; owns group) | no | yes | `selftest_mcpwm` | n/a | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `radio` (Wi-Fi station)                       | yes | yes | `tcp_server`, `selftest_wifi_*` (image boot)       | see "Wi-Fi station and RTOS" | see "Wi-Fi station and RTOS" |
 | `radio.ieee802154` (raw MAC, polling)          | no  | yes | `selftest_ieee802154` (image boot, H2 peer, no wiring) | n/a    | 4/4, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 alone and 3 runs with both (2026-11-20) |
+| `radio.ieee802154` frame security (levels 1–7), enhanced ACKs | no | yes | `selftest_ieee802154_sec` (image boot, two C6 boards, no wiring); expected `DONE pass=11 fail=0` | n/a | 11/11 on both Super Mini ESP32-C6 and XIAO ESP32-C6, 3 runs booted together and 2 with an 8 s stagger (each board first once); ESP32-H2 (ESP-IDF v5.5.1) received the version-2 enhanced ACK (`Rx ack 10 bytes`) |
 | `rtos`                                        | yes | yes | `rtos`: expected `DONE pass=6 fail=0`, five ordered items + empty-queue timeout | 6/6, 3 runs (24ebc5d1) | 6/6, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (24ebc5d1) |
 | `systimer`                                    | yes | yes | `systimer`: expected `DONE pass=4 fail=0`, four IRQs + three 1 s intervals, TIMG0 reference, +/-100 us | 4/4, 3 runs (2026-11-20) | 4/4, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-20) |
 | custom CPU/APB clocks                         | yes | yes | `custom_clock_config`: expected `DONE pass=3 fail=0`, CPU/APB register readback at 20 MHz + 100 ms ROM busy delay vs systimer, +/-100 us | 3/3, 3 runs (2026-11-20) | 3/3, 3 runs each on Super Mini ESP32-C6 and XIAO ESP32-C6 (2026-11-20) |
@@ -703,6 +704,64 @@ suppression, complete secured/IE-bearing ACK reception at 1024 µs, a large ACK
 requiring an explicitly extended wait, bounded missing enhanced ACKs, unsecured
 H2 ACK bytes, ACK size budgets at every level, TX-ACK evidence (RX alone fails),
 and legacy RX/ACK tests. Run `zig build test` in this port.
+
+Two-board test: build in `examples/espressif/esp` with
+`zig build -Doptimize=ReleaseSmall -Dexample=selftest_ieee802154_sec`, then flash
+**the same** `esp32_c6_selftest_ieee802154_sec.bin` image-boot artifact to a
+Super Mini ESP32-C6 and a XIAO ESP32-C6. Leave GPIO3/14 unconnected: the image
+powers/selects the XIAO ESP32-C6 internal RF switch on both boards. Boot both
+within 10 s; channel 25, PAN 0x3254, public test key c0…cf, identifier mode
+1/index 1. Discovery uses full extended addresses, and their numeric order
+assigns roles (`ROLE coordinator` or `ROLE responder`). No H2 or wiring is
+needed. Its context sets `accept_unauthenticated` for the level-4 check.
+Eleven PASS/FAIL lines cover delivery/decryption at levels 1–7,
+enhanced ACKs (secured when data is secured) with header IEs, legacy unsecured
+ACKs, tampered MIC rejection, and replay rejection. The responder's level 1–7,
+`enhanced_ack` and `legacy_ack` checks require an ACK actually transmitted
+(`Frame.ack_transmitted`, and for enhanced ACKs `Ack.transmitted()`) as well as
+the expected received security level; RX_DONE alone cannot pass them. Both
+boards emit `SELFTEST ieee802154_sec DONE pass=11 fail=0` on success, within a
+45 s deadline after each boot (55 s from the first boot with a 10 s stagger).
+Per-stage diagnostics print TX input/DMA bytes, software-derived expected wire
+output, raw RX/ACK bytes (including MIC), decrypted data, auxiliary
+header/counter/key identifier, MIC verification outcome, event bits, numeric
+TX/RX abort reasons, the `ACK-TX transmitted=...` record, and
+delivery/response/ACK decisions. Hardware TX DMA is labelled separately: it may
+contain the plaintext and reserved MIC rather than the on-air output. No
+logging runs in the ISR. Raw snapshots are taken before authentication, so
+failed MICs and replay rejection remain inspectable. MIC `not_checked` means an
+earlier error prevented verification; level 4 reports `absent`. The
+key/counters are test-only and deliberately reset on every boot.
+
+ESP32-H2 interop (enhanced ACK only): an ESP32-H2 running ESP-IDF v5.5.1's
+`ieee802154_cli` console can inject version-2 frames with `tx` and prints the
+ACK it receives. Its console has no key provisioning or decryption, so this
+exercises the unsecured enhanced ACK, not frame security. `tx` takes the MPDU
+octets followed by two placeholder FCS octets, which the H2 radio overwrites.
+On the H2, run `channel -s 25`, then:
+
+1. Boot one C6. Send discovery from a synthetic lower extended address
+   `0100000000000000`: MPDU `41d8005432ffff01000000000000004d5a53434800`, four
+   times about 0.7 s apart. The C6 prints `ROLE responder local=<C6>`; use that
+   extended wire address as `<C6>` below.
+2. Send the control MPDU `41dc005432<C6>01000000000000004d5a53434307`; this
+   selects the `enhanced_ack` check.
+3. Run `promisc -d` on the H2 before the ACK-requested frame. IDF
+   `esp_ieee802154_set_promiscuous` disables RX auto-ACK while promiscuous, and
+   `dev.c:isr_handle_tx_done` then skips the ACK wait, so a promiscuous H2
+   never reports the ACK. Leave the ACK timeout at its default 108 symbols.
+   Send `21ec015432<C6>01000000000000004d5a53434407`. The H2 prints
+   `Rx ack 10 bytes`: FCF version 2, sequence 1, no addresses, and the
+   configured header IE/HT2 (`022201010fee803f`, plus FCS), with no
+   `Failure reason: 3`. The C6 prints `ACK-TX transmitted=true` with
+   `finish_events` containing ACK_TX_DONE (bit 2), then `enhanced_ack: PASS`.
+   The remaining self-test checks are not exercised by this run and report FAIL.
+
+Evidence: on hardware, image boot, `selftest_ieee802154_sec` passed 11/11 on
+both the Super Mini ESP32-C6 and the XIAO ESP32-C6 in 3 runs booted together
+and 2 runs with boots staggered by 8 s (each board booting first once). With
+the procedure above, an ESP32-H2 (ESP-IDF v5.5.1) received the C6's version-2
+enhanced ACK (`Rx ack 10 bytes`).
 
 `selftest_ieee802154` builds the C6 image-boot target and the XIAO ESP32-C6 board
 target; on a XIAO ESP32-C6 use the board build, which powers the rf switch (about 20 dB);
