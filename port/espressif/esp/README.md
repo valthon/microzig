@@ -364,7 +364,7 @@ port directory. Firmware FAIL lines include expected/actual hex and driver error
 
 ### IEEE 802.15.4 raw MAC (C6)
 
-Select `.hal.radio.protocol = .ieee802154` and enable RTOS. The image uses the
+Select `.hal.radio.radios = .{ .wifi = false, .ieee802154 = true }` and enable RTOS. The image uses the
 existing PHY lifecycle, timer and pinned `esp-wifi-sys` blobs (ESP-IDF v5.5.1 ABI).
 The MAC sequence and power conversion follow **v5.5.1**, rather than v6.0.2's
 newer blob TX-power-table API. The existing v6.0.2 Wi-Fi ROM script is retained;
@@ -440,12 +440,183 @@ NO_ACK, terminal busy CCA, and early success/error paths are host unit-tested.
 Host completion tests also cover an ACK latched while the task is descheduled
 across the deadline and an expired ACK window without a completion event.
 
-Limits: no Wi-Fi/BLE coexistence scheduler, multi-PAN, scheduled operations
-or sleep retention.
-Wi-Fi initialization in an IEEE802154 image (and IEEE802154 initialization in a
-Wi-Fi image) returns `UnsupportedRadioProtocol`; the default Wi-Fi path retains
-its existing behavior. Selecting both `hal.radio.ble` and `.ieee802154` is a
-compile error in either init. Legacy version 0/1 and 2015 version 2 frames are
+The radio selection is `hal.radio.radios`. Wi-Fi defaults to true, BLE and
+IEEE 802.15.4 to false. Set one flag, or `.{ .wifi = true, .ble = true }` on the
+C6 for Wi-Fi + BLE coexistence. Every other multi-radio selection is a compile
+error naming the radios. `hal.radio.wifi` configures
+Wi-Fi and `hal.radio.interrupt` selects the interrupt line.
+The C6 coexistence adapter provides shared clock and baseband ownership,
+and higher-priority radio timer and BLE callout tasks for coexistence.
+
+A coexistence image's radios share one heap: it backs the blob OSI adapter's
+allocations and the radio HAL's own init allocations (the radio timer worker,
+the PHY and coex timer nodes, and the Wi-Fi eloop reservation). In a
+coexistence image the allocator argument of `radio.init` and `wifi.init` is
+not used; `Controller.start`'s allocator still backs the BLE controller's NPL
+state. The application owns the shared heap and attaches it once, from task
+context, before the first radio init:
+
+```zig
+const radio = microzig.hal.radio;
+
+var radio_heap_buffer: [128 * 1024]u8 align(16) = undefined;
+var radio_heap: radio.SharedHeap = undefined;
+
+// In main, before the first radio init:
+radio_heap = try radio.SharedHeap.init(&radio_heap_buffer);
+try radio.attach_shared_heap(&radio_heap);
+try radio.wifi.init(gpa, .{});
+try controller.start(gpa);
+```
+
+`SharedHeap.init(buffer: []u8) error{BufferTooSmall}!SharedHeap` lays a
+`microzig.Allocator` over the buffer; that allocator serializes with
+`microzig.interrupt.Mutex`, so Wi-Fi and BLE can allocate from it concurrently.
+`attach_shared_heap(heap: *SharedHeap) error{ SharedHeapAlreadyAttached, WouldBlock }!void`
+stores a pointer to the handle. The buffer and the handle must stay valid,
+unmoved and otherwise unused for the rest of the boot: the blobs keep
+allocations from the heap after every radio has been deinitialized, and there
+is no detach. Until the heap is attached, `wifi.init` and `Controller.start`
+return `error.SharedHeapNotAttached` and acquire nothing. A second attach returns `error.SharedHeapAlreadyAttached` and leaves
+the first heap in use; an attach from an interrupt or a radio callback returns
+`error.WouldBlock`. Single-radio images have no shared heap and no
+`attach_shared_heap` (calling it is a compile error); there the radio
+uses the first init's allocator, as before. The blobs' `malloc` and `free`
+callbacks take no context argument (esp-wifi-sys
+`wifi_os_adapter.h:73-74`), so in a coexistence image the attached handle's
+address is the one routing pointer for the radio's allocations. Attach
+writes it once, under the radio init lock; it is never changed or cleared.
+The OSI callbacks (allocation, semaphores, mutexes, queues, tasks and
+timers) read it on every call, as does the radio code that frees what those
+callbacks allocated: Wi-Fi teardown for the blob's packet task, the
+supplicant start for the eloop timer and mutex it reserves for the blob, and
+the last radio deinit for the timer worker and its nodes. Radio init reads it
+to allocate the timer worker and the PHY and coex timer nodes. The pointer
+lives in an internal module that `hal.radio` does not export; applications
+see only `SharedHeap` and `attach_shared_heap`. Single-radio images keep
+their routing: the first `radio.init` stores its allocator for the callbacks.
+
+Under Wi-Fi + BLE, BLE follows IDF v5.5.1 `bt/controller/esp32c6/bt.c`:
+coex functions are registered, then `coex_init` (1032-1047); enable runs the
+shared PHY as the BT modem, the baseband through coex, then `coex_enable`
+(1185-1240). The modem reset arms the coex hardware timer (512-530). The PHY
+records which modems use it (`esp_phy/src/phy_init.c:308-415`): the first
+enable powers on and calibrates, the last disable powers off, and PLL tracking
+runs once a second per modem group (`phy_common.c:53-155`). BLE-only and
+Wi-Fi-only images keep their private PHY path. The coex preference stays at
+the blob default; there is no `coex_preference_set` call. The coexistence
+semaphore task slots and the four timer slots (`timer_disarm`, `timer_done`,
+`timer_setfn`, `timer_arm_us`) are task-only: an interrupt entry into one
+panics, and that panic is the check. `radio.coex_semaphore_stats()` counts take/give
+calls on the task slots, which the coex scheme locks share with every Wi-Fi
+driver semaphore, and calls of the from-ISR slots, which only the coex core
+lock uses; `from_isr_calls=0` shows that lock was never taken from an
+interrupt.
+`selftest_coex_wifi_ble` (Super Mini ESP32-C6) with its BLE peer
+`xiao_esp32_c6_selftest_coex_ble_peer` (XIAO ESP32-C6) and a WPA2 AP with a UDP
+echo on 192.168.4.1:7 measures UDP loss, AP RSSI and BLE notification rate in
+four interleaved modes (see the source header). In mode D Wi-Fi is torn down
+under a streaming BLE link: deinit, 20 s with Wi-Fi off, an init that the
+driver rejects (a country with zero channels) and that must roll back, a
+fresh init, a second init on the running session, rejoin, DHCP and a UDP echo.
+`-Dcoex_ble_first=true` starts the BLE controller before Wi-Fi.
+Every Wi-Fi phase must send datagrams and get at least one echo back. Each
+A phase (Wi-Fi alone) may lose at most 2% of the datagrams it sent, and each
+Wi-Fi + BLE phase at most `max(2 × A-mode median loss, 2% of that phase's
+datagrams sent)`; each 2% rounds down (12 of about 600 sent), and a send error
+counts as a loss. Without the 2% floor, a lossless A median would allow no
+loss at all; without the A bound, a dead echo server would raise the Wi-Fi +
+BLE bound to every datagram. If the UDP task has not closed a phase 125 s
+after it ended (the cycle's waits and retry sleeps, not the time inside driver
+calls), the run stops there and the UDP loss and Wi-Fi cycle checks fail.
+Expected `SELFTEST coex_wifi_ble DONE pass=8 fail=0 void=0`, repeated with
+`COEX order=wifi_first` (or `ble_first`); the semaphore counters are printed,
+not checked. Evidence: run on hardware with a Super Mini ESP32-C6 as the DUT,
+a XIAO ESP32-C6 as the BLE peer and a Pico 2 W as the channel-6 AP and UDP
+echo, one sitting in each start order. Both printed `pass=8 fail=0 void=0`.
+In each, the phase AP RSSI medians stayed within 1 dB of each other, every
+datagram of the Wi-Fi phases was echoed, BLE streamed about 40 notifications
+a second with no disconnect, the peer saw no sequence gap, and
+`from_isr_calls` stayed 0. Each Wi-Fi cycle finished inside its phase:
+deinit took about 0.1 s, most of it the wait after leaving the AP (see
+`wifi.stop`), and never returned `WouldBlock`; the rejected init returned
+`InvalidArg`; the station rejoined within about 12 s; the UDP probe came back;
+and notifications kept going out while Wi-Fi was deinitialized. With the DUT
+sending to a UDP port the AP does not echo, the same test printed
+`udp_loss: FAIL NothingEchoed`, `wifi_cycle` failed on its UDP probe, and the
+run printed `pass=6 fail=2 void=0`.
+
+The adapter keeps both blob semaphore handles and the
+52-byte ROM callback table for the lifetime of the boot. It reserves the
+scheduler timer before pre-init and releases it on final radio deinit.
+The C6 Wi-Fi blob also retains its API and global recursive mutexes. The
+coexistence path supplies boot-lifetime storage for both. In Wi-Fi-only
+images their original allocator storage must remain valid between sessions.
+Coexistence images put the shared timer worker, timer nodes and allocations
+through the blob OSI adapter on the attached `radio.SharedHeap` (see above);
+the coex examples give it 128 KiB. The last radio owner releases the worker
+and nodes. Wi-Fi can be shut down while BLE keeps running on the common
+resources; the BLE controller has no shutdown. BLE controller
+and NPL storage retain their documented controller lifetime.
+
+Wi-Fi `init`, `deinit`, `start`, `stop`, `set_mode` and `apply` reject a
+competing lifecycle operation immediately. `apply` holds its claim from the
+mode change through the last interface configuration. From a
+synchronous Wi-Fi event, receive, transmit or radio timer callback, schedule
+lifecycle work on an application task after returning.
+Wi-Fi init reports `WifiSessionBusy`, ESP-NOW reports `Busy`, and the other
+coexistence lifecycle calls report `WouldBlock`.
+With no session, `start`, `stop`, `set_mode`, `apply` and `deinit` return
+`error.WifiNotInitialized`. While a teardown or init rollback is pending,
+`start`, `stop`, `set_mode` and `apply` return `error.WouldBlock` until the
+owner's retried deinit finishes. A failed teardown step stays pending until a
+retry gets past it, so a step that keeps failing leaves init returning
+`error.WifiSessionBusy` for the rest of the boot.
+Coexistence Wi-Fi stop and deinit post their steps to the driver's
+packet-processing (PP) task, which waits up to 10 ms for a slot in its
+200-entry queue (C6 libpp.a `pp_post`). If the full queue rejects the driver
+deinit step, `wifi.deinit()` returns `error.WouldBlock`: the driver has
+restored its initialized state, and a retry resumes at that step. If it
+rejects a stop step, `wifi.stop()` and `wifi.deinit()` panic with a message
+naming the rejected step, or both steps. The blob has
+then either stopped the hardware with the interfaces still started or stopped
+the interfaces with the hardware still running. In the disassembly of C6
+libnet80211.a (see `osi.stop_driver`), a second stop then spins in
+`wifi_hw_stop` on the stopped interface, or returns success without stopping
+the hardware. ESP-IDF v5.5.1 links the same
+`esp_wifi_stop`; in the first case its `esp_wifi_deinit` returns
+`ESP_ERR_WIFI_NOT_STOPPED` (`esp_wifi/src/wifi_init.c:180-183`).
+`esp_wifi_stop` also allocates a fresh ioctl for each of its three steps and
+returns `ESP_ERR_NO_MEM` if the second or third allocation fails, after the
+interfaces have stopped. Coexistence `wifi.stop()` and `wifi.deinit()` hand
+those allocations the reserved ioctl buffer, and panic if an allocation still
+fails after the interfaces stopped. The driver deinit allocates its ioctl from
+the heap: if that fails, the driver restores its initialized state,
+`wifi.deinit()` returns `error.OutOfMemory`, and a retry resumes at that step.
+While either is stopping the driver,
+`wifi.disconnect()` returns `error.WouldBlock`: the blob's disconnect tests
+the started state (`g_ic+0x1f1`) without the driver lock, so a stop can
+complete between that test and the post, and the disconnect would then mark the
+stopped interfaces started.
+Only the init caller that receives `error.WifiRollbackPending` must retry
+`wifi.deinit()` until cleanup succeeds.
+A coexistence `wifi.init` does not use its allocator argument: the session
+allocates from the attached `radio.SharedHeap`. As in IDF v5.5.1 (`esp_wifi/src/wifi_init.c:343-345`), init on
+a running session returns success without reading its `InitConfig`. The
+session is shared and keeps the first init's configuration; a second init's
+`power_save_mode` is not checked. One deinit ends the session for every caller.
+`error.WifiSessionBusy` rejects init while another lifecycle call is in
+progress and, once `power_save_mode` has been validated, while a teardown or
+init rollback is pending. That caller acquired nothing
+and must leave deinit to the owner.
+Other init errors finish cleanup before returning.
+A sub-tick deadline lets the timer worker sleep until the next RTOS tick or
+an earlier arm signal. Single-radio images retain their existing clock,
+timer and PTI settings.
+
+Limits include multi-PAN, scheduled operations and sleep retention. Wi-Fi
+initialization in an IEEE 802.15.4 image and IEEE 802.15.4 initialization in a
+Wi-Fi image return `UnsupportedRadioProtocol`. Legacy version 0/1 and 2015 version 2 frames are
 supported; version 2 ACK generation is opt-in (see "Frame security and enhanced
 ACKs" below). Promiscuous RX never auto-ACKs. Polling has no background queue: the MAC is idle between calls and
 frames arriving while the application prints or transmits can be missed.
@@ -2278,10 +2449,11 @@ revision `7623c8d746b55cd8d9f7473359069aef381b7d3b` (`libble_app.a`, `libbtbb.a`
 and `libphy.a`). Its configuration ABI is `0x20250606`; v6.0.2 is incompatible.
 The existing Wi-Fi ROM script is retained. No BLE ROM overrides are added.
 
-Select `hal.radio.ble = true`, enable the RTOS and interrupt stack, and register
+Select `hal.radio.radios = .{ .wifi = false, .ble = true }`, enable the RTOS and interrupt stack, and register
 `bluetooth.interrupt_handler` on interrupt 29, plus the existing radio and RTOS
-handlers. This mode rejects `wifi.init` at compile time: simultaneous Wi-Fi/BLE
-is unsupported. Wi-Fi's default configuration and PHY lifecycle are unchanged.
+handlers. This mode rejects `wifi.init` at compile time; for Wi-Fi and BLE
+together select `.{ .wifi = true, .ble = true }` (see the radio selection above).
+Wi-Fi's default configuration and PHY lifecycle are unchanged.
 Use a 160 MHz PLL CPU / 40 MHz crystal and C6 image-boot target. Startup
 rejects other CPU clocks. MicroZig defaults to 80 MHz; these examples explicitly
 apply a compile-time `hal.clocks.Config.init_comptime(160_000_000)` through their
@@ -2289,13 +2461,16 @@ apply a compile-time `hal.clocks.Config.init_comptime(160_000_000)` through thei
 
 The controller and allocator must stay at stable addresses for the whole boot.
 The controller is a singleton with one connection. There is no shutdown/restart
-API; a failed startup requires reboot. Controller tasks, NPL objects and PHY
-tracking use the supplied allocator for this boot lifetime. NPL callouts use
-millisecond resolution; modem sleep remains disabled. The Zig host implements
-LE Secure Connections and bonding as described below. The controller's LP timer
-runs at 100 kHz; as in IDF's `bt.c` (612-628) its divider is 399 on chip
-revision v0.0 and 4 on later revisions, which clock it from the 500 kHz Wi-Fi
-power clock (`SOC_BLE_USE_WIFI_PWR_CLK_WORKAROUND`).
+API; a failed startup requires reboot. In a BLE-only image the controller
+tasks, NPL objects and the `ble_phy` PHY tracking task use the supplied
+allocator for this boot lifetime. In a coexistence image only the NPL state
+does: the controller tasks and the shared PHY timer node, which does the PHY
+tracking, live on the shared heap, and no `ble_phy` task is spawned. NPL
+callouts use millisecond resolution; modem sleep remains disabled. The Zig
+host implements LE Secure Connections and bonding as described below. The
+controller's LP timer runs at 100 kHz; as in IDF's `bt.c` (612-628) its
+divider is 399 on chip revision v0.0 and 4 on later revisions, which clock it
+from the 500 kHz Wi-Fi power clock (`SOC_BLE_USE_WIFI_PWR_CLK_WORKAROUND`).
 
 `send_command` takes an HCI command header and parameters; `send_acl` takes the
 ACL header and payload. Neither includes an H4 packet-type byte. Both copy their
@@ -2329,7 +2504,9 @@ The observer supports active legacy LE scanning (including scan responses),
 public/random addresses, RSSI and complete/short local names from AD structures.
 `advertise(name)` exposes GAP Device Name plus service FFF0: FFF1 is a mutable
 0–20-byte value with read/write/write-command properties; FFF2 notifies a
-little-endian 32-bit counter once a second when its CCCD is enabled. Call
+little-endian 32-bit counter once a second when its CCCD is enabled.
+`notify()` sends one notification on demand under the same permission check
+and returns false when it withholds it. Call
 `poll()` and `tick()` regularly. Disconnect clears the subscription and counter;
 call `resume_advertising()` to accept another peer. CCCD state is per connection,
 not persisted.
@@ -2859,7 +3036,10 @@ Start an enabled Wi-Fi station or SoftAP interface first, with RTOS and the radi
 interrupt installed as in the Wi-Fi examples. An AP connection is unnecessary.
 `Session.init` returns `WifiNotStarted` until a start event arrives,
 `UnsupportedRadioProtocol` in an IEEE 802.15.4 image, and produces a compile error
-in exclusive BLE mode. Use one stationary, caller-owned `Session`, from one task;
+in a BLE-only image. In a C6 Wi-Fi + BLE image ESP-NOW runs over Wi-Fi. ESP-IDF
+v5.5.1 rates ESP-NOW transmit beside BLE as stable and receive as stable only in
+STA mode (`docs/en/api-guides/coexist.rst:38-40, 116-119`), so use the station
+interface there. Use one stationary, caller-owned `Session`, from one task;
 do not move/copy it, call the vendor ESP-NOW API directly, or stop/reconfigure
 Wi-Fi while it owns the radio. `deinit` precedes Wi-Fi stop/deinit, discards the
 queues, and removes the vendor peer table. It returns `Busy` without changing
@@ -2938,6 +3118,8 @@ From `examples/espressif/esp`, build with
 `zig build -Doptimize=ReleaseSmall -Dexample=selftest_espnow`.
 Image-boot outputs are `esp32_c3_selftest_espnow.bin`,
 `esp32_c6_selftest_espnow.bin`, and `xiao_esp32_c6_selftest_espnow.bin`, plus ELFs.
+`-Dexample` matches by substring, so the same command also builds the two
+`selftest_espnow_coex` images described below.
 Use the XIAO board image for its RF switch; `-Dantenna=internal` is the default,
 `-Dantenna=external` selects U.FL. Flash the same test to exactly two boards
 (chip-specific binary when mixing C3/C6), boot them within ten seconds, and read
@@ -2979,3 +3161,27 @@ and phase requests. Cross-compilation is build evidence only.
 
 All runs used the image-boot builds (`esp32_c3_`, `esp32_c6_` and `xiao_esp32_c6_selftest_espnow.bin`,
 internal antenna) behind the ESP-IDF bootloader.
+
+`-Dexample=selftest_espnow_coex` builds the same test for the C6 as a Wi-Fi + BLE
+image (`esp32_c6_selftest_espnow_coex.bin`, `xiao_esp32_c6_selftest_espnow_coex.bin`).
+Each board starts the BLE controller at 160 MHz and advertises `MZ-ESPNOW`,
+non-connectable, before Wi-Fi starts. After its ESP-NOW exchange each board
+scans for up to 5 s for that name from the peer's public address (the peer's
+station MAC plus two in the last octet, IDF v5.5.1
+`esp_hw_support/mac_addr.c:16-17,391-397` under the C6 default of four
+universal addresses, `port/esp32c6/Kconfig.mac:3,33-40`). The leader finishes
+first, so it hears the follower while the follower is still in its final
+eight-second ESP-NOW window; the follower then hears the leader, which keeps
+advertising for 14 s after its exchange. The follower advertises for 6 s after
+its exchange, as long as the leader's scan can last. Each board then stops
+advertising with an HCI command; if the test's 55 s run limit ends a board's
+advertising early, it logs `run limit cut the advertising hold short`.
+Hearing the peer and stopping are the tenth check, `ble_advertising`; the
+expected result is `SELFTEST espnow DONE pass=10 fail=0`. A Super Mini
+ESP32-C6 (leader) and a XIAO ESP32-C6 (follower) booted together printed
+`DONE pass=10 fail=0` on both boards in every run; each board heard the peer
+within a fraction of a second of starting its scan, and no board logged a cut
+hold. With the
+XIAO ESP32-C6 running the Wi-Fi-only `selftest_espnow`, which does not
+advertise, the Super Mini ESP32-C6 printed `ble_advertising: FAIL` and `DONE pass=9 fail=1`, and the
+XIAO ESP32-C6 `DONE pass=9 fail=0`.

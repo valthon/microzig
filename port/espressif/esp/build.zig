@@ -343,26 +343,106 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target = b.standardTargetOptions(.{});
 
-    const unit_tests = b.addTest(.{
+    const test_step = b.step("test", "Run platform agnostic unit tests");
+    if (b.lazyDependency("esp-wifi-sys", .{})) |sys| {
+        const headers = wifi_headers(b, sys, "esp32c6", target);
+        for ([_]bool{ true, false }) |wifi| {
+            const options = b.addOptions();
+            options.addOption(bool, "wifi", wifi);
+            const host_microzig = b.createModule(.{
+                .root_source_file = b.path("src/hal/usb_serial_jtag/test_microzig.zig"),
+            });
+            host_microzig.addOptions("test-radio-options", options);
+            host_microzig.addImport("core-allocator", b.createModule(.{ .root_source_file = b.path("../../../core/src/allocator.zig") }));
+            host_microzig.addImport("drivers", b.createModule(.{ .root_source_file = b.path("../../../drivers/src/root.zig") }));
+            const unit_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/hal.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+                .filters = if (wifi) &.{} else &.{"public Wi-Fi init validates options before acquiring a session"},
+            });
+            host_microzig.addImport("hal-under-test", unit_tests.root_module);
+            unit_tests.root_module.addImport("microzig", host_microzig);
+            unit_tests.root_module.addImport("esp-wifi-driver", headers);
+            unit_tests.root_module.addImport("interrupt-encoding", b.createModule(.{
+                .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
+            }));
+            test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+            if (!wifi) continue;
+
+            // The public Wi-Fi stop panics, one process each.
+            const stop_panic_tests = b.addTest(.{
+                .name = "wifi-stop-panics",
+                .root_module = unit_tests.root_module,
+                .test_runner = .{ .path = b.path("src/hal/radio/stop_panic_runner.zig"), .mode = .simple },
+            });
+            for ([_][2][]const u8{
+                .{ "rejects the interface stop", "Wi-Fi stop: the PP queue rejected the interface stop (ESP_ERR_WIFI_POST)" },
+                .{ "rejects the hardware stop", "Wi-Fi stop: the PP queue rejected the hardware stop (ESP_ERR_WIFI_POST)" },
+                .{ "rejects both stops", "Wi-Fi stop: the PP queue rejected the interface stop and the hardware stop (ESP_ERR_WIFI_POST)" },
+                .{ "fails after the interfaces stopped", "Wi-Fi stop failed after the interfaces stopped" },
+            }) |case| {
+                const run = b.addRunArtifact(stop_panic_tests);
+                run.addArgs(&case);
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    // Compile the actual C6 ABI layout on RV32 even on a 64-bit test host.
+    const coex_layout = b.addObject(.{ .name = "coex-layout", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/hal/radio/coex_abi.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .riscv32, .os_tag = .freestanding }),
+    }) });
+    test_step.dependOn(&coex_layout.step);
+
+    // Exercise the registered callbacks with debug logging enabled and check
+    // the task-only panics in separate processes.
+    const callback_probe = b.addExecutable(.{
+        .name = "coex-callback-test",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/hal.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_source_file = b.path("src/hal/coex_callback_test.zig"),
+            .target = b.graph.host,
         }),
     });
+    const callback_host = b.createModule(.{ .root_source_file = b.path("src/hal/radio/test_coex_host.zig") });
+    callback_probe.root_module.addImport("microzig", callback_host);
+    callback_probe.root_module.addImport("esp-wifi-driver", callback_host);
+    for ([_][]const u8{ "callbacks", "take", "give", "timer_disarm", "timer_done", "timer_setfn", "timer_arm_us" }) |mode| {
+        const run = b.addRunArtifact(callback_probe);
+        run.addArg(mode);
+        test_step.dependOn(&run.step);
+    }
 
-    const host_microzig = b.createModule(.{
-        .root_source_file = b.path("src/hal/usb_serial_jtag/test_microzig.zig"),
-    });
-    host_microzig.addImport("drivers", b.createModule(.{
-        .root_source_file = b.path("../../../drivers/src/root.zig"),
-    }));
-    unit_tests.root_module.addImport("microzig", host_microzig);
-    unit_tests.root_module.addImport("interrupt-encoding", b.createModule(.{
-        .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
-    }));
-    const unit_tests_run = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run platform agnostic unit tests");
+    const selections = b.addWriteFiles();
+    const radios = b.createModule(.{ .root_source_file = b.path("src/hal/radio/radios.zig") });
+    for ([_][]const u8{
+        ".{ .wifi = false }",
+        ".{ .ieee802154 = true }",
+        ".{ .wifi = false, .ble = true, .ieee802154 = true }",
+        ".{ .ble = true, .ieee802154 = true }",
+    }, [_][]const u8{
+        "hal.radio.radios requires one selected radio",
+        "hal.radio.radios: wifi + ieee802154 together is not supported; the only supported multi-radio selection is wifi + ble",
+        "hal.radio.radios: ble + ieee802154 together is not supported; the only supported multi-radio selection is wifi + ble",
+        "hal.radio.radios: wifi + ble + ieee802154 together is not supported; the only supported multi-radio selection is wifi + ble",
+    }, 0..) |selection, expected, index| {
+        const invalid = b.addObject(.{
+            .name = "invalid-radio-selection",
+            .root_module = b.createModule(.{
+                .root_source_file = selections.add(b.fmt("selection-{d}.zig", .{index}), b.fmt(
+                    "comptime {{ @import(\"radios\").Radios.validate({s}); }}",
+                    .{selection},
+                )),
+                .target = b.graph.host,
+            }),
+        });
+        invalid.root_module.addImport("radios", radios);
+        invalid.expect_errors = .{ .contains = expected };
+        test_step.dependOn(&invalid.step);
+    }
+
     const nvs_crash_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/hal/nvs_crash_test.zig"),
@@ -419,7 +499,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(partition_tests).step);
-    test_step.dependOn(&unit_tests_run.step);
 
     const espnow_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -552,13 +631,7 @@ fn generate_linker_script(
     return run.addOutputFileArg(output_name);
 }
 
-fn make_esp_wifi_driver_module(
-    b: *std.Build,
-    esp_wifi_sys_dep: *std.Build.Dependency,
-    chip_name: []const u8,
-    target_query: std.Target.Query,
-) *std.Build.Module {
-    const radio_resolved_zig_target = b.resolveTargetQuery(target_query);
+fn wifi_headers(b: *std.Build, esp_wifi_sys_dep: *std.Build.Dependency, chip_name: []const u8, radio_resolved_zig_target: std.Build.ResolvedTarget) *std.Build.Module {
     const translate_c = b.addTranslateC(.{
         .root_source_file = esp_wifi_sys_dep.path("c/include/include.h"),
         .target = radio_resolved_zig_target,
@@ -574,7 +647,17 @@ fn make_esp_wifi_driver_module(
 
     // A private module: the package can only register one module per name and there is one
     // of these per supported chip.
-    const mod = translate_c.createModule();
+    return translate_c.createModule();
+}
+
+fn make_esp_wifi_driver_module(
+    b: *std.Build,
+    esp_wifi_sys_dep: *std.Build.Dependency,
+    chip_name: []const u8,
+    target_query: std.Target.Query,
+) *std.Build.Module {
+    const radio_resolved_zig_target = b.resolveTargetQuery(target_query);
+    const mod = wifi_headers(b, esp_wifi_sys_dep, chip_name, radio_resolved_zig_target);
     mod.addLibraryPath(esp_wifi_sys_dep.path(b.fmt("esp-wifi-sys-{s}/libs", .{chip_name})));
 
     mod.linkSystemLibrary(if (std.mem.eql(u8, chip_name, "esp32c6")) "ble_app" else "btdm_app", .{});

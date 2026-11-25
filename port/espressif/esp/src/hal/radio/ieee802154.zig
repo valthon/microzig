@@ -7,8 +7,10 @@
 //! handles FCS and legacy ACK turnaround while software polls event status.
 //! RX_DONE uses interrupt29 at priority 15 only for enhanced ACK turnaround.
 //! Applications still poll synchronous operations; no background RX queue.
-//! Between receive calls the MAC is idle. No Wi-Fi/BLE coexistence.
-//! Init requires radio.protocol = .ieee802154 and RTOS.
+//! Between receive calls the MAC is idle. The coexistence branches below are
+//! compile-only: `hal.radio.radios` rejects 802.15.4 with Wi-Fi or BLE, so no
+//! image can select them (valthon/microzig#40 tracks 802.15.4 coexistence).
+//! Init requires radio.radios.ieee802154 and RTOS.
 const std = @import("std");
 pub const security = @import("ieee802154/security.zig");
 pub const header = @import("ieee802154/header.zig");
@@ -134,9 +136,9 @@ pub const Radio = struct {
 
     /// Initialize in place; do not copy or move the handle until deinit.
     pub fn init(self: *Radio, allocator: std.mem.Allocator, config: Config) InitError!void {
-        if (microzig.options.hal.radio.ble)
+        if (!radio.coex_enabled and microzig.options.hal.radio.radios.ble)
             @compileError("IEEE 802.15.4 and BLE cannot run simultaneously: no RF coexistence scheduler");
-        if (microzig.options.hal.radio.protocol != .ieee802154) return error.UnsupportedRadioProtocol;
+        if (!microzig.options.hal.radio.radios.ieee802154) return error.UnsupportedRadioProtocol;
         try validate_config(config);
         {
             const cs = microzig.interrupt.enter_critical_section();
@@ -148,24 +150,31 @@ pub const Radio = struct {
         try radio.init(allocator);
         self.* = .{ .config = config };
         clocks.ieee802154_clocks_set_enabled(true);
-        osi.phy_enable();
+        if (radio.coex_enabled) osi.phy_modem_enable(.ieee802154) else osi.phy_enable();
         // IDF esp_ieee802154_enable: PHY -> esp_btbb_enable -> MAC reset/init.
         // No BTBB teardown call exists in the blob; IDF disable only drops refs.
-        bt_bb_v2_init_cmplx(0);
+        if (radio.coex_enabled) @import("coex.zig").btbb_enable(0) else bt_bb_v2_init_cmplx(0);
         clocks.ieee802154_mac_reset();
         configure_mac(config);
         ieee802154_txon_delay_set();
     }
 
-    pub fn deinit(self: *Radio) void {
+    pub fn deinit(self: *Radio) if (radio.coex_enabled) error{WouldBlock}!void else void {
+        if (radio.coex_enabled and @import("callback_context.zig").active()) return error.WouldBlock;
         if (!self.is_owner()) return;
         self.stop();
         // Hold MAC in reset before relinquishing DMA buffers, even after faults.
         clocks.ieee802154_mac_reset();
         mac.EVENT_EN.write(.{ .EVENT_EN = 0 });
-        osi.phy_disable();
+        if (radio.coex_enabled) @import("coex.zig").btbb_disable();
+        if (radio.coex_enabled) osi.phy_modem_disable(.ieee802154) else osi.phy_disable();
         clocks.ieee802154_clocks_set_enabled(false);
-        radio.deinit();
+        // The callback check above is radio.deinit's only error, so nothing
+        // after the teardown starts can fail.
+        if (radio.coex_enabled)
+            radio.deinit() catch @panic("802.15.4 deinit released the radio from a callback")
+        else
+            radio.deinit();
         release_owner();
     }
 

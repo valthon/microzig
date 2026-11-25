@@ -13,7 +13,7 @@ pub const std_options = microzig.std_options(.{
 pub const microzig_options: microzig.Options = .{
     .interrupts = .{ .interrupt29 = ble.interrupt_handler, .interrupt30 = hal.radio.interrupt_handler, .interrupt31 = hal.rtos.interrupt_handler },
     .cpu = .{ .interrupt_stack = .{ .enable = true, .size = 8192 } },
-    .hal = .{ .rtos = .{ .enable = true, .priority_bits = 5, .preempt_same_priority_tasks_on_tick = true }, .radio = .{ .ble = true } },
+    .hal = .{ .rtos = .{ .enable = true, .priority_bits = 5, .preempt_same_priority_tasks_on_tick = true }, .radio = .{ .radios = .{ .wifi = false, .ble = true } } },
 };
 const clock_config: hal.clocks.Config = .init_comptime(160_000_000);
 pub fn init() void {

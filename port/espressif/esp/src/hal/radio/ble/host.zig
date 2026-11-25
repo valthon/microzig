@@ -410,6 +410,31 @@ pub const Host = struct {
         try self.send_frame(4, &notification, .{ .permission = server.permissions[gatt.notify_handle - 1] });
         self.last_notify_ms = current;
     }
+    /// Send one notification now if a subscribed peer is connected, for an
+    /// application that paces notifications itself. The notified attribute's
+    /// permission applies as in `tick`. Returns whether the notification went to
+    /// the controller; false while the link lacks the permission.
+    pub fn notify(self: *Host) Error!bool {
+        // Without a subscribed peer there is nothing to send: return before
+        // spending up to procedure_timeout_ms on a credit wait.
+        if (!self.notify_subscribed()) return false;
+        // A credit wait processes events, which can end the link, the
+        // subscription or the link's security, so check all three after it.
+        // With a credit in hand the one-fragment frame goes out without
+        // another wait.
+        const deadline = self.now() + procedure_timeout_ms;
+        while (self.connection != null and self.acl_credits == 0) try self.wait(deadline);
+        if (!self.notify_subscribed()) return false;
+        const server = &self.server.?;
+        if (server.permission_error(gatt.notify_handle) != null) return false;
+        const notification = server.notification();
+        try self.send_frame(4, &notification, .{ .permission = server.permissions[gatt.notify_handle - 1] });
+        return true;
+    }
+    fn notify_subscribed(self: *const Host) bool {
+        const server = if (self.server) |*s| s else return false;
+        return self.connection != null and server.subscribed;
+    }
     fn event(self: *Host, data: []const u8) Error!void {
         if (data.len < 2 or data.len != @as(usize, data[1]) + 2) return error.InvalidPacket;
         switch (data[0]) {
@@ -1207,6 +1232,72 @@ test "peripheral answers CCCD writes, ticks a counter and clears subscription on
     try host.event(&.{ 5, 4, 0, 7, 0, 0x13 });
     try std.testing.expect(!host.server.?.subscribed);
     try host.resume_advertising();
+}
+test "notify sends one counter notification per call only while subscribed" {
+    var fixture: Fixture = .{ .capture_only = true };
+    var host = Host.init(fixture.transport());
+    try host.initialize();
+    try host.advertise("MZ-C6");
+    try std.testing.expect(!try host.notify());
+    host.connection = 7;
+    // Unsubscribed with no ACL credit: false at once, without a credit wait.
+    const credits = host.acl_credits;
+    host.acl_credits = 0;
+    const clock = fixture.clock_ms;
+    try std.testing.expect(!try host.notify());
+    try std.testing.expectEqual(clock, fixture.clock_ms);
+    host.acl_credits = credits;
+    try std.testing.expect(!try host.notify());
+    try fixture.acl_response(&.{ 0x12, 9, 0, 1, 0 }, false);
+    try host.poll(1);
+    try host.poll(1); // Number Of Completed Packets restores the single credit.
+    try std.testing.expect(try host.notify());
+    try std.testing.expectEqualSlices(u8, &.{ 0x1b, 8, 0, 1, 0, 0, 0 }, fixture.captured[8..fixture.captured_len]);
+    // The second call waits for the credit the first notification consumed.
+    try std.testing.expect(try host.notify());
+    try std.testing.expectEqualSlices(u8, &.{ 0x1b, 8, 0, 2, 0, 0, 0 }, fixture.captured[8..fixture.captured_len]);
+}
+test "notify applies the notified attribute's permission like tick" {
+    for ([_]gatt.Permission{ .encrypted, .authenticated }) |permission| {
+        var fixture: Fixture = .{ .capture_only = true };
+        var host = Host.init(fixture.transport());
+        host.connection = 7;
+        host.acl_capacity = 1;
+        host.acl_credits = 1;
+        host.server = try gatt.Server.init("secure");
+        host.server.?.subscribed = true;
+        host.server.?.permissions[gatt.notify_handle - 1] = permission;
+        // Unencrypted link: withheld before anything is queued.
+        try std.testing.expect(!try host.notify());
+        try std.testing.expectEqual(@as(usize, 0), fixture.fragment_count);
+        host.security = smp.Session.init(UnusedCrypto.config, false, @splat(0), test_bond.peer);
+        var bond = test_bond;
+        bond.authenticated = false;
+        try std.testing.expect(host.security.?.restore(bond));
+        try host.security.?.encryption_changed(true, 0);
+        host.sync_server();
+        // An unauthenticated key meets .encrypted only.
+        try std.testing.expectEqual(permission == .encrypted, try host.notify());
+        try std.testing.expectEqual(@as(usize, if (permission == .encrypted) 1 else 0), fixture.fragment_count);
+        if (permission == .authenticated) {
+            host.security.?.authenticated = true;
+            host.sync_server();
+            try std.testing.expect(try host.notify());
+            try std.testing.expectEqual(@as(usize, 1), fixture.fragment_count);
+        }
+        try std.testing.expectEqual(@as(u8, 0x1b), fixture.captured[8]);
+        // Encryption lost during the credit wait: checked after the wait, so
+        // the notification is never queued and is reported unsent.
+        try host.poll(1); // the fixture's credit for the sent notification
+        host.acl_credits = 0;
+        try fixture.enqueue(.event, &.{ 8, 4, 0, 7, 0, 0 });
+        try fixture.enqueue(.event, &.{ 0x13, 5, 1, 7, 0, 1, 0 });
+        const counter = host.server.?.counter;
+        try std.testing.expect(!try host.notify());
+        try std.testing.expectEqual(@as(u16, 1), host.acl_credits);
+        try std.testing.expectEqual(@as(usize, 1), fixture.fragment_count);
+        try std.testing.expectEqual(counter, host.server.?.counter);
+    }
 }
 test "client write command is response-free and subscribe uses the discovered CCCD" {
     var fixture: Fixture = .{ .capture_only = true };

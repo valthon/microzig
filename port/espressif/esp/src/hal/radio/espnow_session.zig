@@ -32,9 +32,10 @@ pub fn Driver(comptime platform: type) type {
 
             /// Initialize in place, keeping this address valid until deinit succeeds.
             pub fn init(self: *Session) Error!void {
-                if (comptime microzig.options.hal.radio.ble)
+                if (platform.lifecycle_busy()) return error.Busy;
+                if (comptime microzig.options.hal.radio.radios.ble and !microzig.options.hal.radio.radios.wifi)
                     @compileError("ESP-NOW requires Wi-Fi; exclusive BLE mode is selected");
-                if (microzig.options.hal.radio.protocol != .wifi) return error.UnsupportedRadioProtocol;
+                if (!microzig.options.hal.radio.radios.wifi) return error.UnsupportedRadioProtocol;
                 if (!wifi.get_sta_state().is_started() and wifi.get_ap_state() != .started) return error.WifiNotStarted;
                 {
                     const cs = microzig.interrupt.enter_critical_section();
@@ -60,6 +61,7 @@ pub fn Driver(comptime platform: type) type {
             /// Then discards queued frames and any unpolled delivery. The handle remains
             /// valid if teardown fails. Call from the single owning task, as for send.
             pub fn deinit(self: *Session) Error!void {
+                if (platform.lifecycle_busy()) return error.Busy;
                 try self.require_owner();
                 {
                     const cs = microzig.interrupt.enter_critical_section();
@@ -227,6 +229,22 @@ test "peer CRUD uses the authoritative blob table and preserves interface, chann
     try std.testing.expectError(error.PeerTableFull, session.add_peer(.{ .address = address }));
 }
 
+test "ESP-NOW rejects lifecycle re-entry before changing ownership" {
+    mock.reset();
+    defer mock.reset();
+    var session: Driver(mock).Session = .{};
+    mock.in_callback = true;
+    try std.testing.expectError(error.Busy, session.init());
+    try std.testing.expect(!mock.initialized);
+    mock.in_callback = false;
+    try session.init();
+    mock.in_callback = true;
+    try std.testing.expectError(error.Busy, session.deinit());
+    try std.testing.expect(mock.initialized);
+    mock.in_callback = false;
+    try session.deinit();
+}
+
 test "ownership, start requirement, init rollback, and late callback after deinit" {
     mock.reset();
     var session: Driver(mock).Session = .{};
@@ -264,7 +282,7 @@ test "send immediate errors release reservation; callback result survives receiv
     var source: Mac = .{ 2, 0, 0, 0, 0, 1 };
     var destination = broadcast;
     var info: mock.esp_now_recv_info_t = .{ .src_addr = &source, .des_addr = &destination, .rx_ctrl = null };
-    for (0..receive_capacity + 1) |_| Driver(mock).receive_callback(&info, "payload", 7);
+    for (0..receive_capacity + 1) |_| mock.receive(&info, "payload");
     try std.testing.expectEqual(@as(u32, 1), try session.dropped_frames());
     try std.testing.expectEqual(Delivery.success, (try session.poll_delivery()).?);
     mock.delivery = 1;
@@ -280,7 +298,7 @@ test "send immediate errors release reservation; callback result survives receiv
     var rssi: i8 = -73;
     info.rx_ctrl = &rssi;
     const maximum: [max_payload]u8 = @splat(0xa5);
-    Driver(mock).receive_callback(&info, &maximum, maximum.len);
+    mock.receive(&info, &maximum);
     try std.testing.expect(try session.poll_receive(&out));
     try std.testing.expectEqual(@as(?i8, -73), out.rssi);
     try std.testing.expectEqualSlices(u8, &maximum, out.payload());
@@ -289,15 +307,35 @@ test "send immediate errors release reservation; callback result survives receiv
 test "IEEE 802.15.4 selection rejects ESP-NOW before touching the blob" {
     const platform = struct {
         pub const c = mock;
+        pub const lifecycle_busy = mock.lifecycle_busy;
         pub const wifi = mock.wifi;
         pub const microzig = struct {
             pub const interrupt = mock.microzig.interrupt;
-            pub const options = .{ .hal = .{ .radio = .{ .ble = false, .protocol = .ieee802154 } } };
+            pub const options = .{ .hal = .{ .radio = .{ .radios = .{ .ble = false, .wifi = false } } } };
         };
     };
     mock.reset();
     var session: Driver(platform).Session = .{};
     try std.testing.expectError(error.UnsupportedRadioProtocol, session.init());
+    try std.testing.expect(!mock.initialized);
+}
+
+test "a Wi-Fi + BLE selection runs ESP-NOW over Wi-Fi" {
+    const platform = struct {
+        pub const c = mock;
+        pub const lifecycle_busy = mock.lifecycle_busy;
+        pub const wifi = mock.wifi;
+        pub const microzig = struct {
+            pub const interrupt = mock.microzig.interrupt;
+            pub const options = .{ .hal = .{ .radio = .{ .radios = .{ .ble = true, .wifi = true } } } };
+        };
+    };
+    mock.reset();
+    defer mock.reset();
+    var session: Driver(platform).Session = .{};
+    try session.init();
+    try std.testing.expect(mock.initialized);
+    try session.deinit();
     try std.testing.expect(!mock.initialized);
 }
 

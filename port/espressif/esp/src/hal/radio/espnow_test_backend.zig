@@ -2,7 +2,7 @@
 const std = @import("std");
 pub const c = @This();
 pub const microzig = struct {
-    pub const options = .{ .hal = .{ .radio = .{ .ble = false, .protocol = .wifi } } };
+    pub const options = .{ .hal = .{ .radio = .{ .radios = .{ .ble = false, .wifi = true } } } };
     pub const interrupt = struct {
         pub fn enter_critical_section() Section {
             return .{};
@@ -45,6 +45,8 @@ pub var delivery: c_uint = 0;
 pub var delay_completion = false;
 var pending_delivery: ?c_uint = null;
 var send_cb: ?Send = null;
+var receive_cb: ?Receive = null;
+pub var in_callback = false;
 pub fn reset() void {
     peers = @splat(null);
     started = true;
@@ -53,6 +55,8 @@ pub fn reset() void {
     delivery = 0;
     delay_completion = false;
     pending_delivery = null;
+    in_callback = false;
+    receive_cb = null;
     send_cb = null;
 }
 pub fn esp_now_init() i32 {
@@ -62,6 +66,7 @@ pub fn esp_now_init() i32 {
 pub fn esp_now_deinit() i32 {
     peers = @splat(null);
     initialized = false;
+    receive_cb = null;
     send_cb = null;
     return 0;
 }
@@ -69,11 +74,12 @@ pub fn esp_now_get_version(version: *u32) i32 {
     version.* = 2;
     return 0;
 }
-pub fn esp_now_register_recv_cb(_: Receive) i32 {
+pub fn esp_now_register_recv_cb(cb: Receive) i32 {
+    if (register_error == 0) receive_cb = cb;
     return register_error;
 }
 pub fn esp_now_register_send_cb(cb: Send) i32 {
-    send_cb = cb;
+    if (register_error == 0) send_cb = cb;
     return register_error;
 }
 pub fn esp_now_set_pmk(_: *const [16]u8) i32 {
@@ -135,4 +141,12 @@ pub fn complete_send() void {
     const status = pending_delivery orelse return;
     pending_delivery = null;
     if (send_cb) |cb| cb(null, status);
+}
+
+pub fn receive(info: *const esp_now_recv_info_t, payload: []const u8) void {
+    if (receive_cb) |cb| cb(info, payload.ptr, @intCast(payload.len));
+}
+
+pub fn lifecycle_busy() bool {
+    return in_callback;
 }

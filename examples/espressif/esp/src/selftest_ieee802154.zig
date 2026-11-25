@@ -46,7 +46,7 @@ pub const microzig_options: microzig.Options = .{
     .cpu = .{ .interrupt_stack = .{ .enable = true, .size = 8192 } },
     .hal = .{
         .rtos = .{ .enable = true },
-        .radio = .{ .protocol = .ieee802154 },
+        .radio = .{ .radios = .{ .wifi = false, .ieee802154 = true } },
     },
 };
 comptime {

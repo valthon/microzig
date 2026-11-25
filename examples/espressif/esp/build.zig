@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
     const ble_scan_seconds = b.option(u32, "ble_scan_seconds", "BLE observer scan duration (1..3600 seconds)") orelse 10;
     if (ble_scan_seconds == 0 or ble_scan_seconds > 3600) @panic("ble_scan_seconds must be in 1..3600");
     const antenna = b.option(Antenna, "antenna", "Antenna the XIAO ESP32C6 radio examples select (default internal)") orelse .internal;
+    const coex_ble_first = b.option(bool, "coex_ble_first", "selftest_coex_wifi_ble: start BLE before Wi-Fi (default Wi-Fi first)") orelse false;
     const smp_role = b.option(SmpRole, "smp_role", "SMP self-test role (default auto)") orelse .auto;
     const smp_method = b.option(SmpMethod, "smp_method", "SMP self-test pairing method (default just_works)") orelse .just_works;
     const smp_peer_text = b.option([]const u8, "smp_peer_address", "SMP peer public address (aa:bb:cc:dd:ee:ff)");
@@ -47,7 +48,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     }) });
-    const test_step = b.step("test", "Test DHCP, systimer intervals, and ESP-NOW rendezvous");
+    const test_step = b.step("test", "Test DHCP, systimer intervals, ESP-NOW rendezvous, and C6 coexistence plumbing");
     test_step.dependOn(&b.addRunArtifact(dhcp_tests).step);
     const systimer_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/systimer.zig"),
@@ -67,11 +68,33 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(smp_tests).step);
+    const coex_udp_loss_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/selftest_coex_udp_loss.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(coex_udp_loss_tests).step);
     const expected_mac: ?u48 = if (expected_mac_text) |text| parse_mac(text) orelse
         std.process.fatal("-Dexpected_mac={s}: expected six hex bytes separated by ':'", .{text}) else null;
 
     const mz_dep = b.dependency("microzig", .{});
     const mb = MicroBuild.init(b, mz_dep) orelse return;
+
+    // Compile the coex callbacks with the C6 register map and blob declarations.
+    // A test object can instantiate all paths without installing a multi-radio image.
+    const probe_path = b.path("src/coex_compile_test.zig");
+    const probe = mb.add_firmware(.{
+        .name = "coex-compile-test",
+        .target = mb.ports.esp.chips.esp32_c6,
+        .root_source_file = b.addWriteFiles().add("compile_root.zig", ""),
+        .optimize = .ReleaseSmall,
+    });
+    const probe_test = b.addTest(.{
+        .root_module = probe.exe.root_module,
+        .test_runner = .{ .path = probe_path, .mode = .simple },
+        .emit_object = true,
+    });
+    test_step.dependOn(&probe_test.step);
 
     var lp_images: [std.enums.values(LpImage).len]*MicroBuild.Firmware = undefined;
     for (std.enums.values(LpImage)) |image| {
@@ -174,6 +197,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "ble_scan", .file = "src/ble_scan.zig", .chips = &.{.esp32_c6}, .ble_options = true, .features = .{ .image_boot_only = true } },
         .{ .name = "ble_peripheral", .file = "src/ble_peripheral.zig", .chips = &.{.esp32_c6}, .ble_options = true, .features = .{ .image_boot_only = true } },
         .{ .name = "ble_central", .file = "src/ble_central.zig", .chips = &.{.esp32_c6}, .ble_options = true, .features = .{ .image_boot_only = true } },
+        // Wi-Fi + BLE coexistence; its BLE peer is the XIAO ESP32-C6 build below.
+        .{ .name = "selftest_coex_wifi_ble", .file = "src/selftest_coex_wifi_ble.zig", .chips = &.{.esp32_c6}, .wifi_options = true, .features = .{ .image_boot_only = true, .flashless = false, .lwip = true } },
+        // ESP-NOW with BLE advertising in a Wi-Fi + BLE image; flash it on both boards.
+        .{ .name = "selftest_espnow_coex", .file = "src/selftest_espnow.zig", .chips = &.{.esp32_c6}, .xiao_board = true, .antenna_option = true, .features = .{ .image_boot_only = true } },
     };
 
     const board_examples: []const BoardExample = &.{
@@ -188,6 +215,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "ble_scan", .file = "src/ble_scan.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
         .{ .name = "ble_peripheral", .file = "src/ble_peripheral.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
         .{ .name = "ble_central", .file = "src/ble_central.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .ble_options = true },
+        .{ .name = "selftest_coex_ble_peer", .file = "src/selftest_coex_ble_peer.zig", .prefix = "xiao_esp32_c6", .target = mb.ports.esp.boards.seeedstudio.xiao_esp32_c6, .antenna_option = true },
         // The radio self-test again, for the XIAO ESP32-C6's rf switch (see its main).
         .{
             .name = "selftest_ieee802154",
@@ -273,6 +301,16 @@ pub fn build(b: *std.Build) void {
                 const options = b.addOptions();
                 options.addOption(?u48, "expected_mac", expected_mac);
                 fw.exe.root_module.addOptions("c6_core_options", options);
+            }
+            if (std.mem.eql(u8, example.file, "src/selftest_espnow.zig")) {
+                const options = b.addOptions();
+                options.addOption(bool, "coex", std.mem.eql(u8, example.name, "selftest_espnow_coex"));
+                fw.exe.root_module.addOptions("espnow_options", options);
+            }
+            if (std.mem.eql(u8, example.name, "selftest_coex_wifi_ble")) {
+                const options = b.addOptions();
+                options.addOption(bool, "ble_first", coex_ble_first);
+                fw.exe.root_module.addOptions("coex_options", options);
             }
             if (std.mem.eql(u8, example.name, "selftest_ble_smp")) {
                 const options = b.addOptions();

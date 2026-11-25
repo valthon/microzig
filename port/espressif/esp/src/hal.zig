@@ -44,6 +44,7 @@ pub const usb_serial_jtag = @import("hal/usb_serial_jtag.zig");
 
 comptime {
     if (!builtin.is_test) {
+        microzig.options.hal.radio.radios.validate();
         // Keep otherwise unused register accessors in firmware compile coverage.
         @export(&compile_check_accessors, .{ .name = "esp_compile_check_accessors" });
 
