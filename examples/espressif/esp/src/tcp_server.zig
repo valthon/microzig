@@ -64,6 +64,12 @@ var maybe_netif: ?*lwip.c.netif = null;
 
 var wifi_ready_signal: rtos.Signal(void) = .{};
 var ap_started: std.atomic.Value(bool) = .init(false);
+/// Count of StaDisconnected events and the reason of the latest, stored together so a
+/// reader never pairs a count with another event's reason. Only `on_wifi_event` writes it,
+/// which the port calls in whichever task posts the event (osi.zig `esp_event_post`).
+var sta_disconnect: std.atomic.Value(StaDisconnect) = .init(.{ .count = 0, .reason = 0 });
+
+const StaDisconnect = packed struct(u32) { count: u16, reason: u16 };
 
 // Lifecycle self-test result, repeated by `lifecycle_reporter` because USB
 // output before the host reopens the port after reset is lost.
@@ -97,8 +103,22 @@ pub fn run(comptime lifecycle_selftest: bool) !void {
 fn run_server(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip.c.netif) !void {
     @import("wifi_antenna.zig").apply();
     try radio.wifi.init(gpa, .{});
-    defer radio.wifi.deinit();
+    const result = serve(lifecycle_selftest, gpa, netif);
+    // The driver keeps allocating from `gpa` until a deinit succeeds, so after a failed one
+    // this parks, and the frame that owns the heap and the netif never returns.
+    radio.wifi.deinit() catch |err| {
+        if (result) |_| {} else |served_err| std.log.err("server failed ({t})", .{served_err});
+        std.log.err("Wi-Fi deinit failed ({t}); keeping its memory", .{err});
+        if (lifecycle_selftest) {
+            lifecycle_step = "deinit";
+            lifecycle_fail(err);
+        }
+        while (true) rtos.sleep(.from_ms(1000));
+    };
+    return result;
+}
 
+fn serve(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip.c.netif) !void {
     exports.gpa = gpa;
     lwip.c.tcpip_init(null, null);
 
@@ -136,7 +156,7 @@ fn run_server(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: 
         lifecycle_step = "reporter_spawn";
         _ = try rtos.spawn(gpa, lifecycle_reporter, .{}, .{});
         lifecycle_step = "start";
-        try run_lifecycle();
+        try run_lifecycle(station);
     } else {
         try radio.wifi.start();
         while (!radio.wifi.get_sta_state().is_started()) {
@@ -158,10 +178,7 @@ fn run_server(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: 
             }
         }
 
-        try radio.wifi.connect();
-        while (radio.wifi.get_sta_state() != .connected) {
-            rtos.sleep(.from_ms(100));
-        }
+        try connect_sta(station);
     }
     try lwip.c_err(lwip.c.netifapi_netif_common(maybe_netif.?, lwip.c.netif_set_link_up, null));
 
@@ -220,6 +237,10 @@ fn on_wifi_event(event: radio.wifi.Event) void {
     switch (event) {
         .ApStart => ap_started.store(true, .monotonic),
         .ApStop => ap_started.store(false, .monotonic),
+        .StaDisconnected => |info| {
+            const count = sta_disconnect.load(.monotonic).count;
+            sta_disconnect.store(.{ .count = count +% 1, .reason = info.reason }, .release);
+        },
         else => {},
     }
 }
@@ -232,7 +253,53 @@ fn wait_sta(comptime expected: radio.wifi.StaState) error{Timeout}!void {
     }
 }
 
-fn run_lifecycle() !void {
+/// Connects the station and, as ESP-IDF directs applications, connects again on
+/// StaDisconnected: "It is the application's responsibility to reconnect. The recommended
+/// reconnection strategy is to call esp_wifi_connect() on receiving event
+/// WIFI_EVENT_STA_DISCONNECTED" (IDF v5.5.1 docs/en/api-guides/wifi.rst, "Wi-Fi Reconnect").
+/// Each call allows 5 retries, the IDF station example's CONFIG_ESP_MAXIMUM_RETRY default, and
+/// 30 s in all.
+///
+/// Before a retry it applies the station configuration again, without changing the mode, and
+/// waits 100 ms. A connect refused during authentication (reason 202) puts the AP on the blob's
+/// station blacklist; the next connect's scan then skips the AP, scans every channel (over 2 s)
+/// and fails with reason 205. `esp_wifi_set_config` clears the blacklist
+/// (`wifi_set_config_process+0x78`). It refuses a configuration while the station is
+/// connecting (`error.WifiState`, `wifi_set_config_process+0x36..0x58`): measured right after
+/// `connect` and 50 ms later, and not after a StaDisconnected, which every retry here follows.
+/// Should it come, the retry goes ahead without the configuration. A Pico 2 W AP refused
+/// connects with deauthentications for over 100 ms after a station left it without
+/// disconnecting first. Where retries applied the configuration again with no wait, the first
+/// retry was sometimes refused again (reason 202) within tens of ms, once the second too.
+fn connect_sta(station: radio.wifi.Config.Station) !void {
+    const max_retries = 5;
+    const deadline = microzig.drivers.time.Deadline.init_relative(hal.time.get_time_since_boot(), .from_ms(30_000));
+    var seen = sta_disconnect.load(.acquire).count;
+    var retries: u32 = 0;
+    try radio.wifi.connect();
+    while (radio.wifi.get_sta_state() != .connected) {
+        if (deadline.is_reached_by(hal.time.get_time_since_boot())) return error.Timeout;
+        const latest = sta_disconnect.load(.acquire);
+        if (latest.count != seen) {
+            seen = latest.count;
+            if (retries == max_retries) return error.StaConnectFailed;
+            retries += 1;
+            std.log.info("Wi-Fi: disconnected (reason {d}), connect again ({d}/{d})", .{ latest.reason, retries, max_retries });
+            radio.wifi.apply_station_config(station) catch |err| switch (err) {
+                error.WifiState => std.log.warn(
+                    "Wi-Fi: station configuration not applied again ({t})",
+                    .{err},
+                ),
+                else => return err,
+            };
+            rtos.sleep(.from_ms(100));
+            try radio.wifi.connect();
+        }
+        rtos.sleep(.from_ms(20));
+    }
+}
+
+fn run_lifecycle(station: radio.wifi.Config.Station) !void {
     std.log.info("Wi-Fi lifecycle: start", .{});
     try radio.wifi.start();
     try wait_sta(.started);
@@ -240,8 +307,7 @@ fn run_lifecycle() !void {
 
     lifecycle_step = "connect";
     std.log.info("Wi-Fi lifecycle: connect", .{});
-    try radio.wifi.connect();
-    try wait_sta(.connected);
+    try connect_sta(station);
     // Keep the PHY active through a tracking period before closing it.
     rtos.sleep(.from_ms(1100));
     lifecycle_pass();
@@ -272,8 +338,7 @@ fn run_lifecycle() !void {
 
     lifecycle_step = "reconnect";
     std.log.info("Wi-Fi lifecycle: connect again", .{});
-    try radio.wifi.connect();
-    try wait_sta(.connected);
+    try connect_sta(station);
     lifecycle_pass();
 
     lifecycle_step = "sta_to_ap_sta";

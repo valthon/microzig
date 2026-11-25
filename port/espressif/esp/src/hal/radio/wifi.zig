@@ -10,6 +10,8 @@ const radio = @import("../radio.zig");
 const osi = @import("osi.zig");
 const wifi_status = @import("wifi_status.zig");
 const compatibility = @import("../compatibility.zig");
+const hal_time = @import("../time.zig");
+const rtos = @import("../rtos.zig");
 
 const log = std.log.scoped(.esp_radio_wifi);
 
@@ -203,9 +205,39 @@ pub fn init(gpa: std.mem.Allocator, config: InitConfig) InitError!void {
     if (compatibility.chip == .esp32_c6) @import("../analog/esp32_c6.zig").wifi_set_inited(true);
 }
 
-pub fn deinit() void {
-    _ = c.esp_wifi_stop();
-    _ = c.esp_wifi_deinit_internal();
+pub const DeinitError = InternalError;
+
+/// Stops Wi-Fi as `stop` does, leaving the AP first, then releases the driver and the radio. A
+/// stop running in another task returns first; a stop called while this runs waits until it has
+/// returned and then, if this released the driver, gets `error.WifiNotInitialized` from
+/// `esp_wifi_stop`.
+///
+/// Returns `error.Timeout` if the running stop has not returned within 5 s, which in the runs
+/// only a stop called from `on_event` caused, and `error.WifiStopping` if the calling task's own
+/// stop is running (a call from an event that stop posted); Wi-Fi is then untouched. It also
+/// returns the error of `esp_wifi_deinit_internal` unless that is `ESP_ERR_WIFI_NOT_INIT`, since
+/// the driver is then still initialised. That error comes after the stop: the station has left
+/// the AP and Wi-Fi has been stopped, unless the error is `ESP_ERR_WIFI_NOT_STOPPED` (below):
+/// Wi-Fi is still started. Either way it releases nothing: the driver and the radio stay
+/// initialised, and the driver keeps allocating from the allocator given to `init`. Keep that
+/// allocator's memory, and anything else lent to the driver or to a network stack on it, until
+/// a later `deinit` returns without an error.
+///
+/// `esp_wifi_deinit_internal` (C3 and C6 libnet80211.a) returns `ESP_ERR_WIFI_NOT_STOPPED`
+/// while Wi-Fi is started, as after a failed `esp_wifi_stop` (+0x18..0x46), the errors of its
+/// API lock (+0x0c..0x16) and `ESP_ERR_WIFI_INIT_STATE` during another init or deinit
+/// (+0x80..0xc0) before it changes any state; after `ESP_ERR_NO_MEM` (+0x132) or a failed
+/// request to the Wi-Fi task (+0xf0..0xfa) it sets its state back to initialised
+/// (+0x136..0x140). `ESP_ERR_WIFI_NOT_INIT` (+0x6e..0x7e) leaves no driver to release, and the
+/// radio is released as after a success. The results of `esp_wifi_stop`, which a started
+/// driver then reports as `ESP_ERR_WIFI_NOT_STOPPED`, and of `esp_supplicant_deinit` are
+/// ignored.
+pub fn deinit() DeinitError!void {
+    try begin_stop();
+    defer end_stop();
+    _ = stop_leaving_ap();
+    const status = c.esp_wifi_deinit_internal();
+    if (status != c.ESP_ERR_WIFI_NOT_INIT) try c_err(status);
     _ = c.esp_supplicant_deinit();
     if (compatibility.chip == .esp32_c6) @import("../analog/esp32_c6.zig").wifi_set_inited(false);
 
@@ -355,7 +387,12 @@ fn apply_access_point_config(config: Config.AccessPoint) ConfigError!void {
     try c_err(c_patched.esp_wifi_set_config(c.WIFI_IF_AP, &tmp));
 }
 
-fn apply_station_config(config: Config.Station) ConfigError!void {
+/// Applies `config` to the station interface without changing the mode, unlike `apply`,
+/// which also sets it. `esp_wifi_set_config` also clears the blob's station blacklist
+/// (`wifi_set_config_process+0x78`, C3 and C6 libnet80211.a). While the station is connecting it
+/// returns `error.WifiState` (`wifi_set_config_process+0x36..0x58`). Applied to a connected
+/// station, it was accepted and a `StaDisconnected` (reason 8) followed within milliseconds.
+pub fn apply_station_config(config: Config.Station) ConfigError!void {
     if (config.ssid.len > 32) {
         return error.InvalidConfig;
     }
@@ -465,14 +502,200 @@ pub fn start() InternalError!void {
     try c_err(c.esp_wifi_start());
 }
 
-/// Non-blocking.
+/// Non-blocking unless the station is connected or connecting, or another stop runs. Such a
+/// station leaves the AP first: `stop` calls `disconnect`, waits for the `StaDisconnected`
+/// (reason 8, `WIFI_REASON_ASSOC_LEAVE`; at most 1 s when connected, 100 ms when connecting),
+/// waits 100 ms more, then calls `esp_wifi_stop`, which posts `StaStop`. A station is connecting
+/// from the `connect` that the blob accepts until the `StaConnected`, `StaDisconnected` or
+/// `StaStop` that follows; a `disconnect` before the station has left scanning posts none of
+/// them, and the next stop then calls `disconnect` again and waits the 100 ms for nothing, as
+/// it can after an attempt whose event came before its `connect` returned (see
+/// `sta_connecting`). From the start of a stop until it returns, `connect` returns
+/// `error.WifiStopping`, so an application that connects again on `StaDisconnected` gets that
+/// error instead of a connect the stop cancels; a stop first waits for connects that began
+/// before it to return. Stops, and `deinit`, run one at a time: a later one waits until the
+/// running one has returned, then stops what is left (nothing, if the first stopped the
+/// station; after `deinit`, `esp_wifi_stop` returns `error.WifiNotInitialized`). A stop waits
+/// at most 5 s for the running one, then returns `error.Timeout` with a warning, without
+/// stopping.
+///
+/// Do not call `stop` or `deinit` from `on_event`. `on_event` runs in the task that posts the
+/// event (`osi.esp_event_post` calls it directly), which for the station events was the Wi-Fi
+/// task, and a stop waits for connects in flight, for the `StaDisconnected` and for another
+/// stop. Called there on `StaConnected` or `StaDisconnected`, even with no connect in flight,
+/// `esp_wifi_stop` blocked for seconds and the board usually trapped afterwards ("unhandled
+/// trap"; Super Mini ESP32-C6 and ESP32-C3), as it did on the base HAL with a connect in flight.
+/// Called there while another task's stop waits for the Wi-Fi task, in its `disconnect` or its
+/// `esp_wifi_stop`, it blocks that stop until its own 5 s wait for it ends; called in a task
+/// whose own stop posted the event, it returns `error.WifiStopping` with a warning.
+///
+/// `esp_wifi_stop` on a connected station sends the disassociation from inside the stop:
+/// `wifi_stop_process` calls `ieee80211_set_hmac_stop` (+0x26), then `_do_wifi_stop` (+0x30),
+/// whose `wifi_station_stop` sends it (`wifi_disconnect_process`, +0x5a) and then removes the
+/// station interface (`ic_set_vif`, +0x74; C3 and C6 libnet80211.a). Sniffed against a
+/// Pico 2 W AP, the stopping station repeated that disassociation dozens of times over tens of
+/// ms, the AP answered the copies with deauthentications for over 100 ms, and a connect in that
+/// time failed (`StaDisconnected` reason 202). A station stopped with `esp_wifi_stop` alone
+/// between `connect` and `StaConnected` burst the same way in most such stops. Leaving first,
+/// the disassociation usually went out once and drew no deauthentication, whether the station
+/// was connected or between `connect` and `StaConnected`; occasionally, on the Super Mini
+/// ESP32-C6, a retry of it drew a few deauthentications over at most about 10 ms. Stopped while
+/// still scanning, the station sent nothing.
+///
+/// The 100 ms is measured, not derived from the blob: with no wait after the
+/// `StaDisconnected`, the next connect still failed that way in some boots, each with a stop
+/// much slower than usual; with 100 ms, in none of the same sitting.
 pub fn stop() InternalError!void {
-    try c_err(c.esp_wifi_stop());
+    try begin_stop();
+    defer end_stop();
+    try c_err(stop_leaving_ap());
 }
 
-/// Non-blocking. Without a station in the mode this returns `error.WifiMode`.
+/// Stops begun and not yet returned, connects in flight, and a count of the stops that gave up
+/// waiting for connects in flight, by which a connect tells whether one gave up on it (see
+/// `sta_connecting`). Read and changed only in a critical section. Nothing waits while holding
+/// it, and `connect` takes no lock: a `connect` in another task waits for the Wi-Fi task until
+/// it has serviced the request (`ieee80211_ioctl+0x1a8..0x1be`), so a lock that `connect` held
+/// across the blob call would deadlock an `on_event` that connects from the Wi-Fi task.
+var calls: struct { stops: u32 = 0, connects: u32 = 0, give_ups: u32 = 0 } = .{};
+
+/// Held by the running stop, so stops run one at a time. Only stops take it.
+var stop_lock: rtos.Mutex = .{};
+
+/// Counts the stop, so that `connect` refuses from here on, then waits for the running stop.
+/// The running stop holds the lock for its own waits, limited to 2.1 s but longer while the
+/// Wi-Fi task keeps the CPU (see `wait_for_connects`), and for its `disconnect` and
+/// `esp_wifi_stop` (with `deinit`, the release of the driver). From another task both wait
+/// for the Wi-Fi task to service them (`ieee80211_ioctl`, which `esp_wifi_disconnect_internal`
+/// tail-calls at +0x42 and `esp_wifi_stop` calls at +0xc4; C3 and C6 libnet80211.a). In the
+/// runs `esp_wifi_stop` returned quickly unless an `on_event` blocked the Wi-Fi task, and took
+/// longer for a station still connecting that a stop which gave up in `wait_for_connects` had
+/// not taken off the AP. A stop from such an `on_event` waits here in the Wi-Fi task, which the
+/// running stop's `disconnect` or `esp_wifi_stop` needs; the 5 s limit ends that wait. A task
+/// that already holds the lock, as a stop called from an event its own stop posted does, is
+/// refused at once.
+fn begin_stop() error{ WifiStopping, Timeout }!void {
+    const held = blk: {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        if (stop_lock.locked == rtos.get_current_task()) break :blk true;
+        calls.stops += 1;
+        break :blk false;
+    };
+    if (held) {
+        log.warn("stop: called during this task's own stop (from on_event?), not stopping", .{});
+        return error.WifiStopping;
+    }
+    stop_lock.lock_with_timeout(.{ .after = .from_ms(5000) }) catch |err| {
+        log.warn("stop: another stop still running after 5 s (one from on_event?), not stopping", .{});
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        calls.stops -= 1;
+        return err;
+    };
+}
+
+fn end_stop() void {
+    stop_lock.unlock();
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    calls.stops -= 1;
+}
+
+fn connects_in_flight() u32 {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    return calls.connects;
+}
+
+/// Runs between `begin_stop` and `end_stop`.
+fn stop_leaving_ap() c.esp_err_t {
+    wait_for_connects();
+    // `update_sta_state` stores the state and counts a StaDisconnected before it clears
+    // `sta_connecting`, so these reads, in this order, see a connecting station either as
+    // connecting or in the state its event left; a StaDisconnected after `seen` ends the wait.
+    // That also needs no connect to set the flag after `wait_for_connects`: none begins while
+    // a stop runs, and those begun before have returned. If the 1 s wait gave up, a connect
+    // still in flight leaves the flag alone when it returns, and this stop does not leave the AP
+    // for it.
+    const seen = sta_disconnects.load(.acquire);
+    const connecting = sta_connecting.load(.acquire);
+    if (get_sta_state() == .connected) {
+        leave_ap(.connected, seen);
+    } else if (connecting) {
+        leave_ap(.connecting, seen);
+    }
+    return c.esp_wifi_stop();
+}
+
+/// Waits until the connects begun before this stop have been serviced, so none is accepted
+/// after the stop has begun. Gives up after 1 s, which a stop reaches when the Wi-Fi task
+/// services nothing for 1 s: when the stop itself runs in an `on_event` there, which is not
+/// supported, or when an `on_event` blocks there for 1 s while another task stops. A connect
+/// in flight when it gives up does not set `sta_connecting` when it returns, so that flag is
+/// not left set after this stop has stopped the station.
+///
+/// The 1 s is checked between 1 ms sleeps, so the give-up comes late while a task above the
+/// caller's priority keeps the CPU. The Wi-Fi task does for the first connect after boot: it
+/// derives the WPA2 key from the passphrase in software (`pbkdf2_sha1`, libwpa_supplicant.a),
+/// which in the runs took well over a second on the ESP32-C3 and ESP32-C6, and a stop in the
+/// main task gave up over a second late; one during the next connect to the same AP, on time.
+fn wait_for_connects() void {
+    const deadline = time.Deadline.init_relative(hal_time.get_time_since_boot(), .from_ms(1000));
+    while (connects_in_flight() != 0) {
+        if (deadline.is_reached_by(hal_time.get_time_since_boot())) {
+            log.warn("stop: a connect still in flight after 1 s, stopping without waiting", .{});
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            calls.give_ups +%= 1;
+            return;
+        }
+        rtos.sleep(.from_ms(1));
+    }
+}
+
+/// `seen` is the StaDisconnected count read before the state, so a StaDisconnected that lands
+/// after that read ends the wait even if this `disconnect` posts none. A station still scanning
+/// when it is stopped has sent nothing to leave, and its `disconnect` posts no
+/// `StaDisconnected`, so a connecting station waits for one at most 100 ms and without a warning.
+fn leave_ap(from: enum { connected, connecting }, seen: u32) void {
+    disconnect() catch |err| {
+        log.warn("stop: disconnect failed ({t}), stopping without it", .{err});
+        return;
+    };
+    const limit: time.Duration = if (from == .connected) .from_ms(1000) else .from_ms(100);
+    const deadline = time.Deadline.init_relative(hal_time.get_time_since_boot(), limit);
+    while (sta_disconnects.load(.acquire) == seen) {
+        if (deadline.is_reached_by(hal_time.get_time_since_boot())) {
+            if (from == .connected) {
+                log.warn("stop: no StaDisconnected within 1 s of disconnect", .{});
+            }
+            return;
+        }
+        rtos.sleep(.from_ms(5));
+    }
+    rtos.sleep(.from_ms(100));
+}
+
+/// Non-blocking. Without a station in the mode this returns `error.WifiMode`; while `stop`
+/// runs, or `deinit`, `error.WifiStopping`. It takes no lock, so `on_event` may call it.
 pub fn connect() InternalError!void {
-    try c_err(c.esp_wifi_connect_internal());
+    const give_ups = blk: {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        if (calls.stops != 0) return error.WifiStopping;
+        calls.connects += 1;
+        break :blk calls.give_ups;
+    };
+    const status = c.esp_wifi_connect_internal();
+    {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        // With the count, so a stop that waited for this connect reads the flag after it is set.
+        if (status == c.ESP_OK and calls.give_ups == give_ups) sta_connecting.store(true, .release);
+        calls.connects -= 1;
+    }
+    try c_err(status);
 }
 
 /// Non-blocking. Without a station in the mode this returns `error.WifiMode`.
@@ -751,6 +974,20 @@ pub const ApState = enum(u32) {
 };
 
 var sta_state: std.atomic.Value(StaState) = .init(.none);
+/// Set by `connect` once the blob has accepted it, and cleared by the StaConnected,
+/// StaDisconnected or StaStop that follows: a stop in between leaves the AP too. A refused
+/// `connect` leaves it as it was. A stop reads it only once no connect is in flight, so setting
+/// it after the blob call is soon enough, and it covers a `connect` issued before an earlier
+/// attempt's event, such as a retry that does not wait for it, and accepted after that event.
+/// It errs towards set: when the Wi-Fi task posts the accepted attempt's own event before the
+/// blob call returns, the flag stays set until the next station event, as it does after a
+/// `disconnect` while the station still scans, which posts none of these. A stop while it is
+/// set without a connect pending calls `disconnect` for nothing and waits the 100 ms for a
+/// StaDisconnected that does not come. A `connect` that a stop gave up waiting for does not set
+/// it (see `wait_for_connects`).
+var sta_connecting: std.atomic.Value(bool) = .init(false);
+/// Count of StaDisconnected events, which `leave_ap` waits for.
+var sta_disconnects: std.atomic.Value(u32) = .init(0);
 var ap_state: std.atomic.Value(ApState) = .init(.none);
 
 fn update_sta_state(event: EventType) void {
@@ -761,7 +998,10 @@ fn update_sta_state(event: EventType) void {
         .StaStop => .stopped,
         else => return,
     };
-    sta_state.store(new_sta_state, .monotonic);
+    // In this order: `stop_leaving_ap` reads them in reverse.
+    sta_state.store(new_sta_state, .release);
+    if (new_sta_state == .disconnected) _ = sta_disconnects.fetchAdd(1, .release);
+    if (new_sta_state != .started) sta_connecting.store(false, .release);
 }
 
 fn update_ap_state(event: EventType) void {
@@ -778,7 +1018,7 @@ pub fn get_ap_state() ApState {
 }
 
 pub fn get_sta_state() StaState {
-    return sta_state.load(.monotonic);
+    return sta_state.load(.acquire);
 }
 
 pub const Interface = enum(u32) {
