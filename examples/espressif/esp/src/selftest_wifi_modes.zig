@@ -136,6 +136,8 @@ fn exercise(gpa: std.mem.Allocator) !void {
     try wifi.stop();
     pass("ok");
 
-    wifi.deinit();
+    // A failed deinit leaves the driver using `gpa`; `report_loop` reports it and never
+    // returns, so the heap in `main` stays.
+    try wifi.deinit();
     pass(try expect_error(error.WifiNotInitialized, wifi.get_mode()));
 }
