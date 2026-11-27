@@ -18,7 +18,7 @@ pub fn Driver(comptime platform: type) type {
     return struct {
         const microzig = platform.microzig;
         const c = platform.c;
-        const wifi = platform.wifi;
+        const Wifi = platform.wifi.Wifi;
         // C callbacks have no context argument. Only this routing pointer is global;
         // all queues and completion state belong to the caller. Protected by critical sections.
         // See ARCHITECTURE.md: the context-free callback ABI singleton exception
@@ -31,7 +31,8 @@ pub fn Driver(comptime platform: type) type {
             max_payload_len: usize = 0,
 
             /// Initialize in place, keeping this address valid until deinit succeeds.
-            pub fn init(self: *Session) Error!void {
+            /// The Wi-Fi handle must have a started interface.
+            pub fn init(self: *Session, wifi: *const Wifi) Error!void {
                 if (platform.lifecycle_busy()) return error.Busy;
                 if (comptime microzig.options.hal.radio.radios.ble and !microzig.options.hal.radio.radios.wifi)
                     @compileError("ESP-NOW requires Wi-Fi; exclusive BLE mode is selected");
@@ -203,9 +204,10 @@ pub fn Driver(comptime platform: type) type {
 }
 
 test "peer CRUD uses the authoritative blob table and preserves interface, channel, keys" {
+    const wifi: mock.wifi.Wifi = .{ .started = true };
     mock.reset();
     var session: Driver(mock).Session = .{};
-    try session.init();
+    try session.init(&wifi);
     defer session.deinit() catch unreachable;
     try session.add_peer(.{ .address = broadcast });
     try std.testing.expectError(error.InvalidArgument, session.add_peer(.{ .address = broadcast, .lmk = @splat(1) }));
@@ -230,14 +232,15 @@ test "peer CRUD uses the authoritative blob table and preserves interface, chann
 }
 
 test "ESP-NOW rejects lifecycle re-entry before changing ownership" {
+    const wifi: mock.wifi.Wifi = .{ .started = true };
     mock.reset();
     defer mock.reset();
     var session: Driver(mock).Session = .{};
     mock.in_callback = true;
-    try std.testing.expectError(error.Busy, session.init());
+    try std.testing.expectError(error.Busy, session.init(&wifi));
     try std.testing.expect(!mock.initialized);
     mock.in_callback = false;
-    try session.init();
+    try session.init(&wifi);
     mock.in_callback = true;
     try std.testing.expectError(error.Busy, session.deinit());
     try std.testing.expect(mock.initialized);
@@ -246,33 +249,35 @@ test "ESP-NOW rejects lifecycle re-entry before changing ownership" {
 }
 
 test "ownership, start requirement, init rollback, and late callback after deinit" {
+    var wifi: mock.wifi.Wifi = .{ .started = true };
     mock.reset();
     var session: Driver(mock).Session = .{};
     try std.testing.expectError(error.NotInitialized, session.peer_count());
-    mock.started = false;
-    try std.testing.expectError(error.WifiNotStarted, session.init());
-    mock.started = true;
+    wifi.started = false;
+    try std.testing.expectError(error.WifiNotStarted, session.init(&wifi));
+    wifi.started = true;
     mock.register_error = 0x306a;
-    try std.testing.expectError(error.Internal, session.init());
+    try std.testing.expectError(error.Internal, session.init(&wifi));
     try std.testing.expect(!mock.initialized);
     mock.register_error = 0;
-    try session.init();
+    try session.init(&wifi);
     var second: Driver(mock).Session = .{};
-    try std.testing.expectError(error.AlreadyInitialized, second.init());
-    try std.testing.expectError(error.AlreadyInitialized, session.init());
+    try std.testing.expectError(error.AlreadyInitialized, second.init(&wifi));
+    try std.testing.expectError(error.AlreadyInitialized, session.init(&wifi));
     try session.add_peer(.{ .address = broadcast });
     try session.deinit();
     Driver(mock).send_callback(null, mock.ESP_NOW_SEND_SUCCESS);
     try std.testing.expectError(error.NotInitialized, session.poll_delivery());
-    try second.init();
+    try second.init(&wifi);
     try std.testing.expectEqualDeep(Counts{ .total = 0, .encrypted = 0 }, try second.peer_count());
     try second.deinit();
 }
 
 test "send immediate errors release reservation; callback result survives receive overflow" {
+    const wifi: mock.wifi.Wifi = .{ .started = true };
     mock.reset();
     var session: Driver(mock).Session = .{};
-    try session.init();
+    try session.init(&wifi);
     defer session.deinit() catch unreachable;
     try std.testing.expectError(error.PeerNotFound, session.send(broadcast, "x"));
     try session.add_peer(.{ .address = broadcast });
@@ -305,6 +310,7 @@ test "send immediate errors release reservation; callback result survives receiv
 }
 
 test "IEEE 802.15.4 selection rejects ESP-NOW before touching the blob" {
+    const wifi_handle: mock.wifi.Wifi = .{ .started = true };
     const platform = struct {
         pub const c = mock;
         pub const lifecycle_busy = mock.lifecycle_busy;
@@ -316,11 +322,12 @@ test "IEEE 802.15.4 selection rejects ESP-NOW before touching the blob" {
     };
     mock.reset();
     var session: Driver(platform).Session = .{};
-    try std.testing.expectError(error.UnsupportedRadioProtocol, session.init());
+    try std.testing.expectError(error.UnsupportedRadioProtocol, session.init(&wifi_handle));
     try std.testing.expect(!mock.initialized);
 }
 
 test "a Wi-Fi + BLE selection runs ESP-NOW over Wi-Fi" {
+    const wifi_handle: mock.wifi.Wifi = .{ .started = true };
     const platform = struct {
         pub const c = mock;
         pub const lifecycle_busy = mock.lifecycle_busy;
@@ -333,24 +340,25 @@ test "a Wi-Fi + BLE selection runs ESP-NOW over Wi-Fi" {
     mock.reset();
     defer mock.reset();
     var session: Driver(platform).Session = .{};
-    try session.init();
+    try session.init(&wifi_handle);
     try std.testing.expect(mock.initialized);
     try session.deinit();
     try std.testing.expect(!mock.initialized);
 }
 
 test "delayed completion prevents teardown and reuse until the old send completes" {
+    const wifi: mock.wifi.Wifi = .{ .started = true };
     mock.reset();
     mock.delay_completion = true;
     var first: Driver(mock).Session = .{};
     var second: Driver(mock).Session = .{};
-    try first.init();
+    try first.init(&wifi);
     try first.add_peer(.{ .address = broadcast });
     mock.delivery = 1;
     try first.send(broadcast, "A");
     try std.testing.expectError(error.Busy, first.deinit());
     try std.testing.expect(mock.initialized);
-    try std.testing.expectError(error.AlreadyInitialized, second.init());
+    try std.testing.expectError(error.AlreadyInitialized, second.init(&wifi));
     try std.testing.expectError(error.NotInitialized, second.send(broadcast, "B"));
     try std.testing.expectError(error.Busy, first.send(broadcast, "A again"));
     try std.testing.expect(try first.poll_delivery() == null);
@@ -359,7 +367,7 @@ test "delayed completion prevents teardown and reuse until the old send complete
     mock.complete_send();
     try std.testing.expectEqual(Delivery.failure, (try first.poll_delivery()).?);
     try first.deinit();
-    try second.init();
+    try second.init(&wifi);
     try second.add_peer(.{ .address = broadcast });
     mock.delivery = 0;
     try second.send(broadcast, "B");

@@ -17,11 +17,15 @@ const hal_time = @import("../time.zig");
 const log = std.log.scoped(.esp_radio_wifi);
 
 pub const Options = struct {
+    /// A process-global listener. An event posted before deinit returned can
+    /// still reach the listener after deinit releases the handle. The driver
+    /// finishes updating handle state before invoking the listener and drops
+    /// events that arrive when there is no owner.
     on_event: ?*const fn (e: Event) void = null,
     on_packet_received: ?*const fn (comptime interface: Interface, data: []const u8) void = null,
     /// Called by the Wi-Fi driver when a transmission completes; `status` is false if it
     /// failed. `data` is the 802.11 frame as the driver sent it, not the Ethernet frame given
-    /// to `send_packet`: MAC header, the CCMP header on a protected link, LLC/SNAP, payload.
+    /// to `Wifi.send_packet`: MAC header, the CCMP header on a protected link, LLC/SNAP, payload.
     /// The station's EAPOL handshake frames arrive here too. `data` ends before the frame
     /// does: on a WPA2 link a 60-byte Ethernet frame (46-byte payload after a 26-byte QoS
     /// header, CCMP header and LLC/SNAP) came back as 74 bytes on an ESP32-C3 and 70 on an
@@ -32,14 +36,18 @@ pub const Options = struct {
     on_packet_transmitted: ?*const fn (interface: Interface, data: []const u8, status: bool) void = null,
 };
 
-const InitError = radio.InitError || PowerSaveError || error{UnsupportedRadioProtocol} ||
-    (if (radio.coex_enabled) error{ WifiSessionBusy, WifiRollbackPending } else error{});
+pub const InitError = radio.InitError || PowerSaveError || error{
+    AlreadyInitialized,
+    UnsupportedRadioProtocol,
+    WifiRollbackPending,
+    WifiSessionBusy,
+};
 
-/// In a coexistence image, `init` on a running session returns success without
+/// In a coexistence image, `Wifi.init` on the running owner returns success without
 /// reading this configuration; the session keeps the first init's settings.
 pub const InitConfig = struct {
     /// Power save mode. Only `.none` is supported on the ESP32-C6. A
-    /// coexistence `init` on a running session returns before checking it.
+    /// coexistence `Wifi.init` on the running owner returns before checking it.
     power_save_mode: PowerSaveMode = .none,
 
     /// Country info. If .auto the country info of the AP to which the station
@@ -166,73 +174,699 @@ pub const InitConfig = struct {
 extern fn wifi_osi_funcs_register(table: *c.wifi_osi_funcs_t) c_int;
 extern var s_wifi_api_lock: ?*anyopaque;
 extern var g_wifi_global_lock: ?*anyopaque;
+// The blob keeps both lock addresses across sessions.
 var boot_locks: osi.WifiBootLocks = .{};
 
-/// In a coexistence image `gpa` is unused (the session allocates from the
-/// attached `radio.SharedHeap`); the parameter stays so that `init` has one
-/// signature in every radio selection, and Wi-Fi-only images allocate from
-/// it. In a coexistence image, init on a running session returns success
-/// without reading `config`. The session is shared: one deinit ends it.
-pub fn init(gpa: std.mem.Allocator, config: InitConfig) InitError!void {
-    if (radio.coex_enabled and !begin_lifecycle()) return error.WifiSessionBusy;
-    defer if (radio.coex_enabled) lifecycle_active.store(false, .release);
-    if (comptime !radio.coex_enabled and microzig.options.hal.radio.radios.ble)
-        @compileError("Wi-Fi and BLE cannot run simultaneously: hal.radio.radios.ble selects exclusive BLE mode");
-    comptime if (!callbacks.host_test) export_symbols();
+fn install_boot_locks() InternalError!void {
+    // wifi_api_lock reads the registered OSI table when its handle is non-null.
+    // C3/C6 libnet80211.a: wifi_api_lock and wifi_init_in_caller_task lazily
+    // allocate the API and global locks. wifi_deinit_in_caller_task deletes
+    // the interrupt and MAC list locks but leaves these two installed.
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    try c_err(wifi_osi_funcs_register(&g_wifi_osi_funcs));
+    boot_locks.install(&s_wifi_api_lock, &g_wifi_global_lock);
+}
 
-    if (!microzig.options.hal.radio.radios.wifi) return error.UnsupportedRadioProtocol;
+// The context-free blob event callback routes through this pointer under a critical section.
+var owner: ?*Wifi = null;
 
-    // IDF v5.5.1 esp_wifi/src/wifi_init.c:343-345: a second init succeeds
-    // without reading the new configuration.
-    if (radio.coex_enabled and osi.wifi_shutdown.stage == .running) return;
+/// Initialize in place and keep this address valid until deinit succeeds and
+/// any concurrent calls on the handle have returned. The caller serializes
+/// operations with deinit, except for stop, deinit and connect, which may
+/// overlap as documented below.
+pub const Wifi = struct {
+    lifecycle_active: std.atomic.Value(bool) = .init(false),
+    /// Stops begun and not yet returned, connects in flight, and a count of the stops that gave up
+    /// waiting for connects in flight, by which a connect tells whether one gave up on it (see
+    /// `sta_connecting`). Read and changed only in a critical section. Nothing waits while holding
+    /// it, and `connect` takes no lock: a `connect` in another task waits for the Wi-Fi task until
+    /// it has serviced the request (`ieee80211_ioctl+0x1a8..0x1be`), so a lock that `connect` held
+    /// across the blob call would deadlock an `on_event` that connects from the Wi-Fi task.
+    calls: struct { stops: u32 = 0, connects: u32 = 0, give_ups: u32 = 0 } = .{},
+    /// Held by the running stop, so stops run one at a time. Only stops take it.
+    /// Host tests simulate acquiring it on one thread.
+    stop_lock: if (callbacks.host_test) HostStopLock else rtos.Mutex = .{},
+    sta_state: std.atomic.Value(StaState) = .init(.none),
+    /// Set by `connect` once the blob has accepted it, and cleared by the StaConnected,
+    /// StaDisconnected or StaStop that follows: a stop in between leaves the AP too. A refused
+    /// `connect` leaves it as it was. A stop reads it only once no connect is in flight, so setting
+    /// it after the blob call is soon enough, and it covers a `connect` issued before an earlier
+    /// attempt's event, such as a retry that does not wait for it, and accepted after that event.
+    /// It errs towards set: when the Wi-Fi task posts the accepted attempt's own event before the
+    /// blob call returns, the flag stays set until the next station event, as it does after a
+    /// `disconnect` while the station still scans, which posts none of these. A stop while it is
+    /// set without a connect pending calls `disconnect` for nothing and waits the 100 ms for a
+    /// StaDisconnected that does not come. A `connect` that a stop gave up waiting for does not set
+    /// it (see `wait_for_connects`).
+    sta_connecting: std.atomic.Value(bool) = .init(false),
+    /// Count of StaDisconnected events, which `leave_ap` waits for.
+    sta_disconnects: std.atomic.Value(u32) = .init(0),
+    ap_state: std.atomic.Value(ApState) = .init(.none),
+    // Protected by the owner critical section. A claimed handle can route
+    // events during init, but only a successful init admits driver calls.
+    ready: bool = false,
 
-    if (compatibility.chip == .esp32_c6 and config.power_save_mode != .none)
-        return error.PowerSaveUnsupported;
+    const InitOutcome = enum { release, rollback_pending, ready };
 
-    if (radio.coex_enabled) {
-        var backend = if (callbacks.host_test)
-            HostWifi{}
+    /// In a coexistence image `gpa` is unused (the session allocates from the
+    /// attached `radio.SharedHeap`); the parameter stays so that `init` has one
+    /// signature in every radio selection, and Wi-Fi-only images allocate from
+    /// it. A second handle returns `error.AlreadyInitialized`. On the owning
+    /// handle, a coexistence init returns success without reading `config` if
+    /// running, or `error.WifiSessionBusy` if busy or pending teardown. A
+    /// single-radio init on the owning handle returns `error.AlreadyInitialized`.
+    /// After deinit, init on that handle returns `error.WifiSessionBusy` until
+    /// any outstanding stops, deinits and connects have drained.
+    ///
+    /// Driver operations on the owner, including connect and disconnect,
+    /// return `error.WouldBlock` until the initial init succeeds. The cached
+    /// station and AP state accessors remain available.
+    ///
+    /// In either image, `error.WifiRollbackPending` means this handle still owns
+    /// Wi-Fi. Retry cleanup with `deinit`, which is allowed after init returns.
+    /// Other init failures release any ownership acquired by the call.
+    pub fn init(self: *Wifi, gpa: std.mem.Allocator, config: InitConfig) InitError!void {
+        const already_owned = try self.claim_init(config);
+        if (comptime !radio.coex_enabled and microzig.options.hal.radio.radios.ble)
+            @compileError("Wi-Fi and BLE cannot run simultaneously: hal.radio.radios.ble selects exclusive BLE mode");
+        comptime if (!callbacks.host_test) export_symbols();
+
+        // IDF v5.5.1 esp_wifi/src/wifi_init.c:343-345: a second init succeeds
+        // without reading the new configuration.
+        if (radio.coex_enabled and already_owned) {
+            defer self.finish_lifecycle();
+            if (osi.wifi_shutdown.stage == .running) return;
+            return error.WifiSessionBusy;
+        }
+
+        var outcome: InitOutcome = .release;
+        defer self.finish_init(outcome);
+        if (!radio.coex_enabled) try radio.init(gpa);
+        var backend = if (callbacks.host_test) HostWifi{} else InitBackend{ .config = config };
+        const configured = if (radio.coex_enabled)
+            start_session(&osi.wifi_shutdown, &backend)
         else
-            InitBackend{ .config = config };
-        try start_session(&osi.wifi_shutdown, &backend);
-        if (!callbacks.host_test) @import("../analog/esp32_c6.zig").wifi_set_inited(true);
-        return;
+            configure_single(&backend);
+        configured catch |err| {
+            if (err == error.WifiRollbackPending) outcome = .rollback_pending;
+            return err;
+        };
+        if (!callbacks.host_test and compatibility.chip == .esp32_c6)
+            @import("../analog/esp32_c6.zig").wifi_set_inited(true);
+        outcome = .ready;
     }
 
-    try radio.init(gpa);
-
-    apply_init_config(config);
-    try c_err(c.esp_wifi_init_internal(&init_config));
-
-    try c_err(c.esp_wifi_set_mode(c.WIFI_MODE_NULL));
-
-    try c_err(c.esp_supplicant_init());
-
-    try c_err(c.esp_wifi_set_tx_done_cb(tx_done_cb));
-    try c_err(c.esp_wifi_internal_reg_rxcb(c.ESP_IF_WIFI_AP, recv_cb_ap));
-    try c_err(c.esp_wifi_internal_reg_rxcb(c.ESP_IF_WIFI_STA, recv_cb_sta));
-
-    {
-        const country_info = config.country_info.get_wifi_country_t(config.max_tx_power);
-        try c_err(c.esp_wifi_set_country(&country_info));
+    /// Stops Wi-Fi as `stop` does, leaving the AP first, then releases the driver and the radio. A
+    /// stop running in another task returns first; a stop called while this runs waits until it has
+    /// returned and then, if this released the driver, gets `error.WifiNotInitialized` from
+    /// the ownership check.
+    ///
+    /// Returns `error.Timeout` if the running stop has not returned within 5 s, which in the runs
+    /// only a stop called from `on_event` caused, or if an earlier connect is still in flight after
+    /// a 1 s wait. It returns `error.WifiStopping` if the calling task's own stop is running
+    /// (a call from an event that stop posted). These errors leave ownership and the driver intact
+    /// and allow a retry. Deinit returns `error.WouldBlock` while init is in
+    /// progress. It also
+    /// returns the error of `esp_wifi_deinit_internal` unless that is `ESP_ERR_WIFI_NOT_INIT`, since
+    /// the driver is then still initialised. That error comes after the stop: the station has left
+    /// the AP and Wi-Fi has been stopped, unless the error is `ESP_ERR_WIFI_NOT_STOPPED` (below):
+    /// Wi-Fi is still started. Either way it releases nothing: the driver and the radio stay
+    /// initialised, and the driver keeps allocating from the allocator given to `init`. Keep that
+    /// allocator's memory, and anything else lent to the driver or to a network stack on it, until
+    /// a later `deinit` returns without an error. Keep this handle at the same address as well.
+    ///
+    /// `esp_wifi_deinit_internal` (C3 and C6 libnet80211.a) returns `ESP_ERR_WIFI_NOT_STOPPED`
+    /// while Wi-Fi is started, as after a failed `esp_wifi_stop` (+0x18..0x46), the errors of its
+    /// API lock (+0x0c..0x16) and `ESP_ERR_WIFI_INIT_STATE` during another init or deinit
+    /// (+0x80..0xc0) before it changes any state; after `ESP_ERR_NO_MEM` (+0x132) or a failed
+    /// request to the Wi-Fi task (+0xf0..0xfa) it sets its state back to initialised
+    /// (+0x136..0x140). `ESP_ERR_WIFI_NOT_INIT` (+0x6e..0x7e) leaves no driver to release, and the
+    /// radio is released as after a success. The results of `esp_wifi_stop`, which a started
+    /// driver then reports as `ESP_ERR_WIFI_NOT_STOPPED`, and of `esp_supplicant_deinit` are
+    /// ignored.
+    ///
+    /// In a coexistence image a deinit while another stop or deinit runs, or from a radio
+    /// callback, returns WouldBlock instead of waiting, and `connect` returns `error.WifiStopping`
+    /// until the whole teardown returns. A coex caller retries deinit from task context on
+    /// WouldBlock, which a driver deinit rejected by the full packet-processing queue returns; a
+    /// retry resumes after the stop and does not leave the AP again. A stop step the queue rejects
+    /// panics, as in `stop`. The coexistence teardown also returns the errors of the stop and of
+    /// the supplicant deinit, which the single-radio one ignores. Every failed step stays pending
+    /// and releases nothing, as above, and a retry resumes where it failed; `ESP_ERR_WIFI_NOT_INIT`
+    /// from the driver deinit counts as done there too. Without a session it returns
+    /// WifiNotInitialized, as IDF v5.5.1 wifi_init.c:267-269.
+    pub fn deinit(self: *Wifi) DeinitError!void {
+        try self.begin_stop(.deinit);
+        var released = false;
+        defer self.end_stop(.deinit, released);
+        if (!self.wait_for_connects()) {
+            log.warn("deinit: a connect still in flight after 1 s, retry teardown", .{});
+            return error.Timeout;
+        }
+        if (radio.coex_enabled) {
+            if (osi.wifi_shutdown.stage == .running) self.leave_ap_before_stop();
+            try deinit_coex();
+        } else {
+            const ready = blk: {
+                const cs = microzig.interrupt.enter_critical_section();
+                defer cs.leave();
+                break :blk self.ready;
+            };
+            // A driver left by init rollback never admitted a start.
+            if (ready) {
+                self.leave_ap_before_stop();
+                _ = if (callbacks.host_test) HostWifi.esp_wifi_stop() else c.esp_wifi_stop();
+            }
+            try release_single(&osi.wifi_shutdown, if (callbacks.host_test) HostWifi else ShutdownBackend);
+        }
+        released = true;
     }
 
-    try set_power_save_mode(config.power_save_mode);
-    if (compatibility.chip == .esp32_c6) @import("../analog/esp32_c6.zig").wifi_set_inited(true);
-}
+    fn claim_init(self: *Wifi, config: InitConfig) InitError!bool {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        if (owner) |current| {
+            if (!radio.coex_enabled or current != self) return error.AlreadyInitialized;
+            if (!self.take_lifecycle()) return error.WifiSessionBusy;
+            return true;
+        }
 
-inline fn apply_init_config(config: InitConfig) void {
-    init_config.wpa_crypto_funcs = c.g_wifi_default_wpa_crypto_funcs;
-    init_config.feature_caps = g_wifi_feature_caps;
-    init_config.static_rx_buf_num = config.static_rx_buf_num;
-    init_config.dynamic_rx_buf_num = config.dynamic_rx_buf_num;
-    init_config.static_tx_buf_num = config.static_tx_buf_num;
-    init_config.dynamic_tx_buf_num = config.dynamic_tx_buf_num;
-    init_config.ampdu_rx_enable = @intFromBool(config.ampdu_rx_enable);
-    init_config.ampdu_tx_enable = @intFromBool(config.ampdu_tx_enable);
-    init_config.amsdu_tx_enable = @intFromBool(config.amsdu_tx_enable);
-    init_config.rx_ba_win = config.rx_ba_win;
-}
+        if (radio.coex_enabled and callbacks.active()) return error.WifiSessionBusy;
+        // A released handle can still have a queued stop or a connect the stop gave up on.
+        if (self.calls.stops != 0 or self.calls.connects != 0 or self.stop_lock.locked != null)
+            return error.WifiSessionBusy;
+        if (!microzig.options.hal.radio.radios.wifi) return error.UnsupportedRadioProtocol;
+        if (compatibility.chip == .esp32_c6 and config.power_save_mode != .none)
+            return error.PowerSaveUnsupported;
+
+        self.* = .{};
+        self.lifecycle_active.store(true, .monotonic);
+        owner = self;
+        return false;
+    }
+
+    fn begin_lifecycle(self: *Wifi) InternalError!void {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        try self.check_operational();
+        if (!self.take_lifecycle()) return error.WouldBlock;
+    }
+
+    fn take_lifecycle(self: *Wifi) bool {
+        return !callbacks.active() and self.lifecycle_active.cmpxchgStrong(false, true, .acquire, .monotonic) == null;
+    }
+
+    fn finish_init(self: *Wifi, outcome: InitOutcome) void {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        self.ready = outcome == .ready;
+        if (outcome == .release) owner = null;
+        self.finish_lifecycle();
+    }
+
+    fn finish_lifecycle(self: *Wifi) void {
+        self.lifecycle_active.store(false, .release);
+    }
+
+    fn require_operational(self: *const Wifi) InternalError!void {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        try self.check_operational();
+    }
+
+    // Caller holds the critical section.
+    fn check_operational(self: *const Wifi) InternalError!void {
+        try self.check_owner();
+        if (!self.ready) return error.WouldBlock;
+    }
+
+    // Caller holds the critical section.
+    fn check_owner(self: *const Wifi) InternalError!void {
+        if (owner != self) return error.WifiNotInitialized;
+    }
+
+    /// In a coexistence image the lifecycle claim covers the mode change and every
+    /// interface configuration, so no other lifecycle call runs between them.
+    pub fn apply(self: *Wifi, config: Config) ConfigError!void {
+        if (radio.coex_enabled) try self.begin_lifecycle() else try self.require_operational();
+        defer if (radio.coex_enabled) self.finish_lifecycle();
+        if (radio.coex_enabled) try require_running_session();
+        switch (config) {
+            .ap => |ap_config| {
+                try set_mode_unclaimed(.ap);
+                try apply_access_point_config(ap_config);
+            },
+            .sta => |sta_config| {
+                try set_mode_unclaimed(.sta);
+                try self.apply_station_config(sta_config);
+            },
+            .ap_sta => |ap_sta_config| {
+                try set_mode_unclaimed(.ap_sta);
+                try apply_access_point_config(ap_sta_config.ap);
+                try self.apply_station_config(ap_sta_config.sta);
+            },
+        }
+    }
+
+    pub fn get_mode(self: *const Wifi) InternalError!WifiMode {
+        try self.require_operational();
+        var mode: c.wifi_mode_t = undefined;
+        try c_err(if (callbacks.host_test) HostWifi.esp_wifi_get_mode(&mode) else c.esp_wifi_get_mode(&mode));
+        return @fromBackingInt(mode);
+    }
+
+    /// With a station or soft-AP started, a mode change stops and starts the
+    /// affected interfaces and posts their events.
+    pub fn set_mode(self: *Wifi, mode: WifiMode) InternalError!void {
+        if (radio.coex_enabled) try self.begin_lifecycle() else try self.require_operational();
+        defer if (radio.coex_enabled) self.finish_lifecycle();
+        if (radio.coex_enabled) try require_running_session();
+        try set_mode_unclaimed(mode);
+    }
+
+    /// Applies `config` to the station interface without changing the mode, unlike `apply`,
+    /// which also sets it. `esp_wifi_set_config` also clears the blob's station blacklist
+    /// (`wifi_set_config_process+0x78`, C3 and C6 libnet80211.a). While the station is connecting it
+    /// returns `error.WifiState` (`wifi_set_config_process+0x36..0x58`). Applied to a connected
+    /// station, it was accepted and a `StaDisconnected` (reason 8) followed within milliseconds.
+    pub fn apply_station_config(self: *const Wifi, config: Config.Station) ConfigError!void {
+        try self.require_operational();
+        if (config.ssid.len > 32) {
+            return error.InvalidConfig;
+        }
+        if (config.password.len > 64) {
+            return error.InvalidConfig;
+        }
+
+        var sta_cfg: c_patched.wifi_sta_config_t = .{
+            .scan_method = @backingInt(config.scan_method),
+            .bssid_set = config.bssid != null,
+            .bssid = config.bssid orelse @splat(0),
+            .channel = config.channel,
+            .listen_interval = config.listen_interval,
+            .sort_method = c.WIFI_CONNECT_AP_BY_SIGNAL,
+            .threshold = .{
+                .rssi = -99,
+                .authmode = @backingInt(config.auth_method),
+                .rssi_5g_adjustment = 0,
+            },
+            .pmf_cfg = .{
+                .capable = true,
+                .required = false,
+            },
+            .sae_pwe_h2e = 3,
+            .failure_retry_cnt = config.failure_retry_cnt,
+        };
+
+        @memcpy(sta_cfg.ssid[0..config.ssid.len], config.ssid);
+        @memcpy(sta_cfg.password[0..config.password.len], config.password);
+
+        var tmp: c_patched.wifi_config_t = .{ .sta = sta_cfg };
+        try c_err(set_config(c.WIFI_IF_STA, &tmp));
+    }
+
+    pub fn set_power_save_mode(self: *const Wifi, mode: PowerSaveMode) PowerSaveError!void {
+        try self.require_operational();
+        try set_power_save_mode_internal(mode);
+    }
+
+    pub fn set_protocol(self: *const Wifi, protocols: []const Protocol) InternalError!void {
+        const mode = try self.get_mode();
+        if (callbacks.host_test) unreachable; // Protocol changes are not modelled.
+        var combined: u8 = 0;
+        for (protocols) |protocol| {
+            combined |= @backingInt(protocol);
+        }
+
+        // With no interface in the mode there is nothing to configure, as `connect`
+        // without a station.
+        if (mode == .none) return error.WifiMode;
+        if (mode.is_sta()) {
+            try c_err(c.esp_wifi_set_protocol(c.WIFI_IF_STA, combined));
+        }
+        if (mode.is_ap()) {
+            try c_err(c.esp_wifi_set_protocol(c.WIFI_IF_AP, combined));
+        }
+    }
+
+    /// Set the inactive time in seconds of the STA or AP.
+    ///
+    /// 1. For Station, if the station does not receive a beacon frame from the
+    /// connected SoftAP during the inactive time, disconnect from SoftAP. Default
+    /// 6s. Must be at least 3s.
+    ///
+    /// 2. For SoftAP, if the softAP doesn't receive any data from the connected
+    /// STA during inactive time, the softAP will force deauth the STA. Default is
+    /// 300s. Must be at least 10s.
+    pub fn set_inactive_time(self: *const Wifi, interface: Interface, inactive_time: u16) InternalError!void {
+        try self.require_operational();
+        if (callbacks.host_test) unreachable; // This blob operation is not modelled.
+        try c_err(c.esp_wifi_set_inactive_time(
+            @backingInt(interface),
+            inactive_time,
+        ));
+    }
+
+    /// Non-blocking.
+    pub fn start(self: *Wifi) InternalError!void {
+        if (radio.coex_enabled) try self.begin_lifecycle() else try self.require_operational();
+        defer if (radio.coex_enabled) self.finish_lifecycle();
+        if (radio.coex_enabled) try require_running_session();
+        try c_err(if (callbacks.host_test) HostWifi.esp_wifi_start() else c.esp_wifi_start());
+    }
+
+    /// Non-blocking unless the station is connected or connecting, or another stop runs. Such a
+    /// station leaves the AP first: `stop` calls `disconnect`, waits for the `StaDisconnected`
+    /// (reason 8, `WIFI_REASON_ASSOC_LEAVE`; at most 1 s when connected, 100 ms when connecting),
+    /// waits 100 ms more, then calls `esp_wifi_stop`, which posts `StaStop`. A station is connecting
+    /// from the `connect` that the blob accepts until the `StaConnected`, `StaDisconnected` or
+    /// `StaStop` that follows; a `disconnect` before the station has left scanning posts none of
+    /// them, and the next stop then calls `disconnect` again and waits the 100 ms for nothing, as
+    /// it can after an attempt whose event came before its `connect` returned (see
+    /// `sta_connecting`). From the start of a stop until it returns, `connect` returns
+    /// `error.WifiStopping`, so an application that connects again on `StaDisconnected` gets that
+    /// error instead of a connect the stop cancels; a stop first waits for connects that began
+    /// before it to return. Stops, and `deinit`, run one at a time: a later one waits until the
+    /// running one has returned, then stops what is left (nothing, if the first stopped the
+    /// station; after `deinit`, the ownership check returns `error.WifiNotInitialized`). A stop waits
+    /// at most 5 s for the running one, then returns `error.Timeout` with a warning, without
+    /// stopping. Stop returns `error.WouldBlock` while init is in progress.
+    ///
+    /// Do not call `stop` or `deinit` from `on_event`. `on_event` runs in the task that posts the
+    /// event (`osi.esp_event_post` calls it directly), which for the station events was the Wi-Fi
+    /// task, and a stop waits for connects in flight, for the `StaDisconnected` and for another
+    /// stop. Called there on `StaConnected` or `StaDisconnected`, even with no connect in flight,
+    /// `esp_wifi_stop` blocked for seconds and the board usually trapped afterwards ("unhandled
+    /// trap"; Super Mini ESP32-C6 and ESP32-C3), as it did on the base HAL with a connect in flight.
+    /// Called there while another task's stop waits for the Wi-Fi task, in its `disconnect` or its
+    /// `esp_wifi_stop`, it blocks that stop until its own 5 s wait for it ends; called in a task
+    /// whose own stop posted the event, it returns `error.WifiStopping` with a warning.
+    ///
+    /// `esp_wifi_stop` on a connected station sends the disassociation from inside the stop:
+    /// `wifi_stop_process` calls `ieee80211_set_hmac_stop` (+0x26), then `_do_wifi_stop` (+0x30),
+    /// whose `wifi_station_stop` sends it (`wifi_disconnect_process`, +0x5a) and then removes the
+    /// station interface (`ic_set_vif`, +0x74; C3 and C6 libnet80211.a). Sniffed against a
+    /// Pico 2 W AP, the stopping station repeated that disassociation dozens of times over tens of
+    /// ms, the AP answered the copies with deauthentications for over 100 ms, and a connect in that
+    /// time failed (`StaDisconnected` reason 202). A station stopped with `esp_wifi_stop` alone
+    /// between `connect` and `StaConnected` burst the same way in most such stops. Leaving first,
+    /// the disassociation usually went out once and drew no deauthentication, whether the station
+    /// was connected or between `connect` and `StaConnected`; occasionally, on the Super Mini
+    /// ESP32-C6, a retry of it drew a few deauthentications over at most about 10 ms. Stopped while
+    /// still scanning, the station sent nothing.
+    ///
+    /// The 100 ms is measured, not derived from the blob: with no wait after the
+    /// `StaDisconnected`, the next connect still failed that way in some boots, each with a stop
+    /// much slower than usual; with 100 ms, in none of the same sitting.
+    ///
+    /// `esp_wifi_stop` itself can sleep too: the C6 driver waits 10 ms between its TX-drain
+    /// retries (at most 500, about 5 s; see `osi.stop_driver`), and in a coexistence image a stop
+    /// also waits for a `disconnect` already in progress to return. The AP is left before that
+    /// wait, since a disconnect during the driver stop returns WouldBlock. In a coexistence image
+    /// a stop while another stop or deinit runs, or from a radio callback, returns WouldBlock
+    /// instead of waiting, and a stop that fails after stopping only the interfaces or only the
+    /// hardware panics, since the driver can neither finish nor repeat it.
+    pub fn stop(self: *Wifi) InternalError!void {
+        if (radio.coex_enabled) try self.begin_lifecycle();
+        defer if (radio.coex_enabled) self.finish_lifecycle();
+        if (radio.coex_enabled) try require_running_session();
+        try self.begin_stop(.stop);
+        defer self.end_stop(.stop, false);
+        if (!self.wait_for_connects()) {
+            log.warn("stop: a connect still in flight after 1 s, stopping without waiting", .{});
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            self.calls.give_ups +%= 1;
+        }
+        self.leave_ap_before_stop();
+        if (radio.coex_enabled) {
+            return osi.wifi_shutdown.stop(callbacks.current_task(), if (callbacks.host_test) HostWifi else ShutdownBackend);
+        }
+        try c_err(if (callbacks.host_test) HostWifi.esp_wifi_stop() else c.esp_wifi_stop());
+    }
+
+    /// Non-blocking. Without a station in the mode this returns `error.WifiMode`; while `stop`
+    /// runs, or `deinit`, `error.WifiStopping`. It takes no lock, so `on_event` may call it.
+    pub fn connect(self: *Wifi) InternalError!void {
+        const give_ups = blk: {
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            // Check readiness in the same critical section that admits the call.
+            try self.check_operational();
+            if (self.calls.stops != 0) return error.WifiStopping;
+            self.calls.connects += 1;
+            break :blk self.calls.give_ups;
+        };
+        const status = if (callbacks.host_test) HostWifi.esp_wifi_connect_internal() else c.esp_wifi_connect_internal();
+        {
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            // With the count, so a stop that waited for this connect reads the flag after it is set.
+            if (owner == self and status == c.ESP_OK and self.calls.give_ups == give_ups)
+                self.sta_connecting.store(true, .release);
+            self.calls.connects -= 1;
+        }
+        try c_err(status);
+    }
+
+    /// Non-blocking. Without a station in the mode this returns `error.WifiMode`.
+    /// In a coexistence image it returns WouldBlock while a stop or deinit is
+    /// stopping the driver (see `osi.DisconnectGate`).
+    pub fn disconnect(self: *const Wifi) InternalError!void {
+        try self.require_operational();
+        if (radio.coex_enabled and !osi.disconnect_gate.enter()) return error.WouldBlock;
+        defer if (radio.coex_enabled) osi.disconnect_gate.leave();
+        const status = if (callbacks.host_test) HostWifi.esp_wifi_disconnect_internal() else c.esp_wifi_disconnect_internal();
+        // connect answers a mode without a station with ESP_ERR_WIFI_MODE
+        // (wifi_connect_process+0x12..0x16, +0x5c..0x5e), but disconnect answers the
+        // same test with bare ESP_FAIL (wifi_disconnect_process+0x1e..0x24, +0x3e;
+        // C3 and C6 libnet80211.a). ESP_FAIL also comes from a station whose
+        // ieee80211_sta_disconnect fails (_do_wifi_disconnect+0xa2..0xa6), so the
+        // mode decides; esp_wifi_get_mode reads the byte both processes test.
+        // The mode is read after the call, so a set_mode racing this disconnect on
+        // another task can swap error.WifiMode and error.WifiOther.
+        if (status == c.ESP_FAIL and !(try self.get_mode()).is_sta()) return error.WifiMode;
+        try c_err(status);
+    }
+
+    pub fn get_ap_state(self: *const Wifi) ApState {
+        return self.ap_state.load(.monotonic);
+    }
+
+    pub fn get_sta_state(self: *const Wifi) StaState {
+        return self.sta_state.load(.acquire);
+    }
+
+    /// RSSI in dBm of the access point the station is connected to
+    /// (IDF v5.5.1 esp_wifi.h:1667 esp_wifi_sta_get_rssi).
+    pub fn get_sta_rssi(self: *const Wifi) InternalError!i32 {
+        try self.require_operational();
+        if (callbacks.host_test) unreachable; // This blob operation is not modelled.
+        var rssi: c_int = 0;
+        try c_err(c.esp_wifi_sta_get_rssi(&rssi));
+        return rssi;
+    }
+
+    pub fn send_packet(self: *const Wifi, iface: Interface, data: []const u8) (error{TooManyPacketsInFlight} || InternalError)!void {
+        try self.require_operational();
+        if (callbacks.host_test) unreachable; // This blob operation is not modelled.
+        try c_err(c.esp_wifi_internal_tx(@backingInt(iface), @ptrCast(@constCast(data.ptr)), @intCast(data.len)));
+    }
+
+    /// Blocks until the scan is finished. The returned iterator must be deinited
+    /// or consumed before another call to scan.
+    pub fn scan(self: *const Wifi, config: ScanConfig) ConfigError!ScanResultsIterator {
+        try self.require_operational();
+        if (callbacks.host_test) unreachable; // This blob operation is not modelled.
+        const scan_time: c.wifi_scan_time_t = switch (config.type) {
+            .active => |active_time| .{
+                .active = .{
+                    .min = @intCast(active_time.min.to_us() / 1000),
+                    .max = @intCast(active_time.max.to_us() / 1000),
+                },
+            },
+            .passive => |passive_time| blk: {
+                if (!passive_time.less_than(.from_ms(1_500)))
+                    return error.InvalidConfig;
+
+                break :blk .{ .passive = @intCast(passive_time.to_us() / 1000) };
+            },
+        };
+
+        var scan_config: c.wifi_scan_config_t = .{
+            .ssid = if (config.ssid) |ssid| @constCast(ssid.ptr) else null,
+            .bssid = if (config.bssid) |bssid| @constCast(bssid.ptr) else null,
+            .channel = config.channel orelse 0,
+            .show_hidden = config.show_hidden,
+            .scan_type = switch (config.type) {
+                .active => c.WIFI_SCAN_TYPE_ACTIVE,
+                .passive => c.WIFI_SCAN_TYPE_PASSIVE,
+            },
+            .scan_time = scan_time,
+            .home_chan_dwell_time = 0,
+            .channel_bitmap = .{
+                .ghz_2_channels = 0,
+                .ghz_5_channels = 0,
+            },
+            .coex_background_scan = false,
+        };
+        try c_err(c.esp_wifi_scan_start(&scan_config, true));
+        return ScanResultsIterator.init(self);
+    }
+
+    const StopOperation = enum { stop, deinit };
+
+    /// Counts the stop, so that `connect` refuses from here on, then waits for the running stop.
+    /// The running stop holds the lock for its own waits, limited to 2.1 s but longer while the
+    /// Wi-Fi task keeps the CPU (see `wait_for_connects`), and for its `disconnect` and
+    /// `esp_wifi_stop` (with `deinit`, the release of the driver). From another task both wait
+    /// for the Wi-Fi task to service them (`ieee80211_ioctl`, which `esp_wifi_disconnect_internal`
+    /// tail-calls at +0x42 and `esp_wifi_stop` calls at +0xc4; C3 and C6 libnet80211.a). In the
+    /// runs `esp_wifi_stop` returned quickly unless an `on_event` blocked the Wi-Fi task, and took
+    /// longer for a station still connecting that a stop which gave up in `wait_for_connects` had
+    /// not taken off the AP. A stop from such an `on_event` waits here in the Wi-Fi task, which the
+    /// running stop's `disconnect` or `esp_wifi_stop` needs; the 5 s limit ends that wait. A task
+    /// that already holds the lock, as a stop called from an event its own stop posted does, is
+    /// refused at once.
+    fn begin_stop(self: *Wifi, comptime operation: StopOperation) InternalError!void {
+        const held = blk: {
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            if (operation == .stop) try self.check_operational() else try self.check_owner();
+            if (!radio.coex_enabled and self.lifecycle_active.load(.acquire)) return error.WouldBlock;
+            if (radio.coex_enabled and operation == .deinit) {
+                // Claim the lifecycle and close connect admission in the same critical section.
+                if (!self.take_lifecycle()) return error.WouldBlock;
+            } else if (self.stop_lock.locked == callbacks.current_task()) {
+                break :blk true;
+            }
+            self.calls.stops += 1;
+            break :blk false;
+        };
+        if (held) {
+            log.warn("stop: called during this task's own stop (from on_event?), not stopping", .{});
+            return error.WifiStopping;
+        }
+        errdefer if (radio.coex_enabled and operation == .deinit) self.finish_lifecycle();
+        const timeout: rtos.Timeout = if (callbacks.host_test) .never else .{ .after = .from_ms(5000) };
+        self.stop_lock.lock_with_timeout(timeout) catch |err| {
+            log.warn("stop: another stop still running after 5 s (one from on_event?), not stopping", .{});
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            self.calls.stops -= 1;
+            return err;
+        };
+        errdefer self.end_stop(.stop, false);
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        // A deinit may have released ownership while this task was waiting for the lock.
+        try self.check_owner();
+    }
+
+    fn end_stop(self: *Wifi, comptime operation: StopOperation, released: bool) void {
+        if (released) {
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            // Unlock may schedule a queued stop. It must see that teardown released Wi-Fi.
+            self.ready = false;
+            owner = null;
+        }
+        self.stop_lock.unlock();
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        // Keep the stop counted through owner release and unlock, which can schedule another task.
+        self.calls.stops -= 1;
+        if (radio.coex_enabled and operation == .deinit) self.lifecycle_active.store(false, .release);
+    }
+
+    fn connects_in_flight(self: *const Wifi) u32 {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        return self.calls.connects;
+    }
+
+    /// Runs after waiting for connects and before asking the driver to stop.
+    fn leave_ap_before_stop(self: *Wifi) void {
+        if (callbacks.host_test) return; // The mock has no AP association or scheduler.
+        // `update_sta_state` stores the state and counts a StaDisconnected before it clears
+        // `sta_connecting`, so these reads, in this order, see a connecting station either as
+        // connecting or in the state its event left; a StaDisconnected after `seen` ends the
+        // wait. No connect begins while a stop runs. If an ordinary stop gave up waiting,
+        // a connect still in flight leaves the flag alone when it returns.
+        const seen = self.sta_disconnects.load(.acquire);
+        const connecting = self.sta_connecting.load(.acquire);
+        if (self.get_sta_state() == .connected) {
+            self.leave_ap(.connected, seen);
+        } else if (connecting) {
+            self.leave_ap(.connecting, seen);
+        }
+    }
+
+    /// Waits at most 1 s for the connects admitted before the stop or deinit.
+    /// A stop can hit this limit if an on_event blocks the Wi-Fi task, including
+    /// a stop called from on_event there, which is unsupported.
+    ///
+    /// The deadline is checked between 1 ms sleeps, so it can be checked late
+    /// while a higher-priority task keeps the CPU. The Wi-Fi task does for the
+    /// first connect after boot: its software WPA2 key derivation (pbkdf2_sha1,
+    /// libwpa_supplicant.a) took well over a second on the ESP32-C3 and ESP32-C6.
+    fn wait_for_connects(self: *const Wifi) bool {
+        if (callbacks.host_test) return self.connects_in_flight() == 0;
+        const deadline = time.Deadline.init_relative(hal_time.get_time_since_boot(), .from_ms(1000));
+        while (self.connects_in_flight() != 0) {
+            if (deadline.is_reached_by(hal_time.get_time_since_boot())) return false;
+            rtos.sleep(.from_ms(1));
+        }
+        return true;
+    }
+
+    /// `seen` is the StaDisconnected count read before the state, so a StaDisconnected that lands
+    /// after that read ends the wait even if this `disconnect` posts none. A station still scanning
+    /// when it is stopped has sent nothing to leave, and its `disconnect` posts no
+    /// `StaDisconnected`, so a connecting station waits for one at most 100 ms and without a warning.
+    fn leave_ap(self: *Wifi, from: enum { connected, connecting }, seen: u32) void {
+        self.disconnect() catch |err| {
+            log.warn("stop: disconnect failed ({t}), stopping without it", .{err});
+            return;
+        };
+        const limit: time.Duration = if (from == .connected) .from_ms(1000) else .from_ms(100);
+        const deadline = time.Deadline.init_relative(hal_time.get_time_since_boot(), limit);
+        while (self.sta_disconnects.load(.acquire) == seen) {
+            if (deadline.is_reached_by(hal_time.get_time_since_boot())) {
+                if (from == .connected) {
+                    log.warn("stop: no StaDisconnected within 1 s of disconnect", .{});
+                }
+                return;
+            }
+            rtos.sleep(.from_ms(5));
+        }
+        rtos.sleep(.from_ms(100));
+    }
+
+    fn update_sta_state(self: *Wifi, event: EventType) void {
+        const new_sta_state: StaState = switch (event) {
+            .StaStart => .started,
+            .StaConnected => .connected,
+            .StaDisconnected => .disconnected,
+            .StaStop => .stopped,
+            else => return,
+        };
+        // In this order: `leave_ap_before_stop` reads them in reverse.
+        self.sta_state.store(new_sta_state, .release);
+        if (new_sta_state == .disconnected) _ = self.sta_disconnects.fetchAdd(1, .release);
+        if (new_sta_state != .started) self.sta_connecting.store(false, .release);
+    }
+
+    fn update_ap_state(self: *Wifi, event: EventType) void {
+        const new_ap_state: ApState = switch (event) {
+            .ApStart => .started,
+            .ApStop => .stopped,
+            else => return,
+        };
+        self.ap_state.store(new_ap_state, .monotonic);
+    }
+};
 
 const InitStep = enum { radio, coex, adapter, driver, mode, supplicant, tx, rx_ap, rx_sta, country, power_save };
 
@@ -241,13 +875,7 @@ fn start_session(state: *osi.WifiShutdown, backend: anytype) InitError!void {
     try backend.run(.radio);
     state.stage = .release;
     inline for (.{ .coex, .adapter, .driver, .mode, .supplicant, .tx, .rx_ap, .rx_sta, .country, .power_save }) |step| {
-        const entry_depth = if (step == .driver) backend.api_depth() else 0;
-        backend.run(step) catch |err| {
-            // C6 libnet80211.a esp_wifi_init_internal takes the API lock at
-            // +0x3e. PM, WDEV and NET80211 table OOM skip the unlock at +0xe0.
-            // Cleanup takes it again at +0x14c and releases only one level.
-            if (step == .driver and backend.api_depth() > entry_depth) backend.unlock_api();
-            if (step == .supplicant) backend.discard_unregistered();
+        run_init_step(backend, step) catch |err| {
             backend.rollback() catch return error.WifiRollbackPending;
             return err;
         };
@@ -257,11 +885,24 @@ fn start_session(state: *osi.WifiShutdown, backend: anytype) InitError!void {
     state.stage = .running;
 }
 
+fn run_init_step(backend: anytype, comptime step: InitStep) InitError!void {
+    const entry_depth = if (step == .driver) backend.api_depth() else 0;
+    backend.run(step) catch |err| {
+        // C3 and C6 libnet80211.a esp_wifi_init_internal take the API lock at
+        // +0x3e. PM, WDEV and NET80211 table OOM skip the unlock at +0xe0.
+        // Cleanup takes it again at +0x14c and releases only one level.
+        if (step == .driver and backend.api_depth() > entry_depth) backend.unlock_api();
+        if (step == .supplicant) backend.discard_unregistered();
+        return err;
+    };
+}
+
 extern var wpa_cb: ?*anyopaque;
 extern fn eloop_destroy() void;
 
-// C6 esp_supplicant_init+0x22 allocates wpa_cb; +0x112..0x11e
-// branches past the ownership transfer on management-frame registration failure.
+// C3/C6 libwpa_supplicant.a esp_supplicant_init+0x22 allocates wpa_cb.
+// On management-frame registration failure, +0x124 skips the transfer at +0x12a.
+// eloop_destroy+0x10 checks the active flag, so a later supplicant deinit can call it again.
 // esp_supplicant_common_init has already undone its own registration there.
 fn discard_unregistered_wpa(slot: *?*anyopaque, destroy_eloop: anytype) void {
     const table = slot.* orelse return;
@@ -270,7 +911,6 @@ fn discard_unregistered_wpa(slot: *?*anyopaque, destroy_eloop: anytype) void {
     osi.free(table);
 }
 
-// Coexistence images only.
 const InitBackend = struct {
     config: InitConfig,
 
@@ -280,21 +920,15 @@ const InitBackend = struct {
             // Allocates from the attached heap; the argument is unused here.
             .radio => try radio.init(.failing),
             .coex => try c_err(c.coex_init()),
-            .adapter => {
-                // wifi_api_lock+0x24 uses g_osi_funcs_p when its handle is non-null.
-                const cs = microzig.interrupt.enter_critical_section();
-                defer cs.leave();
-                try c_err(wifi_osi_funcs_register(&g_wifi_osi_funcs));
-                boot_locks.install(&s_wifi_api_lock, &g_wifi_global_lock);
-            },
+            .adapter => try install_boot_locks(),
             .driver => {
-                apply_init_config(config);
+                const init_config = make_init_config(config);
                 try c_err(c.esp_wifi_init_internal(&init_config));
             },
             .mode => try c_err(c.esp_wifi_set_mode(c.WIFI_MODE_NULL)),
             .supplicant => {
-                try osi.eloop_reservation.reserve(rtos.get_current_task());
-                defer osi.eloop_reservation.finish();
+                if (radio.coex_enabled) try osi.eloop_reservation.reserve(rtos.get_current_task());
+                defer if (radio.coex_enabled) osi.eloop_reservation.finish();
                 try c_err(c.esp_supplicant_init());
             },
             .tx => try c_err(c.esp_wifi_set_tx_done_cb(tx_done_cb)),
@@ -304,7 +938,7 @@ const InitBackend = struct {
                 const country = config.country_info.get_wifi_country_t(config.max_tx_power);
                 try c_err(c.esp_wifi_set_country(&country));
             },
-            .power_save => try set_power_save_mode(config.power_save_mode),
+            .power_save => try set_power_save_mode_internal(config.power_save_mode),
         }
     }
 
@@ -321,15 +955,9 @@ const InitBackend = struct {
     }
 
     fn rollback(_: *@This()) InternalError!void {
-        try deinit_coex();
+        if (radio.coex_enabled) try deinit_coex() else try release_single(&osi.wifi_shutdown, ShutdownBackend);
     }
 };
-
-var lifecycle_active: std.atomic.Value(bool) = .init(false);
-
-fn begin_lifecycle() bool {
-    return !callbacks.active() and lifecycle_active.cmpxchgStrong(false, true, .acquire, .monotonic) == null;
-}
 
 extern fn esp_wifi_unregister_wpa_cb_internal() c_int;
 extern fn esp_wifi_get_user_init_flag_internal() bool;
@@ -354,12 +982,33 @@ const ShutdownBackend = struct {
         rtos.join(task);
     }
     pub fn release() void {
-        @import("../analog/esp32_c6.zig").wifi_set_inited(false);
+        if (compatibility.chip == .esp32_c6) @import("../analog/esp32_c6.zig").wifi_set_inited(false);
         // The lifecycle entry already refused interrupt and callback context,
         // radio.deinit's only error.
-        radio.deinit() catch @panic("Wi-Fi teardown released the radio from a callback");
+        if (radio.coex_enabled) {
+            radio.deinit() catch @panic("Wi-Fi teardown released the radio from a callback");
+        } else {
+            radio.deinit();
+        }
     }
 };
+
+// The radio reference is already held. Unwind even if driver init itself failed.
+fn configure_single(backend: anytype) InitError!void {
+    inline for (.{ .adapter, .driver, .mode, .supplicant, .tx, .rx_ap, .rx_sta, .country, .power_save }) |step| {
+        run_init_step(backend, step) catch |err| {
+            backend.rollback() catch return error.WifiRollbackPending;
+            return err;
+        };
+    }
+}
+
+fn release_single(shutdown: *osi.WifiShutdown, backend: anytype) InternalError!void {
+    backend.deinit_driver() catch |err| if (err != error.WifiNotInitialized) return err;
+    backend.deinit_supplicant() catch |err| log.debug("supplicant teardown returned {t}", .{err});
+    shutdown.join_worker(backend);
+    backend.release();
+}
 
 fn deinit_coex() InternalError!void {
     return osi.wifi_shutdown.deinit(callbacks.current_task(), if (callbacks.host_test) HostWifi else ShutdownBackend);
@@ -379,63 +1028,6 @@ fn require_running_session() InternalError!void {
 }
 
 pub const DeinitError = InternalError;
-
-/// Stops Wi-Fi as `stop` does, leaving the AP first, then releases the driver and the radio. A
-/// stop running in another task returns first; a stop called while this runs waits until it has
-/// returned and then, if this released the driver, gets `error.WifiNotInitialized` from
-/// `esp_wifi_stop`.
-///
-/// Returns `error.Timeout` if the running stop has not returned within 5 s, which in the runs
-/// only a stop called from `on_event` caused, and `error.WifiStopping` if the calling task's own
-/// stop is running (a call from an event that stop posted); Wi-Fi is then untouched. It also
-/// returns the error of `esp_wifi_deinit_internal` unless that is `ESP_ERR_WIFI_NOT_INIT`, since
-/// the driver is then still initialised. That error comes after the stop: the station has left
-/// the AP and Wi-Fi has been stopped, unless the error is `ESP_ERR_WIFI_NOT_STOPPED` (below):
-/// Wi-Fi is still started. Either way it releases nothing: the driver and the radio stay
-/// initialised, and the driver keeps allocating from the allocator given to `init`. Keep that
-/// allocator's memory, and anything else lent to the driver or to a network stack on it, until
-/// a later `deinit` returns without an error.
-///
-/// `esp_wifi_deinit_internal` (C3 and C6 libnet80211.a) returns `ESP_ERR_WIFI_NOT_STOPPED`
-/// while Wi-Fi is started, as after a failed `esp_wifi_stop` (+0x18..0x46), the errors of its
-/// API lock (+0x0c..0x16) and `ESP_ERR_WIFI_INIT_STATE` during another init or deinit
-/// (+0x80..0xc0) before it changes any state; after `ESP_ERR_NO_MEM` (+0x132) or a failed
-/// request to the Wi-Fi task (+0xf0..0xfa) it sets its state back to initialised
-/// (+0x136..0x140). `ESP_ERR_WIFI_NOT_INIT` (+0x6e..0x7e) leaves no driver to release, and the
-/// radio is released as after a success. The results of `esp_wifi_stop`, which a started
-/// driver then reports as `ESP_ERR_WIFI_NOT_STOPPED`, and of `esp_supplicant_deinit` are
-/// ignored.
-///
-/// In a coexistence image a deinit while another stop or deinit runs, or from a radio
-/// callback, returns WouldBlock instead of waiting, and `connect` returns `error.WifiStopping`
-/// until the whole teardown returns. A coex caller retries deinit from task context on
-/// WouldBlock, which a driver deinit rejected by the full packet-processing queue returns; a
-/// retry resumes after the stop and does not leave the AP again. A stop step the queue rejects
-/// panics, as in `stop`. The coexistence teardown also returns the errors of the stop and of
-/// the supplicant deinit, which the single-radio one ignores. Every failed step stays pending
-/// and releases nothing, as above, and a retry resumes where it failed; `ESP_ERR_WIFI_NOT_INIT`
-/// from the driver deinit counts as done there too. Without a session it returns
-/// WifiNotInitialized, as IDF v5.5.1 wifi_init.c:267-269.
-pub fn deinit() DeinitError!void {
-    if (radio.coex_enabled) {
-        if (!begin_lifecycle()) return error.WouldBlock;
-        defer lifecycle_active.store(false, .release);
-        if (osi.wifi_shutdown.stage == .off) return error.WifiNotInitialized;
-        try begin_stop();
-        defer end_stop();
-        if (osi.wifi_shutdown.stage == .running) return stop_leaving_ap(deinit_coex, .{});
-        return deinit_coex();
-    }
-    try begin_stop();
-    defer end_stop();
-    _ = stop_leaving_ap(c.esp_wifi_stop, .{});
-    const status = c.esp_wifi_deinit_internal();
-    if (status != c.ESP_ERR_WIFI_NOT_INIT) try c_err(status);
-    _ = c.esp_supplicant_deinit();
-    if (compatibility.chip == .esp32_c6) @import("../analog/esp32_c6.zig").wifi_set_inited(false);
-
-    radio.deinit();
-}
 
 pub const ConfigError = InternalError || error{
     InvalidConfig,
@@ -503,33 +1095,8 @@ pub const Config = union(enum) {
     };
 };
 
-/// In a coexistence image the lifecycle claim covers the mode change and every
-/// interface configuration, so no other lifecycle call runs between them.
-pub fn apply(config: Config) ConfigError!void {
-    if (radio.coex_enabled and !begin_lifecycle()) return error.WouldBlock;
-    defer if (radio.coex_enabled) lifecycle_active.store(false, .release);
-    if (radio.coex_enabled) try require_running_session();
-    // Single-radio images have no claim and keep calling set_mode.
-    const change_mode = if (radio.coex_enabled) set_mode_unclaimed else set_mode;
-    switch (config) {
-        .ap => |ap_config| {
-            try change_mode(.ap);
-            try apply_access_point_config(ap_config);
-        },
-        .sta => |sta_config| {
-            try change_mode(.sta);
-            try apply_station_config(sta_config);
-        },
-        .ap_sta => |ap_sta_config| {
-            try change_mode(.ap_sta);
-            try apply_access_point_config(ap_sta_config.ap);
-            try apply_station_config(ap_sta_config.sta);
-        },
-    }
-}
-
 pub const WifiMode = enum(u32) {
-    /// No interface. `init` selects it, and `start` succeeds in it.
+    /// No interface. `Wifi.init` selects it, and `Wifi.start` succeeds in it.
     none = c.WIFI_MODE_NULL,
     sta = c.WIFI_MODE_STA,
     ap = c.WIFI_MODE_AP,
@@ -544,24 +1111,7 @@ pub const WifiMode = enum(u32) {
     }
 };
 
-pub fn get_mode() InternalError!WifiMode {
-    var mode: c.wifi_mode_t = undefined;
-    try c_err(if (callbacks.host_test) HostWifi.esp_wifi_get_mode(&mode) else c.esp_wifi_get_mode(&mode));
-    return @fromBackingInt(mode);
-}
-
-/// With a station or soft-AP started, a mode change stops and starts the
-/// affected interfaces and posts their events.
-pub fn set_mode(mode: WifiMode) InternalError!void {
-    if (radio.coex_enabled and !begin_lifecycle()) return error.WouldBlock;
-    defer if (radio.coex_enabled) lifecycle_active.store(false, .release);
-    if (radio.coex_enabled) try require_running_session();
-    try set_mode_unclaimed(mode);
-}
-
-/// The mode change without the lifecycle claim: `set_mode` calls it after
-/// taking the claim, and a coexistence caller that already holds the claim
-/// calls it directly.
+/// Mode change shared by `Wifi.set_mode` and `Wifi.apply` after ownership and lifecycle checks.
 inline fn set_mode_unclaimed(mode: WifiMode) InternalError!void {
     try c_err(if (callbacks.host_test) HostWifi.esp_wifi_set_mode(@backingInt(mode)) else c.esp_wifi_set_mode(@backingInt(mode)));
 }
@@ -599,48 +1149,14 @@ fn apply_access_point_config(config: Config.AccessPoint) ConfigError!void {
     try c_err(set_config(c.WIFI_IF_AP, &tmp));
 }
 
-/// Applies `config` to the station interface without changing the mode, unlike `apply`,
-/// which also sets it. `esp_wifi_set_config` also clears the blob's station blacklist
-/// (`wifi_set_config_process+0x78`, C3 and C6 libnet80211.a). While the station is connecting it
-/// returns `error.WifiState` (`wifi_set_config_process+0x36..0x58`). Applied to a connected
-/// station, it was accepted and a `StaDisconnected` (reason 8) followed within milliseconds.
-pub fn apply_station_config(config: Config.Station) ConfigError!void {
-    if (config.ssid.len > 32) {
-        return error.InvalidConfig;
-    }
-    if (config.password.len > 64) {
-        return error.InvalidConfig;
-    }
-
-    var sta_cfg: c_patched.wifi_sta_config_t = .{
-        .scan_method = @backingInt(config.scan_method),
-        .bssid_set = config.bssid != null,
-        .bssid = config.bssid orelse @splat(0),
-        .channel = config.channel,
-        .listen_interval = config.listen_interval,
-        .sort_method = c.WIFI_CONNECT_AP_BY_SIGNAL,
-        .threshold = .{
-            .rssi = -99,
-            .authmode = @backingInt(config.auth_method),
-            .rssi_5g_adjustment = 0,
-        },
-        .pmf_cfg = .{
-            .capable = true,
-            .required = false,
-        },
-        .sae_pwe_h2e = 3,
-        .failure_retry_cnt = config.failure_retry_cnt,
-    };
-
-    @memcpy(sta_cfg.ssid[0..config.ssid.len], config.ssid);
-    @memcpy(sta_cfg.password[0..config.password.len], config.password);
-
-    var tmp: c_patched.wifi_config_t = .{ .sta = sta_cfg };
-    try c_err(set_config(c.WIFI_IF_STA, &tmp));
-}
-
 fn set_config(interface: c.wifi_interface_t, config: *c_patched.wifi_config_t) c.esp_err_t {
     return if (callbacks.host_test) HostWifi.esp_wifi_set_config(interface) else c_patched.esp_wifi_set_config(interface, config);
+}
+
+fn set_power_save_mode_internal(mode: PowerSaveMode) PowerSaveError!void {
+    if (compatibility.chip == .esp32_c6 and mode != .none) return error.PowerSaveUnsupported;
+    if (callbacks.host_test) return;
+    try c_err(c.esp_wifi_set_ps(@backingInt(mode)));
 }
 
 pub const PowerSaveMode = enum(u32) {
@@ -653,11 +1169,6 @@ pub const PowerSaveError = InternalError || error{
     /// Modem sleep needs the sleep retention hooks, which aren't ported on the ESP32-C6.
     PowerSaveUnsupported,
 };
-
-pub fn set_power_save_mode(mode: PowerSaveMode) PowerSaveError!void {
-    if (compatibility.chip == .esp32_c6 and mode != .none) return error.PowerSaveUnsupported;
-    try c_err(c.esp_wifi_set_ps(@backingInt(mode)));
-}
 
 pub const Protocol = enum(u8) {
     /// 802.11b protocol.
@@ -679,288 +1190,24 @@ pub const Protocol = enum(u8) {
     P802D11BGNAX = c.WIFI_PROTOCOL_11B | c.WIFI_PROTOCOL_11G | c.WIFI_PROTOCOL_11N | c.WIFI_PROTOCOL_11AX,
 };
 
-pub fn set_protocol(protocols: []const Protocol) InternalError!void {
-    var combined: u8 = 0;
-    for (protocols) |protocol| {
-        combined |= @backingInt(protocol);
-    }
-
-    const mode = try get_mode();
-    // With no interface in the mode there is nothing to configure, as `connect`
-    // without a station.
-    if (mode == .none) return error.WifiMode;
-    if (mode.is_sta()) {
-        try c_err(c.esp_wifi_set_protocol(c.WIFI_IF_STA, combined));
-    }
-    if (mode.is_ap()) {
-        try c_err(c.esp_wifi_set_protocol(c.WIFI_IF_AP, combined));
-    }
-}
-
-/// Set the inactive time in seconds of the STA or AP.
-///
-/// 1. For Station, if the station does not receive a beacon frame from the
-/// connected SoftAP during the inactive time, disconnect from SoftAP. Default
-/// 6s. Must be at least 3s.
-///
-/// 2. For SoftAP, if the softAP doesn't receive any data from the connected
-/// STA during inactive time, the softAP will force deauth the STA. Default is
-/// 300s. Must be at least 10s.
-pub fn set_inactive_time(interface: Interface, inactive_time: u16) InternalError!void {
-    try c_err(c.esp_wifi_set_inactive_time(
-        @backingInt(interface),
-        inactive_time,
-    ));
-}
-
-/// Non-blocking.
-pub fn start() InternalError!void {
-    if (radio.coex_enabled and !begin_lifecycle()) return error.WouldBlock;
-    defer if (radio.coex_enabled) lifecycle_active.store(false, .release);
-    if (radio.coex_enabled) try require_running_session();
-    try c_err(if (callbacks.host_test) HostWifi.esp_wifi_start() else c.esp_wifi_start());
-}
-
-/// Non-blocking unless the station is connected or connecting, or another stop runs. Such a
-/// station leaves the AP first: `stop` calls `disconnect`, waits for the `StaDisconnected`
-/// (reason 8, `WIFI_REASON_ASSOC_LEAVE`; at most 1 s when connected, 100 ms when connecting),
-/// waits 100 ms more, then calls `esp_wifi_stop`, which posts `StaStop`. A station is connecting
-/// from the `connect` that the blob accepts until the `StaConnected`, `StaDisconnected` or
-/// `StaStop` that follows; a `disconnect` before the station has left scanning posts none of
-/// them, and the next stop then calls `disconnect` again and waits the 100 ms for nothing, as
-/// it can after an attempt whose event came before its `connect` returned (see
-/// `sta_connecting`). From the start of a stop until it returns, `connect` returns
-/// `error.WifiStopping`, so an application that connects again on `StaDisconnected` gets that
-/// error instead of a connect the stop cancels; a stop first waits for connects that began
-/// before it to return. Stops, and `deinit`, run one at a time: a later one waits until the
-/// running one has returned, then stops what is left (nothing, if the first stopped the
-/// station; after `deinit`, `esp_wifi_stop` returns `error.WifiNotInitialized`). A stop waits
-/// at most 5 s for the running one, then returns `error.Timeout` with a warning, without
-/// stopping.
-///
-/// Do not call `stop` or `deinit` from `on_event`. `on_event` runs in the task that posts the
-/// event (`osi.esp_event_post` calls it directly), which for the station events was the Wi-Fi
-/// task, and a stop waits for connects in flight, for the `StaDisconnected` and for another
-/// stop. Called there on `StaConnected` or `StaDisconnected`, even with no connect in flight,
-/// `esp_wifi_stop` blocked for seconds and the board usually trapped afterwards ("unhandled
-/// trap"; Super Mini ESP32-C6 and ESP32-C3), as it did on the base HAL with a connect in flight.
-/// Called there while another task's stop waits for the Wi-Fi task, in its `disconnect` or its
-/// `esp_wifi_stop`, it blocks that stop until its own 5 s wait for it ends; called in a task
-/// whose own stop posted the event, it returns `error.WifiStopping` with a warning.
-///
-/// `esp_wifi_stop` on a connected station sends the disassociation from inside the stop:
-/// `wifi_stop_process` calls `ieee80211_set_hmac_stop` (+0x26), then `_do_wifi_stop` (+0x30),
-/// whose `wifi_station_stop` sends it (`wifi_disconnect_process`, +0x5a) and then removes the
-/// station interface (`ic_set_vif`, +0x74; C3 and C6 libnet80211.a). Sniffed against a
-/// Pico 2 W AP, the stopping station repeated that disassociation dozens of times over tens of
-/// ms, the AP answered the copies with deauthentications for over 100 ms, and a connect in that
-/// time failed (`StaDisconnected` reason 202). A station stopped with `esp_wifi_stop` alone
-/// between `connect` and `StaConnected` burst the same way in most such stops. Leaving first,
-/// the disassociation usually went out once and drew no deauthentication, whether the station
-/// was connected or between `connect` and `StaConnected`; occasionally, on the Super Mini
-/// ESP32-C6, a retry of it drew a few deauthentications over at most about 10 ms. Stopped while
-/// still scanning, the station sent nothing.
-///
-/// The 100 ms is measured, not derived from the blob: with no wait after the
-/// `StaDisconnected`, the next connect still failed that way in some boots, each with a stop
-/// much slower than usual; with 100 ms, in none of the same sitting.
-///
-/// `esp_wifi_stop` itself can sleep too: the C6 driver waits 10 ms between its TX-drain
-/// retries (at most 500, about 5 s; see `osi.stop_driver`), and in a coexistence image a stop
-/// also waits for a `disconnect` already in progress to return. The AP is left before that
-/// wait, since a disconnect during the driver stop returns WouldBlock. In a coexistence image
-/// a stop while another stop or deinit runs, or from a radio callback, returns WouldBlock
-/// instead of waiting, and a stop that fails after stopping only the interfaces or only the
-/// hardware panics, since the driver can neither finish nor repeat it.
-pub fn stop() InternalError!void {
-    if (radio.coex_enabled) {
-        if (!begin_lifecycle()) return error.WouldBlock;
-        defer lifecycle_active.store(false, .release);
-        try require_running_session();
-        try begin_stop();
-        defer end_stop();
-        return stop_leaving_ap(osi.WifiShutdown.stop, .{ &osi.wifi_shutdown, callbacks.current_task(), if (callbacks.host_test) HostWifi else ShutdownBackend });
-    }
-    try begin_stop();
-    defer end_stop();
-    try c_err(stop_leaving_ap(c.esp_wifi_stop, .{}));
-}
-
-/// Stops begun and not yet returned, connects in flight, and a count of the stops that gave up
-/// waiting for connects in flight, by which a connect tells whether one gave up on it (see
-/// `sta_connecting`). Read and changed only in a critical section. Nothing waits while holding
-/// it, and `connect` takes no lock: a `connect` in another task waits for the Wi-Fi task until
-/// it has serviced the request (`ieee80211_ioctl+0x1a8..0x1be`), so a lock that `connect` held
-/// across the blob call would deadlock an `on_event` that connects from the Wi-Fi task.
-var calls: struct { stops: u32 = 0, connects: u32 = 0, give_ups: u32 = 0 } = .{};
-
-/// Held by the running stop, so stops run one at a time. Only stops take it. Host tests run on
-/// one thread and take no lock.
-var stop_lock: if (callbacks.host_test) HostStopLock else rtos.Mutex = .{};
-
 const HostStopLock = struct {
     locked: ?*rtos.Task = null,
-    fn unlock(_: *HostStopLock) void {}
+    on_wait: ?*const fn (*HostStopLock) void = null,
+
+    fn lock_with_timeout(self: *HostStopLock, _: rtos.Timeout) rtos.TimeoutError!void {
+        if (self.locked != null) {
+            const on_wait = self.on_wait orelse return error.Timeout;
+            on_wait(self);
+        }
+        assert(self.locked == null);
+        self.locked = callbacks.current_task();
+    }
+
+    fn unlock(self: *HostStopLock) void {
+        assert(self.locked == callbacks.current_task());
+        self.locked = null;
+    }
 };
-
-/// Counts the stop, so that `connect` refuses from here on, then waits for the running stop.
-/// The running stop holds the lock for its own waits, limited to 2.1 s but longer while the
-/// Wi-Fi task keeps the CPU (see `wait_for_connects`), and for its `disconnect` and
-/// `esp_wifi_stop` (with `deinit`, the release of the driver). From another task both wait
-/// for the Wi-Fi task to service them (`ieee80211_ioctl`, which `esp_wifi_disconnect_internal`
-/// tail-calls at +0x42 and `esp_wifi_stop` calls at +0xc4; C3 and C6 libnet80211.a). In the
-/// runs `esp_wifi_stop` returned quickly unless an `on_event` blocked the Wi-Fi task, and took
-/// longer for a station still connecting that a stop which gave up in `wait_for_connects` had
-/// not taken off the AP. A stop from such an `on_event` waits here in the Wi-Fi task, which the
-/// running stop's `disconnect` or `esp_wifi_stop` needs; the 5 s limit ends that wait. A task
-/// that already holds the lock, as a stop called from an event its own stop posted does, is
-/// refused at once.
-fn begin_stop() error{ WifiStopping, Timeout }!void {
-    const held = blk: {
-        const cs = microzig.interrupt.enter_critical_section();
-        defer cs.leave();
-        if (stop_lock.locked == callbacks.current_task()) break :blk true;
-        calls.stops += 1;
-        break :blk false;
-    };
-    if (held) {
-        log.warn("stop: called during this task's own stop (from on_event?), not stopping", .{});
-        return error.WifiStopping;
-    }
-    if (callbacks.host_test) return;
-    stop_lock.lock_with_timeout(.{ .after = .from_ms(5000) }) catch |err| {
-        log.warn("stop: another stop still running after 5 s (one from on_event?), not stopping", .{});
-        const cs = microzig.interrupt.enter_critical_section();
-        defer cs.leave();
-        calls.stops -= 1;
-        return err;
-    };
-}
-
-fn end_stop() void {
-    stop_lock.unlock();
-    const cs = microzig.interrupt.enter_critical_section();
-    defer cs.leave();
-    calls.stops -= 1;
-}
-
-fn connects_in_flight() u32 {
-    const cs = microzig.interrupt.enter_critical_section();
-    defer cs.leave();
-    return calls.connects;
-}
-
-/// Runs between `begin_stop` and `end_stop`: leaves the AP, then calls `stop_driver` with `args`.
-fn stop_leaving_ap(comptime stop_driver: anytype, args: anytype) @TypeOf(@call(.auto, stop_driver, args)) {
-    // Host tests model no association or connect in flight, and the waits sleep on the scheduler.
-    if (!callbacks.host_test) {
-        wait_for_connects();
-        // `update_sta_state` stores the state and counts a StaDisconnected before it clears
-        // `sta_connecting`, so these reads, in this order, see a connecting station either as
-        // connecting or in the state its event left; a StaDisconnected after `seen` ends the
-        // wait. That also needs no connect to set the flag after `wait_for_connects`: none
-        // begins while a stop runs, and those begun before have returned. If the 1 s wait gave
-        // up, a connect still in flight leaves the flag alone when it returns, and this stop
-        // does not leave the AP for it.
-        const seen = sta_disconnects.load(.acquire);
-        const connecting = sta_connecting.load(.acquire);
-        if (get_sta_state() == .connected) {
-            leave_ap(.connected, seen);
-        } else if (connecting) {
-            leave_ap(.connecting, seen);
-        }
-    }
-    return @call(.auto, stop_driver, args);
-}
-
-/// Waits until the connects begun before this stop have been serviced, so none is accepted
-/// after the stop has begun. Gives up after 1 s, which a stop reaches when the Wi-Fi task
-/// services nothing for 1 s: when the stop itself runs in an `on_event` there, which is not
-/// supported, or when an `on_event` blocks there for 1 s while another task stops. A connect
-/// in flight when it gives up does not set `sta_connecting` when it returns, so that flag is
-/// not left set after this stop has stopped the station.
-///
-/// The 1 s is checked between 1 ms sleeps, so the give-up comes late while a task above the
-/// caller's priority keeps the CPU. The Wi-Fi task does for the first connect after boot: it
-/// derives the WPA2 key from the passphrase in software (`pbkdf2_sha1`, libwpa_supplicant.a),
-/// which in the runs took well over a second on the ESP32-C3 and ESP32-C6, and a stop in the
-/// main task gave up over a second late; one during the next connect to the same AP, on time.
-fn wait_for_connects() void {
-    const deadline = time.Deadline.init_relative(hal_time.get_time_since_boot(), .from_ms(1000));
-    while (connects_in_flight() != 0) {
-        if (deadline.is_reached_by(hal_time.get_time_since_boot())) {
-            log.warn("stop: a connect still in flight after 1 s, stopping without waiting", .{});
-            const cs = microzig.interrupt.enter_critical_section();
-            defer cs.leave();
-            calls.give_ups +%= 1;
-            return;
-        }
-        rtos.sleep(.from_ms(1));
-    }
-}
-
-/// `seen` is the StaDisconnected count read before the state, so a StaDisconnected that lands
-/// after that read ends the wait even if this `disconnect` posts none. A station still scanning
-/// when it is stopped has sent nothing to leave, and its `disconnect` posts no
-/// `StaDisconnected`, so a connecting station waits for one at most 100 ms and without a warning.
-fn leave_ap(from: enum { connected, connecting }, seen: u32) void {
-    disconnect() catch |err| {
-        log.warn("stop: disconnect failed ({t}), stopping without it", .{err});
-        return;
-    };
-    const limit: time.Duration = if (from == .connected) .from_ms(1000) else .from_ms(100);
-    const deadline = time.Deadline.init_relative(hal_time.get_time_since_boot(), limit);
-    while (sta_disconnects.load(.acquire) == seen) {
-        if (deadline.is_reached_by(hal_time.get_time_since_boot())) {
-            if (from == .connected) {
-                log.warn("stop: no StaDisconnected within 1 s of disconnect", .{});
-            }
-            return;
-        }
-        rtos.sleep(.from_ms(5));
-    }
-    rtos.sleep(.from_ms(100));
-}
-
-/// Non-blocking. Without a station in the mode this returns `error.WifiMode`; while `stop`
-/// runs, or `deinit`, `error.WifiStopping`. It takes no lock, so `on_event` may call it.
-pub fn connect() InternalError!void {
-    const give_ups = blk: {
-        const cs = microzig.interrupt.enter_critical_section();
-        defer cs.leave();
-        if (calls.stops != 0) return error.WifiStopping;
-        calls.connects += 1;
-        break :blk calls.give_ups;
-    };
-    const status = if (callbacks.host_test) HostWifi.esp_wifi_connect_internal() else c.esp_wifi_connect_internal();
-    {
-        const cs = microzig.interrupt.enter_critical_section();
-        defer cs.leave();
-        // With the count, so a stop that waited for this connect reads the flag after it is set.
-        if (status == c.ESP_OK and calls.give_ups == give_ups) sta_connecting.store(true, .release);
-        calls.connects -= 1;
-    }
-    try c_err(status);
-}
-
-/// Non-blocking. Without a station in the mode this returns `error.WifiMode`.
-/// In a coexistence image it returns WouldBlock while a stop or deinit is
-/// stopping the driver (see `osi.DisconnectGate`).
-pub fn disconnect() InternalError!void {
-    if (radio.coex_enabled and !osi.disconnect_gate.enter()) return error.WouldBlock;
-    defer if (radio.coex_enabled) osi.disconnect_gate.leave();
-    const status = if (callbacks.host_test) HostWifi.esp_wifi_disconnect_internal() else c.esp_wifi_disconnect_internal();
-    // connect answers a mode without a station with ESP_ERR_WIFI_MODE
-    // (wifi_connect_process+0x12..0x16, +0x5c..0x5e), but disconnect answers the
-    // same test with bare ESP_FAIL (wifi_disconnect_process+0x1e..0x24, +0x3e;
-    // C3 and C6 libnet80211.a). ESP_FAIL also comes from a station whose
-    // ieee80211_sta_disconnect fails (_do_wifi_disconnect+0xa2..0xa6), so the
-    // mode decides; esp_wifi_get_mode reads the byte both processes test.
-    // The mode is read after the call, so a set_mode racing this disconnect on
-    // another task can swap error.WifiMode and error.WifiOther.
-    if (status == c.ESP_FAIL and !(try get_mode()).is_sta()) return error.WifiMode;
-    try c_err(status);
-}
 
 pub const EventType = enum(i32) {
     /// Wi-Fi is ready for operation.
@@ -1176,11 +1423,20 @@ pub const Event = union(EventType) {
 
 /// Internal function. Called by osi layer.
 pub fn on_event_post(id: i32, data: ?*anyopaque, data_size: usize) void {
-    const event_type: EventType = @fromBackingInt(id);
+    const routed: ?EventType = blk: {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        const wifi = owner orelse break :blk null;
+        const event_type: EventType = @fromBackingInt(id);
+        wifi.update_sta_state(event_type);
+        wifi.update_ap_state(event_type);
+        break :blk event_type;
+    };
+    const event_type = routed orelse {
+        log.debug("dropping event without a Wi-Fi owner: {}", .{id});
+        return;
+    };
     log.debug("event received: {t}", .{event_type});
-
-    update_sta_state(event_type);
-    update_ap_state(event_type);
 
     const event = switch (event_type) {
         inline else => |tag| blk: {
@@ -1224,78 +1480,18 @@ pub const ApState = enum(u32) {
     stopped,
 };
 
-var sta_state: std.atomic.Value(StaState) = .init(.none);
-/// Set by `connect` once the blob has accepted it, and cleared by the StaConnected,
-/// StaDisconnected or StaStop that follows: a stop in between leaves the AP too. A refused
-/// `connect` leaves it as it was. A stop reads it only once no connect is in flight, so setting
-/// it after the blob call is soon enough, and it covers a `connect` issued before an earlier
-/// attempt's event, such as a retry that does not wait for it, and accepted after that event.
-/// It errs towards set: when the Wi-Fi task posts the accepted attempt's own event before the
-/// blob call returns, the flag stays set until the next station event, as it does after a
-/// `disconnect` while the station still scans, which posts none of these. A stop while it is
-/// set without a connect pending calls `disconnect` for nothing and waits the 100 ms for a
-/// StaDisconnected that does not come. A `connect` that a stop gave up waiting for does not set
-/// it (see `wait_for_connects`).
-var sta_connecting: std.atomic.Value(bool) = .init(false);
-/// Count of StaDisconnected events, which `leave_ap` waits for.
-var sta_disconnects: std.atomic.Value(u32) = .init(0);
-var ap_state: std.atomic.Value(ApState) = .init(.none);
-
-fn update_sta_state(event: EventType) void {
-    const new_sta_state: StaState = switch (event) {
-        .StaStart => .started,
-        .StaConnected => .connected,
-        .StaDisconnected => .disconnected,
-        .StaStop => .stopped,
-        else => return,
-    };
-    // In this order: `stop_leaving_ap` reads them in reverse.
-    sta_state.store(new_sta_state, .release);
-    if (new_sta_state == .disconnected) _ = sta_disconnects.fetchAdd(1, .release);
-    if (new_sta_state != .started) sta_connecting.store(false, .release);
-}
-
-fn update_ap_state(event: EventType) void {
-    const new_ap_state: ApState = switch (event) {
-        .ApStart => .started,
-        .ApStop => .stopped,
-        else => return,
-    };
-    ap_state.store(new_ap_state, .monotonic);
-}
-
-pub fn get_ap_state() ApState {
-    return ap_state.load(.monotonic);
-}
-
-pub fn get_sta_state() StaState {
-    return sta_state.load(.acquire);
-}
-
-/// RSSI in dBm of the access point the station is connected to
-/// (IDF v5.5.1 esp_wifi.h:1667 esp_wifi_sta_get_rssi).
-pub fn get_sta_rssi() InternalError!i32 {
-    var rssi: c_int = 0;
-    try c_err(c.esp_wifi_sta_get_rssi(&rssi));
-    return rssi;
-}
-
 pub const Interface = enum(u32) {
     ap = c.WIFI_IF_AP,
     sta = c.WIFI_IF_STA,
 
-    pub fn is_active(self: Interface) InternalError!bool {
-        const mode = try get_mode();
+    pub fn is_active(self: Interface, wifi: *const Wifi) InternalError!bool {
+        const mode = try wifi.get_mode();
         return switch (self) {
             .ap => mode.is_ap(),
             .sta => mode.is_sta(),
         };
     }
 };
-
-pub fn send_packet(iface: Interface, data: []const u8) (error{TooManyPacketsInFlight} || InternalError)!void {
-    try c_err(c.esp_wifi_internal_tx(@backingInt(iface), @ptrCast(@constCast(data.ptr)), @intCast(data.len)));
-}
 
 fn tx_done_cb(
     iface_idx: u8,
@@ -1375,59 +1571,22 @@ pub const ScanConfig = struct {
     };
 };
 
-/// Blocks until the scan is finished. The returned iterator must be deinited
-/// or consumed before another call to scan.
-pub fn scan(config: ScanConfig) ConfigError!ScanResultsIterator {
-    const scan_time: c.wifi_scan_time_t = switch (config.type) {
-        .active => |active_time| .{
-            .active = .{
-                .min = @intCast(active_time.min.to_us() / 1000),
-                .max = @intCast(active_time.max.to_us() / 1000),
-            },
-        },
-        .passive => |passive_time| blk: {
-            if (!passive_time.less_than(.from_ms(1_500)))
-                return error.InvalidConfig;
-
-            break :blk .{ .passive = @intCast(passive_time.to_us() / 1000) };
-        },
-    };
-
-    var scan_config: c.wifi_scan_config_t = .{
-        .ssid = if (config.ssid) |ssid| @constCast(ssid.ptr) else null,
-        .bssid = if (config.bssid) |bssid| @constCast(bssid.ptr) else null,
-        .channel = config.channel orelse 0,
-        .show_hidden = config.show_hidden,
-        .scan_type = switch (config.type) {
-            .active => c.WIFI_SCAN_TYPE_ACTIVE,
-            .passive => c.WIFI_SCAN_TYPE_PASSIVE,
-        },
-        .scan_time = scan_time,
-        .home_chan_dwell_time = 0,
-        .channel_bitmap = .{
-            .ghz_2_channels = 0,
-            .ghz_5_channels = 0,
-        },
-        .coex_background_scan = false,
-    };
-    try c_err(c.esp_wifi_scan_start(&scan_config, true));
-    return try .init();
-}
-
-/// SAFETY: There can be only one instance of `ScanIterator` at any given time.
+/// SAFETY: There can be only one scan iterator at a time. Deinit it before deinitializing Wi-Fi.
 pub const ScanResultsIterator = struct {
+    wifi: *const Wifi,
     remaining: u16,
     ap_record: c_patched.wifi_ap_record_t = undefined,
 
     /// Blocks the current thread until the scan finishes and returns an
     /// iterator for the scan results.
-    pub fn init() InternalError!ScanResultsIterator {
+    fn init(wifi: *const Wifi) InternalError!ScanResultsIterator {
         var ap_count: u16 = undefined;
         try c_err(c.esp_wifi_scan_get_ap_num(&ap_count));
-        return .{ .remaining = ap_count };
+        return .{ .wifi = wifi, .remaining = ap_count };
     }
 
-    pub fn deinit(_: ScanResultsIterator) void {
+    pub fn deinit(self: ScanResultsIterator) InternalError!void {
+        try self.wifi.require_operational();
         // free any ap records that were not returned
         c_err(c.esp_wifi_clear_ap_list()) catch |err| {
             std.log.warn("failed to clear ap list: {t}", .{err});
@@ -1436,6 +1595,7 @@ pub const ScanResultsIterator = struct {
 
     /// SAFETY: AP_Record strings last until the next call to next.
     pub fn next(self: *ScanResultsIterator) InternalError!?AP_Record {
+        try self.wifi.require_operational();
         if (self.remaining == 0) {
             return null;
         }
@@ -1498,37 +1658,39 @@ fn export_symbols() void {
     @export(&g_wifi_osi_funcs, .{ .name = "g_wifi_osi_funcs" });
 }
 
-// TODO: configurable
-var init_config: c.wifi_init_config_t = .{
-    .osi_funcs = &g_wifi_osi_funcs,
-    // .wpa_crypto_funcs = c.g_wifi_default_wpa_crypto_funcs,
-    .static_rx_buf_num = 10, // overwritten by init
-    .dynamic_rx_buf_num = 32, // overwritten by init
-    .tx_buf_type = c.CONFIG_ESP_WIFI_TX_BUFFER_TYPE,
-    .static_tx_buf_num = 0, // overwritten by init
-    .dynamic_tx_buf_num = 32, // overwritten by init
-    // IDF WIFI_INIT_CONFIG_DEFAULT: 0 = static, 1 = dynamic. The STATIC_RX_MGMT_BUFFER
-    // choice flag is 1 when static is selected, which would request dynamic buffers.
-    .rx_mgmt_buf_type = c.CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUF,
-    .rx_mgmt_buf_num = c.CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF,
-    .cache_tx_buf_num = c.WIFI_CACHE_TX_BUFFER_NUM,
-    .csi_enable = 0, // TODO: WiFi channel state information enable flag.
-    .ampdu_rx_enable = 1, // overwritten by init
-    .ampdu_tx_enable = 1, // overwritten by init
-    .amsdu_tx_enable = 0, // overwritten by init
-    .nvs_enable = 0,
-    .nano_enable = 0,
-    .rx_ba_win = 6, // overwritten by init
-    .wifi_task_core_id = 0,
-    .beacon_max_len = c.WIFI_SOFTAP_BEACON_MAX_LEN,
-    .mgmt_sbuf_num = c.WIFI_MGMT_SBUF_NUM,
-    .feature_caps = c.WIFI_FEATURE_CAPS,
-    .sta_disconnected_pm = false,
-    .espnow_max_encrypt_num = c.CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM,
-    .tx_hetb_queue_num = 3,
-    .dump_hesigb_enable = false,
-    .magic = c.WIFI_INIT_CONFIG_MAGIC,
-};
+// ESP-IDF v5.5.1's station_example_main.c passes a stack-local config in wifi_init_sta.
+fn make_init_config(config: InitConfig) c.wifi_init_config_t {
+    return .{
+        .osi_funcs = &g_wifi_osi_funcs,
+        .wpa_crypto_funcs = c.g_wifi_default_wpa_crypto_funcs,
+        .static_rx_buf_num = config.static_rx_buf_num,
+        .dynamic_rx_buf_num = config.dynamic_rx_buf_num,
+        .tx_buf_type = c.CONFIG_ESP_WIFI_TX_BUFFER_TYPE,
+        .static_tx_buf_num = config.static_tx_buf_num,
+        .dynamic_tx_buf_num = config.dynamic_tx_buf_num,
+        // IDF WIFI_INIT_CONFIG_DEFAULT: 0 = static, 1 = dynamic. The STATIC_RX_MGMT_BUFFER
+        // choice flag is 1 when static is selected, which would request dynamic buffers.
+        .rx_mgmt_buf_type = c.CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUF,
+        .rx_mgmt_buf_num = c.CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF,
+        .cache_tx_buf_num = c.WIFI_CACHE_TX_BUFFER_NUM,
+        .csi_enable = 0, // TODO: WiFi channel state information enable flag.
+        .ampdu_rx_enable = @intFromBool(config.ampdu_rx_enable),
+        .ampdu_tx_enable = @intFromBool(config.ampdu_tx_enable),
+        .amsdu_tx_enable = @intFromBool(config.amsdu_tx_enable),
+        .nvs_enable = 0,
+        .nano_enable = 0,
+        .rx_ba_win = config.rx_ba_win,
+        .wifi_task_core_id = 0,
+        .beacon_max_len = c.WIFI_SOFTAP_BEACON_MAX_LEN,
+        .mgmt_sbuf_num = c.WIFI_MGMT_SBUF_NUM,
+        .feature_caps = g_wifi_feature_caps,
+        .sta_disconnected_pm = false,
+        .espnow_max_encrypt_num = c.CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM,
+        .tx_hetb_queue_num = 3,
+        .dump_hesigb_enable = false,
+        .magic = c.WIFI_INIT_CONFIG_MAGIC,
+    };
+}
 
 const wifi_enable_wpa3_sae: u64 = 1 << 0;
 const wifi_enable_enterprise: u64 = 1 << 7;
@@ -1538,8 +1700,10 @@ const wifi_enable_enterprise: u64 = 1 << 7;
 // const wifi_enable_gmac: u64 = 1 << 5;
 // const wifi_enable_11r: u64 = 1 << 6;
 
+// Exported storage for the blob's g_wifi_feature_caps ABI symbol.
 var g_wifi_feature_caps: u64 = wifi_enable_wpa3_sae | wifi_enable_enterprise;
 
+// The blob retains this OS adapter table through its C ABI.
 var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
     var f: c.wifi_osi_funcs_t = .{
         ._version = c.ESP_WIFI_OS_ADAPTER_VERSION,
@@ -1556,7 +1720,7 @@ var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
         ._wifi_int_restore = osi.wifi_int_restore,
         ._task_yield_from_isr = osi.task_yield_from_isr,
         ._semphr_create = osi.semphr_create,
-        ._semphr_delete = if (radio.coex_enabled) osi.WifiPpSlots.delete_sem else osi.semphr_delete,
+        ._semphr_delete = osi.WifiPpSlots.delete_sem,
         // IDF v5.5.1 esp_wifi/esp32c6/esp_adapter.c:598-599 shares the
         // coex semaphore ABI. ieee80211_ioctl reads the driver's return
         // status only when its completion semaphore take returns pdTRUE.
@@ -1583,7 +1747,7 @@ var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
         ._event_group_wait_bits = @ptrCast(&osi.event_group_wait_bits),
         ._task_create_pinned_to_core = osi.task_create_pinned_to_core,
         ._task_create = osi.task_create,
-        ._task_delete = if (radio.coex_enabled) osi.wifi_task_delete else osi.task_delete,
+        ._task_delete = osi.wifi_task_delete,
         ._task_delay = osi.task_delay,
         ._task_ms_to_tick = osi.task_ms_to_tick,
         ._task_get_current_task = osi.task_get_current_task,
@@ -1640,7 +1804,7 @@ var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
         ._wifi_calloc = osi.wifi_calloc,
         ._wifi_zalloc = if (radio.coex_enabled) osi.wifi_shutdown_zalloc else osi.wifi_zalloc,
         ._wifi_create_queue = osi.wifi_create_queue,
-        ._wifi_delete_queue = if (radio.coex_enabled) osi.WifiPpSlots.delete_queue else osi.wifi_delete_queue,
+        ._wifi_delete_queue = osi.WifiPpSlots.delete_queue,
         ._coex_init = osi.coex_init,
         ._coex_deinit = osi.coex_deinit,
         ._coex_enable = osi.coex_enable,
@@ -1820,6 +1984,7 @@ pub const c_patched = struct {
 };
 
 test "coex Wi-Fi init releases each acquired stage and only the owner retries rollback" {
+    if (!radio.coex_enabled) return error.SkipZigTest;
     const Host = struct {
         state: osi.WifiShutdown = .{},
         caller: rtos.Task = undefined,
@@ -1888,8 +2053,8 @@ test "coex Wi-Fi init releases each acquired stage and only the owner retries ro
 
         fn take_api(self: *@This()) bool {
             const caller = self.init_caller orelse &self.caller;
-            if (self.locks.api.owning_task) |owner| {
-                if (owner != caller) return false;
+            if (self.locks.api.owning_task) |locking_task| {
+                if (locking_task != caller) return false;
             }
             self.locks.api.owning_task = caller;
             self.locks.api.value += 1;
@@ -2032,16 +2197,22 @@ const HostWifi = struct {
 
     const not_init = 0x3001;
     const not_started = 0x3002;
+    const not_stopped = 0x3003;
     const mode_error = 0x3005;
     const wifi_post = 0x3012;
     const no_mem = 0x101;
     const fail = -1;
 
+    var on_adapter: ?*const fn () InitError!void = null;
+    var on_country: ?*const fn () InitError!void = null;
+
     fn run(_: *@This(), comptime step: InitStep) InitError!void {
         switch (step) {
             .radio => try radio.init(.failing),
+            .adapter => if (on_adapter) |probe| try probe(),
             .driver => initialized = true,
             .mode => try c_err(esp_wifi_set_mode(c.WIFI_MODE_NULL)),
+            .country => if (on_country) |probe| try probe(),
             else => {},
         }
     }
@@ -2130,7 +2301,9 @@ const HostWifi = struct {
     // posts wifi_set_config_process; the interface checks are not modelled.
     fn esp_wifi_set_config(interface: c.wifi_interface_t) i32 {
         if (!initialized) return not_init;
-        configured[configured_len] = .{ .interface = interface, .claimed = lifecycle_active.load(.acquire) };
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        configured[configured_len] = .{ .interface = interface, .claimed = owner.?.lifecycle_active.load(.acquire) };
         configured_len += 1;
         return 0;
     }
@@ -2156,7 +2329,11 @@ const HostWifi = struct {
         return 0;
     }
 
+    var connect_calls: usize = 0;
+    var disconnect_calls: usize = 0;
+
     fn esp_wifi_connect_internal() i32 {
+        connect_calls += 1;
         if (!initialized) return not_init; // +0xc
         if (!started) return not_started; // +0x18
         if (!has_sta(mode)) return mode_error; // wifi_connect_process+0x16, +0x5c
@@ -2164,6 +2341,7 @@ const HostWifi = struct {
     }
 
     fn esp_wifi_disconnect_internal() i32 {
+        disconnect_calls += 1;
         if (!initialized) return not_init; // +0xc
         if (!started) return not_started; // +0x18
         if (!has_sta(mode)) return fail; // wifi_disconnect_process+0x24, +0x3e
@@ -2178,7 +2356,7 @@ const HostWifi = struct {
     }
     fn discard_unregistered(_: *@This()) void {}
     fn rollback(_: *@This()) InternalError!void {
-        try deinit_coex();
+        if (radio.coex_enabled) try deinit_coex() else try release_single(&osi.wifi_shutdown, @This());
     }
 
     // Shutdown backend.
@@ -2194,6 +2372,7 @@ const HostWifi = struct {
     pub fn deinit_supplicant() InternalError!void {}
     pub fn unregister_wpa() InternalError!void {}
     pub fn deinit_driver() InternalError!void {
+        if (started) return c_err(not_stopped);
         // A full PP queue fails the deinit ioctl with 0x3012
         // (ieee80211_ioctl+0x15a..0x18e); the driver stays initialized.
         if (reject_deinit_driver) return c_err(wifi_post);
@@ -2207,35 +2386,42 @@ const HostWifi = struct {
         unreachable; // The simulated driver starts no PP task.
     }
     pub fn release() void {
-        radio.deinit() catch unreachable;
+        if (radio.coex_enabled) radio.deinit() catch unreachable else radio.deinit();
     }
 };
 
+const host_session_allocator = if (radio.coex_enabled) std.testing.failing_allocator else std.testing.allocator;
+
 test "public Wi-Fi init validates options before acquiring a session" {
-    const allocator = std.testing.failing_allocator;
+    var wifi: Wifi = .{};
+    errdefer EventLog.end_failed_session(&wifi);
+    const allocator = host_session_allocator;
     if (!microzig.options.hal.radio.radios.wifi) {
-        try std.testing.expectError(error.UnsupportedRadioProtocol, init(allocator, .{}));
-        try std.testing.expectError(error.UnsupportedRadioProtocol, init(allocator, .{ .power_save_mode = .min }));
+        try std.testing.expectError(error.UnsupportedRadioProtocol, wifi.init(allocator, .{}));
+        try std.testing.expectError(error.UnsupportedRadioProtocol, wifi.init(allocator, .{ .power_save_mode = .min }));
     } else {
-        try std.testing.expectError(error.PowerSaveUnsupported, init(allocator, .{ .power_save_mode = .min }));
-        try std.testing.expect(osi.wifi_shutdown.stage == .off and !lifecycle_active.load(.acquire));
-        @import("host_test_heap.zig").attach();
-        try init(allocator, .{});
-        try deinit();
+        try std.testing.expectError(error.PowerSaveUnsupported, wifi.init(allocator, .{ .power_save_mode = .min }));
+        try std.testing.expect(osi.wifi_shutdown.stage == .off and !wifi.lifecycle_active.load(.acquire));
+        if (radio.coex_enabled) @import("host_test_heap.zig").attach();
+        try wifi.init(allocator, .{});
+        try wifi.deinit();
     }
-    try std.testing.expect(osi.wifi_shutdown.stage == .off and !lifecycle_active.load(.acquire));
+    try std.testing.expect(osi.wifi_shutdown.stage == .off and !wifi.lifecycle_active.load(.acquire));
 }
 
 test "ordinary StaStart reaches the configured Wi-Fi listener" {
-    const previous_state = sta_state.load(.monotonic);
-    defer sta_state.store(previous_state, .monotonic);
+    var wifi: Wifi = .{};
+    if (radio.coex_enabled) @import("host_test_heap.zig").attach();
+    try wifi.init(host_session_allocator, .{});
+    errdefer EventLog.end_failed_session(&wifi);
     var event_id: i32 = -1;
     const previous_observer = microzig.observed_wifi_event;
     microzig.observed_wifi_event = &event_id;
     defer microzig.observed_wifi_event = previous_observer;
     on_event_post(@backingInt(EventType.StaStart), null, 0);
     try std.testing.expectEqual(@backingInt(EventType.StaStart), event_id);
-    try std.testing.expectEqual(StaState.started, get_sta_state());
+    try std.testing.expectEqual(StaState.started, wifi.get_sta_state());
+    try wifi.deinit();
 }
 
 // Records every Wi-Fi event the configured listener receives.
@@ -2244,8 +2430,6 @@ const EventLog = struct {
     var len: usize = 0;
 
     listener: @TypeOf(microzig.wifi_listener),
-    sta: StaState,
-    ap: ApState,
 
     fn on_event(event: Event) void {
         events[len] = event;
@@ -2253,8 +2437,8 @@ const EventLog = struct {
     }
 
     fn install() EventLog {
-        @import("host_test_heap.zig").attach();
-        const saved: EventLog = .{ .listener = microzig.wifi_listener, .sta = get_sta_state(), .ap = get_ap_state() };
+        if (radio.coex_enabled) @import("host_test_heap.zig").attach();
+        const saved: EventLog = .{ .listener = microzig.wifi_listener };
         microzig.wifi_listener = on_event;
         len = 0;
         return saved;
@@ -2262,16 +2446,14 @@ const EventLog = struct {
 
     fn restore(saved: EventLog) void {
         microzig.wifi_listener = saved.listener;
-        sta_state.store(saved.sta, .monotonic);
-        ap_state.store(saved.ap, .monotonic);
         len = 0;
     }
 
     // Registered with errdefer after `defer restore`, so it runs only when the
     // test already failed, and before restore. It ends any session or
     // lifecycle claim the failed test left, so later tests start from boot state.
-    fn end_failed_session() void {
-        lifecycle_active.store(false, .release);
+    fn end_failed_session(wifi: *Wifi) void {
+        wifi.lifecycle_active.store(false, .release);
         HostWifi.reject_deinit_driver = false;
         HostWifi.deinit_driver_gone = false;
         HostWifi.reject_stop = .{};
@@ -2280,8 +2462,13 @@ const EventLog = struct {
         osi.disconnect_gate = .{};
         microzig.wifi_listener = on_event;
         len = 0;
-        deinit_coex() catch {
-            osi.wifi_shutdown = .{};
+        wifi.deinit() catch {
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            if (owner == wifi) {
+                osi.wifi_shutdown = .{};
+                owner = null;
+            }
         };
         HostWifi.initialized = false;
         HostWifi.started = false;
@@ -2295,183 +2482,653 @@ const EventLog = struct {
 };
 
 test "public Wi-Fi calls before init and after final deinit return WifiNotInitialized" {
+    var wifi: Wifi = .{};
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
+    errdefer EventLog.end_failed_session(&wifi);
     for (0..2) |round| {
         try std.testing.expect(osi.wifi_shutdown.stage == .off);
-        try std.testing.expectError(error.WifiNotInitialized, start());
-        try std.testing.expectError(error.WifiNotInitialized, stop());
-        try std.testing.expectError(error.WifiNotInitialized, set_mode(.sta));
-        try std.testing.expectError(error.WifiNotInitialized, get_mode());
-        try std.testing.expectError(error.WifiNotInitialized, connect());
-        try std.testing.expectError(error.WifiNotInitialized, disconnect());
-        try std.testing.expectError(error.WifiNotInitialized, deinit());
-        try std.testing.expect(!lifecycle_active.load(.acquire));
+        try std.testing.expectError(error.WifiNotInitialized, wifi.start());
+        try std.testing.expectError(error.WifiNotInitialized, wifi.stop());
+        try std.testing.expectError(error.WifiNotInitialized, wifi.set_mode(.sta));
+        try std.testing.expectError(error.WifiNotInitialized, wifi.get_mode());
+        try std.testing.expectError(error.WifiNotInitialized, wifi.connect());
+        try std.testing.expectError(error.WifiNotInitialized, wifi.disconnect());
+        try std.testing.expectError(error.WifiNotInitialized, wifi.deinit());
+        try std.testing.expect(!wifi.lifecycle_active.load(.acquire));
         if (round == 0) {
-            try init(std.testing.failing_allocator, .{});
-            try set_mode(.sta);
-            try start();
-            try deinit();
+            try wifi.init(host_session_allocator, .{});
+            try wifi.set_mode(.sta);
+            try wifi.start();
+            try wifi.deinit();
         }
     }
     try std.testing.expectEqualSlices(EventType, &.{ .StaStart, .StaStop }, EventLog.take());
 }
 
-test "public Wi-Fi deinit releases the radio when the driver is already deinitialised" {
+test "a second Wi-Fi handle cannot change the running driver or its own state" {
+    var first: Wifi = .{};
+    var second: Wifi = .{};
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
-    try init(std.testing.failing_allocator, .{});
+    errdefer EventLog.end_failed_session(&first);
+    const allocator = host_session_allocator;
+    try first.init(allocator, .{});
+    try first.set_mode(.ap_sta);
+    try first.start();
+    second.sta_state.store(.stopped, .monotonic);
+    try std.testing.expectError(error.AlreadyInitialized, second.init(allocator, .{ .power_save_mode = .min }));
+    try std.testing.expectError(error.WifiNotInitialized, second.apply(.{ .sta = .{ .ssid = "net" } }));
+    try std.testing.expectError(error.WifiNotInitialized, second.apply_station_config(.{ .ssid = "net" }));
+    try std.testing.expectError(error.WifiNotInitialized, second.set_mode(.sta));
+    try std.testing.expectError(error.WifiNotInitialized, second.get_mode());
+    try std.testing.expectError(error.WifiNotInitialized, second.start());
+    try std.testing.expectError(error.WifiNotInitialized, second.stop());
+    try std.testing.expectError(error.WifiNotInitialized, second.connect());
+    try std.testing.expectError(error.WifiNotInitialized, second.disconnect());
+    try std.testing.expectError(error.WifiNotInitialized, second.scan(.{}));
+    try std.testing.expectError(error.WifiNotInitialized, second.send_packet(.sta, "frame"));
+    try std.testing.expectError(error.WifiNotInitialized, second.set_protocol(&.{.P802D11BGN}));
+    try std.testing.expectError(error.WifiNotInitialized, second.set_inactive_time(.sta, 6));
+    try std.testing.expectError(error.WifiNotInitialized, second.set_power_save_mode(.min));
+    try std.testing.expectError(error.WifiNotInitialized, second.get_sta_rssi());
+    try std.testing.expectError(error.WifiNotInitialized, Interface.sta.is_active(&second));
+    try std.testing.expectError(error.WifiNotInitialized, second.deinit());
+    try std.testing.expectEqual(WifiMode.ap_sta, try first.get_mode());
+    try std.testing.expectEqual(StaState.started, first.get_sta_state());
+    try std.testing.expectEqual(ApState.started, first.get_ap_state());
+    try std.testing.expectEqual(StaState.stopped, second.get_sta_state());
+    try std.testing.expectEqualSlices(EventType, &.{ .StaStart, .ApStart }, EventLog.take());
+    try first.deinit();
+
+    try std.testing.expectError(error.PowerSaveUnsupported, first.init(allocator, .{ .power_save_mode = .min }));
+    try std.testing.expectEqual(StaState.stopped, first.get_sta_state());
+    try std.testing.expectEqual(ApState.stopped, first.get_ap_state());
+
+    // Claiming ownership resets existing handle state.
+    errdefer EventLog.end_failed_session(&second);
+    try second.init(allocator, .{});
+    try std.testing.expectEqual(StaState.none, second.get_sta_state());
+    try std.testing.expectEqual(ApState.none, second.get_ap_state());
+    try std.testing.expectEqual(WifiMode.none, try second.get_mode());
+    try second.deinit();
+}
+
+test "events posted with no Wi-Fi owner are dropped" {
+    var wifi: Wifi = .{};
+    const saved = EventLog.install();
+    defer saved.restore();
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.init(host_session_allocator, .{});
+    try wifi.set_mode(.ap_sta);
+    try wifi.start();
+    try wifi.deinit();
+    try std.testing.expectEqualSlices(EventType, &.{ .StaStart, .ApStart, .StaStop, .ApStop }, EventLog.take());
+
+    HostWifi.post(.StaStart);
+    HostWifi.post(.ApStart);
+    try std.testing.expectEqual(StaState.stopped, wifi.get_sta_state());
+    try std.testing.expectEqual(ApState.stopped, wifi.get_ap_state());
+    try std.testing.expectEqual(0, EventLog.take().len);
+}
+
+test "a stop queued across single-radio teardown prevents reuse until it returns" {
+    if (radio.coex_enabled) return error.SkipZigTest;
+    const Probe = struct {
+        fn on_wait(lock: *HostStopLock) void {
+            const handle: *Wifi = @fieldParentPtr("stop_lock", lock);
+            const waiter = callbacks.host_current;
+            callbacks.host_current = lock.locked.?;
+            defer callbacks.host_current = waiter;
+
+            // The earlier task finishes teardown before this task acquires the lock.
+            handle.end_stop(.deinit, true);
+            assert(handle.calls.stops == 1);
+            if (handle.init(host_session_allocator, .{})) |_| unreachable else |err| {
+                assert(err == error.WifiSessionBusy);
+            }
+        }
+    };
+    var wifi: Wifi = .{};
+    try std.testing.expect(!try wifi.claim_init(.{}));
+    wifi.finish_init(.ready);
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.begin_stop(.stop);
+    wifi.stop_lock.on_wait = Probe.on_wait;
+
+    var waiter: rtos.Task = undefined;
+    const previous_task = callbacks.host_current;
+    callbacks.host_current = &waiter;
+    defer callbacks.host_current = previous_task;
+    try std.testing.expectError(error.WifiNotInitialized, wifi.begin_stop(.stop));
+    try std.testing.expectEqual(0, wifi.calls.stops);
+    try std.testing.expect(wifi.stop_lock.locked == null);
+    try std.testing.expect(!try wifi.claim_init(.{}));
+    wifi.finish_init(.release);
+}
+
+test "single-radio adapter runs before driver init and releases the radio on failure" {
+    if (radio.coex_enabled) return error.SkipZigTest;
+
+    const Probe = struct {
+        var calls: usize = 0;
+        var reject = true;
+        var accounting: *std.testing.FailingAllocator = undefined;
+
+        fn on_adapter() InitError!void {
+            assert(!HostWifi.initialized);
+            assert(accounting.allocations > accounting.deallocations);
+            calls += 1;
+            if (reject) return error.InvalidArg;
+        }
+    };
+
+    var accounting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var wifi: Wifi = .{};
+    errdefer EventLog.end_failed_session(&wifi);
+    Probe.accounting = &accounting;
+    HostWifi.on_adapter = Probe.on_adapter;
+    defer HostWifi.on_adapter = null;
+
+    try std.testing.expectError(error.InvalidArg, wifi.init(accounting.allocator(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(null, owner);
+    try std.testing.expect(!HostWifi.initialized);
+    try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+
+    Probe.reject = false;
+    try wifi.init(accounting.allocator(), .{});
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expect(HostWifi.initialized);
+    try wifi.deinit();
+    try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+}
+
+test "public Wi-Fi operations cannot enter the driver during init or rollback" {
+    const Probe = struct {
+        var handle: *Wifi = undefined;
+
+        fn reject_country() InitError!void {
+            // The blob is initialized at this step, so a premature start
+            // could succeed and make the driver reject rollback.
+            assert(HostWifi.initialized and !HostWifi.started);
+            var other: Wifi = .{};
+            expect_error(error.WouldBlock, handle.start());
+            assert(!HostWifi.started);
+
+            // A connect that gets past admission here could reach the blob
+            // after another handle has taken over. Verify that it never
+            // registers an in-flight call or enters the blob.
+            const connects = HostWifi.connect_calls;
+            const disconnects = HostWifi.disconnect_calls;
+            expect_error(error.WouldBlock, handle.connect());
+            expect_error(error.WouldBlock, handle.disconnect());
+            assert(handle.calls.connects == 0 and HostWifi.connect_calls == connects);
+            assert(HostWifi.disconnect_calls == disconnects);
+            expect_error(error.WouldBlock, handle.get_mode());
+            expect_error(error.WouldBlock, handle.stop());
+            expect_error(error.WouldBlock, handle.deinit());
+            expect_error(error.WifiNotInitialized, other.stop());
+            expect_error(error.WifiNotInitialized, other.deinit());
+            assert(handle.calls.stops == 0);
+            return error.InvalidArg;
+        }
+
+        fn expect_error(expected: InternalError, result: anytype) void {
+            if (result) |_| unreachable else |err| assert(err == expected);
+        }
+    };
+
+    var wifi: Wifi = .{};
+    var other: Wifi = .{};
+    const saved = EventLog.install();
+    defer saved.restore();
+    errdefer EventLog.end_failed_session(&wifi);
+
+    Probe.handle = &wifi;
+    HostWifi.on_country = Probe.reject_country;
+    defer HostWifi.on_country = null;
+
+    try std.testing.expectError(error.InvalidArg, wifi.init(host_session_allocator, .{}));
+    try std.testing.expectEqual(null, owner);
+    try std.testing.expect(!HostWifi.initialized and !wifi.ready);
+
+    HostWifi.on_country = null;
+    try other.init(host_session_allocator, .{});
+    {
+        errdefer EventLog.end_failed_session(&other);
+        try other.set_mode(.sta);
+        try other.start();
+        const connects = HostWifi.connect_calls;
+        try std.testing.expectError(error.WifiNotInitialized, wifi.connect());
+        try std.testing.expectEqual(connects, HostWifi.connect_calls);
+        try other.connect();
+        try std.testing.expectEqual(connects + 1, HostWifi.connect_calls);
+        try other.deinit();
+    }
+
+    // Force one rollback failure. Only deinit can reach the driver while
+    // the failed init retains the owner.
+    HostWifi.on_country = Probe.reject_country;
+    HostWifi.reject_deinit_driver = true;
+    defer HostWifi.reject_deinit_driver = false;
+    try std.testing.expectError(error.WifiRollbackPending, wifi.init(host_session_allocator, .{}));
+    try std.testing.expect(owner == &wifi and HostWifi.initialized and !wifi.ready);
+    try std.testing.expectError(error.AlreadyInitialized, other.init(host_session_allocator, .{}));
+    try std.testing.expectError(error.WouldBlock, wifi.start());
+    try std.testing.expectError(error.WouldBlock, wifi.get_mode());
+    try std.testing.expectError(error.WouldBlock, wifi.connect());
+    try std.testing.expectError(error.WouldBlock, wifi.disconnect());
+    try std.testing.expectError(error.WouldBlock, wifi.stop());
+    try std.testing.expectError(if (radio.coex_enabled) error.WouldBlock else error.WifiPost, wifi.deinit());
+    try std.testing.expect(owner == &wifi and HostWifi.initialized);
+
+    HostWifi.reject_deinit_driver = false;
+    HostWifi.on_country = null;
+    try wifi.deinit();
+    try std.testing.expectEqual(null, owner);
+    try std.testing.expect(!HostWifi.initialized);
+    try wifi.init(host_session_allocator, .{});
+    try std.testing.expect(wifi.ready);
+    try wifi.deinit();
+}
+
+test "single-radio init failure releases the driver and radio or leaves teardown retryable" {
+    const Backend = struct {
+        shutdown: osi.WifiShutdown = .{},
+        fail_step: InitStep = .country,
+        depth: u32 = 0,
+        entry_depth: u32 = 0,
+        adapter_installed: bool = false,
+        wpa_unregistered: bool = false,
+
+        var driver_error: ?InternalError = null;
+        var supplicant_released = false;
+        var radio_released = false;
+
+        fn run(self: *@This(), comptime step: InitStep) InitError!void {
+            if (step == .adapter) self.adapter_installed = true;
+            if (step == .driver) assert(self.adapter_installed);
+            if (step != self.fail_step) return;
+            if (step == .supplicant) {
+                self.wpa_unregistered = true;
+                return error.OutOfMemory;
+            }
+            if (step == .driver) {
+                self.depth += 1;
+                return error.OutOfMemory;
+            }
+            return error.InvalidArg;
+        }
+
+        fn api_depth(self: *@This()) u32 {
+            return self.depth;
+        }
+
+        fn unlock_api(self: *@This()) void {
+            self.depth -= 1;
+        }
+
+        fn discard_unregistered(self: *@This()) void {
+            assert(self.wpa_unregistered);
+            self.wpa_unregistered = false;
+        }
+
+        fn rollback(self: *@This()) InternalError!void {
+            assert(!self.wpa_unregistered);
+            assert(self.entry_depth == self.depth);
+            try release_single(&self.shutdown, @This());
+        }
+
+        fn deinit_driver() InternalError!void {
+            if (driver_error) |err| return err;
+        }
+
+        fn deinit_supplicant() InternalError!void {
+            supplicant_released = true;
+        }
+
+        pub fn join(_: *rtos.Task) void {
+            unreachable; // These failures model no PP worker.
+        }
+
+        fn release() void {
+            assert(supplicant_released);
+            radio_released = true;
+        }
+    };
+
+    var backend: Backend = .{};
+    for ([_]?InternalError{ null, error.WifiNotInitialized, error.WouldBlock }) |status| {
+        Backend.driver_error = status;
+        Backend.supplicant_released = false;
+        Backend.radio_released = false;
+        if ((status orelse error.WifiOther) == error.WouldBlock) {
+            try std.testing.expectError(error.WifiRollbackPending, configure_single(&backend));
+            try std.testing.expect(!Backend.supplicant_released and !Backend.radio_released);
+            Backend.driver_error = null;
+            try release_single(&backend.shutdown, Backend);
+        } else {
+            try std.testing.expectError(error.InvalidArg, configure_single(&backend));
+        }
+        try std.testing.expect(Backend.supplicant_released and Backend.radio_released);
+    }
+
+    // An early driver-init failure leaves a recursive level held even when
+    // its deinit reports that the driver never initialized.
+    for ([_]u32{ 0, 1 }) |entry_depth| {
+        backend = .{ .fail_step = .driver, .depth = entry_depth, .entry_depth = entry_depth };
+        Backend.driver_error = error.WifiNotInitialized;
+        Backend.supplicant_released = false;
+        Backend.radio_released = false;
+        try std.testing.expectError(error.OutOfMemory, configure_single(&backend));
+        try std.testing.expectEqual(entry_depth, backend.depth);
+        try std.testing.expect(Backend.supplicant_released and Backend.radio_released);
+    }
+
+    // A supplicant failure must discard the partial registration before teardown.
+    backend = .{ .fail_step = .supplicant };
+    Backend.driver_error = null;
+    Backend.supplicant_released = false;
+    Backend.radio_released = false;
+    try std.testing.expectError(error.OutOfMemory, configure_single(&backend));
+    try std.testing.expect(!backend.wpa_unregistered);
+    try std.testing.expect(Backend.supplicant_released and Backend.radio_released);
+}
+
+test "single-radio cleanup joins and reclaims both packet-worker deletion paths" {
+    const Backend = struct {
+        var active: *@This() = undefined;
+        shutdown: osi.WifiShutdown = .{},
+        accounting: *std.testing.FailingAllocator,
+        scheduler: rtos.RTOS_State,
+        worker_slot: ?*rtos.Task,
+        manual: bool,
+        deinit_result: ?InternalError,
+        joined: bool = false,
+        released: bool = false,
+
+        fn detach(task: *rtos.Task) void {
+            active.scheduler.detach_task(task);
+        }
+
+        fn exit(action: rtos.YieldAction) void {
+            assert(action == .exit and active.worker_slot == null);
+            active.shutdown.worker.?.state = .exited;
+        }
+
+        fn deinit_driver(self: *@This()) InternalError!void {
+            if (self.manual) {
+                // pp_delete_task_manually passes the task handle, then clears it.
+                self.shutdown.delete_task(self.worker_slot.?, self.scheduler.current_task, detach, exit);
+                self.worker_slot = null;
+            }
+            if (self.deinit_result) |err| return err;
+        }
+
+        fn deinit_supplicant(_: *@This()) InternalError!void {}
+
+        pub fn join(self: *@This(), task: *rtos.Task) void {
+            assert(self.accounting.deallocations == 0);
+            if (!self.manual) {
+                // After acknowledging deletion, ppTask clears the blob slot
+                // and exits through task_delete(null).
+                self.worker_slot = null;
+                self.shutdown.delete_task(null, task, detach, exit);
+            }
+            assert(task.state == .exited and self.worker_slot == null);
+            self.joined = true;
+        }
+
+        fn release(self: *@This()) void {
+            assert(self.joined and self.shutdown.worker == null and self.accounting.deallocations == 1);
+            self.released = true;
+        }
+    };
+
+    for ([_]bool{ false, true }) |manual| {
+        var accounting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var route: @import("shared_heap.zig").TestRoute = .{};
+        const previous_gpa = osi.gpa;
+        if (radio.coex_enabled) route.install(accounting.allocator()) else osi.gpa = accounting.allocator();
+        defer if (radio.coex_enabled) route.restore() else {
+            osi.gpa = previous_gpa;
+        };
+        const mem = try osi.callback_allocator().alignedAlloc(u8, .@"16", @sizeOf(rtos.Task) + 64);
+        const worker: *rtos.Task = @ptrCast(mem.ptr);
+        worker.* = .{ .context = undefined, .stack = mem[@sizeOf(rtos.Task)..], .priority = .lowest, .state = .suspended };
+        var queue: rtos.PriorityWaitQueue = .{};
+        var waiter: rtos.PriorityWaitQueue.Waiter = .{ .task = worker, .priority = .lowest };
+        if (manual) {
+            queue.list.append(&waiter.node);
+            worker.active_wait = .{ .queue = &queue, .node = &waiter.node };
+        }
+
+        var caller: rtos.Task = undefined;
+        var backend: Backend = .{
+            .accounting = &accounting,
+            .scheduler = .{ .current_task = &caller, .current_sleep_queue = undefined, .overflow_sleep_queue = undefined },
+            .worker_slot = worker,
+            .manual = manual,
+            .deinit_result = if (manual) error.WifiNotInitialized else null,
+        };
+        Backend.active = &backend;
+        backend.shutdown.record_worker(worker);
+        try release_single(&backend.shutdown, &backend);
+        try std.testing.expect(backend.released and queue.list.first == null);
+        try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+    }
+}
+
+test "deinit times out with a counted connect and ordinary stop still gives up" {
+    var wifi: Wifi = .{};
+    var second: Wifi = .{};
+    const saved = EventLog.install();
+    defer saved.restore();
+    errdefer EventLog.end_failed_session(&wifi);
+    const allocator = host_session_allocator;
+    try wifi.init(allocator, .{});
+    try wifi.set_mode(.sta);
+    try wifi.start();
+    try std.testing.expectEqualSlices(EventType, &.{.StaStart}, EventLog.take());
+
+    // Suspend a caller between admission and entering the blob. The host wait
+    // models expiration immediately because it does not run the scheduler.
+    wifi.calls.connects = 1;
+    try std.testing.expectError(error.Timeout, wifi.deinit());
+    try std.testing.expectEqual(0, wifi.calls.give_ups);
+    try std.testing.expect(HostWifi.initialized and HostWifi.started);
+    try std.testing.expectError(error.AlreadyInitialized, second.init(allocator, .{}));
+    try std.testing.expectEqual(0, EventLog.take().len);
+
+    // The failed deinit reopens admission. Ordinary stop can continue even
+    // while the first caller is still counted.
+    try wifi.connect();
+    try std.testing.expectEqual(1, wifi.calls.connects);
+    try wifi.stop();
+    try std.testing.expectEqual(1, wifi.calls.give_ups);
+    try std.testing.expectEqualSlices(EventType, &.{.StaStop}, EventLog.take());
+
+    wifi.calls.connects = 0;
+    try wifi.deinit();
+    try std.testing.expectError(error.WifiNotInitialized, wifi.connect());
+}
+
+test "public Wi-Fi deinit releases the radio when the driver is already deinitialised" {
+    var wifi: Wifi = .{};
+    const saved = EventLog.install();
+    defer saved.restore();
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.init(host_session_allocator, .{});
     HostWifi.deinit_driver_gone = true;
     defer HostWifi.deinit_driver_gone = false;
-    try deinit();
+    try wifi.deinit();
     try std.testing.expect(osi.wifi_shutdown.stage == .off);
     HostWifi.deinit_driver_gone = false;
     // The radio was released, so a new session starts and ends.
-    try init(std.testing.failing_allocator, .{});
-    try deinit();
+    try wifi.init(host_session_allocator, .{});
+    try wifi.deinit();
     try std.testing.expect(osi.wifi_shutdown.stage == .off);
 }
 
 test "public Wi-Fi null mode starts and stops no interface" {
+    var wifi: Wifi = .{};
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
-    try init(std.testing.failing_allocator, .{});
-    try std.testing.expectEqual(WifiMode.none, try get_mode());
-    try start();
-    try start();
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.init(host_session_allocator, .{});
+    try std.testing.expectEqual(WifiMode.none, try wifi.get_mode());
+    try wifi.start();
+    try wifi.start();
     // 0x3005 from wifi_connect_process and ESP_FAIL from wifi_disconnect_process.
-    try std.testing.expectError(error.WifiMode, connect());
-    try std.testing.expectError(error.WifiMode, disconnect());
-    // A second init keeps the started session (IDF wifi_init.c:343-345).
-    try init(std.testing.failing_allocator, .{ .power_save_mode = .min });
-    try std.testing.expect(osi.wifi_shutdown.stage == .running);
-    try stop();
-    try start();
-    try deinit();
+    try std.testing.expectError(error.WifiMode, wifi.connect());
+    try std.testing.expectError(error.WifiMode, wifi.disconnect());
+    // A second coex init keeps the started session (IDF wifi_init.c:343-345).
+    const invalid: InitConfig = .{ .power_save_mode = .min };
+    if (radio.coex_enabled) {
+        try wifi.init(host_session_allocator, invalid);
+        try std.testing.expect(osi.wifi_shutdown.stage == .running);
+    } else {
+        try std.testing.expectError(error.AlreadyInitialized, wifi.init(host_session_allocator, invalid));
+    }
+    try wifi.stop();
+    try wifi.start();
+    try wifi.deinit();
     try std.testing.expectEqual(0, EventLog.take().len);
     try std.testing.expect(osi.wifi_shutdown.stage == .off);
 }
 
 test "public Wi-Fi station start and stop post one event per transition" {
+    var wifi: Wifi = .{};
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
-    try init(std.testing.failing_allocator, .{});
-    try set_mode(.sta);
-    try stop();
-    try std.testing.expectError(error.WifiNotStarted, connect());
-    try std.testing.expectError(error.WifiNotStarted, disconnect());
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.init(host_session_allocator, .{});
+    try wifi.set_mode(.sta);
+    try wifi.stop();
+    try std.testing.expectError(error.WifiNotStarted, wifi.connect());
+    try std.testing.expectError(error.WifiNotStarted, wifi.disconnect());
     try std.testing.expectEqual(0, EventLog.take().len);
-    try start();
-    try start();
-    try connect();
-    try disconnect();
-    try stop();
-    try stop();
+    try wifi.start();
+    try wifi.start();
+    try wifi.connect();
+    try wifi.disconnect();
+    try wifi.stop();
+    try wifi.stop();
     try std.testing.expectEqualSlices(EventType, &.{ .StaStart, .StaStop }, EventLog.take());
-    try start();
-    try deinit();
+    try wifi.start();
+    try wifi.deinit();
     try std.testing.expectEqualSlices(EventType, &.{ .StaStart, .StaStop }, EventLog.take());
-    try std.testing.expectEqual(StaState.stopped, get_sta_state());
+    try std.testing.expectEqual(StaState.stopped, wifi.get_sta_state());
     try std.testing.expect(osi.wifi_shutdown.stage == .off);
 }
 
 test "public Wi-Fi stop hands every stop step the reserved ioctl" {
+    if (!radio.coex_enabled) return error.SkipZigTest;
+    var wifi: Wifi = .{};
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
-    try init(std.testing.failing_allocator, .{});
-    try set_mode(.sta);
-    try start();
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.init(host_session_allocator, .{});
+    try wifi.set_mode(.sta);
+    try wifi.start();
     _ = EventLog.take();
     // With no heap left, steps 1 and 2 would fail with ESP_ERR_NO_MEM after
     // the interfaces stopped.
     HostWifi.ioctl_heap_budget = 0;
     defer HostWifi.ioctl_heap_budget = null;
     HostWifi.reserved_ioctls = 0;
-    try stop();
+    try wifi.stop();
     try std.testing.expectEqual(3, HostWifi.reserved_ioctls);
     try std.testing.expectEqualSlices(EventType, &.{.StaStop}, EventLog.take());
     try std.testing.expect(osi.wifi_shutdown.owner == null and !HostWifi.started);
 
     // A failed allocation before step 0 stops nothing and is returned.
-    try start();
+    try wifi.start();
     _ = EventLog.take();
     osi.wifi_shutdown.ioctl_in_use = true;
-    try std.testing.expectError(error.OutOfMemory, stop());
+    try std.testing.expectError(error.OutOfMemory, wifi.stop());
     osi.wifi_shutdown.ioctl_in_use = false;
     try std.testing.expect(HostWifi.started and EventLog.take().len == 0);
-    try deinit();
+    try wifi.deinit();
     try std.testing.expectEqualSlices(EventType, &.{.StaStop}, EventLog.take());
     try std.testing.expect(osi.wifi_shutdown.stage == .off);
 }
 
 test "public Wi-Fi disconnect returns WouldBlock while the driver is stopping" {
+    if (!radio.coex_enabled) return error.SkipZigTest;
+    var wifi: Wifi = .{};
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
-    try init(std.testing.failing_allocator, .{});
-    try set_mode(.sta);
-    try start();
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.init(host_session_allocator, .{});
+    try wifi.set_mode(.sta);
+    try wifi.start();
     osi.disconnect_gate.close(struct {
         fn wait() void {
             unreachable; // no disconnect is inside
         }
     }.wait);
-    try std.testing.expectError(error.WouldBlock, disconnect());
-    try connect();
+    try std.testing.expectError(error.WouldBlock, wifi.disconnect());
+    try wifi.connect();
     osi.disconnect_gate.open();
-    try disconnect();
-    try deinit();
+    try wifi.disconnect();
+    try wifi.deinit();
     try std.testing.expect(osi.wifi_shutdown.stage == .off);
 }
 
 // A stop that fails part-way panics, so these run one per process under
 // stop_panic_runner.zig, which passes only on the expected panic message.
 // The default test runner skips them.
-fn start_for_stop_panic() !void {
+fn start_for_stop_panic(wifi: *Wifi) !void {
     if (!@hasDecl(@import("root"), "stop_panic_runner")) return error.SkipZigTest;
-    @import("host_test_heap.zig").attach();
-    try init(std.testing.failing_allocator, .{});
-    try set_mode(.sta);
-    try start();
+    if (radio.coex_enabled) @import("host_test_heap.zig").attach();
+    try wifi.init(host_session_allocator, .{});
+    try wifi.set_mode(.sta);
+    try wifi.start();
 }
 
 test "Wi-Fi stop panics when the PP queue rejects the interface stop" {
-    try start_for_stop_panic();
+    if (!radio.coex_enabled) return error.SkipZigTest;
+    var wifi: Wifi = .{};
+    try start_for_stop_panic(&wifi);
     HostWifi.reject_stop = .{ .interfaces = true };
-    try stop();
+    try wifi.stop();
 }
 
 test "Wi-Fi stop panics when the PP queue rejects the hardware stop" {
-    try start_for_stop_panic();
+    if (!radio.coex_enabled) return error.SkipZigTest;
+    var wifi: Wifi = .{};
+    try start_for_stop_panic(&wifi);
     HostWifi.reject_stop = .{ .hardware = true };
-    try stop();
+    try wifi.stop();
 }
 
 test "Wi-Fi stop panics when the PP queue rejects both stops" {
-    try start_for_stop_panic();
+    if (!radio.coex_enabled) return error.SkipZigTest;
+    var wifi: Wifi = .{};
+    try start_for_stop_panic(&wifi);
     HostWifi.reject_stop = .{ .interfaces = true, .hardware = true };
-    try stop();
+    try wifi.stop();
 }
 
 test "Wi-Fi stop panics when an allocation fails after the interfaces stopped" {
-    try start_for_stop_panic();
+    if (!radio.coex_enabled) return error.SkipZigTest;
+    var wifi: Wifi = .{};
+    try start_for_stop_panic(&wifi);
     // Without the reserved ioctl, the heap grants only step 0's.
     osi.wifi_shutdown.ioctl_in_use = true;
     HostWifi.ioctl_heap_budget = 1;
-    try stop();
+    try wifi.stop();
 }
 
 test "public Wi-Fi mode changes on a started session switch only the affected interfaces" {
+    var wifi: Wifi = .{};
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
-    try init(std.testing.failing_allocator, .{});
-    try start();
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.init(host_session_allocator, .{});
+    try wifi.start();
     const steps = [_]struct { WifiMode, []const EventType }{
         .{ .sta, &.{.StaStart} },
         .{ .ap_sta, &.{.ApStart} },
@@ -2482,121 +3139,135 @@ test "public Wi-Fi mode changes on a started session switch only the affected in
         .{ .ap_sta, &.{ .StaStart, .ApStart } },
     };
     for (steps) |step| {
-        try set_mode(step[0]);
-        try std.testing.expectEqual(step[0], try get_mode());
+        try wifi.set_mode(step[0]);
+        try std.testing.expectEqual(step[0], try wifi.get_mode());
         try std.testing.expectEqualSlices(EventType, step[1], EventLog.take());
     }
-    try deinit();
+    try wifi.deinit();
     try std.testing.expectEqualSlices(EventType, &.{ .StaStop, .ApStop }, EventLog.take());
-    try std.testing.expectEqual(ApState.stopped, get_ap_state());
+    try std.testing.expectEqual(ApState.stopped, wifi.get_ap_state());
     try std.testing.expect(osi.wifi_shutdown.stage == .off);
 }
 
 test "apply holds the lifecycle claim from the mode change through every interface configuration" {
+    if (!radio.coex_enabled) return error.SkipZigTest;
+    var wifi: Wifi = .{};
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
+    errdefer EventLog.end_failed_session(&wifi);
     HostWifi.configured_len = 0;
-    try std.testing.expectError(error.WifiNotInitialized, apply(.{ .sta = .{ .ssid = "net" } }));
-    try init(std.testing.failing_allocator, .{});
-    try apply(.{ .ap_sta = .{ .ap = .{ .ssid = "ap", .channel = 1, .max_connections = 1 }, .sta = .{ .ssid = "net" } } });
-    try std.testing.expectEqual(WifiMode.ap_sta, try get_mode());
+    try std.testing.expectError(error.WifiNotInitialized, wifi.apply(.{ .sta = .{ .ssid = "net" } }));
+    try wifi.init(host_session_allocator, .{});
+    try wifi.apply(.{ .ap_sta = .{ .ap = .{ .ssid = "ap", .channel = 1, .max_connections = 1 }, .sta = .{ .ssid = "net" } } });
+    try std.testing.expectEqual(WifiMode.ap_sta, try wifi.get_mode());
     try std.testing.expectEqual(@as(usize, 2), HostWifi.configured_len);
     for (HostWifi.configured[0..2], [_]c.wifi_interface_t{ c.WIFI_IF_AP, c.WIFI_IF_STA }) |entry, interface| {
         try std.testing.expectEqual(interface, entry.interface);
         try std.testing.expect(entry.claimed);
     }
-    try std.testing.expect(!lifecycle_active.load(.acquire));
+    try std.testing.expect(!wifi.lifecycle_active.load(.acquire));
 
     // Another owner: neither the mode nor a configuration changes.
-    lifecycle_active.store(true, .release);
-    try std.testing.expectError(error.WouldBlock, apply(.{ .ap = .{ .ssid = "ap", .channel = 1, .max_connections = 1 } }));
-    lifecycle_active.store(false, .release);
-    try std.testing.expectEqual(WifiMode.ap_sta, try get_mode());
+    wifi.lifecycle_active.store(true, .release);
+    try std.testing.expectError(error.WouldBlock, wifi.apply(.{ .ap = .{ .ssid = "ap", .channel = 1, .max_connections = 1 } }));
+    wifi.lifecycle_active.store(false, .release);
+    try std.testing.expectEqual(WifiMode.ap_sta, try wifi.get_mode());
     try std.testing.expectEqual(@as(usize, 2), HostWifi.configured_len);
 
     // A rejected configuration still releases the claim.
-    try std.testing.expectError(error.InvalidConfig, apply(.{ .sta = .{ .ssid = &@as([33]u8, @splat('x')) } }));
-    try std.testing.expect(!lifecycle_active.load(.acquire));
-    try deinit();
+    try std.testing.expectError(error.InvalidConfig, wifi.apply(.{ .sta = .{ .ssid = &@as([33]u8, @splat('x')) } }));
+    try std.testing.expect(!wifi.lifecycle_active.load(.acquire));
+    try wifi.deinit();
     _ = EventLog.take();
 }
 
 test "public Wi-Fi calls wait for a pending teardown or another lifecycle owner" {
+    if (!radio.coex_enabled) return error.SkipZigTest;
+    var wifi: Wifi = .{};
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
-    try init(std.testing.failing_allocator, .{});
-    try set_mode(.sta);
-    try start();
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.init(host_session_allocator, .{});
+    try wifi.set_mode(.sta);
+    try wifi.start();
     _ = EventLog.take();
 
     // Another task owns the lifecycle. Blob calls outside it are not gated.
-    lifecycle_active.store(true, .release);
-    try std.testing.expectError(error.WifiSessionBusy, init(std.testing.failing_allocator, .{}));
-    try std.testing.expectError(error.WouldBlock, deinit());
-    try std.testing.expectError(error.WouldBlock, start());
-    try std.testing.expectError(error.WouldBlock, stop());
-    try std.testing.expectError(error.WouldBlock, set_mode(.ap));
-    try std.testing.expectEqual(WifiMode.sta, try get_mode());
-    try connect();
-    try disconnect();
-    lifecycle_active.store(false, .release);
+    wifi.lifecycle_active.store(true, .release);
+    try std.testing.expectError(error.WifiSessionBusy, wifi.init(host_session_allocator, .{}));
+    try std.testing.expectError(error.WouldBlock, wifi.deinit());
+    try std.testing.expectError(error.WouldBlock, wifi.start());
+    try std.testing.expectError(error.WouldBlock, wifi.stop());
+    try std.testing.expectError(error.WouldBlock, wifi.set_mode(.ap));
+    try std.testing.expectEqual(WifiMode.sta, try wifi.get_mode());
+    try wifi.connect();
+    try wifi.disconnect();
+    wifi.lifecycle_active.store(false, .release);
 
     // The deinit ioctl is rejected after the stop and supplicant stages.
     HostWifi.reject_deinit_driver = true;
     defer HostWifi.reject_deinit_driver = false;
-    try std.testing.expectError(error.WouldBlock, deinit());
-    try std.testing.expect(osi.wifi_shutdown.stage == .driver and !lifecycle_active.load(.acquire));
+    try std.testing.expectError(error.WouldBlock, wifi.deinit());
+    var second: Wifi = .{};
+    try std.testing.expectError(error.AlreadyInitialized, second.init(host_session_allocator, .{}));
+    try std.testing.expectError(error.WifiNotInitialized, second.deinit());
+    try std.testing.expect(osi.wifi_shutdown.stage == .driver and !wifi.lifecycle_active.load(.acquire));
     try std.testing.expectEqualSlices(EventType, &.{.StaStop}, EventLog.take());
-    try std.testing.expectError(error.WifiSessionBusy, init(std.testing.failing_allocator, .{}));
-    try std.testing.expectError(error.WouldBlock, start());
-    try std.testing.expectError(error.WouldBlock, stop());
-    try std.testing.expectError(error.WouldBlock, set_mode(.ap));
-    try std.testing.expectEqual(WifiMode.sta, try get_mode());
-    try std.testing.expectError(error.WifiNotStarted, connect());
-    try std.testing.expectError(error.WifiNotStarted, disconnect());
+    try std.testing.expectError(error.WifiSessionBusy, wifi.init(host_session_allocator, .{ .power_save_mode = .min }));
+    try std.testing.expectError(error.WouldBlock, wifi.start());
+    try std.testing.expectError(error.WouldBlock, wifi.stop());
+    try std.testing.expectError(error.WouldBlock, wifi.set_mode(.ap));
+    try std.testing.expectEqual(WifiMode.sta, try wifi.get_mode());
+    try std.testing.expectError(error.WifiNotStarted, wifi.connect());
+    try std.testing.expectError(error.WifiNotStarted, wifi.disconnect());
     HostWifi.reject_deinit_driver = false;
-    try deinit();
+    wifi.calls.connects = 1;
+    try std.testing.expectError(error.Timeout, wifi.deinit());
+    try std.testing.expect(osi.wifi_shutdown.stage == .driver);
+    wifi.calls.connects = 0;
+    try wifi.deinit();
     try std.testing.expect(osi.wifi_shutdown.stage == .off);
     try std.testing.expectEqual(0, EventLog.take().len);
-
-    lifecycle_active.store(true, .release);
-    defer lifecycle_active.store(false, .release);
-    try std.testing.expectError(error.WifiSessionBusy, init(std.testing.failing_allocator, .{}));
-    try std.testing.expectError(error.WouldBlock, deinit());
-    try std.testing.expectError(error.WouldBlock, start());
-    try std.testing.expectError(error.WouldBlock, stop());
-    try std.testing.expectError(error.WouldBlock, set_mode(.sta));
-    try std.testing.expectError(error.WifiNotInitialized, get_mode());
 }
 
 test "public Wi-Fi deinit completes when StaStop calls public init" {
+    if (!radio.coex_enabled) return error.SkipZigTest;
+    var wifi: Wifi = .{};
     const Probe = struct {
         var observed = false;
+        var handle: *Wifi = undefined;
         fn on_event(event: Event) void {
             assert(event == .StaStop);
-            if (init(std.testing.failing_allocator, .{})) |_| unreachable else |err| assert(err == error.WifiSessionBusy);
-            if (deinit()) |_| unreachable else |err| assert(err == error.WouldBlock);
-            if (start()) |_| unreachable else |err| assert(err == error.WouldBlock);
-            if (stop()) |_| unreachable else |err| assert(err == error.WouldBlock);
-            if (set_mode(.none)) |_| unreachable else |err| assert(err == error.WouldBlock);
-            if (disconnect()) |_| unreachable else |err| assert(err == error.WouldBlock);
-            assert((get_mode() catch unreachable) == .sta);
-            if (radio.init(std.testing.failing_allocator)) |_| unreachable else |err| assert(err == error.WouldBlock);
+            var other: Wifi = .{};
+            try_non_owner(other.stop());
+            try_non_owner(other.deinit());
+            if (handle.init(host_session_allocator, .{})) |_| unreachable else |err| assert(err == error.WifiSessionBusy);
+            if (handle.deinit()) |_| unreachable else |err| assert(err == error.WouldBlock);
+            if (handle.start()) |_| unreachable else |err| assert(err == error.WouldBlock);
+            if (handle.stop()) |_| unreachable else |err| assert(err == error.WouldBlock);
+            if (handle.connect()) |_| unreachable else |err| assert(err == error.WifiStopping);
+            if (handle.set_mode(.none)) |_| unreachable else |err| assert(err == error.WouldBlock);
+            if (handle.disconnect()) |_| unreachable else |err| assert(err == error.WouldBlock);
+            assert((handle.get_mode() catch unreachable) == .sta);
+            if (radio.init(host_session_allocator)) |_| unreachable else |err| assert(err == error.WouldBlock);
             if (radio.deinit()) |_| unreachable else |err| assert(err == error.WouldBlock);
             observed = true;
+        }
+
+        fn try_non_owner(result: InternalError!void) void {
+            if (result) |_| unreachable else |err| assert(err == error.WifiNotInitialized);
         }
     };
     const saved = EventLog.install();
     defer saved.restore();
-    errdefer EventLog.end_failed_session();
-    try init(std.testing.failing_allocator, .{});
-    try set_mode(.sta);
-    try start();
+    errdefer EventLog.end_failed_session(&wifi);
+    try wifi.init(host_session_allocator, .{});
+    try wifi.set_mode(.sta);
+    try wifi.start();
+    Probe.handle = &wifi;
     microzig.wifi_listener = Probe.on_event;
     defer Probe.observed = false;
-    try deinit();
+    try wifi.deinit();
     try std.testing.expect(Probe.observed);
-    try std.testing.expect(!lifecycle_active.load(.acquire) and osi.wifi_shutdown.stage == .off);
+    try std.testing.expect(!wifi.lifecycle_active.load(.acquire) and osi.wifi_shutdown.stage == .off);
 }

@@ -451,7 +451,7 @@ and higher-priority radio timer and BLE callout tasks for coexistence.
 A coexistence image's radios share one heap: it backs the blob OSI adapter's
 allocations and the radio HAL's own init allocations (the radio timer worker,
 the PHY and coex timer nodes, and the Wi-Fi eloop reservation). In a
-coexistence image the allocator argument of `radio.init` and `wifi.init` is
+coexistence image the allocator argument of `radio.init` and `Wifi.init` is
 not used; `Controller.start`'s allocator still backs the BLE controller's NPL
 state. The application owns the shared heap and attaches it once, from task
 context, before the first radio init:
@@ -465,7 +465,8 @@ var radio_heap: radio.SharedHeap = undefined;
 // In main, before the first radio init:
 radio_heap = try radio.SharedHeap.init(&radio_heap_buffer);
 try radio.attach_shared_heap(&radio_heap);
-try radio.wifi.init(gpa, .{});
+var wifi: radio.wifi.Wifi = .{};
+try wifi.init(gpa, .{});
 try controller.start(gpa);
 ```
 
@@ -476,7 +477,7 @@ try controller.start(gpa);
 stores a pointer to the handle. The buffer and the handle must stay valid,
 unmoved and otherwise unused for the rest of the boot: the blobs keep
 allocations from the heap after every radio has been deinitialized, and there
-is no detach. Until the heap is attached, `wifi.init` and `Controller.start`
+is no detach. Until the heap is attached, `Wifi.init` and `Controller.start`
 return `error.SharedHeapNotAttached` and acquire nothing. A second attach returns `error.SharedHeapAlreadyAttached` and leaves
 the first heap in use; an attach from an interrupt or a radio callback returns
 `error.WouldBlock`. Single-radio images have no shared heap and no
@@ -539,7 +540,7 @@ datagram of the Wi-Fi phases was echoed, BLE streamed about 40 notifications
 a second with no disconnect, the peer saw no sequence gap, and
 `from_isr_calls` stayed 0. Each Wi-Fi cycle finished inside its phase:
 deinit took about 0.1 s, most of it the wait after leaving the AP (see
-`wifi.stop`), and never returned `WouldBlock`; the rejected init returned
+`Wifi.stop`), and never returned `WouldBlock`; the rejected init returned
 `InvalidArg`; the station rejoined within about 12 s; the UDP probe came back;
 and notifications kept going out while Wi-Fi was deinitialized. With the DUT
 sending to a UDP port the AP does not echo, the same test printed
@@ -549,9 +550,9 @@ run printed `pass=6 fail=2 void=0`.
 The adapter keeps both blob semaphore handles and the
 52-byte ROM callback table for the lifetime of the boot. It reserves the
 scheduler timer before pre-init and releases it on final radio deinit.
-The C6 Wi-Fi blob also retains its API and global recursive mutexes. The
-coexistence path supplies boot-lifetime storage for both. In Wi-Fi-only
-images their original allocator storage must remain valid between sessions.
+The C3 and C6 Wi-Fi blobs also retain their API and global recursive mutexes.
+Wi-Fi supplies boot-lifetime storage for both, so these mutexes survive a
+failed init or deinit followed by a session with a different allocator.
 Coexistence images put the shared timer worker, timer nodes and allocations
 through the blob OSI adapter on the attached `radio.SharedHeap` (see above);
 the coex examples give it 128 KiB. The last radio owner releases the worker
@@ -575,9 +576,9 @@ retry gets past it, so a step that keeps failing leaves init returning
 Coexistence Wi-Fi stop and deinit post their steps to the driver's
 packet-processing (PP) task, which waits up to 10 ms for a slot in its
 200-entry queue (C6 libpp.a `pp_post`). If the full queue rejects the driver
-deinit step, `wifi.deinit()` returns `error.WouldBlock`: the driver has
+deinit step, `Wifi.deinit()` returns `error.WouldBlock`: the driver has
 restored its initialized state, and a retry resumes at that step. If it
-rejects a stop step, `wifi.stop()` and `wifi.deinit()` panic with a message
+rejects a stop step, `Wifi.stop()` and `Wifi.deinit()` panic with a message
 naming the rejected step, or both steps. The blob has
 then either stopped the hardware with the interfaces still started or stopped
 the interfaces with the hardware still running. In the disassembly of C6
@@ -588,28 +589,55 @@ the hardware. ESP-IDF v5.5.1 links the same
 `ESP_ERR_WIFI_NOT_STOPPED` (`esp_wifi/src/wifi_init.c:180-183`).
 `esp_wifi_stop` also allocates a fresh ioctl for each of its three steps and
 returns `ESP_ERR_NO_MEM` if the second or third allocation fails, after the
-interfaces have stopped. Coexistence `wifi.stop()` and `wifi.deinit()` hand
+interfaces have stopped. Coexistence `Wifi.stop()` and `Wifi.deinit()` hand
 those allocations the reserved ioctl buffer, and panic if an allocation still
 fails after the interfaces stopped. The driver deinit allocates its ioctl from
 the heap: if that fails, the driver restores its initialized state,
-`wifi.deinit()` returns `error.OutOfMemory`, and a retry resumes at that step.
+`Wifi.deinit()` returns `error.OutOfMemory`, and a retry resumes at that step.
 While either is stopping the driver,
-`wifi.disconnect()` returns `error.WouldBlock`: the blob's disconnect tests
+`Wifi.disconnect()` returns `error.WouldBlock`: the blob's disconnect tests
 the started state (`g_ic+0x1f1`) without the driver lock, so a stop can
 complete between that test and the post, and the disconnect would then mark the
 stopped interfaces started.
-Only the init caller that receives `error.WifiRollbackPending` must retry
-`wifi.deinit()` until cleanup succeeds.
-A coexistence `wifi.init` does not use its allocator argument: the session
-allocates from the attached `radio.SharedHeap`. As in IDF v5.5.1 (`esp_wifi/src/wifi_init.c:343-345`), init on
-a running session returns success without reading its `InitConfig`. The
-session is shared and keeps the first init's configuration; a second init's
-`power_save_mode` is not checked. One deinit ends the session for every caller.
-`error.WifiSessionBusy` rejects init while another lifecycle call is in
-progress and, once `power_save_mode` has been validated, while a teardown or
-init rollback is pending. That caller acquired nothing
-and must leave deinit to the owner.
-Other init errors finish cleanup before returning.
+Declare a caller-owned `radio.wifi.Wifi` and initialize it in place. Keep the
+handle at that address until `Wifi.deinit` succeeds and any concurrent calls
+have returned. Serialize operations with deinit, except for stop, deinit and
+connect, which may overlap as documented by `Wifi`. Reinitializing a handle
+while any of those calls from the previous session are still outstanding
+returns `error.WifiSessionBusy`. The handle retains the last station and AP
+event state after deinit and after an init rejected during option validation.
+In either radio selection, a second handle's init returns
+`error.AlreadyInitialized`. Driver operations on a handle without ownership
+return `error.WifiNotInitialized` before any `error.WouldBlock` check. In both
+radio selections, driver operations on the owner, including connect and
+disconnect, return `error.WouldBlock` until the initial init succeeds.
+The cached station and AP state accessors remain available. If init returns
+`error.WifiRollbackPending`, the owner can call deinit to retry cleanup.
+
+Deinit refuses new connects and waits up to 1 s for earlier connects to
+finish, including on every coexistence deinit retry. If a connect is still
+in flight, deinit returns retryable
+`error.Timeout` before advancing teardown. An ordinary stop can proceed after
+that wait.
+
+`Options.on_event` is a process-global listener. An event posted before
+`Wifi.deinit` returned can still reach the listener after deinit releases the
+handle. The driver finishes updating handle state before invoking the
+listener. Events that arrive with no owner are dropped.
+
+A coexistence `Wifi.init` allocates from the attached `radio.SharedHeap`.
+As in IDF v5.5.1 (`esp_wifi/src/wifi_init.c:343-345`), init on the running
+owner succeeds without reading its `InitConfig`. It returns
+`error.WifiSessionBusy` while another lifecycle call is in progress or a
+teardown or init rollback is pending. In these cases the owning handle
+returns `error.WifiSessionBusy` before validating the power-save mode. In a
+single-radio image, init on the owner returns `error.AlreadyInitialized`.
+
+In either selection, `error.WifiRollbackPending` means the handle still owns
+Wi-Fi. Retry `Wifi.deinit` with that handle until cleanup succeeds. An init
+that acquires ownership and fails with another error finishes cleanup before
+returning. The [ESP-IDF v5.5.1 station example](https://github.com/espressif/esp-idf/blob/v5.5.1/examples/wifi/getting_started/station/main/station_example_main.c#L104-L105)
+passes its Wi-Fi initialization configuration from the stack.
 A sub-tick deadline lets the timer worker sleep until the next RTOS tick or
 an earlier arm signal. Single-radio images retain their existing clock,
 timer and PTI settings.
@@ -1017,6 +1045,9 @@ The last promiscuous window may start just before the five seconds end, so the
 promiscuous phase can overrun by up to 0.5 s.
 
 ### Wi-Fi station and RTOS
+
+See the [ESP Wi-Fi handle design](../../../docs/design/esp-wifi-handle.md)
+for ownership, lifecycle and callback routing.
 
 The optional TX-done callback ran on hardware through `selftest_wifi_tx_done` (below):
 10 of 10 callbacks, `DONE pass=3 fail=0` in 3 of 3 boots each on the C3, the Super Mini ESP32-C6 and
@@ -2451,7 +2482,7 @@ The existing Wi-Fi ROM script is retained. No BLE ROM overrides are added.
 
 Select `hal.radio.radios = .{ .wifi = false, .ble = true }`, enable the RTOS and interrupt stack, and register
 `bluetooth.interrupt_handler` on interrupt 29, plus the existing radio and RTOS
-handlers. This mode rejects `wifi.init` at compile time; for Wi-Fi and BLE
+handlers. This mode rejects `Wifi.init` at compile time; for Wi-Fi and BLE
 together select `.{ .wifi = true, .ble = true }` (see the radio selection above).
 Wi-Fi's default configuration and PHY lifecycle are unchanged.
 Use a 160 MHz PLL CPU / 40 MHz crystal and C6 image-boot target. Startup
@@ -3034,7 +3065,7 @@ The C bindings supply the receive-info and send-info callback ABI from that head
 
 Start an enabled Wi-Fi station or SoftAP interface first, with RTOS and the radio
 interrupt installed as in the Wi-Fi examples. An AP connection is unnecessary.
-`Session.init` returns `WifiNotStarted` until a start event arrives,
+Pass the Wi-Fi handle to `Session.init`. It returns `WifiNotStarted` until a start event arrives,
 `UnsupportedRadioProtocol` in an IEEE 802.15.4 image, and produces a compile error
 in a BLE-only image. In a C6 Wi-Fi + BLE image ESP-NOW runs over Wi-Fi. ESP-IDF
 v5.5.1 rates ESP-NOW transmit beside BLE as stable and receive as stable only in
@@ -3049,7 +3080,7 @@ An already completed delivery may be discarded without polling it.
 ```zig
 const espnow = hal.radio.espnow;
 var session: espnow.Session = .{}; // keep at this address until deinit
-try session.init();
+try session.init(&wifi);
 try session.add_peer(.{ .address = espnow.broadcast, .channel = 1 });
 try session.send(espnow.broadcast, "hello");
 // In the application loop (sleep/yield between polls as appropriate):
@@ -3092,7 +3123,7 @@ Peer operations are `add_peer`, `modify_peer`, `remove_peer`, `get_peer`,
 table; the wrapper keeps no second copy. Each peer selects `.sta` or `.ap` and
 channel 0 (current) or 1–14 (must match the interface channel and country policy).
 Add the broadcast peer before broadcasting. There are at most 20 peers; encrypted
-capacity follows `wifi.init_config.espnow_max_encrypt_num`, currently the pinned
+capacity follows the Wi-Fi init configuration's `espnow_max_encrypt_num`, currently the pinned
 SDK's `CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM` (7 on C3/C6). The header's legacy
 `ESP_NOW_MAX_ENCRYPT_PEER_NUM` macro says 6; the wrapper leaves capacity enforcement
 to the blob and propagates `PeerTableFull`.

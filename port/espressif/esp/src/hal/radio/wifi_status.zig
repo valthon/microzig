@@ -8,8 +8,9 @@ const log = std.log.scoped(.esp_radio_wifi);
 pub const Error = error{
     OutOfMemory,
     InvalidArg,
-    /// ESP_ERR_WIFI_TIMEOUT (0x300C) from the blob, or `wifi.stop` or `wifi.deinit` giving up
-    /// after waiting 5 s for another stop, or a `wifi.deinit`, to return.
+    /// ESP_ERR_WIFI_TIMEOUT (0x300C) from the blob, or `Wifi.stop` or `Wifi.deinit` giving up
+    /// after waiting 5 s for another stop or deinit to return. `Wifi.deinit`
+    /// also returns it if a connect is still in flight after waiting 1 s.
     Timeout,
     WouldBlock,
     WifiNotInitialized,
@@ -37,8 +38,8 @@ pub const Error = error{
     WifiInitState,
     /// ESP_ERR_WIFI_STOP_STATE: Wi-Fi is stopping. The blob returns it (0x3014) to a request
     /// made from another task while a stop is in progress (`ieee80211_ioctl+0x116..0x148`).
-    /// `wifi.connect` returns it while `wifi.stop` or `wifi.deinit` runs, and `wifi.stop` and
-    /// `wifi.deinit` return it when called in a task whose own `wifi.stop` or `wifi.deinit` is
+    /// `Wifi.connect` returns it while `Wifi.stop` or `Wifi.deinit` runs, and `Wifi.stop` and
+    /// `Wifi.deinit` return it when called in a task whose own `Wifi.stop` or `Wifi.deinit` is
     /// running.
     WifiStopping,
     /// ESP_ERR_WIFI_NOT_ASSOC: the connection is not associated.

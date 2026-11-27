@@ -771,8 +771,8 @@ fn task_create_common(
         return 0;
     };
 
-    if (coex_enabled and task_handle == @as(?*anyopaque, @ptrCast(&pp_task_hdl))) {
-        // C6 libpp pp_create_task+0x140..0x150 passes &pp_task_hdl.
+    if (microzig.options.hal.radio.radios.wifi and task_handle == @as(?*anyopaque, @ptrCast(&pp_task_hdl))) {
+        // C3/C6 libpp.a pp_create_task loads &pp_task_hdl at +0x154, calls at +0x164.
         // The blob clears that slot even on an internal init rollback.
         wifi_shutdown.record_worker(task);
     }
@@ -968,7 +968,7 @@ fn no_wait() void {
     unreachable;
 }
 
-// C6 libpp.a: pp_delete_task+0x24..0x42 falls back to
+// C3/C6 libpp.a: pp_delete_task+0x24..0x42 falls back to
 // pp_delete_task_manually on semaphore OOM. A failed pp_post takes the
 // same path at +0x54. Manual deletion stops pp_task_hdl before s_wifi_queue.
 pub const WifiShutdown = struct {
@@ -1031,25 +1031,30 @@ pub const WifiShutdown = struct {
             };
             self.stage = .release;
         }
-        if (self.worker) |task| {
-            // This join is bounded, also after ESP_ERR_WIFI_NOT_INIT. In C6
-            // libnet80211.a, s_wifi_init_state (static to ieee80211_api.o) is 1,
-            // the NOT_INIT case of esp_wifi_deinit_internal+0x6e, at boot and
-            // after the only two stores of 1: esp_wifi_deinit_internal+0x124
-            // and the esp_wifi_init_internal rollback (+0x13a stores it,
-            // +0x16c loads it). Both follow wifi_deinit_in_caller_task
-            // (+0xfc, +0x144), whose
-            // ic_delete_wifi_task call (+0xe) runs libpp.a pp_delete_task. That
-            // deletes the PP task by handle (+0x3e or +0x54 into
-            // pp_delete_task_manually+0x18) or posts the delete and waits for
-            // ppTask's semaphore give (+0x84..0x90). After the give
-            // (ppTask+0xd6..0xe6), ppTask only deletes its queue and clears two
-            // handles before it deletes itself (+0x10c).
-            backend.join(task);
-            rtos.free_exited_task(callback_allocator(), task);
-        }
+        self.join_worker(backend);
         backend.release();
         self.* = .{};
+    }
+
+    // This join is bounded, also after ESP_ERR_WIFI_NOT_INIT. In C3/C6
+    // libnet80211.a, s_wifi_init_state (static to ieee80211_api.o) is 1,
+    // the NOT_INIT case of esp_wifi_deinit_internal+0x6e, at boot and
+    // after the only two stores of 1: esp_wifi_deinit_internal+0x124
+    // and the esp_wifi_init_internal rollback (+0x13a stores it,
+    // +0x16c loads it). Both follow wifi_deinit_in_caller_task
+    // (+0xfc, +0x144), whose
+    // ic_delete_wifi_task call (+0xe) runs libpp.a pp_delete_task. That
+    // deletes the PP task by handle (+0x3e or +0x54 into
+    // pp_delete_task_manually+0x18) or posts the delete and waits for
+    // ppTask's semaphore give (+0x84..0x90). After the give
+    // (C3 ppTask+0xd4..0xe4, C6 +0xd6..0xe6), ppTask only deletes its queue
+    // and clears two handles before calling task_delete(null) at C3 +0x10e
+    // (argument and slot load at +0x108/+0x10a) or C6 +0x110 (+0x10a/+0x10c).
+    pub fn join_worker(self: *WifiShutdown, backend: anytype) void {
+        const task = self.worker orelse return;
+        backend.join(task);
+        rtos.free_exited_task(callback_allocator(), task);
+        self.worker = null;
     }
 
     /// Stops the driver with the caller owning the reserved ioctl and with
@@ -1078,9 +1083,9 @@ pub const WifiShutdown = struct {
         return true;
     }
 
-    /// A task that deletes itself exits without being freed. In the C6 Wi-Fi
-    /// blobs that is ppTask (+0x10c), which teardown frees, and tasks the
-    /// port never starts: libmesh's task mains (it calls no esp_mesh API) and
+    /// A task that deletes itself exits without being freed. In the C3/C6 Wi-Fi
+    /// blobs that is ppTask (C3 +0x10e, C6 +0x110), which teardown frees,
+    /// and tasks the port never starts: libmesh's task mains and
     /// libwpa_supplicant.a's wpa2_task (+0x17e) and wps_task (+0x192), which
     /// only the WPA2-Enterprise and WPS APIs create (the port has neither).
     /// Starting any of them would leak its stack and TCB for the boot.
@@ -1750,7 +1755,7 @@ pub const WifiPpSlots = PpDeleteCallbacks(&s_pp_task_create_sem, &xphyQueue);
 fn PpDeleteCallbacks(comptime create_sem: *?*anyopaque, comptime phy_queue: *?*anyopaque) type {
     return struct {
         pub fn delete_sem(ptr: ?*anyopaque) callconv(.c) void {
-            // C6 pp_create_task frees the startup semaphore on task-create
+            // C3/C6 pp_create_task frees the startup semaphore on task-create
             // failure, but only the success path clears s_pp_task_create_sem.
             if (create_sem.* == ptr) create_sem.* = null;
             semphr_delete(ptr);

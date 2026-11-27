@@ -26,13 +26,13 @@ comptime {
     @export(&check, .{ .name = "check_coex_plumbing" });
 }
 
-fn check(shared: *radio.SharedHeap, heap: *std.mem.Allocator, ble: *radio.bluetooth.Controller, mac: *radio.ieee802154.Radio, config: *radio.ieee802154.Config, espnow: *radio.espnow.Session) callconv(.c) void {
+fn check(shared: *radio.SharedHeap, heap: *std.mem.Allocator, wifi: *radio.wifi.Wifi, ble: *radio.bluetooth.Controller, mac: *radio.ieee802154.Radio, config: *radio.ieee802154.Config, espnow: *radio.espnow.Session) callconv(.c) void {
     radio.attach_shared_heap(shared) catch return;
-    radio.wifi.init(heap.*, .{}) catch return;
+    wifi.init(heap.*, .{}) catch return;
     ble.start(heap.*) catch return;
-    espnow.init() catch return;
+    espnow.init(wifi) catch return;
     espnow.deinit() catch return;
     mac.init(heap.*, config.*) catch return;
     mac.deinit() catch return;
-    radio.wifi.deinit() catch return;
+    wifi.deinit() catch return;
 }

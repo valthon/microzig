@@ -6,7 +6,10 @@ const microzig = @import("microzig");
 const enter_critical_section = microzig.interrupt.enter_critical_section;
 const TrapFrame = microzig.cpu.TrapFrame;
 const rtos_options = microzig.options.hal.rtos;
-const coex_enabled = microzig.options.hal.radio.radios.coexistence();
+const radios = microzig.options.hal.radio.radios;
+const coex_enabled = radios.coexistence();
+// The Wi-Fi blob can detach its packet worker on either radio selection.
+const task_teardown_enabled = coex_enabled or radios.wifi;
 
 const system = @import("system.zig");
 const systimer = @import("systimer.zig");
@@ -267,7 +270,7 @@ pub fn spawn(
         .priority = options.priority,
     };
 
-    if (coex_enabled) task.allocation_alignment = alloc_align;
+    if (task_teardown_enabled) task.allocation_alignment = alloc_align;
 
     const cs = enter_critical_section();
     defer cs.leave();
@@ -283,7 +286,7 @@ pub fn spawn(
 /// same as the one used for spawning.
 pub fn wait_and_free(gpa: std.mem.Allocator, task: *Task) void {
     join(task);
-    if (coex_enabled) return free_exited_task(gpa, task);
+    if (task_teardown_enabled) return free_exited_task(gpa, task);
     // alloc_size = stack_end - task
     const alloc_size = @intFromPtr(task.stack[task.stack.len..].ptr) - @intFromPtr(task);
     const alloc: []u8 = @as([*]u8, @ptrCast(task))[0..alloc_size];
@@ -725,8 +728,8 @@ pub const Task = struct {
     priority: Priority,
 
     in_radio_callback: if (coex_enabled) bool else void = if (coex_enabled) false else {},
-    active_wait: if (coex_enabled) ?ActiveWait else void = if (coex_enabled) null else {},
-    allocation_alignment: if (coex_enabled) std.mem.Alignment else void = if (coex_enabled) STACK_ALIGN else {},
+    active_wait: if (task_teardown_enabled) ?ActiveWait else void = if (task_teardown_enabled) null else {},
+    allocation_alignment: if (task_teardown_enabled) std.mem.Alignment else void = if (task_teardown_enabled) STACK_ALIGN else {},
 
     /// What is the deal with this task right now?
     state: State = .none,
@@ -925,7 +928,7 @@ pub const PriorityWaitQueue = struct {
     pub fn wake_all(q: *PriorityWaitQueue, hptw: *bool) void {
         while (q.list.pop_first()) |current_node| {
             const current_waiter: *Waiter = @alignCast(@fieldParentPtr("node", current_node));
-            if (coex_enabled) current_waiter.task.active_wait = null;
+            if (task_teardown_enabled) current_waiter.task.active_wait = null;
             make_ready(current_waiter.task, hptw);
         }
     }
@@ -951,14 +954,14 @@ pub const PriorityWaitQueue = struct {
             q.list.append(&waiter.node);
         }
 
-        if (coex_enabled) task.active_wait = .{ .queue = q, .node = &waiter.node };
+        if (task_teardown_enabled) task.active_wait = .{ .queue = q, .node = &waiter.node };
         if (maybe_timeout_duration) |duration| {
             yield_from_cs(.{ .sleep = duration });
         } else {
             yield_from_cs(.wait);
         }
 
-        if (coex_enabled) {
+        if (task_teardown_enabled) {
             // wake_all may already have removed this waiter before it resumed.
             if (task.active_wait == null) return;
             task.active_wait = null;

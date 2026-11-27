@@ -48,6 +48,8 @@ const coex_options = @import("coex_options");
 const hal = microzig.hal;
 const rtos = hal.rtos;
 const radio = hal.radio;
+
+var wifi: radio.wifi.Wifi = .{};
 const ble = radio.bluetooth;
 const Host = ble.host.Host;
 
@@ -304,20 +306,20 @@ fn join_wifi(gpa: std.mem.Allocator) !void {
 }
 
 fn start_wifi(gpa: std.mem.Allocator) !void {
-    try radio.wifi.init(gpa, .{});
-    try radio.wifi.apply(.{ .sta = .{
+    try wifi.init(gpa, .{});
+    try wifi.apply(.{ .sta = .{
         .ssid = wifi_options.ssid,
         .password = wifi_options.password,
         .auth_method = .wpa2_personal,
     } });
-    try radio.wifi.start();
+    try wifi.start();
     try wait_sta(.started);
 }
 
 /// Start DHCP and associate; the netif must already be added.
 fn connect_wifi() !void {
     try lwip.c_err(lwip.c.netifapi_netif_common(&netif, null, lwip.c.dhcp_start));
-    try radio.wifi.connect();
+    try wifi.connect();
     try wait_sta(.connected);
     wifi_live.store(true, .release);
 }
@@ -341,7 +343,7 @@ fn cycle_wifi(conn: *lwip.c.struct_netconn, phase: usize, phase_start: u64) void
     wifi_live.store(false, .release);
     const deinit_start = now_ms();
     while (true) {
-        radio.wifi.deinit() catch |err| switch (err) {
+        wifi.deinit() catch |err| switch (err) {
             error.WouldBlock => {
                 cycle.would_block += 1;
                 if (cycle.would_block < deinit_retries) {
@@ -372,7 +374,7 @@ fn cycle_wifi(conn: *lwip.c.struct_netconn, phase: usize, phase_start: u64) void
     // rolls the partial session back before it returns.
     const rejected: radio.wifi.InitConfig = .{ .country_info = .{ .manual = .{ .total_channel_number = 0 } } };
     wifi_off.store(false, .release);
-    if (radio.wifi.init(heap_gpa, rejected)) |_| {
+    if (wifi.init(heap_gpa, rejected)) |_| {
         std.log.err("COEX phase={d} init accepted a zero-channel country", .{phase + 1});
         return;
     } else |err| switch (err) {
@@ -391,7 +393,7 @@ fn cycle_wifi(conn: *lwip.c.struct_netconn, phase: usize, phase_start: u64) void
     cycle.reinit_ok = true;
     // IDF v5.5.1 wifi_init.c:343-345: init on a running session succeeds
     // without reading its configuration, so the rejected country is ignored.
-    radio.wifi.init(heap_gpa, rejected) catch |err| {
+    wifi.init(heap_gpa, rejected) catch |err| {
         std.log.err("COEX phase={d} init on the running session: {t}", .{ phase + 1, err });
         return;
     };
@@ -426,7 +428,7 @@ fn fail_with(step: []const u8, err: anyerror) anyerror {
 
 fn wait_sta(expected: radio.wifi.StaState) !void {
     const deadline = now_ms() + wait_ms;
-    while (radio.wifi.get_sta_state() != expected) {
+    while (wifi.get_sta_state() != expected) {
         if (now_ms() >= deadline) return error.Timeout;
         rtos.sleep(.from_ms(20));
     }
@@ -646,7 +648,7 @@ fn udp_loop() !void {
             const u = &udp_phases[phase];
             if (now_ms() >= next_rssi and !cycles_wifi(mode_of(phase))) {
                 next_rssi = now_ms() + 1000;
-                if (radio.wifi.get_sta_rssi()) |rssi| {
+                if (wifi.get_sta_rssi()) |rssi| {
                     if (u.rssi_len < u.rssi.len) {
                         u.rssi[u.rssi_len] = @intCast(std.math.clamp(rssi, -128, 127));
                         u.rssi_len += 1;
@@ -732,6 +734,6 @@ fn netif_output(_: [*c]lwip.c.struct_netif, pbuf_c: [*c]lwip.c.struct_pbuf) call
     const pbuf: *lwip.c.struct_pbuf = pbuf_c;
     if (pbuf.tot_len > packet_buf.len) return lwip.c.ERR_BUF;
     if (lwip.c.pbuf_copy_partial(pbuf, &packet_buf, pbuf.tot_len, 0) != pbuf.tot_len) return lwip.c.ERR_BUF;
-    radio.wifi.send_packet(.sta, packet_buf[0..pbuf.tot_len]) catch return lwip.c.ERR_IF;
+    wifi.send_packet(.sta, packet_buf[0..pbuf.tot_len]) catch return lwip.c.ERR_IF;
     return lwip.c.ERR_OK;
 }

@@ -40,6 +40,7 @@ fn on_packet_transmitted(_: wifi.Interface, _: []const u8, _: bool) void {}
 // Runtime references force analysis of the functions, not just their types.
 export fn compile_wifi_references() void {
     reference_functions(wifi);
+    reference_functions(wifi.Wifi);
     inline for (.{ wifi.WifiMode, wifi.StaState, wifi.Interface, wifi.ScanResultsIterator }) |T|
         reference_functions(T);
 }

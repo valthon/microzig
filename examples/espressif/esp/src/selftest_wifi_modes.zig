@@ -6,7 +6,9 @@ const std = @import("std");
 const microzig = @import("microzig");
 const hal = microzig.hal;
 const rtos = hal.rtos;
-const wifi = hal.radio.wifi;
+const wifi_driver = hal.radio.wifi;
+
+var wifi: wifi_driver.Wifi = .{};
 
 pub const panic = microzig.panic;
 pub const std_options = microzig.std_options(.{
@@ -70,7 +72,7 @@ fn report_loop(err: ?anyerror) noreturn {
     }
 }
 
-fn expect_mode(expected: wifi.WifiMode) ![]const u8 {
+fn expect_mode(expected: wifi_driver.WifiMode) ![]const u8 {
     const mode = try wifi.get_mode();
     results[current].observed = @tagName(mode);
     if (mode != expected) return error.UnexpectedMode;
@@ -125,8 +127,8 @@ fn exercise(gpa: std.mem.Allocator) !void {
     } });
     _ = try expect_mode(.ap);
     try wait_ap_started();
-    if (try wifi.Interface.sta.is_active()) return error.StationActive;
-    if (!try wifi.Interface.ap.is_active()) return error.AccessPointInactive;
+    if (try wifi_driver.Interface.sta.is_active(&wifi)) return error.StationActive;
+    if (!try wifi_driver.Interface.ap.is_active(&wifi)) return error.AccessPointInactive;
     pass("ap");
 
     pass(try expect_error(error.WifiMode, wifi.disconnect()));
