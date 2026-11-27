@@ -23,6 +23,9 @@ boards: struct {
     nicekeyboards: struct {
         nice_nano: *const microzig.Target,
     },
+    seeed: struct {
+        xiao_nrf52840_sense: *const microzig.Target,
+    },
 },
 
 pub fn init(dep: *std.Build.Dependency) ?Self {
@@ -112,6 +115,10 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
         .hal = hal,
     };
 
+    const nrf52840_patches = &.{
+        b.path("patches/nrf528xx.zon"),
+        b.path("patches/nrf52840.zon"),
+    };
     const chip_nrf52840: microzig.Target = .{
         .dep = dep,
         .preferred_binary_format = .elf,
@@ -138,9 +145,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                 // CODE_RAM
                 .{ .name = "code_ram", .offset = 0x800000, .length = 0x40000, .access = .x },
             },
-            .patch_files = &.{
-                b.path("patches/nrf528xx.zon"),
-            },
+            .patch_files = nrf52840_patches,
         },
         .hal = hal,
     };
@@ -207,14 +212,42 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                             .{ .tag = .flash, .offset = 0x00026000, .length = 0x100000 - 0x26000, .access = .rx },
                             .{ .tag = .ram, .offset = 0x20000008, .length = 0x40000 - 8, .access = .rwx },
                         },
-                        .patch_files = &.{
-                            b.path("patches/nrf528xx.zon"),
-                        },
+                        .patch_files = nrf52840_patches,
                     },
                     .board = .{
                         .name = "nice!nano",
                         .url = "https://nicekeyboards.com/docs/nice-nano",
                         .root_source_file = b.path("src/boards/nice_nano.zig"),
+                    },
+                }),
+            },
+            .seeed = .{
+                // Ships with the Adafruit UF2 bootloader and SoftDevice S140 v7, whose
+                // applications start at 0x27000 (Adafruit_nRF52_Bootloader README, "S140
+                // v6 is 0x26000, v7 is 0x27000"). The image ends where Adafruit's Arduino
+                // core ends its own (0xED000, linker/nrf52840_s140_v6.ld), leaving its
+                // flash file system and the bootloader at 0xF4000 (linker/nrf52840.ld)
+                // alone. The first eight RAM bytes belong to the MBR. Reserve the
+                // next eight for the board breadcrumb and keep application RAM
+                // eight-byte aligned. The SoftDevice is never enabled.
+                .xiao_nrf52840_sense = chip_nrf52840.derive(.{
+                    .preferred_binary_format = .{ .uf2 = .{ .family_id = .NRF52840 } },
+                    .chip = .{
+                        .name = "nrf52840",
+                        .url = "https://www.nordicsemi.com/products/nrf52840",
+                        .register_definition = .{
+                            .svd = nrfx.path("mdk/nrf52840.svd"),
+                        },
+                        .memory_regions = &.{
+                            .{ .tag = .flash, .offset = 0x00027000, .length = 0xED000 - 0x27000, .access = .rx },
+                            .{ .tag = .ram, .offset = 0x20000010, .length = 0x40000 - 0x10, .access = .rwx },
+                        },
+                        .patch_files = nrf52840_patches,
+                    },
+                    .board = .{
+                        .name = "XIAO nRF52840 Sense",
+                        .url = "https://wiki.seeedstudio.com/XIAO_BLE",
+                        .root_source_file = b.path("src/boards/xiao_nrf52840_sense.zig"),
                     },
                 }),
             },

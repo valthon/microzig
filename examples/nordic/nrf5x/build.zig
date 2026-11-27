@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     const microbit_v1 = mb.ports.nrf5x.boards.bbc.microbit_v1;
     const microbit_v2 = mb.ports.nrf5x.boards.bbc.microbit_v2;
     const nice_nano = mb.ports.nrf5x.boards.nicekeyboards.nice_nano;
+    const xiao_nrf52840_sense = mb.ports.nrf5x.boards.seeed.xiao_nrf52840_sense;
 
     const available_examples = [_]Example{
         .{ .target = nrf52840_dongle, .name = "nrf52840_dongle_blinky", .file = "src/blinky.zig" },
@@ -46,6 +47,18 @@ pub fn build(b: *std.Build) void {
 
         // A UF2 image for a flash region that starts behind a SoftDevice, at 0x26000.
         .{ .target = nice_nano, .name = "nice_nano_uart", .file = "src/uart.zig" },
+
+        // UF2 images for the flash behind the board's SoftDevice S140 v7, at 0x27000.
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_blinky", .file = "src/blinky.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_usb_cdc", .file = "src/usb_cdc.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_probe", .file = "src/xiao_probe.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_harness", .file = "src/selftest/harness_check.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_harness_min", .file = "src/selftest/harness_min.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_fallback_hang", .file = "src/selftest/fallback_hang.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_timing", .file = "src/selftest/timing.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_storage", .file = "src/selftest/storage.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_analog", .file = "src/selftest/analog.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_sense", .file = "src/selftest/sense.zig" },
     };
 
     for (available_examples) |example| {
@@ -65,6 +78,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .root_source_file = b.path(example.file),
         });
+
+        fw.exe.root_module.addImport("cdc_console", b.createModule(.{
+            .root_source_file = b.path("src/cdc_console.zig"),
+            .imports = &.{.{ .name = "microzig", .module = fw.core_mod }},
+        }));
 
         // `install_firmware()` is the MicroZig pendant to `Build.installArtifact()`
         // and allows installing the firmware as a typical firmware file.

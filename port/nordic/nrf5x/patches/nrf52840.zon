@@ -1,0 +1,21 @@
+// nRF52840 Revision 3 Errata, anomaly 122. The second workaround write
+// targets 0x40029054, a register absent from the nRF52840 SVD.
+.{
+    .{ .add_peripheral = .{
+        .device_name = "nrf52840",
+        .name = "QSPI_ERRATA",
+        .description = "nRF52840 QSPI anomaly 122 workaround",
+        .base_address = 0x40029000,
+        .registers = .{
+            .{
+                .name = "DEACTIVATE_WORKAROUND",
+                .offset_bytes = 0x54,
+                .size_bits = 32,
+                .access = .write_only,
+                .fields = .{
+                    .{ .name = "APPLY", .offset_bits = 0, .size_bits = 1 },
+                },
+            },
+        },
+    } },
+}

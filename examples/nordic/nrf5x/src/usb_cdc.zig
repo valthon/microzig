@@ -2,6 +2,7 @@
 //! examples/raspberrypi/rp2xxx/src/usb_cdc.zig
 
 const std = @import("std");
+const console = @import("cdc_console");
 const microzig = @import("microzig");
 const nrf = microzig.hal;
 const board = microzig.board;
@@ -40,6 +41,13 @@ var usb_controller: usb.DeviceController(.{
     .{ .serial = usb.drivers.CDC{ .itf_notifi_str = "Board CDC", .itf_data_str = "Board CDC Data" } },
 )}) = .init;
 
+const has_fallback = @hasDecl(board, "arm_bootloader_fallback");
+
+pub fn init() void {
+    if (has_fallback) _ = board.arm_bootloader_fallback(20_000);
+    nrf.init();
+}
+
 pub fn main() !void {
     board.init();
 
@@ -53,66 +61,53 @@ pub fn main() !void {
     clocks.hfxo.start();
     usb_device = .init();
 
-    var old: u64 = 0;
-    var new: u64 = 0;
-
+    var last_us: u64 = 0;
     var i: u32 = 0;
+    var lines: console.Lines = .{};
+    var rx_buf: [64]u8 = undefined;
 
     while (true) {
-        // You can now poll for USB events
-        usb_device.poll(&usb_controller);
+        console.poll(&usb_device, &usb_controller);
+        lines.sync_configuration(usb_device.get_configuration_generation());
+        if (console.serial(&usb_device, &usb_controller) == null) {
+            lines.clear();
+            continue;
+        }
+        if (has_fallback) board.feed_bootloader_fallback();
 
-        // Ensure that the host as finished enumerating our USB device
-        if (usb_controller.drivers()) |drivers| {
-            new = time.get_time_since_boot().to_us();
-            if (new - old > 500_000) {
-                old = new;
-                board.led1.toggle();
-                i += 1;
-                std.log.info("cdc test: {}", .{i});
-
-                usb_cdc_write(&drivers.serial, "This is very very long text sent from nRF52 by USB CDC to your device: {}\r\n", .{i});
+        const now = time.get_time_since_boot().to_us();
+        if (now - last_us >= 500_000) {
+            last_us = now;
+            board.led1.toggle();
+            i += 1;
+            std.log.info("cdc test: {}", .{i});
+            if (!write("This is very very long text sent from nRF52 by USB CDC to your device: {}\r\n", .{i})) {
+                lines.clear();
+                continue;
             }
+        }
 
-            // read and print host command if present
-            const message = usb_cdc_read(&drivers.serial);
-            if (message.len > 0) {
-                usb_cdc_write(&drivers.serial, "Your message to me was: {s}\r\n", .{message});
+        const serial = console.serial(&usb_device, &usb_controller) orelse continue;
+        const n = serial.read(&rx_buf);
+        for (rx_buf[0..n]) |byte| {
+            const line = lines.push(byte) orelse continue;
+            if (@hasDecl(board, "reboot_to_bootloader") and
+                std.mem.eql(u8, std.mem.trim(u8, line, " "), "uf2"))
+                board.reboot_to_bootloader();
+            if (!write("Your message to me was: {s}\r\n", .{line})) {
+                lines.clear();
+                break;
             }
         }
     }
 }
 
-var usb_tx_buff: [1024]u8 = undefined;
+var usb_tx_buff: [console.Lines.capacity + 64]u8 = undefined;
 
-/// Transfer data to host
-/// NOTE: After each USB chunk transfer, we have to call the USB task so that bus TX events can be
-/// handled
-pub fn usb_cdc_write(serial: *usb.drivers.CDC.Runtime, comptime fmt: []const u8, args: anytype) void {
-    var tx = std.mem.print(&usb_tx_buff, fmt, args) catch &.{};
-
-    while (tx.len > 0) {
-        tx = tx[serial.write(tx)..];
-        usb_device.poll(&usb_controller);
-    }
-    // Short messages are not sent right away; instead, they accumulate in a buffer, so we have to force a flush to send them
-    while (!serial.flush())
-        usb_device.poll(&usb_controller);
-}
-
-var usb_rx_buff: [1024]u8 = undefined;
-
-/// Receive data from host
-/// NOTE: Read code was not tested extensively. In case of issues, try to call USB task before every
-/// read operation
-pub fn usb_cdc_read(serial: *usb.drivers.CDC.Runtime) []const u8 {
-    var rx_len: usize = 0;
-
-    while (true) {
-        const len = serial.read(usb_rx_buff[rx_len..]);
-        rx_len += len;
-        if (len == 0) break;
-    }
-
-    return usb_rx_buff[0..rx_len];
+fn write(comptime fmt: []const u8, args: anytype) bool {
+    const tx = std.fmt.bufPrint(&usb_tx_buff, fmt, args) catch {
+        std.log.err("CDC response exceeds its TX buffer", .{});
+        return true;
+    };
+    return console.write_all(&usb_device, &usb_controller, tx);
 }
