@@ -886,7 +886,6 @@ fn start_session(state: *osi.WifiShutdown, backend: anytype) InitError!void {
 }
 
 fn run_init_step(backend: anytype, comptime step: InitStep) InitError!void {
-    if (!radio.coex_enabled) return backend.run(step);
     const entry_depth = if (step == .driver) backend.api_depth() else 0;
     backend.run(step) catch |err| {
         // C3 and C6 libnet80211.a esp_wifi_init_internal take the API lock at
@@ -901,8 +900,9 @@ fn run_init_step(backend: anytype, comptime step: InitStep) InitError!void {
 extern var wpa_cb: ?*anyopaque;
 extern fn eloop_destroy() void;
 
-// C6 esp_supplicant_init+0x22 allocates wpa_cb; +0x112..0x11e
-// branches past the ownership transfer on management-frame registration failure.
+// C3/C6 libwpa_supplicant.a esp_supplicant_init+0x22 allocates wpa_cb.
+// On management-frame registration failure, +0x124 skips the transfer at +0x12a.
+// eloop_destroy+0x10 checks the active flag, so a later supplicant deinit can call it again.
 // esp_supplicant_common_init has already undone its own registration there.
 fn discard_unregistered_wpa(slot: *?*anyopaque, destroy_eloop: anytype) void {
     const table = slot.* orelse return;
@@ -955,7 +955,7 @@ const InitBackend = struct {
     }
 
     fn rollback(_: *@This()) InternalError!void {
-        if (radio.coex_enabled) try deinit_coex() else return error.WouldBlock;
+        if (radio.coex_enabled) try deinit_coex() else try release_single(&osi.wifi_shutdown, ShutdownBackend);
     }
 };
 
@@ -993,12 +993,9 @@ const ShutdownBackend = struct {
     }
 };
 
+// The radio reference is already held. Unwind even if driver init itself failed.
 fn configure_single(backend: anytype) InitError!void {
-    run_init_step(backend, .adapter) catch |err| {
-        release_single(&osi.wifi_shutdown, if (callbacks.host_test) HostWifi else ShutdownBackend) catch return error.WifiRollbackPending;
-        return err;
-    };
-    inline for (.{ .driver, .mode, .supplicant, .tx, .rx_ap, .rx_sta, .country, .power_save }) |step| {
+    inline for (.{ .adapter, .driver, .mode, .supplicant, .tx, .rx_ap, .rx_sta, .country, .power_save }) |step| {
         run_init_step(backend, step) catch |err| {
             backend.rollback() catch return error.WifiRollbackPending;
             return err;
@@ -2359,7 +2356,7 @@ const HostWifi = struct {
     }
     fn discard_unregistered(_: *@This()) void {}
     fn rollback(_: *@This()) InternalError!void {
-        if (radio.coex_enabled) try deinit_coex() else return error.WouldBlock;
+        if (radio.coex_enabled) try deinit_coex() else try release_single(&osi.wifi_shutdown, @This());
     }
 
     // Shutdown backend.
@@ -2692,6 +2689,27 @@ test "public Wi-Fi operations cannot enter the driver during init or rollback" {
     HostWifi.on_country = Probe.reject_country;
     defer HostWifi.on_country = null;
 
+    try std.testing.expectError(error.InvalidArg, wifi.init(host_session_allocator, .{}));
+    try std.testing.expectEqual(null, owner);
+    try std.testing.expect(!HostWifi.initialized and !wifi.ready);
+
+    HostWifi.on_country = null;
+    try other.init(host_session_allocator, .{});
+    {
+        errdefer EventLog.end_failed_session(&other);
+        try other.set_mode(.sta);
+        try other.start();
+        const connects = HostWifi.connect_calls;
+        try std.testing.expectError(error.WifiNotInitialized, wifi.connect());
+        try std.testing.expectEqual(connects, HostWifi.connect_calls);
+        try other.connect();
+        try std.testing.expectEqual(connects + 1, HostWifi.connect_calls);
+        try other.deinit();
+    }
+
+    // Force one rollback failure. Only deinit can reach the driver while
+    // the failed init retains the owner.
+    HostWifi.on_country = Probe.reject_country;
     HostWifi.reject_deinit_driver = true;
     defer HostWifi.reject_deinit_driver = false;
     try std.testing.expectError(error.WifiRollbackPending, wifi.init(host_session_allocator, .{}));
@@ -2713,6 +2731,109 @@ test "public Wi-Fi operations cannot enter the driver during init or rollback" {
     try wifi.init(host_session_allocator, .{});
     try std.testing.expect(wifi.ready);
     try wifi.deinit();
+}
+
+test "single-radio init failure releases the driver and radio or leaves teardown retryable" {
+    const Backend = struct {
+        shutdown: osi.WifiShutdown = .{},
+        fail_step: InitStep = .country,
+        depth: u32 = 0,
+        entry_depth: u32 = 0,
+        adapter_installed: bool = false,
+        wpa_unregistered: bool = false,
+
+        var driver_error: ?InternalError = null;
+        var supplicant_released = false;
+        var radio_released = false;
+
+        fn run(self: *@This(), comptime step: InitStep) InitError!void {
+            if (step == .adapter) self.adapter_installed = true;
+            if (step == .driver) assert(self.adapter_installed);
+            if (step != self.fail_step) return;
+            if (step == .supplicant) {
+                self.wpa_unregistered = true;
+                return error.OutOfMemory;
+            }
+            if (step == .driver) {
+                self.depth += 1;
+                return error.OutOfMemory;
+            }
+            return error.InvalidArg;
+        }
+
+        fn api_depth(self: *@This()) u32 {
+            return self.depth;
+        }
+
+        fn unlock_api(self: *@This()) void {
+            self.depth -= 1;
+        }
+
+        fn discard_unregistered(self: *@This()) void {
+            assert(self.wpa_unregistered);
+            self.wpa_unregistered = false;
+        }
+
+        fn rollback(self: *@This()) InternalError!void {
+            assert(!self.wpa_unregistered);
+            assert(self.entry_depth == self.depth);
+            try release_single(&self.shutdown, @This());
+        }
+
+        fn deinit_driver() InternalError!void {
+            if (driver_error) |err| return err;
+        }
+
+        fn deinit_supplicant() InternalError!void {
+            supplicant_released = true;
+        }
+
+        pub fn join(_: *rtos.Task) void {
+            unreachable; // These failures model no PP worker.
+        }
+
+        fn release() void {
+            assert(supplicant_released);
+            radio_released = true;
+        }
+    };
+
+    var backend: Backend = .{};
+    for ([_]?InternalError{ null, error.WifiNotInitialized, error.WouldBlock }) |status| {
+        Backend.driver_error = status;
+        Backend.supplicant_released = false;
+        Backend.radio_released = false;
+        if ((status orelse error.WifiOther) == error.WouldBlock) {
+            try std.testing.expectError(error.WifiRollbackPending, configure_single(&backend));
+            try std.testing.expect(!Backend.supplicant_released and !Backend.radio_released);
+            Backend.driver_error = null;
+            try release_single(&backend.shutdown, Backend);
+        } else {
+            try std.testing.expectError(error.InvalidArg, configure_single(&backend));
+        }
+        try std.testing.expect(Backend.supplicant_released and Backend.radio_released);
+    }
+
+    // An early driver-init failure leaves a recursive level held even when
+    // its deinit reports that the driver never initialized.
+    for ([_]u32{ 0, 1 }) |entry_depth| {
+        backend = .{ .fail_step = .driver, .depth = entry_depth, .entry_depth = entry_depth };
+        Backend.driver_error = error.WifiNotInitialized;
+        Backend.supplicant_released = false;
+        Backend.radio_released = false;
+        try std.testing.expectError(error.OutOfMemory, configure_single(&backend));
+        try std.testing.expectEqual(entry_depth, backend.depth);
+        try std.testing.expect(Backend.supplicant_released and Backend.radio_released);
+    }
+
+    // A supplicant failure must discard the partial registration before teardown.
+    backend = .{ .fail_step = .supplicant };
+    Backend.driver_error = null;
+    Backend.supplicant_released = false;
+    Backend.radio_released = false;
+    try std.testing.expectError(error.OutOfMemory, configure_single(&backend));
+    try std.testing.expect(!backend.wpa_unregistered);
+    try std.testing.expect(Backend.supplicant_released and Backend.radio_released);
 }
 
 test "single-radio cleanup joins and reclaims both packet-worker deletion paths" {
