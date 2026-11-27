@@ -64,6 +64,15 @@ Interrupts are the hidden concurrency in firmware. Every piece of state touched 
 - **Flag:** blocking work inside an ISR: busy-wait sleeps, `std.log` to a slow UART, flash erase, unbounded loops. ISRs do the minimum and hand off.
 - **Flag:** a lock taken in the main loop that an ISR also takes. If the ISR fires while the main loop holds it, the device deadlocks.
 
+A driver whose state machine runs in an ISR has a second kind of race: between *states*, not variables. These are designed out up front with the tables in [`DRIVER_DESIGN.md`](DRIVER_DESIGN.md); review checks for them:
+
+- **Flag:** a foreground transition (stop, retune, cancel, new submission) that does not first reconcile hardware events already latched (a frame that reached its end, a transmission that already started). The event is lost, or reported out of order.
+- **Flag:** a public entry point that checks only the foreground's operation and not phases the ISR enters on its own (an automatic ACK in flight). Check every entry point, including configuration setters, against every phase.
+- **Flag:** an event cleared only after the wait it ends, not before the action that sets it. A stale latch ends the next wait early or blocks the next transition.
+- **Flag:** a deadline judged by which event a poll or ISR sees first. Use a hardware timestamp captured at the event, corrected by its documented latency.
+- **Flag:** one field holding both a request and current state (the channel the user asked for and the one the hardware is on). One operation overwrites the other's value.
+- **Flag:** an operation accepted without reserving queue space for every event it can emit; or one notification standing for several queued events without a documented drain-until-empty rule.
+
 ### 2.4 Explicit allocators — and usually, no allocation at all
 
 - **Rule:** most firmware should not allocate at runtime. Prefer static buffers, caller-provided buffers, and comptime-sized arrays. When allocation is genuinely needed, the function **takes an `Allocator` parameter**. There are no hidden allocations.
@@ -201,6 +210,7 @@ This fork disagrees with banning the tool and agrees with the bar. What that mea
 - [ ] No hand edits to generated register code; corrections are patches
 - [ ] State shared with an ISR or the other core is protected; `defer cs.leave()` directly after `enter_critical_section()`
 - [ ] No blocking work in ISRs; no lock shared between ISR and main loop
+- [ ] State machines shared between foreground and an ISR or the hardware match their reviewed design tables (`DRIVER_DESIGN.md`): latched events reconciled on every transition, every entry point checked against every phase, deadlines from hardware timestamps
 - [ ] Every hardware wait is bounded, or cites the datasheet guarantee
 - [ ] No runtime allocation on-target without reason; allocating fns take an `Allocator` and pair alloc/free
 - [ ] No ignored or swallowed errors; hardware failures are errors, not `unreachable`

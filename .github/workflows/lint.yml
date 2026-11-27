@@ -118,3 +118,24 @@ jobs:
           fi
           xargs -0 tools/linter/zig-out/bin/linter < "$RUNNER_TEMP/changed.z" > "$RUNNER_TEMP/lint.json"
           jq -r '.[] | "::warning file=\(.file),line=\(.line)::\(.message)"' "$RUNNER_TEMP/lint.json"
+
+  # Design docs (docs/design/) name the code they describe on a `Covers:` line.
+  # This job lists, in the job summary, the docs whose covered code the PR
+  # touches, so a reviewer knows where to look. The listing never annotates or
+  # fails; the job fails only if the listing's own scenario test does.
+  design-docs:
+    name: Design docs touched
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: List design docs that describe changed code
+        run: |
+          scripts/design_docs/test_touched_docs.sh
+          # The checkout is the PR's merge commit: its first parent is the base branch, and its
+          # docs are the ones that will be on main.
+          python3 scripts/design_docs/touched_docs.py "$(git rev-parse HEAD^1)" "$(git rev-parse HEAD)" \
+            >> "$GITHUB_STEP_SUMMARY"
