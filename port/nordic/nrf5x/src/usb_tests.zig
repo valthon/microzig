@@ -25,3 +25,7 @@ test "CDC reads notified OUT across suspend without a successful wake" {
 test "CDC IN survives wake timeout and completes after host resume" {
     try @import("hal/usbd.zig").testing.cdc_in_wake_timeout();
 }
+
+test "reselecting the active USB configuration invalidates the previous CDC lifetime" {
+    try @import("hal/usbd.zig").testing.configuration_reselection();
+}
