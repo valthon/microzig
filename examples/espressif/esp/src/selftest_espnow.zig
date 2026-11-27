@@ -1,14 +1,25 @@
 //! Same image on two boards, no AP or wiring. Lower station MAC coordinates.
 //! Expected SELFTEST espnow DONE pass=9 fail=0, within 60 seconds of first boot.
+//! The selftest_espnow_coex build selects Wi-Fi + BLE: each board starts the
+//! BLE controller and advertises "MZ-ESPNOW" (non-connectable) before Wi-Fi.
+//! After its ESP-NOW exchange each board scans for the peer's advertisement
+//! from the peer's public address, keeps advertising while the peer can still
+//! be scanning, then stops advertising with an HCI command. Hearing the peer
+//! and stopping are a tenth check. Expected DONE pass=10 fail=0.
 const std = @import("std");
 const microzig = @import("microzig");
 const hal = microzig.hal;
 const radio = hal.radio;
 const now = radio.espnow;
 const rtos = hal.rtos;
+const coex = @import("espnow_options").coex;
 pub const panic = microzig.panic;
 pub const std_options = microzig.std_options(.{ .logFn = hal.usb_serial_jtag.logger.log, .log_level = .info });
-pub const microzig_options: microzig.Options = .{
+pub const microzig_options: microzig.Options = if (coex) .{
+    .interrupts = .{ .interrupt29 = radio.bluetooth.interrupt_handler, .interrupt30 = radio.interrupt_handler, .interrupt31 = rtos.interrupt_handler },
+    .cpu = .{ .interrupt_stack = .{ .enable = true, .size = 8192 } },
+    .hal = .{ .rtos = .{ .enable = true }, .radio = .{ .radios = .{ .wifi = true, .ble = true } } },
+} else .{
     .interrupts = .{ .interrupt30 = radio.interrupt_handler, .interrupt31 = rtos.interrupt_handler },
     .cpu = .{ .interrupt_stack = .{ .enable = true, .size = 8192 } },
     .hal = .{ .rtos = .{ .enable = true } },
@@ -16,7 +27,20 @@ pub const microzig_options: microzig.Options = .{
 comptime {
     _ = microzig.export_startup();
 }
-const names = [_][]const u8{ "init", "peer_table", "broadcast", "absent_delivery", "unicast", "encrypted", "mismatched_key", "maximum_payload", "deinit" };
+// The BLE controller requires the 160 MHz CPU clock (bluetooth.zig rejects
+// others with InvalidCpuClock); the Wi-Fi-only build keeps the HAL default.
+pub const init = if (coex) init_160_mhz else hal.init;
+const clock_160_mhz: hal.clocks.Config = .init_comptime(160_000_000);
+fn init_160_mhz() void {
+    hal.init_sequence(clock_160_mhz);
+}
+const names = [_][]const u8{ "init", "peer_table", "broadcast", "absent_delivery", "unicast", "encrypted", "mismatched_key", "maximum_payload", "deinit" } ++
+    (if (coex) [_][]const u8{"ble_advertising"} else [_][]const u8{});
+var controller: if (coex) radio.bluetooth.Controller else void = if (coex) .{} else {};
+var host: if (coex) radio.bluetooth.host.Host else void = undefined;
+// The coex build's heap shared by Wi-Fi and BLE, attached for the rest of the boot.
+var radio_heap_buffer: if (coex) [128 * 1024]u8 else void align(16) = undefined;
+var radio_heap: if (coex) radio.SharedHeap else void = undefined;
 var results: [names.len]bool = @splat(false);
 var session: now.Session = .{};
 var frame: now.Frame = undefined;
@@ -28,6 +52,11 @@ const magic = "MZESPNOW";
 const protocol = @import("selftest_espnow_protocol.zig");
 const absent: now.Mac = .{ 2, 0x4d, 0x5a, 0xee, 0xff, 0x19 };
 var run_limit: microzig.drivers.time.Deadline = undefined;
+const ble_name = "MZ-ESPNOW";
+// Flags (LE General Discoverable, no BR/EDR) and the complete local name.
+const advertising_data = [_]u8{ 2, 1, 6, ble_name.len + 1, 9 } ++ ble_name.*;
+/// How long a board scans for the peer's advertisement.
+const scan_ms = 5000;
 
 fn deadline(ms: u32) microzig.drivers.time.Deadline {
     return .init_relative(hal.time.get_time_since_boot(), .from_ms(ms));
@@ -230,6 +259,12 @@ fn follow() !void {
 }
 fn exercise(gpa: std.mem.Allocator) !void {
     @import("wifi_antenna.zig").apply();
+    if (coex) {
+        try controller.start(gpa);
+        host = .init(controller.transport());
+        try host.initialize();
+        try host.advertise_nonconnectable(&advertising_data);
+    }
     try radio.wifi.init(gpa, .{});
     try radio.wifi.apply(.{ .sta = .{ .ssid = "", .channel = 1 } });
     try radio.wifi.start();
@@ -250,13 +285,67 @@ fn exercise(gpa: std.mem.Allocator) !void {
     const leader = std.mem.order(u8, &own, &other) == .lt;
     std.log.info("SELFTEST espnow role={s} version={d} maximum={d}", .{ if (leader) "leader" else "follower", session.version, session.max_payload_len });
     if (leader) try lead() else try follow();
+    // Advertise while the peer can still be scanning. The follower leaves its
+    // final window at most phase_ms after the leader's exchange ends, then
+    // scans for up to scan_ms. The leader ended first and scans for up to
+    // scan_ms, so its scan ends within scan_ms of the follower's end. The extra
+    // second covers the peer's session deinit before its scan.
+    const hold = if (coex) deadline(if (leader) protocol.phase_ms + scan_ms + 1000 else scan_ms + 1000) else {};
     if (try session.dropped_frames() != 0) return error.ReceiveOverflow;
     try session.deinit();
     results[8] = true;
+    if (coex) {
+        const heard = try hear_peer(hold);
+        try host.stop_advertising();
+        results[9] = heard;
+    }
+}
+/// Scan for the peer's advertisement, which proves that it is still
+/// advertising after this board's exchange: the leader ends first and hears
+/// the follower during the follower's final ESP-NOW window, and the follower
+/// hears the leader after the leader's exchange. Advertising continues until
+/// `hold`, so the peer's scan can hear this board; the run limit can cut the
+/// hold short, which is logged.
+fn hear_peer(hold: microzig.drivers.time.Deadline) !bool {
+    var heard = false;
+    host.on_advertisement = peer_advertisement;
+    host.advertisement_context = &heard;
+    defer host.on_advertisement = null;
+    const start = hal.time.get_time_since_boot();
+    try host.scan(true);
+    const limit = deadline(scan_ms);
+    while (!heard and !expired(limit)) try poll_host();
+    try host.scan(false);
+    if (heard) std.log.info("SELFTEST espnow heard the peer's {s} after {d} ms", .{ ble_name, (hal.time.get_time_since_boot().to_us() - start.to_us()) / 1000 });
+    while (!expired(hold)) try poll_host();
+    if (!hold.is_reached_by(hal.time.get_time_since_boot()))
+        std.log.warn("SELFTEST espnow run limit cut the advertising hold short", .{});
+    return heard;
+}
+fn poll_host() !void {
+    host.poll(50) catch |err| if (err != error.Timeout) return err;
+}
+/// Matches the peer's name from its public address: bluetooth.zig sets the
+/// station MAC plus two in the last octet (IDF v5.5.1
+/// esp_hw_support/mac_addr.c:16-17,391-397 under the C6 default of four
+/// universal addresses, port/esp32c6/Kconfig.mac:3,33-40), and HCI reports
+/// carry it reversed.
+fn peer_advertisement(context: ?*anyopaque, ad: *const radio.bluetooth.host.Advertisement) void {
+    const heard: *bool = @ptrCast(@alignCast(context));
+    var address = other;
+    address[5] +%= 2;
+    std.mem.reverse(u8, &address);
+    const name = ad.name() orelse return;
+    if (ad.address_type == 0 and std.mem.eql(u8, &ad.address, &address) and std.mem.eql(u8, name, ble_name)) heard.* = true;
 }
 pub fn main() void {
     run_limit = deadline(55000);
-    var heap = microzig.Allocator.init_with_heap(65536) catch |err| finish(err);
+    // The BLE controller's storage comes from the same heap in the coex build.
+    var heap = microzig.Allocator.init_with_heap(if (coex) 160 * 1024 else 65536) catch |err| finish(err);
+    if (coex) {
+        radio_heap = radio.SharedHeap.init(&radio_heap_buffer) catch |err| finish(err);
+        radio.attach_shared_heap(&radio_heap) catch |err| finish(err);
+    }
     exercise(heap.allocator()) catch |err| finish(err);
     finish(null);
 }

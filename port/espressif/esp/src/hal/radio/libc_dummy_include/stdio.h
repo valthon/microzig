@@ -1,5 +1,5 @@
 #include <stdint.h>
 
-typedef uint32_t size_t;
+#include <stddef.h>
 
 typedef void FILE;

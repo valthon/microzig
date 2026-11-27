@@ -1,6 +1,7 @@
 //! ESP32-C6 BLE controller/HCI, paired with the pinned ESP-IDF v5.5.1 blobs.
 //! One controller per boot; storage and allocator must outlive it. No modem
-//! sleep or concurrent Wi-Fi. See the port README for evidence.
+//! sleep. Wi-Fi may run concurrently only in a Wi-Fi + BLE coexistence
+//! image. See the port README for evidence.
 const std = @import("std");
 const microzig = @import("microzig");
 const c = @import("esp-wifi-driver");
@@ -48,12 +49,13 @@ pub const Controller = struct {
             @export(&blob_putchar, .{ .name = "_putchar" });
             if (@import("../compatibility.zig").chip != .esp32_c6)
                 @compileError("BLE controller is supported only on ESP32-C6");
-            if (!microzig.options.hal.radio.ble)
-                @compileError("select hal.radio.ble=true for exclusive BLE mode");
-            if (microzig.options.hal.radio.protocol != .wifi)
-                @compileError("BLE and IEEE 802.15.4 cannot run simultaneously: no RF coexistence scheduler");
+            if (!microzig.options.hal.radio.radios.ble)
+                @compileError("select hal.radio.radios.ble=true for exclusive BLE mode");
             microzig.cpu.interrupt.expect_handler(.interrupt29, interrupt_handler);
         }
+        if (radio.coex_enabled and @import("callback_context.zig").active()) return error.WouldBlock;
+        // Before claiming the controller: a failed start below needs a reboot.
+        if (radio.coex_enabled) _ = try @import("shared_heap.zig").allocator();
         // C6 TRM §8.2.4.1: PLL root / 3, no extra HS divider or
         // 120 MHz force. This must match cfg.cpu_freq_mhz, not IDF's build
         // default: MicroZig's default CPU clock is 80 MHz.
@@ -75,6 +77,8 @@ pub const Controller = struct {
         clocks_enable();
         var cfg = config();
         try checked(abi.ble_osi_coex_funcs_register(&coex_funcs));
+        // bt.c:1045-1047: coex_init after registering the coex functions.
+        if (radio.coex_enabled) try checked(c.coex_init());
         try checked(abi.esp_ble_register_bb_funcs());
         try checked(abi.r_ble_controller_init(&cfg));
         // IDF v5.5.1 ble.c: the feature stack environments are separate from
@@ -88,15 +92,23 @@ pub const Controller = struct {
         abi.r_filter_duplicate_mode_enable(5); // address + PDU type, bt.c
         abi.r_filter_duplicate_set_ring_list_max_num(100);
         try checked(abi.r_esp_ble_msys_init(128, 320, 12, 12, 1));
-        // IDF v5.5.1 mac_addr.c: the pinned four-address configuration
+        // IDF v5.5.1 esp_hw_support/mac_addr.c:16-17,391-397: the C6 default
+        // of four universal addresses (port/esp32c6/Kconfig.mac:3,33-40)
         // assigns BT the base address plus two in its final octet.
         var mac = radio.read_mac(.sta);
         mac[5] +%= 2;
         std.mem.reverse(u8, &mac);
         try checked(abi.r_esp_ble_ll_set_public_addr(&mac));
         abi.r_ble_hci_trans_cfg_hs(receive_event, self, receive_acl, self);
-        try phy_enable();
-        abi.bt_bb_v2_init_cmplx(1);
+        if (radio.coex_enabled) {
+            // bt.c:1201-1206: PHY for the BT modem, baseband, then coex_enable.
+            osi.phy_modem_enable(.bt);
+            @import("coex.zig").btbb_enable(1);
+            try checked(c.coex_enable());
+        } else {
+            try phy_enable();
+            abi.bt_bb_v2_init_cmplx(1);
+        }
         try checked(abi.base_stack_enable());
         try checked(abi.adv_stack_enable());
         try checked(abi.extAdv_stack_enable());
@@ -104,6 +116,8 @@ pub const Controller = struct {
         try checked(abi.conn_stack_enable());
         try checked(abi.r_ble_controller_enable(1)); // ESP_BT_MODE_BLE
         self.enabled = true;
+        // The shared PHY's timer tracks the PLL for every enabled modem.
+        if (radio.coex_enabled) return;
         _ = try rtos.spawn(allocator, track_phy, .{}, .{
             .name = "ble_phy",
             .priority = .lowest,
@@ -228,7 +242,10 @@ const ext_funcs: abi.ExtFuncs = .{
     .ecc_dh = security_hardware.controller_dh,
     .reset_modem = reset_modem,
 };
-const coex_funcs: abi.CoexFuncs = .{ .set = no_coex, .clear = no_coex };
+pub const coex_funcs: abi.CoexFuncs = .{
+    .set = if (radio.coex_enabled) osi.coex_schm_status_bit_set else no_coex,
+    .clear = if (radio.coex_enabled) osi.coex_schm_status_bit_clear else no_coex,
+};
 fn no_coex(_: u32, _: u32) callconv(.c) void {}
 fn controller_assert(_: u32, _: [*:0]const u8, _: u32, _: u32) callconv(.c) void {
     @panic("BLE controller assertion");
@@ -295,8 +312,13 @@ fn clocks_enable() void {
         .CLK_BLE_TIMER_EN = 1,
         .CLK_ETM_EN = 1,
     });
-    p.MODEM_SYSCON.CLK_CONF1.modify(.{ .CLK_BT_APB_EN = 1, .CLK_BT_EN = 1 });
-    p.MODEM_LPCON.CLK_CONF.modify(.{ .CLK_COEX_EN = 1, .CLK_LP_TIMER_EN = 1 });
+    if (radio.coex_enabled) {
+        analog.shared_clocks_set_enabled(.ble, true);
+        p.MODEM_LPCON.CLK_CONF.modify(.{ .CLK_LP_TIMER_EN = 1 });
+    } else {
+        p.MODEM_SYSCON.CLK_CONF1.modify(.{ .CLK_BT_APB_EN = 1, .CLK_BT_EN = 1 });
+        p.MODEM_LPCON.CLK_CONF.modify(.{ .CLK_COEX_EN = 1, .CLK_LP_TIMER_EN = 1 });
+    }
     p.MODEM_LPCON.LP_TIMER_CONF.modify(.{
         .CLK_LP_TIMER_SEL_OSC_SLOW = 0,
         .CLK_LP_TIMER_SEL_OSC_FAST = 0,
@@ -342,7 +364,43 @@ fn chip_revision() u32 {
     return @as(u32, efuse.read(.{ .block = 1, .bit_offset = 118, .bit_length = 2 })) * 100 +
         efuse.read(.{ .block = 1, .bit_offset = 114, .bit_length = 4 });
 }
+
+/// IDF bt.c:512-530 esp_reset_modem with coexistence enabled.
+fn reset_modem_sequence(hw: anytype, opts: u8, start: u8) void {
+    if (opts != 5) return;
+    if (start == 0) return hw.timer_disable(4);
+    hw.timer_set(4, 2, 15, 0, 5000);
+    hw.timer_enable(4);
+    hw.reset_btbb();
+}
+
+const CoexModemHw = struct {
+    // bt.c:128-130 declares these libcoexist entry points.
+    extern fn coex_hw_timer_set(idx: u8, src: u8, pti: u8, latency: u32, period: u32) void;
+    extern fn coex_hw_timer_enable(idx: u8) void;
+    extern fn coex_hw_timer_disable(idx: u8) void;
+
+    fn timer_set(_: CoexModemHw, idx: u8, src: u8, pti: u8, latency: u32, period: u32) void {
+        coex_hw_timer_set(idx, src, pti, latency, period);
+    }
+    fn timer_enable(_: CoexModemHw, idx: u8) void {
+        coex_hw_timer_enable(idx);
+    }
+    fn timer_disable(_: CoexModemHw, idx: u8) void {
+        coex_hw_timer_disable(idx);
+    }
+    fn reset_btbb(_: CoexModemHw) void {
+        p.MODEM_SYSCON.MODEM_RST_CONF.modify(.{ .RST_BTBB = 1, .RST_BTBB_APB = 1 });
+        p.MODEM_SYSCON.MODEM_RST_CONF.modify(.{ .RST_BTBB = 0, .RST_BTBB_APB = 0 });
+    }
+};
+
 fn reset_modem(opts: u8, start: u8) callconv(.c) void {
+    if (radio.coex_enabled) {
+        const cs = cs_enter();
+        defer cs.leave();
+        return reset_modem_sequence(CoexModemHw{}, opts, start);
+    }
     if (opts != 5 or start == 0) return;
     const cs = cs_enter();
     defer cs.leave();
@@ -358,9 +416,11 @@ fn phy_enable() Error!void {
     analog.calibration_clocks_set_enabled(true);
     defer {
         analog.calibration_clocks_set_enabled(false);
-        const cs = cs_enter();
-        defer cs.leave();
-        p.MODEM_SYSCON.CLK_CONF1.modify(.{ .CLK_BT_APB_EN = 1, .CLK_BT_EN = 1 });
+        if (!radio.coex_enabled) {
+            const cs = cs_enter();
+            defer cs.leave();
+            p.MODEM_SYSCON.CLK_CONF1.modify(.{ .CLK_BT_APB_EN = 1, .CLK_BT_EN = 1 });
+        }
     }
     phy_init_param_set(1);
     phy_bbpll_en_usb(true);
@@ -434,4 +494,51 @@ fn config() abi.Config {
     cfg.adv_rsv_cnt = 1;
     cfg.conn_rsv_cnt = 1;
     return cfg;
+}
+
+test "BLE LP timer divider follows the chip revision workaround" {
+    try std.testing.expectEqual(@as(u12, 399), lp_timer_divider(0));
+    try std.testing.expectEqual(@as(u12, 4), lp_timer_divider(1));
+    try std.testing.expectEqual(@as(u12, 4), lp_timer_divider(2));
+}
+
+test "coexistence modem reset arms the coex hardware timer before the BB reset" {
+    const Recorder = struct {
+        log: [4][]const u8 = undefined,
+        len: usize = 0,
+        set_args: [5]u32 = @splat(0),
+        fn push(self: *@This(), entry: []const u8) void {
+            self.log[self.len] = entry;
+            self.len += 1;
+        }
+        fn timer_set(self: *@This(), idx: u8, src: u8, pti: u8, latency: u32, period: u32) void {
+            self.set_args = .{ idx, src, pti, latency, period };
+            self.push("set");
+        }
+        fn timer_enable(self: *@This(), idx: u8) void {
+            std.debug.assert(idx == 4);
+            self.push("enable");
+        }
+        fn timer_disable(self: *@This(), idx: u8) void {
+            std.debug.assert(idx == 4);
+            self.push("disable");
+        }
+        fn reset_btbb(self: *@This()) void {
+            self.push("reset");
+        }
+    };
+    var start: Recorder = .{};
+    reset_modem_sequence(&start, 5, 1);
+    try std.testing.expectEqual(@as(usize, 3), start.len);
+    for ([_][]const u8{ "set", "enable", "reset" }, start.log[0..3]) |want, got| try std.testing.expectEqualStrings(want, got);
+    try std.testing.expectEqual([5]u32{ 4, 2, 15, 0, 5000 }, start.set_args);
+
+    var stop: Recorder = .{};
+    reset_modem_sequence(&stop, 5, 0);
+    try std.testing.expectEqual(@as(usize, 1), stop.len);
+    try std.testing.expectEqualStrings("disable", stop.log[0]);
+
+    var other: Recorder = .{};
+    reset_modem_sequence(&other, 4, 1);
+    try std.testing.expectEqual(@as(usize, 0), other.len);
 }

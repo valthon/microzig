@@ -6,6 +6,7 @@ const microzig = @import("microzig");
 const enter_critical_section = microzig.interrupt.enter_critical_section;
 const TrapFrame = microzig.cpu.TrapFrame;
 const rtos_options = microzig.options.hal.rtos;
+const coex_enabled = microzig.options.hal.radio.radios.coexistence();
 
 const system = @import("system.zig");
 const systimer = @import("systimer.zig");
@@ -120,6 +121,24 @@ pub const RTOS_State = struct {
     overflow_count: u32 = 0,
 
     just_switched_tasks_cooperatively: bool = false,
+
+    /// Remove a quiesced driver task before reclaiming its stack. The caller
+    /// holds the critical section and owns the task's final join.
+    pub fn detach_task(state: *RTOS_State, task: *Task) void {
+        if (task == state.current_task or task.awaiter != null) @panic("detach_task: the task is running or joined");
+        if (task.active_wait) |wait| {
+            wait.queue.list.remove(wait.node);
+            task.active_wait = null;
+        }
+        switch (task.state) {
+            .ready => state.ready_queue.remove(task),
+            .sleep_queue_0 => state.sleep_queues[0].remove(&task.node),
+            .sleep_queue_1 => state.sleep_queues[1].remove(&task.node),
+            .suspended, .exited, .none => {},
+            .running => unreachable,
+        }
+        task.state = .exited;
+    }
 };
 
 /// Automatically called inside hal startup sequence if it the rtos is enabled
@@ -248,6 +267,8 @@ pub fn spawn(
         .priority = options.priority,
     };
 
+    if (coex_enabled) task.allocation_alignment = alloc_align;
+
     const cs = enter_critical_section();
     defer cs.leave();
 
@@ -261,18 +282,35 @@ pub fn spawn(
 /// Wait for a task to finish and free its memory. The allocator must be the
 /// same as the one used for spawning.
 pub fn wait_and_free(gpa: std.mem.Allocator, task: *Task) void {
-    {
-        const cs = enter_critical_section();
-        defer cs.leave();
-        if (task.state != .exited) {
-            task.awaiter = rtos_state.current_task;
-            yield_from_cs(.wait);
-        }
-    }
+    join(task);
+    if (coex_enabled) return free_exited_task(gpa, task);
     // alloc_size = stack_end - task
     const alloc_size = @intFromPtr(task.stack[task.stack.len..].ptr) - @intFromPtr(task);
     const alloc: []u8 = @as([*]u8, @ptrCast(task))[0..alloc_size];
     gpa.free(alloc);
+}
+
+/// Wait for a task to finish. Free it with `free_exited_task`.
+pub fn join(task: *Task) void {
+    const cs = enter_critical_section();
+    defer cs.leave();
+    if (task.state != .exited) {
+        task.awaiter = rtos_state.current_task;
+        yield_from_cs(.wait);
+    }
+}
+
+/// Stop another task after its driver has finished using shared resources.
+pub fn detach_task(task: *Task) void {
+    const cs = enter_critical_section();
+    defer cs.leave();
+    rtos_state.detach_task(task);
+}
+
+pub fn free_exited_task(gpa: std.mem.Allocator, task: *Task) void {
+    if (task.state != .exited) @panic("free_exited_task: the task has not exited");
+    const len = @intFromPtr(task.stack[task.stack.len..].ptr) - @intFromPtr(task);
+    gpa.rawFree(@as([*]u8, @ptrCast(task))[0..len], task.allocation_alignment, @returnAddress());
 }
 
 /// Must execute inside a critical section.
@@ -675,7 +713,7 @@ pub fn log_task_info(task: *Task) void {
     }
 }
 
-inline fn in_isr() bool {
+pub inline fn in_isr() bool {
     return microzig.cpu.csr.mscratch.read_raw() != 0;
 }
 
@@ -685,6 +723,10 @@ pub const Task = struct {
     context: Context,
     stack: []u8,
     priority: Priority,
+
+    in_radio_callback: if (coex_enabled) bool else void = if (coex_enabled) false else {},
+    active_wait: if (coex_enabled) ?ActiveWait else void = if (coex_enabled) null else {},
+    allocation_alignment: if (coex_enabled) std.mem.Alignment else void = if (coex_enabled) STACK_ALIGN else {},
 
     /// What is the deal with this task right now?
     state: State = .none,
@@ -700,6 +742,8 @@ pub const Task = struct {
 
     /// Task specific semaphore (required by the wifi driver)
     semaphore: Semaphore = .init(0, 1),
+
+    const ActiveWait = struct { queue: *PriorityWaitQueue, node: *DoublyLinkedList.Node };
 
     pub const State = enum {
         none,
@@ -881,6 +925,7 @@ pub const PriorityWaitQueue = struct {
     pub fn wake_all(q: *PriorityWaitQueue, hptw: *bool) void {
         while (q.list.pop_first()) |current_node| {
             const current_waiter: *Waiter = @alignCast(@fieldParentPtr("node", current_node));
+            if (coex_enabled) current_waiter.task.active_wait = null;
             make_ready(current_waiter.task, hptw);
         }
     }
@@ -906,12 +951,18 @@ pub const PriorityWaitQueue = struct {
             q.list.append(&waiter.node);
         }
 
+        if (coex_enabled) task.active_wait = .{ .queue = q, .node = &waiter.node };
         if (maybe_timeout_duration) |duration| {
             yield_from_cs(.{ .sleep = duration });
         } else {
             yield_from_cs(.wait);
         }
 
+        if (coex_enabled) {
+            // wake_all may already have removed this waiter before it resumed.
+            if (task.active_wait == null) return;
+            task.active_wait = null;
+        }
         q.list.remove(&waiter.node);
     }
 };

@@ -24,7 +24,7 @@ pub const microzig_options: microzig.Options = .{
         // Match IDF's controller priorities and give host/callout/PHY tasks
         // fair service even when advertising reports arrive continuously.
         .rtos = .{ .enable = true, .priority_bits = 5, .preempt_same_priority_tasks_on_tick = true },
-        .radio = .{ .ble = true },
+        .radio = .{ .radios = .{ .wifi = false, .ble = true } },
     },
 };
 pub const Role = enum { scan, peripheral, central };

@@ -25,7 +25,7 @@ pub const microzig_options: microzig.Options = .{
         .interrupt31 = hal.rtos.interrupt_handler,
     },
     .cpu = .{ .interrupt_stack = .{ .enable = true, .size = 8192 } },
-    .hal = .{ .rtos = .{ .enable = true }, .radio = .{ .protocol = .ieee802154 } },
+    .hal = .{ .rtos = .{ .enable = true }, .radio = .{ .radios = .{ .wifi = false, .ieee802154 = true } } },
 };
 comptime {
     _ = microzig.export_startup();

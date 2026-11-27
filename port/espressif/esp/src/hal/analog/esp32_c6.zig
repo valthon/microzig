@@ -162,13 +162,30 @@ var phy_clock_refs: u32 = 0;
 var analog_clock_owned = false;
 var slowclk_period: u32 = 0;
 var ieee802154_clocks_owned = false;
+const coex_enabled = @import("../radio.zig").coex_enabled;
+const ClockUsers = @import("../radio/shared_clocks.zig").Users;
+var clock_users: ClockUsers = .{};
+
+// Caller holds the same critical section as the private gate updates.
+pub fn shared_clocks_set_enabled(comptime owner: ClockUsers.Owner, enabled: bool) void {
+    clock_users.update(owner, enabled);
+    MODEM_SYSCON.CLK_CONF1.modify(.{ .CLK_BT_APB_EN = clock_users.bt(), .CLK_BT_EN = clock_users.bt() });
+    MODEM_LPCON.CLK_CONF.modify(.{ .CLK_COEX_EN = clock_users.coex() });
+    MODEM_SYSCON.CLK_CONF.modify(.{ .CLK_ETM_EN = clock_users.etm() });
+}
 
 /// ESP-IDF v5.5.1 modem_clock.c IEEE802154_CLOCK_DEPS: MAC/APB, shared
 /// BT BB, ETM and coexistence. radio_init already maps ZB to ACTIVE only.
-/// The radio protocol option excludes Wi-Fi; no BLE clock owner exists here.
+/// BLE and 802.15.4 share BT BB and ETM in coexistence mode.
 pub fn ieee802154_clocks_set_enabled(enabled: bool) void {
     const cs = microzig.interrupt.enter_critical_section();
     defer cs.leave();
+    if (coex_enabled) {
+        shared_clocks_set_enabled(.ieee802154, enabled);
+        const en = @intFromBool(clock_users.ieee802154 != 0);
+        MODEM_SYSCON.CLK_CONF.modify(.{ .CLK_ZB_APB_EN = en, .CLK_ZB_MAC_EN = en });
+        return;
+    }
     ieee802154_clocks_owned = enabled;
     const en = @intFromBool(enabled);
     MODEM_SYSCON.CLK_CONF.modify(.{ .CLK_ZB_APB_EN = en, .CLK_ZB_MAC_EN = en, .CLK_ETM_EN = en });
@@ -190,6 +207,7 @@ pub fn ieee802154_mac_reset() void {
 pub fn sleep_blocked() bool {
     const cs = microzig.interrupt.enter_critical_section();
     defer cs.leave();
+    if (coex_enabled and clock_users.coex() != 0) return true;
     return wifi_inited or ieee802154_clocks_owned or wifi_clock_refs != 0 or bb_clock_refs != 0 or phy_clock_refs != 0;
 }
 
@@ -204,18 +222,19 @@ pub fn wifi_set_inited(inited: bool) void {
 pub fn wifi_clocks_set_enabled(enabled: bool) void {
     const cs = microzig.interrupt.enter_critical_section();
     defer cs.leave();
+    if (coex_enabled) shared_clocks_set_enabled(.wifi, enabled);
     if (enabled) {
         wifi_clock_refs += 1;
         if (wifi_clock_refs == 1) {
             MODEM_SYSCON.CLK_CONF1.modify(.{ .CLK_WIFIMAC_EN = 1 });
-            MODEM_LPCON.CLK_CONF.modify(.{ .CLK_COEX_EN = 1 });
+            if (!coex_enabled) MODEM_LPCON.CLK_CONF.modify(.{ .CLK_COEX_EN = 1 });
         }
     } else {
         if (wifi_clock_refs == 0) return;
         wifi_clock_refs -= 1;
         if (wifi_clock_refs == 0) {
             if (!wifi_inited) MODEM_SYSCON.CLK_CONF1.modify(.{ .CLK_WIFIMAC_EN = 0 });
-            MODEM_LPCON.CLK_CONF.modify(.{ .CLK_COEX_EN = 0 });
+            if (!coex_enabled) MODEM_LPCON.CLK_CONF.modify(.{ .CLK_COEX_EN = 0 });
         }
     }
     bb_clocks_set_enabled(enabled);
@@ -226,7 +245,9 @@ pub fn wifi_clocks_set_enabled(enabled: bool) void {
 pub fn calibration_clocks_set_enabled(enabled: bool) void {
     const cs = microzig.interrupt.enter_critical_section();
     defer cs.leave();
+    if (coex_enabled and !enabled and clock_users.calibration == 0) return;
     bb_clocks_set_enabled(enabled);
+    if (coex_enabled) return shared_clocks_set_enabled(.calibration, enabled);
     // IDF PHY_CALIBRATION_BT_I154_CLOCK_DEPS also opens the shared BT BB.
     // Retain the shared BB when an 802.15.4 owner survives calibration.
     const en = @intFromBool(enabled or ieee802154_clocks_owned);

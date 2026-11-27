@@ -46,7 +46,7 @@ pub const State = struct {
         active = self;
         _ = try rtos.spawn(self.allocator, service, .{self}, .{
             .name = "ble_callout",
-            .priority = .lowest,
+            .priority = if (@import("../../radio.zig").coex_enabled) @import("../timer.zig").coex_task_priority() else .lowest,
             .stack_size = 2048,
         });
     }
@@ -176,6 +176,9 @@ fn event_init(h: *Handle, callback: Callback, arg: ?*anyopaque) callconv(.c) voi
         return;
     }
     const ev = alloc(Event);
+    install_event(ev, h, callback, arg);
+}
+fn install_event(ev: *Event, h: *Handle, callback: Callback, arg: ?*anyopaque) void {
     ev.* = .{ .callback = callback, .arg = arg, .handle = h, .allocation_next = active.events };
     active.events = ev;
     h.ptr = ev;
@@ -300,7 +303,15 @@ fn callout_init(h: *Handle, q: ?*Handle, cb: Callback, arg: ?*anyopaque) callcon
     }
     const co = active.allocator.create(Callout) catch return 1;
     co.* = .{ .handle = h, .event = .{ .ptr = null }, .queue = q };
-    event_init(&co.event, cb, arg);
+    if (@import("../../radio.zig").coex_enabled) {
+        // callout_init can report BLE_NPL_ENOMEM even if its nested event
+        // allocation fails. Neither handle is published until both exist.
+        const ev = active.allocator.create(Event) catch {
+            active.allocator.destroy(co);
+            return 1;
+        };
+        install_event(ev, &co.event, cb, arg);
+    } else event_init(&co.event, cb, arg);
     co.next = active.callouts;
     active.callouts = co;
     h.ptr = co;
@@ -393,6 +404,12 @@ fn time_forever() callconv(.c) u32 {
 fn in_critical() callconv(.c) u8 {
     return @intFromBool(!microzig.cpu.interrupt.globally_enabled());
 }
+// spawn can immediately preempt Controller.start. At a slow tick rate a
+// millisecond rounds down to zero and the higher-priority worker stays ready.
+pub inline fn wait_for_next_poll(comptime sleep: fn (rtos.Duration) void) void {
+    sleep(if (@import("../../radio.zig").coex_enabled) .from_ticks(1) else .from_ms(1));
+}
+
 fn service(state: *State) void {
     while (true) {
         // Select one expired callout at a time. Queue insertion is done with the
@@ -426,7 +443,7 @@ fn service(state: *State) void {
                 }
             }
         }
-        rtos.sleep(.from_ms(1));
+        wait_for_next_poll(rtos.sleep);
     }
 }
 
@@ -479,3 +496,22 @@ pub const Funcs = extern struct {
     p_ble_npl_eventq_put_to_front: @TypeOf(&eventq_front) = &eventq_front,
 };
 pub const funcs: Funcs = .{};
+
+test "callout init returns ENOMEM and can retry after its event allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var state: State = .{ .allocator = failing.allocator() };
+    const previous_context = active;
+    active = &state;
+    defer active = previous_context;
+    var handle: Handle = .{ .ptr = null };
+    const cb = struct {
+        fn run(_: *Handle) callconv(.c) void {}
+    }.run;
+    try std.testing.expectEqual(1, callout_init(&handle, null, cb, null));
+    try std.testing.expect(handle.ptr == null and state.callouts == null and state.events == null);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(0, callout_init(&handle, null, cb, null));
+    callout_deinit(&handle);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}

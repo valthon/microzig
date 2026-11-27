@@ -22,11 +22,26 @@ pub const Timer = struct {
     node: std.SinglyLinkedList.Node = .{},
 };
 
+// One allocator backs the worker and every node on `timer_list`: the
+// radio's. `radio.init` passes it to `init` and for the PHY and coex nodes;
+// `radio.deinit` and the blob's `timer_setfn`/`timer_done` callbacks pass
+// `osi.callback_allocator()`, which routes to it (the attached heap in a
+// coexistence image, the first owner's allocator in a single-radio image).
 var timer_task: ?*rtos.Task = null;
 var exit_flag: std.atomic.Value(bool) = .init(false);
 var reload_semaphore: rtos.Semaphore = .init(0, 1);
 var mutex: rtos.Mutex = .{};
 var timer_list: std.SinglyLinkedList = .{};
+
+const CoexDeadlines = @import("coex_timer_wait.zig").Deadlines;
+const coex_enabled = @import("../radio.zig").coex_enabled;
+const host_test = @import("callback_context.zig").host_test;
+
+// IDF v5.5.1 esp_system/include/esp_task.h:46 runs the esp_timer task at MAX-3.
+// NPL callouts use that task (bt/porting/npl/freertos/src/npl_os_freertos.c:656-668).
+pub fn coex_task_priority() rtos.Priority {
+    return @fromBackingInt(@max(1, @backingInt(rtos.Priority.highest) -| 2));
+}
 
 pub fn init(gpa: Allocator) Allocator.Error!void {
     exit_flag.store(false, .monotonic);
@@ -34,18 +49,22 @@ pub fn init(gpa: Allocator) Allocator.Error!void {
     assert(timer_task == null);
     timer_task = try rtos.spawn(gpa, task_fn, .{}, .{
         .name = "radio_timer",
-        .priority = .lowest, // TODO: what should the priority be?
+        .priority = if (coex_enabled) coex_task_priority() else .lowest,
         .stack_size = 4096,
     });
 }
 
 pub fn deinit(gpa: Allocator) void {
-    exit_flag.store(true, .monotonic);
-    reload_semaphore.give();
+    // Host tests have no scheduler and start no worker (radio.zig's
+    // HostResources stands in); they run only the drain below.
+    if (!host_test) {
+        exit_flag.store(true, .monotonic);
+        reload_semaphore.give();
 
-    if (timer_task) |task| {
-        rtos.wait_and_free(gpa, task);
-        timer_task = null;
+        if (timer_task) |task| {
+            rtos.wait_and_free(gpa, task);
+            timer_task = null;
+        }
     }
 
     while (timer_list.popFirst()) |node| {
@@ -70,18 +89,36 @@ pub fn setfn(
             tim.deadline = .no_deadline;
         } else {
             const timer = try gpa.create(Timer);
-            timer.* = .{
-                .ets_timer = ets_timer,
-                .callback = callback,
-                .arg = arg,
-                .deadline = .no_deadline,
-                .periodic = null,
-            };
-            timer_list.prepend(&timer.node);
+            insert(timer, ets_timer, callback, arg);
         }
     }
 
     reload_semaphore.give();
+}
+
+pub fn setfn_reserved(node: *Timer, ets_timer: *c.ets_timer, callback: CallbackFn, arg: ?*anyopaque) void {
+    mutex.lock();
+    defer mutex.unlock();
+    // Pre-init runs once per timer worker. The new timer is disarmed.
+    insert(node, ets_timer, callback, arg);
+}
+
+/// Host tests: put `node` on the list as `setfn_reserved` does, without its
+/// lock, which needs the scheduler. The new timer is disarmed.
+pub fn insert_for_test(node: *Timer, ets_timer: *c.ets_timer) void {
+    comptime assert(host_test);
+    insert(node, ets_timer, undefined, null);
+}
+
+inline fn insert(timer: *Timer, ets_timer: *c.ets_timer, callback: CallbackFn, arg: ?*anyopaque) void {
+    timer.* = .{
+        .ets_timer = ets_timer,
+        .callback = callback,
+        .arg = arg,
+        .deadline = .no_deadline,
+        .periodic = null,
+    };
+    timer_list.prepend(&timer.node);
 }
 
 pub fn arm(
@@ -140,14 +177,22 @@ fn task_fn() void {
 
                 const tim = find_expired(now) orelse break;
                 if (tim.periodic) |period| {
-                    tim.deadline = .init_relative(now, period);
+                    tim.deadline = .init_relative(now, if (coex_enabled and period.to_us() == 0) time.Duration.from_us(1) else period);
                 } else {
                     tim.deadline = .no_deadline;
                 }
                 break :blk .{ tim.callback, tim.arg };
             };
 
+            const scope = @import("callback_context.zig").Scope.enter();
+            defer scope.leave();
             callback(arg);
+        }
+
+        if (coex_enabled) {
+            const next = coex_deadlines();
+            next.wait(&reload_semaphore, get_time_since_boot().to_us(), rtos.Duration.us_per_tick);
+            continue;
         }
 
         const timeout: rtos.Timeout = blk: {
@@ -185,6 +230,19 @@ fn find_expired(now: time.Absolute) ?*Timer {
     return null;
 }
 
+fn coex_deadlines() CoexDeadlines {
+    mutex.lock();
+    defer mutex.unlock();
+    var next: CoexDeadlines = .{};
+    var it = timer_list.first;
+    while (it) |node| : (it = node.next) {
+        const tim: *Timer = @alignCast(@fieldParentPtr("node", node));
+        if (tim.deadline.can_be_reached())
+            next.include(tim.deadline.timeout.to_us(), tim.periodic != null);
+    }
+    return next;
+}
+
 fn find_next_wake_absolute() ?time.Absolute {
     var it = timer_list.first;
     var min_deadline: time.Deadline = .no_deadline;
@@ -195,4 +253,16 @@ fn find_next_wake_absolute() ?time.Absolute {
         }
     }
     return if (min_deadline.can_be_reached()) min_deadline.timeout else null;
+}
+
+test "deinit returns every node to the allocator it is given" {
+    var accounting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var keys: [3]c.ets_timer = undefined;
+    for (&keys) |*key| {
+        const node = try accounting.allocator().create(Timer);
+        insert(node, key, undefined, null);
+    }
+    deinit(accounting.allocator());
+    try std.testing.expect(timer_list.first == null);
+    try std.testing.expect(accounting.allocations == 3 and accounting.allocated_bytes == accounting.freed_bytes);
 }
