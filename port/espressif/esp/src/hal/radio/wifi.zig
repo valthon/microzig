@@ -338,7 +338,7 @@ pub const Wifi = struct {
                 self.leave_ap_before_stop();
                 _ = if (callbacks.host_test) HostWifi.esp_wifi_stop() else c.esp_wifi_stop();
             }
-            try release_single(if (callbacks.host_test) HostWifi else ShutdownBackend);
+            try release_single(&osi.wifi_shutdown, if (callbacks.host_test) HostWifi else ShutdownBackend);
         }
         released = true;
     }
@@ -995,7 +995,7 @@ const ShutdownBackend = struct {
 
 fn configure_single(backend: anytype) InitError!void {
     run_init_step(backend, .adapter) catch |err| {
-        release_single(if (callbacks.host_test) HostWifi else ShutdownBackend) catch return error.WifiRollbackPending;
+        release_single(&osi.wifi_shutdown, if (callbacks.host_test) HostWifi else ShutdownBackend) catch return error.WifiRollbackPending;
         return err;
     };
     inline for (.{ .driver, .mode, .supplicant, .tx, .rx_ap, .rx_sta, .country, .power_save }) |step| {
@@ -1006,9 +1006,10 @@ fn configure_single(backend: anytype) InitError!void {
     }
 }
 
-fn release_single(backend: anytype) InternalError!void {
+fn release_single(shutdown: *osi.WifiShutdown, backend: anytype) InternalError!void {
     backend.deinit_driver() catch |err| if (err != error.WifiNotInitialized) return err;
     backend.deinit_supplicant() catch |err| log.debug("supplicant teardown returned {t}", .{err});
+    shutdown.join_worker(backend);
     backend.release();
 }
 
@@ -1722,7 +1723,7 @@ var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
         ._wifi_int_restore = osi.wifi_int_restore,
         ._task_yield_from_isr = osi.task_yield_from_isr,
         ._semphr_create = osi.semphr_create,
-        ._semphr_delete = if (radio.coex_enabled) osi.WifiPpSlots.delete_sem else osi.semphr_delete,
+        ._semphr_delete = osi.WifiPpSlots.delete_sem,
         // IDF v5.5.1 esp_wifi/esp32c6/esp_adapter.c:598-599 shares the
         // coex semaphore ABI. ieee80211_ioctl reads the driver's return
         // status only when its completion semaphore take returns pdTRUE.
@@ -1749,7 +1750,7 @@ var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
         ._event_group_wait_bits = @ptrCast(&osi.event_group_wait_bits),
         ._task_create_pinned_to_core = osi.task_create_pinned_to_core,
         ._task_create = osi.task_create,
-        ._task_delete = if (radio.coex_enabled) osi.wifi_task_delete else osi.task_delete,
+        ._task_delete = osi.wifi_task_delete,
         ._task_delay = osi.task_delay,
         ._task_ms_to_tick = osi.task_ms_to_tick,
         ._task_get_current_task = osi.task_get_current_task,
@@ -1806,7 +1807,7 @@ var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
         ._wifi_calloc = osi.wifi_calloc,
         ._wifi_zalloc = if (radio.coex_enabled) osi.wifi_shutdown_zalloc else osi.wifi_zalloc,
         ._wifi_create_queue = osi.wifi_create_queue,
-        ._wifi_delete_queue = if (radio.coex_enabled) osi.WifiPpSlots.delete_queue else osi.wifi_delete_queue,
+        ._wifi_delete_queue = osi.WifiPpSlots.delete_queue,
         ._coex_init = osi.coex_init,
         ._coex_deinit = osi.coex_deinit,
         ._coex_enable = osi.coex_enable,
@@ -2712,6 +2713,90 @@ test "public Wi-Fi operations cannot enter the driver during init or rollback" {
     try wifi.init(host_session_allocator, .{});
     try std.testing.expect(wifi.ready);
     try wifi.deinit();
+}
+
+test "single-radio cleanup joins and reclaims both packet-worker deletion paths" {
+    const Backend = struct {
+        var active: *@This() = undefined;
+        shutdown: osi.WifiShutdown = .{},
+        accounting: *std.testing.FailingAllocator,
+        scheduler: rtos.RTOS_State,
+        worker_slot: ?*rtos.Task,
+        manual: bool,
+        deinit_result: ?InternalError,
+        joined: bool = false,
+        released: bool = false,
+
+        fn detach(task: *rtos.Task) void {
+            active.scheduler.detach_task(task);
+        }
+
+        fn exit(action: rtos.YieldAction) void {
+            assert(action == .exit and active.worker_slot == null);
+            active.shutdown.worker.?.state = .exited;
+        }
+
+        fn deinit_driver(self: *@This()) InternalError!void {
+            if (self.manual) {
+                // pp_delete_task_manually passes the task handle, then clears it.
+                self.shutdown.delete_task(self.worker_slot.?, self.scheduler.current_task, detach, exit);
+                self.worker_slot = null;
+            }
+            if (self.deinit_result) |err| return err;
+        }
+
+        fn deinit_supplicant(_: *@This()) InternalError!void {}
+
+        pub fn join(self: *@This(), task: *rtos.Task) void {
+            assert(self.accounting.deallocations == 0);
+            if (!self.manual) {
+                // After acknowledging deletion, ppTask clears the blob slot
+                // and exits through task_delete(null).
+                self.worker_slot = null;
+                self.shutdown.delete_task(null, task, detach, exit);
+            }
+            assert(task.state == .exited and self.worker_slot == null);
+            self.joined = true;
+        }
+
+        fn release(self: *@This()) void {
+            assert(self.joined and self.shutdown.worker == null and self.accounting.deallocations == 1);
+            self.released = true;
+        }
+    };
+
+    for ([_]bool{ false, true }) |manual| {
+        var accounting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var route: @import("shared_heap.zig").TestRoute = .{};
+        const previous_gpa = osi.gpa;
+        if (radio.coex_enabled) route.install(accounting.allocator()) else osi.gpa = accounting.allocator();
+        defer if (radio.coex_enabled) route.restore() else {
+            osi.gpa = previous_gpa;
+        };
+        const mem = try osi.callback_allocator().alignedAlloc(u8, .@"16", @sizeOf(rtos.Task) + 64);
+        const worker: *rtos.Task = @ptrCast(mem.ptr);
+        worker.* = .{ .context = undefined, .stack = mem[@sizeOf(rtos.Task)..], .priority = .lowest, .state = .suspended };
+        var queue: rtos.PriorityWaitQueue = .{};
+        var waiter: rtos.PriorityWaitQueue.Waiter = .{ .task = worker, .priority = .lowest };
+        if (manual) {
+            queue.list.append(&waiter.node);
+            worker.active_wait = .{ .queue = &queue, .node = &waiter.node };
+        }
+
+        var caller: rtos.Task = undefined;
+        var backend: Backend = .{
+            .accounting = &accounting,
+            .scheduler = .{ .current_task = &caller, .current_sleep_queue = undefined, .overflow_sleep_queue = undefined },
+            .worker_slot = worker,
+            .manual = manual,
+            .deinit_result = if (manual) error.WifiNotInitialized else null,
+        };
+        Backend.active = &backend;
+        backend.shutdown.record_worker(worker);
+        try release_single(&backend.shutdown, &backend);
+        try std.testing.expect(backend.released and queue.list.first == null);
+        try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+    }
 }
 
 test "deinit times out with a counted connect and ordinary stop still gives up" {
