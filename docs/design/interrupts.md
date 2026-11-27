@@ -56,18 +56,19 @@ purpose. It does not cover RTOS scheduling (`hal/rtos.zig`) or the radio blobs' 
   `std.debug.assert`, which ReleaseFast and ReleaseSmall builds do not check. New HAL code uses a
   compile-time mechanism.
 - Singleton routing, for new drivers: one `var owner: ?*Handle = null`, set under a critical
-  section at init; a second init returns an error; every ISR or callback does
-  `owner orelse return`; teardown clears `owner` under a critical section only when no completion
-  can still arrive, and returns `error.Busy` otherwise (ESP-NOW's rule). The handle the caller owns
-  holds all queues and operation state. `ARCHITECTURE.md` names ESP-NOW and 802.15.4 as users of
-  the exception; BLE's `active` pointer and the Wi-Fi blob hooks in `radio/osi.zig` (`gpa`,
-  `wifi_interrupt_handler`) are module-level state it does not name.
+  section at init; a second owner is rejected; a routed ISR or callback drops events when there
+  is no owner. Clear `owner` under a critical section and keep old completions from reaching a
+  new owner. The caller-owned handle holds operation state.
+  `ARCHITECTURE.md` names ESP Wi-Fi, ESP-NOW and 802.15.4 as users of the exception. BLE's
+  `active` pointer and the Wi-Fi adapter hooks in `radio/osi.zig` (`gpa`, `wifi_interrupt_handler`)
+  are additional module-level state.
 
 ## Prior art: singleton routing
 
 | Driver | Routing pointer | Second owner | Teardown with work in flight |
 | --- | --- | --- | --- |
-| ESP-NOW `radio/espnow_session.zig` | `owner: ?*Session` | `AlreadyInitialized` | `Busy` while a send completion is outstanding |
+| [ESP Wi-Fi](esp-wifi-handle.md) `radio/wifi.zig` | `owner: ?*Wifi` | `AlreadyInitialized` | Connect-drain `Timeout` or a cleanup error keeps the current owner. Success clears it before unlocking. A waiter rechecks ownership before cleanup and can return `WifiNotInitialized`. |
+| ESP-NOW `radio/espnow_session.zig` | `owner: ?*Session` | `AlreadyInitialized` | `Busy` while a send completion is outstanding. Otherwise clears the pointer before `esp_now_deinit` and restores it on error. |
 | ESP 802.15.4 `radio/ieee802154.zig` | `owner: ?*Radio` | `AlreadyInitialized` | no refusal: stops the MAC synchronously (operations are synchronous); `WouldBlock` from a coex callback; silent for a non-owner |
 | ESP BLE `radio/bluetooth.zig` | `active: ?*Controller` | `AlreadyStarted` | none: one controller per boot |
 
@@ -83,7 +84,7 @@ a new one.
 | Mostly polled: the foreground poll services hardware events itself under a critical section; the ISR runs only for enhanced-ACK turnaround and posts to atomics (`pending_events`, `ack_failed`) | ESP 802.15.4 `radio/ieee802154.zig` (`RxIo.poll`, `interrupt_handler`); the poll loops in `radio/ieee802154_rx.zig`, `radio/ieee802154_tx.zig` | operations short enough to block on |
 | RTOS queue, `put_one_from_isr` + yield | ESP BLE `radio/bluetooth.zig` | RTOS present; consumer blocks |
 | IRQ only as a wakeup; all work in foreground `poll` | nrf5x `hal/usbd.zig` | complex state better kept out of the ISR |
-| Direct callbacks from the vendor task | ESP Wi-Fi `radio/wifi.zig` | vendor blob owns the thread; callback must not tear down |
+| Direct callbacks in the posting task | ESP Wi-Fi `radio/wifi.zig` | the Wi-Fi task was observed posting station events. Schedule teardown from an application task after the callback returns. |
 
 The two queues here state an overflow policy: the ESP-NOW ring drops the newest frame and counts
 it; the BLE queue latches an overflow error. A new queue states its policy too.

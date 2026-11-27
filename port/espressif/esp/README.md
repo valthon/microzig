@@ -1046,6 +1046,9 @@ promiscuous phase can overrun by up to 0.5 s.
 
 ### Wi-Fi station and RTOS
 
+See the [ESP Wi-Fi handle design](../../../docs/design/esp-wifi-handle.md)
+for ownership, lifecycle and callback routing.
+
 The optional TX-done callback ran on hardware through `selftest_wifi_tx_done` (below):
 10 of 10 callbacks, `DONE pass=3 fail=0` in 3 of 3 boots each on the C3, the Super Mini ESP32-C6 and
 the XIAO ESP32-C6 (board build), 2026-11-20. It is also cross-compiled in `compile_wifi`
