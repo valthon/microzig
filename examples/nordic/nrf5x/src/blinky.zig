@@ -25,5 +25,7 @@ pub fn main() !void {
         board.led2.toggle();
         board.led3.toggle();
         time.sleep_ms(500);
+
+        board.led3.toggle();
     }
 }
