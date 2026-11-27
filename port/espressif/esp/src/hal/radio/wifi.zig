@@ -201,7 +201,7 @@ pub fn init(gpa: std.mem.Allocator, config: InitConfig) InitError!void {
 
     try radio.init(gpa);
 
-    apply_init_config(config);
+    const init_config = make_init_config(config);
     try c_err(c.esp_wifi_init_internal(&init_config));
 
     try c_err(c.esp_wifi_set_mode(c.WIFI_MODE_NULL));
@@ -219,19 +219,6 @@ pub fn init(gpa: std.mem.Allocator, config: InitConfig) InitError!void {
 
     try set_power_save_mode(config.power_save_mode);
     if (compatibility.chip == .esp32_c6) @import("../analog/esp32_c6.zig").wifi_set_inited(true);
-}
-
-inline fn apply_init_config(config: InitConfig) void {
-    init_config.wpa_crypto_funcs = c.g_wifi_default_wpa_crypto_funcs;
-    init_config.feature_caps = g_wifi_feature_caps;
-    init_config.static_rx_buf_num = config.static_rx_buf_num;
-    init_config.dynamic_rx_buf_num = config.dynamic_rx_buf_num;
-    init_config.static_tx_buf_num = config.static_tx_buf_num;
-    init_config.dynamic_tx_buf_num = config.dynamic_tx_buf_num;
-    init_config.ampdu_rx_enable = @intFromBool(config.ampdu_rx_enable);
-    init_config.ampdu_tx_enable = @intFromBool(config.ampdu_tx_enable);
-    init_config.amsdu_tx_enable = @intFromBool(config.amsdu_tx_enable);
-    init_config.rx_ba_win = config.rx_ba_win;
 }
 
 const InitStep = enum { radio, coex, adapter, driver, mode, supplicant, tx, rx_ap, rx_sta, country, power_save };
@@ -288,7 +275,7 @@ const InitBackend = struct {
                 boot_locks.install(&s_wifi_api_lock, &g_wifi_global_lock);
             },
             .driver => {
-                apply_init_config(config);
+                const init_config = make_init_config(config);
                 try c_err(c.esp_wifi_init_internal(&init_config));
             },
             .mode => try c_err(c.esp_wifi_set_mode(c.WIFI_MODE_NULL)),
@@ -1498,37 +1485,39 @@ fn export_symbols() void {
     @export(&g_wifi_osi_funcs, .{ .name = "g_wifi_osi_funcs" });
 }
 
-// TODO: configurable
-var init_config: c.wifi_init_config_t = .{
-    .osi_funcs = &g_wifi_osi_funcs,
-    // .wpa_crypto_funcs = c.g_wifi_default_wpa_crypto_funcs,
-    .static_rx_buf_num = 10, // overwritten by init
-    .dynamic_rx_buf_num = 32, // overwritten by init
-    .tx_buf_type = c.CONFIG_ESP_WIFI_TX_BUFFER_TYPE,
-    .static_tx_buf_num = 0, // overwritten by init
-    .dynamic_tx_buf_num = 32, // overwritten by init
-    // IDF WIFI_INIT_CONFIG_DEFAULT: 0 = static, 1 = dynamic. The STATIC_RX_MGMT_BUFFER
-    // choice flag is 1 when static is selected, which would request dynamic buffers.
-    .rx_mgmt_buf_type = c.CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUF,
-    .rx_mgmt_buf_num = c.CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF,
-    .cache_tx_buf_num = c.WIFI_CACHE_TX_BUFFER_NUM,
-    .csi_enable = 0, // TODO: WiFi channel state information enable flag.
-    .ampdu_rx_enable = 1, // overwritten by init
-    .ampdu_tx_enable = 1, // overwritten by init
-    .amsdu_tx_enable = 0, // overwritten by init
-    .nvs_enable = 0,
-    .nano_enable = 0,
-    .rx_ba_win = 6, // overwritten by init
-    .wifi_task_core_id = 0,
-    .beacon_max_len = c.WIFI_SOFTAP_BEACON_MAX_LEN,
-    .mgmt_sbuf_num = c.WIFI_MGMT_SBUF_NUM,
-    .feature_caps = c.WIFI_FEATURE_CAPS,
-    .sta_disconnected_pm = false,
-    .espnow_max_encrypt_num = c.CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM,
-    .tx_hetb_queue_num = 3,
-    .dump_hesigb_enable = false,
-    .magic = c.WIFI_INIT_CONFIG_MAGIC,
-};
+// ESP-IDF v5.5.1's station_example_main.c passes a stack-local config in wifi_init_sta.
+fn make_init_config(config: InitConfig) c.wifi_init_config_t {
+    return .{
+        .osi_funcs = &g_wifi_osi_funcs,
+        .wpa_crypto_funcs = c.g_wifi_default_wpa_crypto_funcs,
+        .static_rx_buf_num = config.static_rx_buf_num,
+        .dynamic_rx_buf_num = config.dynamic_rx_buf_num,
+        .tx_buf_type = c.CONFIG_ESP_WIFI_TX_BUFFER_TYPE,
+        .static_tx_buf_num = config.static_tx_buf_num,
+        .dynamic_tx_buf_num = config.dynamic_tx_buf_num,
+        // IDF WIFI_INIT_CONFIG_DEFAULT: 0 = static, 1 = dynamic. The STATIC_RX_MGMT_BUFFER
+        // choice flag is 1 when static is selected, which would request dynamic buffers.
+        .rx_mgmt_buf_type = c.CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUF,
+        .rx_mgmt_buf_num = c.CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF,
+        .cache_tx_buf_num = c.WIFI_CACHE_TX_BUFFER_NUM,
+        .csi_enable = 0, // TODO: WiFi channel state information enable flag.
+        .ampdu_rx_enable = @intFromBool(config.ampdu_rx_enable),
+        .ampdu_tx_enable = @intFromBool(config.ampdu_tx_enable),
+        .amsdu_tx_enable = @intFromBool(config.amsdu_tx_enable),
+        .nvs_enable = 0,
+        .nano_enable = 0,
+        .rx_ba_win = config.rx_ba_win,
+        .wifi_task_core_id = 0,
+        .beacon_max_len = c.WIFI_SOFTAP_BEACON_MAX_LEN,
+        .mgmt_sbuf_num = c.WIFI_MGMT_SBUF_NUM,
+        .feature_caps = g_wifi_feature_caps,
+        .sta_disconnected_pm = false,
+        .espnow_max_encrypt_num = c.CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM,
+        .tx_hetb_queue_num = 3,
+        .dump_hesigb_enable = false,
+        .magic = c.WIFI_INIT_CONFIG_MAGIC,
+    };
+}
 
 const wifi_enable_wpa3_sae: u64 = 1 << 0;
 const wifi_enable_enterprise: u64 = 1 << 7;

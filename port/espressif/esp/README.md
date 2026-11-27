@@ -610,6 +610,8 @@ progress and, once `power_save_mode` has been validated, while a teardown or
 init rollback is pending. That caller acquired nothing
 and must leave deinit to the owner.
 Other init errors finish cleanup before returning.
+The [ESP-IDF v5.5.1 station example](https://github.com/espressif/esp-idf/blob/v5.5.1/examples/wifi/getting_started/station/main/station_example_main.c#L104-L105)
+passes its Wi-Fi initialization configuration from the stack.
 A sub-tick deadline lets the timer worker sleep until the next RTOS tick or
 an earlier arm signal. Single-radio images retain their existing clock,
 timer and PTI settings.
