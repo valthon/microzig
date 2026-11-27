@@ -994,6 +994,10 @@ const ShutdownBackend = struct {
 };
 
 fn configure_single(backend: anytype) InitError!void {
+    run_init_step(backend, .adapter) catch |err| {
+        release_single(if (callbacks.host_test) HostWifi else ShutdownBackend) catch return error.WifiRollbackPending;
+        return err;
+    };
     inline for (.{ .driver, .mode, .supplicant, .tx, .rx_ap, .rx_sta, .country, .power_save }) |step| {
         run_init_step(backend, step) catch |err| {
             backend.rollback() catch return error.WifiRollbackPending;
@@ -2201,11 +2205,13 @@ const HostWifi = struct {
     const no_mem = 0x101;
     const fail = -1;
 
+    var on_adapter: ?*const fn () InitError!void = null;
     var on_country: ?*const fn () InitError!void = null;
 
     fn run(_: *@This(), comptime step: InitStep) InitError!void {
         switch (step) {
             .radio => try radio.init(.failing),
+            .adapter => if (on_adapter) |probe| try probe(),
             .driver => initialized = true,
             .mode => try c_err(esp_wifi_set_mode(c.WIFI_MODE_NULL)),
             .country => if (on_country) |probe| try probe(),
@@ -2601,6 +2607,43 @@ test "a stop queued across single-radio teardown prevents reuse until it returns
     try std.testing.expect(wifi.stop_lock.locked == null);
     try std.testing.expect(!try wifi.claim_init(.{}));
     wifi.finish_init(.release);
+}
+
+test "single-radio adapter runs before driver init and releases the radio on failure" {
+    if (radio.coex_enabled) return error.SkipZigTest;
+
+    const Probe = struct {
+        var calls: usize = 0;
+        var reject = true;
+        var accounting: *std.testing.FailingAllocator = undefined;
+
+        fn on_adapter() InitError!void {
+            assert(!HostWifi.initialized);
+            assert(accounting.allocations > accounting.deallocations);
+            calls += 1;
+            if (reject) return error.InvalidArg;
+        }
+    };
+
+    var accounting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var wifi: Wifi = .{};
+    errdefer EventLog.end_failed_session(&wifi);
+    Probe.accounting = &accounting;
+    HostWifi.on_adapter = Probe.on_adapter;
+    defer HostWifi.on_adapter = null;
+
+    try std.testing.expectError(error.InvalidArg, wifi.init(accounting.allocator(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(null, owner);
+    try std.testing.expect(!HostWifi.initialized);
+    try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+
+    Probe.reject = false;
+    try wifi.init(accounting.allocator(), .{});
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expect(HostWifi.initialized);
+    try wifi.deinit();
+    try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
 }
 
 test "public Wi-Fi operations cannot enter the driver during init or rollback" {

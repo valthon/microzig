@@ -550,9 +550,9 @@ run printed `pass=6 fail=2 void=0`.
 The adapter keeps both blob semaphore handles and the
 52-byte ROM callback table for the lifetime of the boot. It reserves the
 scheduler timer before pre-init and releases it on final radio deinit.
-The C6 Wi-Fi blob also retains its API and global recursive mutexes. The
-coexistence path supplies boot-lifetime storage for both. In Wi-Fi-only
-images their original allocator storage must remain valid between sessions.
+The C3 and C6 Wi-Fi blobs also retain their API and global recursive mutexes.
+Wi-Fi supplies boot-lifetime storage for both, so these mutexes survive a
+failed init or deinit followed by a session with a different allocator.
 Coexistence images put the shared timer worker, timer nodes and allocations
 through the blob OSI adapter on the attached `radio.SharedHeap` (see above);
 the coex examples give it 128 KiB. The last radio owner releases the worker
