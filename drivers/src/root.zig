@@ -60,6 +60,7 @@ pub const sensor = struct {
     pub const HTS221 = @import("sensor/HTS221.zig").HTS221;
     pub const DS18B20 = @import("sensor/DS18B20.zig").DS18B20;
     pub const ICM_20948 = @import("sensor/ICM_20948.zig").ICM_20948;
+    pub const LSM6DS3TR_C = @import("sensor/LSM6DS3TR_C.zig").LSM6DS3TR_C;
     pub const MLX90640 = @import("sensor/MLX90640.zig").MLX90640;
     pub const MPU_6050 = @import("sensor/MPU_6050.zig").MPU_6050;
     pub const TLV493D = @import("sensor/TLV493D.zig").TLV493D;
@@ -242,6 +243,7 @@ test {
     _ = input.rotary_encoder;
 
     _ = sensor.ICM_20948;
+    _ = sensor.LSM6DS3TR_C;
     _ = sensor.MLX90640;
     _ = sensor.MPU_6050;
     _ = sensor.TLV493D;
