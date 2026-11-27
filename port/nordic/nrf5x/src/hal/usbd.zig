@@ -13,12 +13,12 @@ const usb = microzig.core.usb;
 
 const errata = @import("./usbd/errata.zig");
 const ep0 = @import("./usbd/ep0.zig");
-const Dma = @import("./usbd/dma.zig");
+const DMA = @import("./usbd/dma.zig");
 const out_flow = @import("./usbd/out_flow.zig");
 
 test {
     _ = ep0;
-    _ = Dma;
+    _ = DMA;
     _ = out_flow;
 }
 
@@ -80,9 +80,10 @@ pub const USBD = struct {
     const Self = @This();
 
     power: PowerState = .detached,
+    configuration_generation: u32 = 0,
     /// A timed-out DMA still owns its buffer and anomaly 199 workaround. Only a system
     /// reset may recover this instance; no further peripheral tasks or buffer reuse.
-    dma: Dma = .{},
+    dma: DMA = .{},
 
     bufs_in: [NUM_EP][MAX_PACKET_SIZE]u8 align(4) = @splat(@splat(0)),
     bufs_out: [NUM_EP][MAX_PACKET_SIZE]u8 align(4) = @splat(@splat(0)),
@@ -183,6 +184,18 @@ pub const USBD = struct {
         };
     }
 
+    /// The pull-up is active and USB service has no latched EasyDMA fault.
+    /// Check the controller separately for an active configuration.
+    pub fn is_connected(self: *const Self) bool {
+        return self.power == .connected and !self.dma.faulted;
+    }
+
+    /// Identifies the current endpoint lifetime. It changes on bus reset,
+    /// detach, or when the controller closes the old configuration.
+    pub fn get_configuration_generation(self: *const Self) u32 {
+        return self.configuration_generation;
+    }
+
     /// Run from foreground only: control OUT and controller callbacks perform synchronous
     /// EasyDMA and may wait up to EASYDMA_WAIT_TURNS (wake waits are bounded too).
     /// Calls from an ISR leave all events pending and do no work. If using the USBD IRQ
@@ -196,6 +209,7 @@ pub const USBD = struct {
         if (self.power != .detached and peripherals.POWER.USBREGSTATUS.read().VBUSDETECT == .NoVbus) {
             self.teardown();
             self.power = .detached;
+            self.configuration_generation +%= 1;
             return;
         }
 
@@ -284,6 +298,7 @@ pub const USBD = struct {
                     peripherals.USBD.EVENTS_USBRESET.write_raw(0);
 
                     self.reset();
+                    self.configuration_generation +%= 1;
                     controller.on_bus_reset(&self.interface);
                     return;
                 }
@@ -648,11 +663,11 @@ pub const USBD = struct {
     /// On timeout quarantine the instance, its buffers and the workaround until system
     /// reset. Returning an error must not make a possibly active DMA's buffer reusable.
     fn run_easydma(self: *Self, dir: usb.types.Dir, i: u4) bool {
-        var io: DmaIo = .{ .dir = dir, .i = i };
+        var io: DMA_IO = .{ .dir = dir, .i = i };
         return self.dma.run(&io);
     }
 
-    const DmaIo = struct {
+    const DMA_IO = struct {
         dir: usb.types.Dir,
         i: u4,
 
@@ -1004,6 +1019,9 @@ pub const USBD = struct {
 
     fn ep_close_all(itf: *usb.DeviceInterface) void {
         const self: *Self = @fieldParentPtr("interface", itf);
+        // The controller is discarding its active runtime, even if EP0 did
+        // not recognize the request or the hardware can no longer be used.
+        self.configuration_generation +%= 1;
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled and !self.dma.faulted) cpu.interrupt.enable(.USBD);
         usbd_interrupt_off();
@@ -1029,7 +1047,7 @@ pub const testing = if (@import("builtin").is_test) struct {
         var alloc: usb.DescriptorAllocator = .init(false, &.{});
         break :blk (usb.drivers.CDC{}).driver_info(.{ .max_packet_size0 = 64, .max_packet_size = 64 }, &alloc).descriptor;
     };
-    const CdcController = struct {
+    const CDC_Controller = struct {
         cdc: usb.drivers.CDC.Runtime = undefined,
         pub fn on_bus_reset(_: *@This(), _: *usb.DeviceInterface) void {}
         pub fn on_setup_req(_: *@This(), _: *usb.DeviceInterface, _: *const usb.types.SetupPacket) void {}
@@ -1044,7 +1062,7 @@ pub const testing = if (@import("builtin").is_test) struct {
         io.dma_ready = true;
         io.out_packet = "pending OUT";
         var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
-        var ctl: CdcController = .{};
+        var ctl: CDC_Controller = .{};
         var storage: [128]u8 = undefined;
         ctl.cdc.init(.{}, &cdc_desc, &dev.interface, &storage);
         const n = @backingInt(cdc_desc.ep_out.endpoint.num);
@@ -1073,7 +1091,7 @@ pub const testing = if (@import("builtin").is_test) struct {
         for ([_]usize{ 11, 64 }) |len| {
             io.reset();
             var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected, .low_power = true };
-            var ctl: CdcController = .{};
+            var ctl: CDC_Controller = .{};
             var storage: [128]u8 = undefined;
             ctl.cdc.init(.{}, &cdc_desc, &dev.interface, &storage);
             const n = @backingInt(cdc_desc.ep_in.endpoint.num);
@@ -1200,6 +1218,54 @@ pub const testing = if (@import("builtin").is_test) struct {
             try std.testing.expectEqual(0, peripherals.USBD.EVENTCAUSE.raw & CAUSE_USBWUALLOWED);
         }
     }
+    pub fn configuration_reselection() !void {
+        microzig.testing_io.reset();
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
+        var ctl: usb.DeviceController(.{
+            .device_triple = .unspecified,
+            .bcd_device = .v1_00,
+            .serial = "test",
+            .device_capabilities = USBD.device_capabilities,
+        }, &.{usb.Configuration(
+            .{ .attributes = .{ .self_powered = false }, .max_current_ma = 50 },
+            .{ .serial = usb.drivers.CDC{} },
+        )}) = .init;
+
+        const regs = peripherals.USBD;
+        regs.BREQUEST.raw = @backingInt(usb.types.SetupRequest.set_configuration);
+        regs.WVALUEL.raw = 1;
+        regs.EVENTS_EP0SETUP.raw = 1;
+        dev.poll(&ctl);
+        const drivers = ctl.drivers() orelse return error.ExpectedConfiguration;
+        const generation = dev.get_configuration_generation();
+
+        // SET_CONFIGURATION(1) again rebuilds CDC at the same address.
+        regs.EVENTS_EP0SETUP.raw = 1;
+        dev.poll(&ctl);
+        try std.testing.expect(ctl.drivers() == drivers);
+        try std.testing.expectEqual(generation +% 1, dev.get_configuration_generation());
+
+        // Polling the completed setup again does not count a new change.
+        dev.poll(&ctl);
+        try std.testing.expectEqual(generation +% 1, dev.get_configuration_generation());
+
+        // Core still replaces CDC for a device-to-host SET_CONFIGURATION.
+        // EP0 does not recognize it as a configuration change.
+        drivers.serial.tx_end = 1;
+        regs.BMREQUESTTYPE.raw = 0x80;
+        regs.EVENTS_EP0SETUP.raw = 1;
+        dev.poll(&ctl);
+        try std.testing.expect(ctl.drivers() == drivers);
+        try std.testing.expectEqual(0, drivers.serial.tx_end);
+        try std.testing.expectEqual(generation +% 2, dev.get_configuration_generation());
+
+        const before_reset = dev.get_configuration_generation();
+        regs.EVENTS_USBRESET.raw = 1;
+        dev.poll(&ctl);
+        try std.testing.expect(ctl.drivers() == null);
+        try std.testing.expect(dev.get_configuration_generation() != before_reset);
+    }
+
     pub fn foreground_poll() !void {
         const io = microzig.testing_io;
         io.reset();
