@@ -346,9 +346,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run platform agnostic unit tests");
     if (b.lazyDependency("esp-wifi-sys", .{})) |sys| {
         const headers = wifi_headers(b, sys, "esp32c6", target);
-        for ([_]bool{ true, false }) |wifi| {
+        const HostRadios = enum { coex, wifi_disabled, wifi_only };
+        for ([_]HostRadios{ .coex, .wifi_disabled, .wifi_only }) |radios| {
             const options = b.addOptions();
-            options.addOption(bool, "wifi", wifi);
+            options.addOption(bool, "wifi", radios != .wifi_disabled);
+            options.addOption(bool, "coex", radios != .wifi_only);
             const host_microzig = b.createModule(.{
                 .root_source_file = b.path("src/hal/usb_serial_jtag/test_microzig.zig"),
             });
@@ -356,12 +358,17 @@ pub fn build(b: *std.Build) void {
             host_microzig.addImport("core-allocator", b.createModule(.{ .root_source_file = b.path("../../../core/src/allocator.zig") }));
             host_microzig.addImport("drivers", b.createModule(.{ .root_source_file = b.path("../../../drivers/src/root.zig") }));
             const unit_tests = b.addTest(.{
+                .name = b.fmt("hal-host-{s}", .{@tagName(radios)}),
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("src/hal.zig"),
                     .target = target,
                     .optimize = optimize,
                 }),
-                .filters = if (wifi) &.{} else &.{"public Wi-Fi init validates options before acquiring a session"},
+                .filters = switch (radios) {
+                    .coex => &.{},
+                    .wifi_disabled => &.{"public Wi-Fi init validates options before acquiring a session"},
+                    .wifi_only => &.{"hal.radio.wifi.test."},
+                },
             });
             host_microzig.addImport("hal-under-test", unit_tests.root_module);
             unit_tests.root_module.addImport("microzig", host_microzig);
@@ -370,7 +377,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
             }));
             test_step.dependOn(&b.addRunArtifact(unit_tests).step);
-            if (!wifi) continue;
+            if (radios != .coex) continue;
 
             // The public Wi-Fi stop panics, one process each.
             const stop_panic_tests = b.addTest(.{

@@ -195,7 +195,7 @@ conversion step (e.g. to _uf2_ or _bin_) and copies the result to _zig-out/firmw
   owner. The caller still explicitly initializes a stationary handle that owns all queues
   and operation state; a second owner is rejected, and teardown must prevent outstanding
   completions from reaching a subsequent owner. This is not an exception for global
-  allocators or general library state. ESP-NOW and IEEE 802.15.4 radio callbacks use this
+  allocators or general library state. ESP Wi-Fi, ESP-NOW, and IEEE 802.15.4 callbacks use this
   context-free singleton routing pattern.
 - **Memory regions are the port's responsibility.** Core and drivers don't assume any particular
   memory layout.

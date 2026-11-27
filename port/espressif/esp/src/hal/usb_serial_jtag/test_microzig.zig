@@ -20,6 +20,7 @@ pub const radio_test = struct {
 };
 
 const radio = @import("hal-under-test").radio;
+const radio_options = @import("test-radio-options");
 
 // The host application has a configured listener. Individual probes can
 // temporarily replace it without changing the HAL's dispatch path.
@@ -36,7 +37,7 @@ fn on_wifi_event(event: radio.wifi.Event) void {
 pub const options = .{ .hal = .{
     .radio = .{
         .wifi = radio.wifi.Options{ .on_event = on_wifi_event },
-        .radios = radio.Radios{ .wifi = @import("test-radio-options").wifi, .ble = true, .ieee802154 = true },
+        .radios = radio.Radios{ .wifi = radio_options.wifi, .ble = radio_options.coex, .ieee802154 = radio_options.coex },
     },
     .rtos = .{ .enable = true, .priority_bits = 4, .ready_queue_force_no_buckets = false },
 } };

@@ -9,6 +9,8 @@ const microzig = @import("microzig");
 const hal = microzig.hal;
 const rtos = hal.rtos;
 const radio = hal.radio;
+
+var wifi: radio.wifi.Wifi = .{};
 const usb_serial_jtag = hal.usb_serial_jtag;
 
 const options = @import("softap_options");
@@ -78,7 +80,7 @@ pub fn main() !void {
     const gpa = heap.allocator();
     _ = try rtos.spawn(gpa, reporter, .{}, .{});
     @import("wifi_antenna.zig").apply();
-    try radio.wifi.init(gpa, .{});
+    try wifi.init(gpa, .{});
     exports.gpa = gpa;
     lwip.c.tcpip_init(null, null);
     const ip = ipv4(dhcp.gateway);
@@ -93,14 +95,14 @@ pub fn main() !void {
         lwip.c.tcpip_input,
     ));
     try start_dhcp();
-    try radio.wifi.apply(.{ .ap = .{
+    try wifi.apply(.{ .ap = .{
         .ssid = options.ssid,
         .password = options.password,
         .auth_method = .wpa2_personal,
         .channel = 6,
         .max_connections = dhcp.max_stations,
     } });
-    try radio.wifi.start();
+    try wifi.start();
     const deadline = microzig.drivers.time.Deadline.init_relative(hal.time.get_time_since_boot(), .from_ms(10_000));
     while (!ap_started.load(.acquire)) {
         if (deadline.is_reached_by(hal.time.get_time_since_boot())) return error.ApStartTimeout;
@@ -264,7 +266,7 @@ fn netif_output(_: [*c]lwip.c.netif, p: [*c]lwip.c.pbuf) callconv(.c) lwip.c.err
     if (p.*.tot_len > packet_buf.len) return lwip.c.ERR_BUF;
     const len = lwip.c.pbuf_copy_partial(p, &packet_buf, p.*.tot_len, 0);
     if (len != p.*.tot_len) return lwip.c.ERR_BUF;
-    radio.wifi.send_packet(.ap, packet_buf[0..len]) catch |err| {
+    wifi.send_packet(.ap, packet_buf[0..len]) catch |err| {
         std.log.warn("SOFTAP TX: {t}", .{err});
         return lwip.c.ERR_IF;
     };

@@ -20,12 +20,17 @@ pub const wifi = struct {
             return self == .started;
         }
     };
-    pub fn get_sta_state() Sta {
-        return if (started) .started else .stopped;
-    }
-    pub fn get_ap_state() enum { stopped, started } {
-        return .stopped;
-    }
+    pub const Wifi = struct {
+        started: bool,
+
+        pub fn get_sta_state(self: *const Wifi) Sta {
+            return if (self.started) .started else .stopped;
+        }
+
+        pub fn get_ap_state(_: *const Wifi) enum { stopped, started } {
+            return .stopped;
+        }
+    };
 };
 pub const WIFI_IF_STA = 0;
 pub const WIFI_IF_AP = 1;
@@ -38,7 +43,6 @@ pub const esp_now_peer_num_t = extern struct { total_num: c_int, encrypt_num: c_
 const Receive = *const fn ([*c]const esp_now_recv_info_t, [*c]const u8, c_int) callconv(.c) void;
 const Send = *const fn ([*c]const esp_now_send_info_t, esp_now_send_status_t) callconv(.c) void;
 var peers: [20]?esp_now_peer_info_t = @splat(null);
-pub var started = true;
 pub var initialized = false;
 pub var register_error: i32 = 0;
 pub var delivery: c_uint = 0;
@@ -49,7 +53,6 @@ var receive_cb: ?Receive = null;
 pub var in_callback = false;
 pub fn reset() void {
     peers = @splat(null);
-    started = true;
     initialized = false;
     register_error = 0;
     delivery = 0;

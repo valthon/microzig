@@ -46,7 +46,7 @@ const shared_heap = @import("radio/shared_heap.zig");
 /// adapter's allocations and the radio HAL's own init allocations: the
 /// radio timer worker, the PHY and coex timer nodes, and the Wi-Fi eloop
 /// reservation. In a coexistence image the allocator argument of `init` and
-/// `wifi.init` is not used; the BLE controller's allocator still backs its
+/// `Wifi.init` is not used; the BLE controller's allocator still backs its
 /// NPL state. Either radio can be torn down while the other runs, so this
 /// storage cannot come from either radio's allocator.
 ///
@@ -106,7 +106,11 @@ pub fn init(session_allocator: Allocator) InitError!void {
     }
 
     errdefer _ = refcount.rmw(.Sub, 1, .monotonic);
-    if (callbacks.host_test) return HostResources.start(gpa);
+    if (callbacks.host_test) {
+        try HostResources.start(gpa);
+        if (!coex_enabled) osi.gpa = gpa;
+        return;
+    }
     const radio_interrupt = microzig.options.hal.radio.interrupt;
     try timer.init(gpa);
     errdefer timer.deinit(gpa);
@@ -266,6 +270,7 @@ pub const interrupt_handler: microzig.cpu.InterruptHandler = .{
 };
 
 test {
+    _ = wifi;
     _ = osi;
     _ = @import("radio/ble/npl.zig");
     _ = @import("radio/coex.zig");
@@ -308,9 +313,10 @@ test "coexistence radio allocations come from the shared heap and survive releas
     host_test_heap.attach();
     // Each init gets a failing allocator: in a coexistence image the
     // argument is not used, so an allocation through it fails the test.
-    try wifi.init(std.testing.failing_allocator, .{});
+    var wifi_handle: wifi.Wifi = .{};
+    try wifi_handle.init(std.testing.failing_allocator, .{});
     try init(std.testing.failing_allocator);
-    try wifi.deinit();
+    try wifi_handle.deinit();
 
     try std.testing.expect(refcount.load(.monotonic) == 1);
     const lo = @intFromPtr(&host_test_heap.buffer);
@@ -341,9 +347,10 @@ test "a coexistence radio init before attach_shared_heap returns SharedHeapNotAt
             try std.testing.expectError(error.SharedHeapNotAttached, init(std.testing.allocator));
             try std.testing.expect(refcount.load(.monotonic) == 0 and HostResources.live == null);
             if (microzig.options.hal.radio.radios.wifi) {
-                try std.testing.expectError(error.SharedHeapNotAttached, wifi.init(std.testing.allocator, .{}));
+                var wifi_handle: wifi.Wifi = .{};
+                try std.testing.expectError(error.SharedHeapNotAttached, wifi_handle.init(std.testing.allocator, .{}));
                 try std.testing.expect(osi.wifi_shutdown.stage == .off and refcount.load(.monotonic) == 0);
-                try std.testing.expectError(error.WifiNotInitialized, wifi.deinit());
+                try std.testing.expectError(error.WifiNotInitialized, wifi_handle.deinit());
             }
             // Still unattached: the blob allocation callbacks fail instead of
             // reaching storage nobody owns.

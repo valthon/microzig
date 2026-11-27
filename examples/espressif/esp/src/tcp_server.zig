@@ -5,6 +5,8 @@ const microzig = @import("microzig");
 const hal = microzig.hal;
 const rtos = hal.rtos;
 const radio = hal.radio;
+
+var wifi: radio.wifi.Wifi = .{};
 const usb_serial_jtag = hal.usb_serial_jtag;
 
 const exports = @import("lwip/exports.zig");
@@ -102,11 +104,20 @@ pub fn run(comptime lifecycle_selftest: bool) !void {
 
 fn run_server(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip.c.netif) !void {
     @import("wifi_antenna.zig").apply();
-    try radio.wifi.init(gpa, .{});
+    wifi.init(gpa, .{}) catch |err| {
+        if (err == error.WifiRollbackPending) {
+            wifi.deinit() catch |cleanup_err| {
+                std.log.err("Wi-Fi init rollback failed ({t}); keeping its memory", .{cleanup_err});
+                if (lifecycle_selftest) lifecycle_fail(err);
+                while (true) rtos.sleep(.from_ms(1000));
+            };
+        }
+        return err;
+    };
     const result = serve(lifecycle_selftest, gpa, netif);
     // The driver keeps allocating from `gpa` until a deinit succeeds, so after a failed one
     // this parks, and the frame that owns the heap and the netif never returns.
-    radio.wifi.deinit() catch |err| {
+    wifi.deinit() catch |err| {
         if (result) |_| {} else |served_err| std.log.err("server failed ({t})", .{served_err});
         std.log.err("Wi-Fi deinit failed ({t}); keeping its memory", .{err});
         if (lifecycle_selftest) {
@@ -142,12 +153,12 @@ fn serve(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip
     if (lifecycle_selftest) {
         // Configure a deterministic AP while stopped, then enter STA for the test.
         // The running STA->AP_STA transition below changes only the mode.
-        try radio.wifi.apply(.{ .ap_sta = .{
+        try wifi.apply(.{ .ap_sta = .{
             .sta = station,
             .ap = .{ .ssid = "microzig-lifecycle", .channel = 1, .max_connections = 2 },
         } });
     }
-    try radio.wifi.apply(.{ .sta = station });
+    try wifi.apply(.{ .sta = station });
 
     if (lifecycle_selftest) {
         // Default 4096-byte reporter stack shares the Wi-Fi/lwIP allocator:
@@ -158,15 +169,15 @@ fn serve(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip
         lifecycle_step = "start";
         try run_lifecycle(station);
     } else {
-        try radio.wifi.start();
-        while (!radio.wifi.get_sta_state().is_started()) {
+        try wifi.start();
+        while (!wifi.get_sta_state().is_started()) {
             rtos.sleep(.from_ms(100));
         }
 
         {
             std.log.info("Scanning for access points...", .{});
-            var scan_iter = try radio.wifi.scan(.{});
-            defer scan_iter.deinit();
+            var scan_iter = try wifi.scan(.{});
+            defer scan_iter.deinit() catch |err| std.log.warn("Wi-Fi scan cleanup failed ({t})", .{err});
             while (try scan_iter.next()) |record| {
                 // Neighbour SSIDs are broadcast, not credentials.
                 std.log.info("Found ap `{s}` RSSI: {} Channel: {}, Auth: {?t}", .{
@@ -247,7 +258,7 @@ fn on_wifi_event(event: radio.wifi.Event) void {
 
 fn wait_sta(comptime expected: radio.wifi.StaState) error{Timeout}!void {
     const deadline = microzig.drivers.time.Deadline.init_relative(hal.time.get_time_since_boot(), .from_ms(30_000));
-    while (radio.wifi.get_sta_state() != expected) {
+    while (wifi.get_sta_state() != expected) {
         if (deadline.is_reached_by(hal.time.get_time_since_boot())) return error.Timeout;
         rtos.sleep(.from_ms(20));
     }
@@ -276,8 +287,8 @@ fn connect_sta(station: radio.wifi.Config.Station) !void {
     const deadline = microzig.drivers.time.Deadline.init_relative(hal.time.get_time_since_boot(), .from_ms(30_000));
     var seen = sta_disconnect.load(.acquire).count;
     var retries: u32 = 0;
-    try radio.wifi.connect();
-    while (radio.wifi.get_sta_state() != .connected) {
+    try wifi.connect();
+    while (wifi.get_sta_state() != .connected) {
         if (deadline.is_reached_by(hal.time.get_time_since_boot())) return error.Timeout;
         const latest = sta_disconnect.load(.acquire);
         if (latest.count != seen) {
@@ -285,7 +296,7 @@ fn connect_sta(station: radio.wifi.Config.Station) !void {
             if (retries == max_retries) return error.StaConnectFailed;
             retries += 1;
             std.log.info("Wi-Fi: disconnected (reason {d}), connect again ({d}/{d})", .{ latest.reason, retries, max_retries });
-            radio.wifi.apply_station_config(station) catch |err| switch (err) {
+            wifi.apply_station_config(station) catch |err| switch (err) {
                 error.WifiState => std.log.warn(
                     "Wi-Fi: station configuration not applied again ({t})",
                     .{err},
@@ -293,7 +304,7 @@ fn connect_sta(station: radio.wifi.Config.Station) !void {
                 else => return err,
             };
             rtos.sleep(.from_ms(100));
-            try radio.wifi.connect();
+            try wifi.connect();
         }
         rtos.sleep(.from_ms(20));
     }
@@ -301,7 +312,7 @@ fn connect_sta(station: radio.wifi.Config.Station) !void {
 
 fn run_lifecycle(station: radio.wifi.Config.Station) !void {
     std.log.info("Wi-Fi lifecycle: start", .{});
-    try radio.wifi.start();
+    try wifi.start();
     try wait_sta(.started);
     lifecycle_pass();
 
@@ -314,7 +325,7 @@ fn run_lifecycle(station: radio.wifi.Config.Station) !void {
 
     lifecycle_step = "stop";
     std.log.info("Wi-Fi lifecycle: stop", .{});
-    try radio.wifi.stop();
+    try wifi.stop();
     try wait_sta(.stopped);
     if (hal.compatibility.chip == .esp32_c6) {
         // N2: initialized Wi-Fi keeps MAC/APB/BB clocks; IDF never gates FE.
@@ -332,7 +343,7 @@ fn run_lifecycle(station: radio.wifi.Config.Station) !void {
 
     lifecycle_step = "restart";
     std.log.info("Wi-Fi lifecycle: start again", .{});
-    try radio.wifi.start();
+    try wifi.start();
     try wait_sta(.started);
     lifecycle_pass();
 
@@ -344,13 +355,13 @@ fn run_lifecycle(station: radio.wifi.Config.Station) !void {
     lifecycle_step = "sta_to_ap_sta";
     std.log.info("Wi-Fi lifecycle: STA -> AP_STA", .{});
     ap_started.store(false, .monotonic);
-    try radio.wifi.set_mode(.ap_sta);
+    try wifi.set_mode(.ap_sta);
     const deadline = microzig.drivers.time.Deadline.init_relative(hal.time.get_time_since_boot(), .from_ms(30_000));
     while (!ap_started.load(.monotonic)) {
         if (deadline.is_reached_by(hal.time.get_time_since_boot())) return error.Timeout;
         rtos.sleep(.from_ms(20));
     }
-    if (try radio.wifi.get_mode() != .ap_sta) return error.WrongWifiMode;
+    if (try wifi.get_mode() != .ap_sta) return error.WrongWifiMode;
     rtos.sleep(.from_ms(1100));
     try wait_sta(.connected);
     lifecycle_pass();
@@ -460,7 +471,7 @@ fn netif_output(_: [*c]lwip.c.struct_netif, pbuf_c: [*c]lwip.c.struct_pbuf) call
         off += cnt;
     }
 
-    radio.wifi.send_packet(.sta, packet_buf[0..pbuf.tot_len]) catch |err| {
+    wifi.send_packet(.sta, packet_buf[0..pbuf.tot_len]) catch |err| {
         std.log.err("failed to send packet: {}", .{err});
         return lwip.c.ERR_IF;
     };

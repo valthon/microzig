@@ -8,6 +8,8 @@ const microzig = @import("microzig");
 const hal = microzig.hal;
 const rtos = hal.rtos;
 const radio = hal.radio;
+
+var wifi: radio.wifi.Wifi = .{};
 const usb_serial_jtag = hal.usb_serial_jtag;
 
 const exports = @import("lwip/exports.zig");
@@ -111,7 +113,7 @@ fn deadline() microzig.drivers.time.Deadline {
 
 fn wait_sta(expected: radio.wifi.StaState) !void {
     const limit = deadline();
-    while (radio.wifi.get_sta_state() != expected) {
+    while (wifi.get_sta_state() != expected) {
         if (limit.is_reached_by(hal.time.get_time_since_boot())) return error.Timeout;
         rtos.sleep(.from_ms(20));
     }
@@ -121,15 +123,15 @@ fn exercise(gpa: std.mem.Allocator, netif: *lwip.c.netif) !void {
     if (mode == .open_ap and (auth == .none or wifi_options.password.len == 0))
         return error.ProtectedAuthRequired;
     @import("wifi_antenna.zig").apply();
-    try radio.wifi.init(gpa, .{});
+    try wifi.init(gpa, .{});
     const station: radio.wifi.Config.Station = if (mode == .softap_echo) .{
         .ssid = softap_options.ssid,
         .password = softap_options.password,
         .auth_method = .wpa2_personal,
     } else .{ .ssid = wifi_options.ssid, .password = wifi_options.password, .auth_method = auth };
-    try radio.wifi.apply(.{ .sta = station });
+    try wifi.apply(.{ .sta = station });
     step = "start";
-    try radio.wifi.start();
+    try wifi.start();
     try wait_sta(.started);
     pass();
     if (mode == .open_ap) return reject_open_ap();
@@ -143,7 +145,7 @@ fn exercise(gpa: std.mem.Allocator, netif: *lwip.c.netif) !void {
         try lwip.c_err(lwip.c.netifapi_netif_common(netif, null, lwip.c.dhcp_start));
     }
     step = "join";
-    try radio.wifi.connect();
+    try wifi.connect();
     try wait_sta(.connected);
     pass();
     if (mode == .tx_done) return check_tx_done();
@@ -156,10 +158,10 @@ fn exercise(gpa: std.mem.Allocator, netif: *lwip.c.netif) !void {
 
 fn reject_open_ap() !void {
     step = "open_peer_present";
-    var scan = try radio.wifi.scan(.{});
+    var scan = try wifi.scan(.{});
     var found = false;
     {
-        defer scan.deinit();
+        defer scan.deinit() catch |err| std.log.warn("Wi-Fi scan cleanup failed ({t})", .{err});
         while (try scan.next()) |record| {
             if (!std.mem.eql(u8, record.ssid, wifi_options.ssid)) continue;
             if (record.auth_mode != .none) return error.ProtectedPeerAlsoPresent;
@@ -169,7 +171,7 @@ fn reject_open_ap() !void {
     if (!found) return error.OpenPeerMissing;
     pass();
     step = "reject_open_join";
-    try radio.wifi.connect();
+    try wifi.connect();
     const limit = deadline();
     while (!limit.is_reached_by(hal.time.get_time_since_boot())) {
         if (connected_once.load(.acquire)) return error.OpenPeerAccepted;
@@ -222,7 +224,7 @@ fn check_tx_done() !void {
     var sent: u32 = 0;
     for (0..frame_count) |seq| {
         frame[14 + marker.len] = @intCast(seq);
-        try radio.wifi.send_packet(.sta, &frame);
+        try wifi.send_packet(.sta, &frame);
         sent += 1;
         // Keep this buffer unchanged until its callback, also bounding in-flight
         // frames to one. A duplicate callback cannot hide a missing sequence.
@@ -370,7 +372,7 @@ fn netif_output(_: [*c]lwip.c.struct_netif, pbuf_c: [*c]lwip.c.struct_pbuf) call
         off += cnt;
     }
 
-    radio.wifi.send_packet(.sta, packet_buf[0..pbuf.tot_len]) catch |err| {
+    wifi.send_packet(.sta, packet_buf[0..pbuf.tot_len]) catch |err| {
         std.log.err("failed to send packet: {}", .{err});
         return lwip.c.ERR_IF;
     };

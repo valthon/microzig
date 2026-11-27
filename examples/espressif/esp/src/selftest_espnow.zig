@@ -10,6 +10,8 @@ const std = @import("std");
 const microzig = @import("microzig");
 const hal = microzig.hal;
 const radio = hal.radio;
+
+var wifi: radio.wifi.Wifi = .{};
 const now = radio.espnow;
 const rtos = hal.rtos;
 const coex = @import("espnow_options").coex;
@@ -265,16 +267,16 @@ fn exercise(gpa: std.mem.Allocator) !void {
         try host.initialize();
         try host.advertise_nonconnectable(&advertising_data);
     }
-    try radio.wifi.init(gpa, .{});
-    try radio.wifi.apply(.{ .sta = .{ .ssid = "", .channel = 1 } });
-    try radio.wifi.start();
+    try wifi.init(gpa, .{});
+    try wifi.apply(.{ .sta = .{ .ssid = "", .channel = 1 } });
+    try wifi.start();
     const limit = deadline(3000);
-    while (!radio.wifi.get_sta_state().is_started()) {
+    while (!wifi.get_sta_state().is_started()) {
         if (expired(limit)) return error.WifiStartTimeout;
         rtos.sleep(.from_ms(5));
     }
     try radio.wifi.c_err(radio.wifi.c.esp_wifi_set_channel(1, radio.wifi.c.WIFI_SECOND_CHAN_NONE));
-    try session.init();
+    try session.init(&wifi);
     try session.set_pmk(@splat(0x91));
     try session.set_wake_window(65535);
     try session.add_peer(.{ .address = now.broadcast, .channel = 1 });
