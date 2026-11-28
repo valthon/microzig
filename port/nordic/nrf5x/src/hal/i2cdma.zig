@@ -1,13 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
-const microzig = @import("microzig");
+const hal = @import("../hal.zig");
+const microzig = if (builtin.is_test) hal.serial_test else @import("microzig");
 const mdf = microzig.drivers;
 const drivers = mdf.base;
 const peripherals = microzig.chip.peripherals;
 const compatibility = @import("compatibility.zig");
 
 const gpio = @import("gpio.zig");
-const time = @import("time.zig");
+const time = if (builtin.is_test) hal.serial_test else @import("time.zig");
 
 const version: enum {
     nrf5283x,
@@ -150,7 +152,7 @@ pub const I2C = enum(u1) {
             return Error.TooMuchData;
 
         const regs = i2c.get_regs();
-        regs.TXD.PTR.write(.{ .PTR = @intFromPtr(buf.ptr) });
+        regs.TXD.PTR.write(.{ .PTR = @truncate(@intFromPtr(buf.ptr)) });
         regs.TXD.MAXCNT.write(.{ .MAXCNT = @truncate(buf.len) });
     }
 
@@ -163,7 +165,7 @@ pub const I2C = enum(u1) {
         const rx_cnt_type = @FieldType(@FieldType(@FieldType(I2cRegs, "RXD"), "MAXCNT").underlying_type, "MAXCNT");
         if (std.math.cast(rx_cnt_type, buf.len) == null)
             return Error.TooMuchData;
-        regs.RXD.PTR.write(.{ .PTR = @intFromPtr(buf.ptr) });
+        regs.RXD.PTR.write(.{ .PTR = @truncate(@intFromPtr(buf.ptr)) });
         regs.RXD.MAXCNT.write(.{ .MAXCNT = @truncate(buf.len) });
     }
 

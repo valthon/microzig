@@ -2,8 +2,10 @@
 //! This file implements driver abstractions based on HAL devices.
 //!
 
-const microzig = @import("microzig");
+const builtin = @import("builtin");
 const hal = @import("../hal.zig");
+const microzig = if (builtin.is_test) hal.serial_test else @import("microzig");
+const gpio = if (builtin.is_test) hal.serial_test.gpio else hal.gpio;
 const mdf = microzig.drivers;
 
 const drivers = microzig.drivers.base;
@@ -277,12 +279,14 @@ pub const SPI_Device = struct {
     pub const WriteError = DatagramDevice.WriteError;
     pub const ReadError = DatagramDevice.ReadError;
     pub const ChipSelect = struct {
-        pin: hal.gpio.Pin,
+        pin: gpio.Pin,
         active_level: Digital_IO.State = .low,
     };
 
     bus: hal.spim.SPIM,
     maybe_chip_select: ?ChipSelect = null,
+    /// Default transfer timeout. Null waits indefinitely.
+    timeout: ?time.Duration = null,
 
     pub fn init(bus: hal.spim.SPIM, maybe_chip_select: ?ChipSelect) SPI_Device {
         if (maybe_chip_select) |cs|
@@ -321,20 +325,20 @@ pub const SPI_Device = struct {
     }
 
     pub fn write(dev: SPI_Device, tx: []const u8) !void {
-        return dev.bus.write_blocking(u8, tx);
+        return dev.bus.write_blocking(tx, dev.timeout);
     }
 
     pub fn writev(dev: SPI_Device, datagrams: []const []const u8) !void {
-        return dev.bus.writev_blocking(u8, datagrams);
+        return dev.bus.writev_blocking(datagrams, dev.timeout);
     }
 
     pub fn read(dev: SPI_Device, rx: []u8) !usize {
-        dev.bus.read_blocking(u8, rx);
+        try dev.bus.read_blocking(rx, dev.timeout);
         return rx.len;
     }
 
-    pub fn readv(dev: SPI_Device, datagrams: []const []const u8) !usize {
-        dev.bus.readv_blocking(u8, datagrams);
+    pub fn readv(dev: SPI_Device, datagrams: []const []u8) !usize {
+        try dev.bus.readv_blocking(datagrams, dev.timeout);
         return microzig.utilities.SliceVector([]u8).init(datagrams).size();
     }
 
@@ -358,7 +362,7 @@ pub const SPI_Device = struct {
 
     fn writev_fn(dd: *anyopaque, chunks: []const []const u8) WriteError!void {
         const dev: *SPI_Device = @ptrCast(@alignCast(dd));
-        return dev.bus.writev_blocking(chunks, null) catch |err| switch (err) {
+        return dev.writev(chunks) catch |err| switch (err) {
             error.Timeout => WriteError.Timeout,
             else => WriteError.Unsupported,
         };
@@ -366,11 +370,10 @@ pub const SPI_Device = struct {
 
     fn readv_fn(dd: *anyopaque, chunks: []const []u8) ReadError!usize {
         const dev: *SPI_Device = @ptrCast(@alignCast(dd));
-        dev.bus.readv_blocking(chunks, null) catch |err| switch (err) {
-            error.Timeout => return ReadError.Timeout,
-            else => return ReadError.Unsupported,
+        return dev.readv(chunks) catch |err| switch (err) {
+            error.Timeout => ReadError.Timeout,
+            else => ReadError.Unsupported,
         };
-        return microzig.utilities.SliceVector([]u8).init(chunks).size();
     }
 };
 

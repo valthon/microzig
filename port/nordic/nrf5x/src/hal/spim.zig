@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
-const microzig = @import("microzig");
+const hal = @import("../hal.zig");
+const microzig = if (builtin.is_test) hal.serial_test else @import("microzig");
 const mdf = microzig.drivers;
 const peripherals = microzig.chip.peripherals;
 const compatibility = @import("compatibility.zig");
@@ -9,7 +11,7 @@ const Deadline = mdf.time.Deadline;
 const Duration = mdf.time.Duration;
 
 const gpio = @import("gpio.zig");
-const time = @import("time.zig");
+const time = if (builtin.is_test) hal.serial_test else @import("time.zig");
 
 const version: enum {
     nrf5283x,
@@ -58,8 +60,9 @@ pub const TransactionError = error{
     UnknownAbort,
 };
 
+/// Selects SPIM0 or SPIM1.
 pub fn num(n: u2) SPIM {
-    return @fromBackingInt(n);
+    return @fromBackingInt(@as(u1, @intCast(n)));
 }
 
 pub const SPIM = enum(u1) {
@@ -181,26 +184,8 @@ pub const SPIM = enum(u1) {
     }
 
     pub fn writev_blocking(spi: SPIM, chunks: []const []const u8, timeout: ?Duration) TransactionError!void {
-        if (timeout) |initial_timeout| {
-            const deadline: Deadline = .init_relative(time.get_time_since_boot(), initial_timeout);
-            var remaining_timeout = initial_timeout;
-
-            var last = time.get_time_since_boot();
-            for (chunks) |chunk| {
-                const now = time.get_time_since_boot();
-                if (deadline.is_reached_by(now))
-                    return error.Timeout;
-                const elapsed = now.diff(last);
-                remaining_timeout = remaining_timeout.minus(elapsed);
-
-                try spi.write_blocking(chunk, remaining_timeout);
-                last = now;
-            }
-        } else {
-            for (chunks) |chunk| {
-                try spi.write_blocking(chunk, null);
-            }
-        }
+        const deadline: Deadline = .init_relative(time.get_time_since_boot(), timeout);
+        for (chunks) |chunk| try spi.inner_tx_rx(chunk, &.{}, deadline);
     }
 
     pub fn read_blocking(spi: SPIM, dst: []u8, timeout: ?Duration) TransactionError!void {
@@ -209,26 +194,8 @@ pub const SPIM = enum(u1) {
     }
 
     pub fn readv_blocking(spi: SPIM, chunks: []const []u8, timeout: ?Duration) TransactionError!void {
-        if (timeout) |initial_timeout| {
-            const deadline: Deadline = .init_relative(time.get_time_since_boot(), initial_timeout);
-            var remaining_timeout = initial_timeout;
-
-            var last = time.get_time_since_boot();
-            for (chunks) |chunk| {
-                const now = time.get_time_since_boot();
-                if (deadline.is_reached_by(now))
-                    return error.Timeout;
-                const elapsed = now.diff(last);
-                remaining_timeout = remaining_timeout.minus(elapsed);
-
-                try spi.read_blocking(chunk, remaining_timeout);
-                last = now;
-            }
-        } else {
-            for (chunks) |chunk| {
-                try spi.read_blocking(chunk, null);
-            }
-        }
+        const deadline: Deadline = .init_relative(time.get_time_since_boot(), timeout);
+        for (chunks) |chunk| try spi.inner_tx_rx(&.{}, chunk, deadline);
     }
 
     pub fn transceive_blocking(spi: SPIM, tx: []const u8, rx: []u8, timeout: ?Duration) TransactionError!void {
@@ -238,10 +205,10 @@ pub const SPIM = enum(u1) {
 
     fn prepare_dma_transfer(spi: SPIM, tx: []const u8, rx: []u8) TransactionError!void {
         const regs = spi.get_regs();
-        regs.RXD.PTR.write_raw(@intFromPtr(rx.ptr));
+        regs.RXD.PTR.write_raw(@truncate(@intFromPtr(rx.ptr)));
         regs.RXD.MAXCNT.write(.{ .MAXCNT = @truncate(rx.len) });
 
-        regs.TXD.PTR.write_raw(@intFromPtr(tx.ptr));
+        regs.TXD.PTR.write_raw(@truncate(@intFromPtr(tx.ptr)));
         regs.TXD.MAXCNT.write(.{ .MAXCNT = @truncate(tx.len) });
 
         regs.EVENTS_END.write(.{ .EVENTS_END = .NotGenerated });

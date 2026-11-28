@@ -267,13 +267,43 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/usb_test_microzig.zig"),
         .imports = &.{.{ .name = "usb", .module = usb_core }},
     });
+    const nrfx = b.dependencyLazy("nrfx", .{}) catch return;
+    const internals = b.dependency("microzig/build-internals", .{});
+    const regz = internals.builder.dependency("regz", .{ .optimize = .safe }).artifact("regz");
+    const generate = b.addRunArtifact(regz);
+    generate.addArgs(&.{ "--format", "svd", "--output_path" });
+    const chips = generate.addOutputDirectoryArg2("chips", .{});
+    for ([_][]const u8{ "patches/nrf528xx.zon", "patches/nrf52840.zon" }) |patch| {
+        generate.addArg("--patch_path");
+        generate.addFileArg2(b.path(patch), .{});
+    }
+    generate.addFileArg2(nrfx.path("mdk/nrf52840.svd"), .{});
+    const serial_mmio = b.createModule(.{
+        .root_source_file = b.path("src/hal/serial_test_mmio.zig"),
+    });
+    const serial_chip = b.createModule(.{
+        .root_source_file = chips.path(b, "nrf52840.zig"),
+        .imports = &.{.{ .name = "microzig", .module = serial_mmio }},
+    });
+    const serial_drivers = b.createModule(.{
+        .root_source_file = b.path("../../../drivers/src/root.zig"),
+    });
+    const driver_options = b.addOptions();
+    driver_options.addOption(bool, "asserts", true);
+    serial_drivers.addOptions("config", driver_options);
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/hal.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "microzig", .module = usb_test_microzig }},
+            .imports = &.{
+                .{ .name = "microzig", .module = usb_test_microzig },
+                .{ .name = "serial_chip", .module = serial_chip },
+                .{ .name = "serial_drivers", .module = serial_drivers },
+                .{ .name = "serial_core", .module = usb_core },
+                .{ .name = "serial_test_mmio", .module = serial_mmio },
+            },
         }),
     });
 

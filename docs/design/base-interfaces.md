@@ -165,8 +165,6 @@ count fits `CNTR.NDT` in the port's register definitions.
 - `port/nordic/nrf5x/src/hal/drivers.zig:I2C_DatagramDevice.writev_then_readv` discards the configured timeout. ([#76](https://github.com/valthon/microzig/issues/76))
 - `port/espressif/esp/src/hal/spi.zig:SPI.wait_for_transfer_blocking` has no software deadline.
 - `port/raspberrypi/rp2xxx/src/hal/spi.zig:SPI.writev_blocking` and `SPI.readv_blocking` wait without software deadlines.
-- `port/nordic/nrf5x/src/hal/drivers.zig:SPI_Device` passes null timeouts through its erased slots. ([#76](https://github.com/valthon/microzig/issues/76))
-- `port/nordic/nrf5x/src/hal/drivers.zig:SPI_Device` uses incompatible HAL signatures in its concrete read/write helpers. ([#76](https://github.com/valthon/microzig/issues/76))
 - `port/nordic/nrf5x/src/hal/spim.zig:SPIM.inner_tx_rx` can slice past an exhausted direction on a later DMA chunk, including when a one-way transfer spans multiple chunks. ([#76](https://github.com/valthon/microzig/issues/76))
 - `port/nordic/nrf5x/src/hal/spim.zig:SPIM.inner_tx_rx_chunk` can return `Timeout` after starting DMA without stopping it or confirming completion, so the buffers can still be in use. ([#76](https://github.com/valthon/microzig/issues/76))
 - `port/nordic/nrf5x/src/hal/i2cdma.zig:I2C.wait` requests STOP on timeout and returns before waiting for STOPPED, so the DMA buffers may still be in use. ([#76](https://github.com/valthon/microzig/issues/76))

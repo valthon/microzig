@@ -1,13 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
-const microzig = @import("microzig");
+const hal = @import("../hal.zig");
+const microzig = if (builtin.is_test) hal.serial_test else @import("microzig");
 const mdf = microzig.drivers;
 const peripherals = microzig.chip.peripherals;
 const compatibility = @import("compatibility.zig");
 const drivers = mdf.base;
 
 const gpio = @import("gpio.zig");
-const time = @import("time.zig");
+const time = if (builtin.is_test) hal.serial_test else @import("time.zig");
 
 const version: enum {
     nrf5283x,

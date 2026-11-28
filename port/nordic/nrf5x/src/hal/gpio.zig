@@ -1,6 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
-const microzig = @import("microzig");
+const microzig = if (builtin.is_test) @import("../hal.zig").serial_test else @import("microzig");
 const peripherals = microzig.chip.peripherals;
 const compatibility = @import("compatibility.zig");
 
