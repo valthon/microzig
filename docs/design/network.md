@@ -170,7 +170,6 @@ within the remaining buffer.
 - `modules/network/src/root.zig:Interface.c_netif_linkoutput` extends the original pbuf for headroom without restoring it. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Interface.init` reinitializes global lwIP on each call and leaves the interface registered on a DHCP start error. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Interface.ready` checks a word of the primary address union and misses the separate IPv6 slots. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Udp.bind` stores its callback before bind succeeds, so retry can panic. ([#62](https://github.com/valthon/microzig/issues/62))
 - `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Connection.close` sets `.closed` while the old PCB can still call the wrapper on data ACKs or reset during FIN processing, so `.closed` is unsafe as a reuse signal. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` recycles session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))

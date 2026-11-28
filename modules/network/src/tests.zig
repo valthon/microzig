@@ -23,6 +23,24 @@ test "TCP send limits match the compiled lwIP configuration" {
     try testing.expectEqual(pcb.snd_buf, conn.send_buffer());
 }
 
+fn recv_udp(_: *net.Udp, _: []u8, _: net.Udp.RecvOptions) void {}
+
+test "UDP bind can retry after a port collision" {
+    try init_stack();
+    var nic: net.Interface = .{ .link = undefined };
+    var first = try net.Udp.init(&nic);
+    defer lwip.udp_remove(first.pcb);
+    var second = try net.Udp.init(&nic);
+    defer lwip.udp_remove(second.pcb);
+
+    try first.bind(8000, recv_udp);
+    try testing.expectEqual(null, second.on_recv);
+    try testing.expectError(error.AddressInUse, second.bind(8000, recv_udp));
+    try testing.expectEqual(null, second.on_recv);
+    try second.bind(8001, recv_udp);
+    try testing.expect(second.on_recv != null);
+}
+
 var stack_initialized = false;
 
 fn init_stack() !void {

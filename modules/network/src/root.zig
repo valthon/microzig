@@ -272,8 +272,8 @@ pub const Udp = struct {
             self.on_recv == null,
             "net.Udp.bind already bound",
         );
-        self.on_recv = on_recv;
         try c_err(lwip.udp_bind(self.pcb, lwip.IP_ADDR_ANY, port));
+        self.on_recv = on_recv;
         lwip.udp_recv(self.pcb, Self.c_on_recv, self);
     }
 
