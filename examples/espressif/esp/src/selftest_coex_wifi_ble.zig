@@ -179,7 +179,7 @@ const CyclePhase = struct {
 var udp_phases: [phase_count]UdpPhase = @splat(.{});
 var cycle_phases: [phase_count]CyclePhase = @splat(.{});
 /// False from just before a Wi-Fi deinit until the station has rejoined.
-var wifi_live: std.atomic.Value(bool) = .init(false);
+var tx_gate: @import("lwip/tx_gate.zig") = .{};
 /// True from a successful Wi-Fi deinit until the next init call.
 var wifi_off: std.atomic.Value(bool) = .init(false);
 var probe_echoed: std.atomic.Value(bool) = .init(false);
@@ -321,7 +321,7 @@ fn connect_wifi() !void {
     try lwip.c_err(lwip.c.netifapi_netif_common(&netif, null, lwip.c.dhcp_start));
     try wifi.connect();
     try wait_sta(.connected);
-    wifi_live.store(true, .release);
+    tx_gate.set_enabled(true);
 }
 
 fn get_address() !void {
@@ -337,31 +337,7 @@ fn cycle_wifi(conn: *lwip.c.struct_netconn, phase: usize, phase_start: u64) void
         cycle.in_phase = current_phase.load(.acquire) == phase;
         cycle.done = true;
     }
-    // Release the lease and drop the link first, so lwIP stops sending.
-    lwip.c_err(lwip.c.netifapi_netif_common(&netif, lwip.c.dhcp_release_and_stop, null)) catch |err| std.log.warn("COEX dhcp release: {t}", .{err});
-    lwip.c_err(lwip.c.netifapi_netif_common(&netif, lwip.c.netif_set_link_down, null)) catch |err| std.log.warn("COEX link down: {t}", .{err});
-    wifi_live.store(false, .release);
-    const deinit_start = now_ms();
-    while (true) {
-        wifi.deinit() catch |err| switch (err) {
-            error.WouldBlock => {
-                cycle.would_block += 1;
-                if (cycle.would_block < deinit_retries) {
-                    rtos.sleep(.from_ms(deinit_retry_ms));
-                    continue;
-                }
-                std.log.err("COEX phase={d} wifi deinit: still WouldBlock", .{phase + 1});
-                return;
-            },
-            else => {
-                std.log.err("COEX phase={d} wifi deinit: {t}", .{ phase + 1, err });
-                return;
-            },
-        };
-        break;
-    }
-    cycle.deinit_ms = @intCast(now_ms() - deinit_start);
-    cycle.deinit_ok = true;
+    if (!deinit_wifi(phase, cycle)) return;
     wifi_off.store(true, .release);
 
     const resume_at = phase_start + wifi_down_ms;
@@ -419,6 +395,36 @@ fn cycle_wifi(conn: *lwip.c.struct_netconn, phase: usize, phase_start: u64) void
         }
     }
     std.log.err("COEX phase={d} no UDP echo after re-init", .{phase + 1});
+}
+
+fn deinit_wifi(phase: usize, cycle: *CyclePhase) bool {
+    // Release the lease while TX is available. Pending ARP can still call
+    // linkoutput after link-down, so drain and close TX under the core lock.
+    lwip.c_err(lwip.c.netifapi_netif_common(&netif, lwip.c.dhcp_release_and_stop, null)) catch |err| std.log.warn("COEX dhcp release: {t}", .{err});
+    tx_gate.set_enabled(false);
+    lwip.c_err(lwip.c.netifapi_netif_common(&netif, lwip.c.netif_set_link_down, null)) catch |err| std.log.warn("COEX link down: {t}", .{err});
+    const deinit_start = now_ms();
+    while (true) {
+        wifi.deinit() catch |err| switch (err) {
+            error.WouldBlock => {
+                cycle.would_block += 1;
+                if (cycle.would_block < deinit_retries) {
+                    rtos.sleep(.from_ms(deinit_retry_ms));
+                    continue;
+                }
+                std.log.err("COEX phase={d} wifi deinit: still WouldBlock", .{phase + 1});
+                return false;
+            },
+            else => {
+                std.log.err("COEX phase={d} wifi deinit: {t}", .{ phase + 1, err });
+                return false;
+            },
+        };
+        break;
+    }
+    cycle.deinit_ms = @intCast(now_ms() - deinit_start);
+    cycle.deinit_ok = true;
+    return true;
 }
 
 fn fail_with(step: []const u8, err: anyerror) anyerror {
@@ -730,10 +736,30 @@ var packet_buf: [1600]u8 = undefined;
 
 fn netif_output(_: [*c]lwip.c.struct_netif, pbuf_c: [*c]lwip.c.struct_pbuf) callconv(.c) lwip.c.err_t {
     // The driver is down or not yet associated during a D-phase cycle.
-    if (!wifi_live.load(.acquire)) return lwip.c.ERR_IF;
+    if (!tx_gate.enabled) return lwip.c.ERR_IF;
     const pbuf: *lwip.c.struct_pbuf = pbuf_c;
     if (pbuf.tot_len > packet_buf.len) return lwip.c.ERR_BUF;
     if (lwip.c.pbuf_copy_partial(pbuf, &packet_buf, pbuf.tot_len, 0) != pbuf.tot_len) return lwip.c.ERR_BUF;
     wifi.send_packet(.sta, packet_buf[0..pbuf.tot_len]) catch return lwip.c.ERR_IF;
     return lwip.c.ERR_OK;
+}
+
+test "coex shutdown drains linkoutput and rejects pending output at link-down unlock" {
+    lwip.c.TxTest.reset(.dhcp_release);
+    defer lwip.c.TxTest.finish();
+    try lwip.c_err(lwip.c.netifapi_netif_add(
+        &netif,
+        @ptrCast(lwip.c.IP4_ADDR_ANY),
+        @ptrCast(lwip.c.IP4_ADDR_ANY),
+        @ptrCast(lwip.c.IP4_ADDR_ANY),
+        null,
+        netif_init,
+        lwip.c.tcpip_input,
+    ));
+    tx_gate.set_enabled(true);
+    var cycle: CyclePhase = .{};
+    try std.testing.expect(deinit_wifi(3, &cycle));
+    try std.testing.expect(cycle.deinit_ok);
+    try std.testing.expectEqual(lwip.c.ERR_IF, lwip.c.TxTest.pending_at_link_down);
+    try lwip.c.TxTest.expect_drained();
 }

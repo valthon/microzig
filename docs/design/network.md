@@ -65,11 +65,16 @@ Keep the C allocator route and its backing storage valid for all live lwIP alloc
 including across Wi-Fi deinit and reinit. Vendor RX allocates a pbuf before taking the
 TCP/IP core lock, so both allocator routes must be safe across their calling tasks.
 Keep the netif and its context alive while registered or reachable by callbacks.
+The TCP server keeps its registered netif and allocator for the boot. SoftAP keeps its
+allocator for the boot so the reporter, Wi-Fi and lwIP can retain it if the application
+returns an error.
 
 The TCP/IP task services lwIP timeouts using a wrapping millisecond clock. The
 sys_arch mailbox and semaphore waits take milliseconds. Zero waits indefinitely,
 and expiry returns `SYS_ARCH_TIMEOUT`. The port uses a separate task mutex for
 lightweight protection (`examples/espressif/esp/src/lwip/exports.zig:core_mutex`).
+`sys_mbox_trypost_fromisr` uses the ISR queue API and requests a deferred reschedule
+when a higher-priority waiter wakes.
 
 `tcpip_input`, netifapi and netconn API-message calls such as `netconn_bind`,
 `netconn_listen` and `netconn_write_partly` acquire the non-recursive core mutex
@@ -77,11 +82,16 @@ lightweight protection (`examples/espressif/esp/src/lwip/exports.zig:core_mutex`
 Raw callbacks hold the lock, so defer netifapi and netconn API-message calls to an
 application task that calls them with the lock released. For raw calls from application
 tasks, take `LOCK_TCPIP_CORE` as in `examples/espressif/esp/src/softap.zig:start_dhcp`.
+`lwip_assert_core_locked` rejects ISR calls and checks that the calling task owns the
+TCP/IP core mutex once lwIP has created it. Task calls during early lwIP initialization
+are allowed before the mutex exists.
 
 Vendor RX runs inline on the vendor task. Locked input can call `linkoutput` there
 before RX returns, and TX can also run on the TCP/IP task or a caller holding the lock.
 Keep `linkoutput` from waiting for vendor work that could be blocked on that lock.
-Publish the registered netif before RX uses it. Keep the caller-owned `Wifi` stationary
+Publish the registered netif before RX uses it. The TCP server publishes the pointer
+with a release store after registration, and its vendor RX callback loads it with acquire.
+Keep the caller-owned `Wifi` stationary
 and quiesce calls into it, including TX through `linkoutput`, before deinit.
 Run lifecycle waits in the application task outside the lwIP lock.
 
@@ -111,8 +121,12 @@ Ethernet header to the IP parser.
 
 ESP registration and `netif_set_up` leave the link down. The application calls
 `netif_set_link_up` through `netifapi_netif_common` after station association or AP
-start. This releases a DHCP client waiting for link up. The coexistence example
-releases DHCP and calls `netif_set_link_down` before tearing Wi-Fi down.
+start. This releases a DHCP client waiting for link up. In the coexistence example,
+shutdown releases DHCP while TX is available, closes the TX gate under the core lock,
+then calls `netif_set_link_down` before deinitializing Wi-Fi. Acquiring the core lock
+drains any admitted `linkoutput`, and the closed gate rejects later output, including
+pending ARP retries. The TCP server closes its gate under the same lock on exit from
+`serve`, before deinitializing Wi-Fi.
 
 On bare metal, TX can run during a send, while input is processed or when timers
 are serviced. If the first TX pbuf cannot expose the configured headroom,
@@ -139,8 +153,8 @@ within the remaining buffer.
   and `examples/espressif/esp/src/selftest_wifi_checks.zig:exercise`. They use release/acquire
   to publish the registered netif across tasks. `examples/espressif/esp/src/tcp_server.zig:serve` shows
   station DHCP. `examples/espressif/esp/src/softap.zig:main` registers the AP with a
-  static IPv4 address, mask and gateway. `examples/espressif/esp/src/selftest_coex_wifi_ble.zig:cycle_wifi` keeps the
-  registered netif alive, gates TX with `wifi_live`, and reinitializes the same `Wifi` handle.
+  static IPv4 address, mask and gateway. `examples/espressif/esp/src/selftest_coex_wifi_ble.zig:cycle_wifi`
+  keeps the netif registered, reinitializes the same `Wifi` handle, and reopens TX after association.
 
 ## Shared patterns
 
@@ -155,11 +169,14 @@ within the remaining buffer.
   for checking RX capacity before the bus read. No build test step includes these tests.
 - `zig build test` in `examples/espressif/esp/` runs "DHCP allocation, renewal, collision, release, exhaustion and expiry"
   in `examples/espressif/esp/src/softap_dhcp.zig`, covering the AP's lease logic.
+- The ESP example host tests exercise the C exports for ISR mailbox posting and TCP/IP
+  core lock ownership. They also exercise the TCP server bind failure and coexistence
+  shutdown with a paused send and pending link output.
 - The ESP port README records station DHCP and TCP echo between an ESP32-C3 and a XIAO ESP32-C6
   in both roles. Build the images in `examples/espressif/esp/` with `-Dexample=selftest_wifi_softap_echo` and `-Dexample=softap`.
   [ESP Wi-Fi self-tests](../../port/espressif/esp/README.md#wi-fi-station-and-rtos)
 - No host test checks build configuration, pbuf failure ownership, TX headroom and
-  scratch lifetime, core-lock use, callback and close ordering, netif flags and link handoff,
+  scratch lifetime, application callback and connection close ordering, netif flags,
   allocator lifetime and concurrency, timers, sys_arch waits or Pico ISR handoff and re-arm.
 
 ## Open questions
@@ -177,10 +194,3 @@ within the remaining buffer.
 - `modules/network/src/root.zig:Endpoint.parse` and `Interface.Options.Fixed.init` pass slice pointers to C parsers that expect NUL termination. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Endpoint.format` always formats the address as IPv4. ([#64](https://github.com/valthon/microzig/issues/64))
 - `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
-- `examples/espressif/esp/src/tcp_server.zig:run` can return from an ordinary server error even after successful Wi-Fi teardown, while lwIP still references the stack-local netif and allocator. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/tcp_server.zig:run_server` can deinitialize Wi-Fi after a server error with the netif still up and registered, allowing TX to overlap teardown. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/tcp_server.zig:maybe_netif` is shared with the vendor task without synchronized publication. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/softap.zig:main` can return while the reporter, Wi-Fi or lwIP still uses its stack-local allocator. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/lwip/exports.zig:sys_mbox_trypost` exports a from-ISR alias that uses the task queue API. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/lwip/exports.zig:lwip_assert_core_locked` checks for a lock holder without checking that it is the calling task. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/selftest_coex_wifi_ble.zig:cycle_wifi` clears the TX gate without synchronizing with a `linkoutput` already inside that gate before deinit. ([#81](https://github.com/valthon/microzig/issues/81))

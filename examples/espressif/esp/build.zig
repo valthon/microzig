@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     }) });
-    const test_step = b.step("test", "Test DHCP, systimer intervals, ESP-NOW rendezvous, and C6 coexistence plumbing");
+    const test_step = b.step("test", "Run ESP example tests");
     test_step.dependOn(&b.addRunArtifact(dhcp_tests).step);
     const systimer_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/systimer.zig"),
@@ -74,10 +74,58 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(coex_udp_loss_tests).step);
+    const lwip_host = b.createModule(.{ .root_source_file = b.path("src/lwip/test/lwip.zig") });
+    const esp_host = b.createModule(.{ .root_source_file = b.path("src/lwip/test/microzig.zig") });
+    esp_host.addImport("lwip", lwip_host);
+    const lwip_host_options = b.addOptions();
+    lwip_host_options.addOption([]const u8, "ssid", "test");
+    lwip_host_options.addOption([]const u8, "password", "");
+    lwip_host_options.addOption([]const u8, "auth", "none");
+    const lwip_host_antenna = b.addOptions();
+    lwip_host_antenna.addOption(Antenna, "antenna", .internal);
+    const lwip_host_coex = b.addOptions();
+    lwip_host_coex.addOption(bool, "ble_first", false);
+    const lwip_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/lwip_tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    lwip_tests.root_module.addImport("microzig", esp_host);
+    lwip_tests.root_module.addImport("lwip", lwip_host);
+    lwip_tests.root_module.addOptions("wifi_options", lwip_host_options);
+    lwip_tests.root_module.addOptions("antenna_options", lwip_host_antenna);
+    lwip_tests.root_module.addOptions("coex_options", lwip_host_coex);
+    test_step.dependOn(&b.addRunArtifact(lwip_tests).step);
     const expected_mac: ?u48 = if (expected_mac_text) |text| parse_mac(text) orelse
         std.process.fatal("-Dexpected_mac={s}: expected six hex bytes separated by ':'", .{text}) else null;
 
     const mz_dep = b.dependency("microzig", .{});
+    const core_lock_panics = b.addTest(.{
+        .name = "lwip-core-lock-panics",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lwip_core_lock_panic_test.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "microzig", .module = esp_host },
+                .{ .name = "lwip", .module = lwip_host },
+            },
+        }),
+        .test_runner = .{
+            .path = mz_dep.path("port/espressif/esp/src/hal/radio/stop_panic_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    for ([_][]const u8{
+        "lwIP core lock assertion rejects an unlocked mutex",
+        "lwIP core lock assertion rejects another task's lock",
+        "lwIP core lock assertion rejects ISR context",
+    }) |case| {
+        const run = b.addRunArtifact(core_lock_panics);
+        run.addArgs(&.{ case, "lwIP core lock is not held by the calling task" });
+        test_step.dependOn(&run.step);
+    }
+
     const mb = MicroBuild.init(b, mz_dep) orelse return;
 
     // Compile the coex callbacks with the C6 register map and blob declarations.
