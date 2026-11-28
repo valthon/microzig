@@ -78,9 +78,7 @@ pub fn main() !void {
 
     timer.schedule_alarm(.alarm0, timer.read_low() +% tick_interval_ms * 1000);
     while (true) {
-        // get and reset wakeup source
-        const src = wakeup_source;
-        wakeup_source = .{};
+        const src = take_wakeup_source();
 
         if (src.wifi) {
             // Interrupt will be enabled after last packet is read
@@ -99,10 +97,25 @@ pub fn main() !void {
 
 const tick_interval_ms = 50;
 
-var wakeup_source: packed struct {
+const WakeupSource = struct {
     wifi: bool = false,
     tick: bool = false,
-} = .{};
+};
+
+/// Set by the interrupt handlers, taken by the main loop. Each flag is its
+/// own byte, so a handler sets it with a store that leaves the other intact.
+var wakeup_source: WakeupSource = .{};
+
+/// Read and clear the wakeup flags as one step, so a flag an interrupt sets
+/// in between is not cleared unseen. A lost Wi-Fi flag would leave the Wi-Fi
+/// interrupt masked with no poll to re-enable it.
+fn take_wakeup_source() WakeupSource {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    const src = wakeup_source;
+    wakeup_source = .{};
+    return src;
+}
 
 fn gpio_interrupt() linksection(".ram_text") callconv(.c) void {
     // Disable interrupts storm, store source and wake up main loop.

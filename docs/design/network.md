@@ -12,9 +12,9 @@ package directly and supply their own netif and RTOS glue.
 ## Code map
 
 - `modules/lwip/build.zig:build` compiles the pinned upstream C sources and translates the
-  umbrella header with the same port include directory. `modules/lwip/src/root.zig:c`
+  umbrella header with the same port include directory and configured macros. `modules/lwip/src/root.zig:c`
   exports the translated bindings.
-- `modules/network/build.zig:build` links foundation libc and sizes the internal lwIP heap
+- `modules/network/build.zig:add_network_module` (called from `build`) links foundation libc and sizes the internal lwIP heap
   and packet buffer (pbuf) pool at build time. MTU counts IP bytes. Size the pool buffer
   for the Ethernet header, driver headroom and any extra receive storage.
 - `modules/network/src/include/lwipopts.h:NO_SYS` selects the bare-metal raw API and
@@ -32,11 +32,14 @@ package directly and supply their own netif and RTOS glue.
 ### Bare metal
 
 Keep the link context and the caller-owned `Interface` at stable addresses.
-`modules/network/src/root.zig:Interface.init` initializes global lwIP state, registers
-the embedded netif with `netif_input`, and makes it the default. It installs ARP and
+`modules/network/src/root.zig:Interface.init` initializes the shared lwIP stack once and registers
+the embedded netif with `netif_input`. A successful registration becomes the default.
+A failed DHCP start removes the new netif and preserves the existing default. It installs ARP and
 IPv6 output, sets the MAC and creates an IPv6 link-local address. Choose fixed IPv4 or
 let the interface supply its embedded DHCP state. The wrapper has no teardown API,
 so reserve these objects for the registered lifetime and treat initialization as one-time.
+`Interface.ready` reports an up netif with link up and either an IPv4 address or a
+valid IPv6 address outside link-local scope.
 
 Run raw API calls, RX, TX and timers in one foreground context. From a callback,
 defer `Interface.poll` and `Interface.tick` until the current stack call returns.
@@ -46,12 +49,18 @@ do nothing, so keep bus transfers, allocation and lwIP calls in the foreground.
 
 Raw UDP and TCP receive callbacks borrow one pbuf segment at a time. UDP marks the
 last with `last_fragment`. Copy data you need after return. UDP and TCP copy outgoing
-data, and TCP `on_sent` reports acknowledged bytes. Retry `tcp.Connection.send` only
-if the bytes were never queued, since `tcp_output` can fail after `tcp_write` succeeds.
-Defer a graceful close requested by `on_recv` until the stack call returns so the
-wrapper can credit the received bytes. Keep callback contexts stationary and TCP
-connection wrappers reserved until lwIP can no longer call them, even after `close`.
-The UDP and TCP listener wrappers have no close API.
+data, and TCP `on_sent` reports acknowledged bytes. `tcp.Connection.send` fails only
+if the bytes were not queued, so the same bytes can be retried. If the immediate output
+fails after queuing, lwIP sends the bytes later from its timers or on incoming segments.
+The wrapper credits received bytes to the window before calling `on_recv`, so
+`on_recv` may queue a reply and close without the close resetting the connection.
+Keep callback contexts stationary. lwIP holds a TCP connection wrapper from `connect`
+or accept until `close`, a reset or an abort. `close` detaches the wrapper from the PCB, which
+lwIP keeps until the FIN exchange ends, and stops callbacks for that connection, including
+`on_sent` for bytes still in flight. A wrapper that reads `.closed` can be reused or
+reconnected at once.
+The UDP and TCP listener wrappers have no close API. IPv6 endpoints format as
+`[address]:port` and IPv4 endpoints as `address:port`.
 
 ### ESP tasks
 
@@ -104,8 +113,8 @@ Ethernet header to the IP parser.
 | Drain | Zero length or `next_packet_available = false` ends the poll, and a frame with true or null triggers another receive. | `port/espressif/esp/src/hal/radio/wifi.zig:recv_cb_sta` and `port/espressif/esp/src/hal/radio/wifi.zig:recv_cb_ap` free the vendor buffer after the callback returns. |
 | Link state | The receive result drives link up and down. | The application task reports link changes through netifapi. |
 | Input | `Interface.poll` adjusts the pbuf and passes the frame to the stack. | Call the registered input function with the copy. |
-| Ownership | The wrapper frees an empty pbuf or one rejected by input. Successful input transfers ownership to lwIP. | lwIP takes the pbuf on successful input, and the adapter frees it on copy or input error. |
-| Transmit | `Interface.c_netif_linkoutput` exposes headroom in the original first pbuf before cloning a chain. | Flatten the whole chain into transmit scratch without freeing or modifying the input pbuf. |
+| Ownership | The wrapper frees the pbuf on empty RX, driver error, invalid range or rejected input. Successful input transfers ownership to lwIP. | lwIP takes the pbuf on successful input, and the adapter frees it on copy or input error. |
+| Transmit | `Interface.c_netif_linkoutput` exposes headroom in a single pbuf only while `send` runs and restores it, or copies a chain or a pbuf without headroom after the headroom of a pool pbuf. | Flatten the whole chain into transmit scratch without freeing or modifying the input pbuf. |
 | TX lifetime | `send` may fill the reserved prefix and borrows the slice until return. | Reuse scratch only once the driver releases its borrow. A new asynchronous adapter must copy into owned storage or retain a buffer until completion. |
 | TX failure | `OutOfMemory`, `LinkDown` and `InternalError` become `ERR_MEM`, `ERR_IF` and `ERR_ARG`. | The examples map `send_packet` failure to `ERR_IF`. |
 
@@ -115,12 +124,11 @@ start. This releases a DHCP client waiting for link up. The coexistence example
 releases DHCP and calls `netif_set_link_down` before tearing Wi-Fi down.
 
 On bare metal, TX can run during a send, while input is processed or when timers
-are serviced. If the first TX pbuf cannot expose the configured headroom,
-`linkoutput` returns `ERR_ARG` before cloning or calling `send`, even if a clone would
-fit in the pool buffer. The wrapper frees its temporary clone. Preserve the Ethernet
+are serviced. `linkoutput` returns the caller's pbuf unchanged, as lwIP expects it to
+send the pbuf as-is. The copy starts word-aligned, and a failed copy allocation returns
+`ERR_MEM`. The wrapper frees its temporary copy. Preserve the Ethernet
 bytes and release the driver's borrow before returning from `send`.
-For RX, keep `head` representable as a signed 16-bit header adjustment and `len`
-within the remaining buffer.
+For RX, the wrapper checks that `head` and `len` describe a frame within the supplied buffer.
 
 ## Prior art
 
@@ -131,7 +139,9 @@ within the remaining buffer.
   bus status word. Preserve the four-byte alignment and accessible tail padding
   for the TX adapter's word-rounded transfer. The driver reports association as
   link state and checks firmware credit before writing TX.
-- In `examples/raspberrypi/rp2xxx/src/net/irq.zig:main`, GPIO masks the source and posts a wake.
+- In `examples/raspberrypi/rp2xxx/src/net/irq.zig:main`, GPIO masks the source and posts a wake,
+  and the foreground reads and clears the wake flags in one critical section
+  (`examples/raspberrypi/rp2xxx/src/net/irq.zig:take_wakeup_source`).
   The HAL also masks the pin around SPI transfers and restores its previous state. Foreground drains RX, and
   `drivers/src/wireless/cyw43439/wifi.zig:read` asks the HAL to re-arm when the interrupt
   is set, no packet remains and join state is other than `.none`.
@@ -158,25 +168,20 @@ within the remaining buffer.
 - The ESP port README records station DHCP and TCP echo between an ESP32-C3 and a XIAO ESP32-C6
   in both roles. Build the images in `examples/espressif/esp/` with `-Dexample=selftest_wifi_softap_echo` and `-Dexample=softap`.
   [ESP Wi-Fi self-tests](../../port/espressif/esp/README.md#wi-fi-station-and-rtos)
-- No host test checks build configuration, pbuf failure ownership, TX headroom and
-  scratch lifetime, core-lock use, callback and close ordering, netif flags and link handoff,
+- The network host tests check TCP send limits against the compiled lwIP configuration.
+- The network host tests check that RX driver errors and invalid frame ranges return the
+  pbuf to the pool.
+- The network host tests check that TX returns the caller's pbuf unchanged.
+- The network host tests run TCP through a link that loops frames back to the interface.
+  They check that a reply sent and closed from `on_recv` reaches the peer, and that a
+  closed wrapper gets no callbacks from its closing PCB and can reconnect at once. A send
+  whose immediate output fails reaches the peer once, after lwIP's slow timer runs.
+- No host test checks ESP adapter pbuf failure ownership, TX
+  scratch lifetime, core-lock use, netif flags and link handoff,
   allocator lifetime and concurrency, timers, sys_arch waits or Pico ISR handoff and re-arm.
 
 ## Open questions
 
-- `modules/network/src/root.zig:Interface.poll` can return on a receive error before installing pbuf cleanup. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Interface.poll` trusts the frame length without checking it against the remaining pbuf. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Interface.c_netif_linkoutput` extends the original pbuf for headroom without restoring it. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Interface.init` reinitializes global lwIP on each call and leaves the interface registered on a DHCP start error. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Interface.ready` checks a word of the primary address union and misses the separate IPv6 slots. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Udp.bind` stores its callback before bind succeeds, so retry can panic. ([#62](https://github.com/valthon/microzig/issues/62))
-- `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:tcp.Connection.close` sets `.closed` while the old PCB can still call the wrapper on data ACKs or reset during FIN processing, so `.closed` is unsafe as a reuse signal. ([#80](https://github.com/valthon/microzig/issues/80))
-- `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` recycles session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:tcp.Server.bind` passes the result of `tcp_listen` onward without checking for null. ([#63](https://github.com/valthon/microzig/issues/63))
-- `modules/network/src/root.zig:Endpoint.parse` and `Interface.Options.Fixed.init` pass slice pointers to C parsers that expect NUL termination. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Endpoint.format` always formats the address as IPv4. ([#64](https://github.com/valthon/microzig/issues/64))
-- `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/espressif/esp/src/tcp_server.zig:run` can return from an ordinary server error even after successful Wi-Fi teardown, while lwIP still references the stack-local netif and allocator. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/tcp_server.zig:run_server` can deinitialize Wi-Fi after a server error with the netif still up and registered, allowing TX to overlap teardown. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/tcp_server.zig:maybe_netif` is shared with the vendor task without synchronized publication. ([#81](https://github.com/valthon/microzig/issues/81))

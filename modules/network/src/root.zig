@@ -39,19 +39,25 @@ pub const Interface = struct {
             gw: lwip.ip4_addr,
 
             pub fn init(ip: []const u8, netmask: []const u8, gw: []const u8) !Fixed {
-                var f: Fixed = undefined;
-                if (lwip.ip4addr_aton(ip.ptr, &f.ip) != 1 or
-                    lwip.ip4addr_aton(netmask.ptr, &f.netmask) != 1 or
-                    lwip.ip4addr_aton(gw.ptr, &f.gw) != 1)
-                    return error.IpAddrParse;
-                return f;
+                return .{
+                    .ip = try parse_ipv4(ip),
+                    .netmask = try parse_ipv4(netmask),
+                    .gw = try parse_ipv4(gw),
+                };
             }
         };
     };
 
     pub fn init(self: *Self, mac: [6]u8, opt: Options) !void {
-        lwip.lwip_init();
+        // memp_init installs the statistics pointers for the global pools.
+        // They remain installed even if the first netif fails to register.
+        if (lwip.lwip_stats.memp[lwip.MEMP_PBUF_POOL] == null) lwip.lwip_init();
         const netif: *lwip.netif = &self.netif;
+
+        var registered = lwip.netif_list;
+        while (registered != null) : (registered = registered[0].next) {
+            if (registered == netif) return error.AlreadyInitialized;
+        }
 
         if (opt.fixed) |fixed| {
             _ = lwip.netif_add(
@@ -72,17 +78,20 @@ pub const Interface = struct {
             ) orelse return error.OutOfMemory;
         }
 
+        errdefer lwip.netif_remove(netif);
+
         std.mem.copyForwards(u8, &netif.hwaddr, &mac);
         lwip.netif_create_ip6_linklocal_address(netif, 1);
         netif.ip6_autoconfig_enabled = 1;
-        lwip.netif_set_default(netif);
         lwip.netif_set_up(netif);
-        lwip.netif_set_status_callback(netif, c_on_netif_status);
-        lwip.netif_set_link_callback(netif, c_on_netif_status);
         if (opt.fixed == null) {
             lwip.dhcp_set_struct(netif, &self.dhcp);
+            errdefer netif.client_data[lwip.LWIP_NETIF_CLIENT_DATA_INDEX_DHCP] = null;
             try c_err(lwip.dhcp_start(netif));
         }
+        lwip.netif_set_default(netif);
+        lwip.netif_set_status_callback(netif, c_on_netif_status);
+        lwip.netif_set_link_callback(netif, c_on_netif_status);
     }
 
     // synchronously called from init (during netif_add)
@@ -115,25 +124,38 @@ pub const Interface = struct {
 
     /// Called by lwip when there is a packet to send.
     /// pbuf chain total_len is <= netif.mtu + ethernet header
+    ///
+    /// lwIP sends the pbuf as-is, so the caller gets it back unchanged. A
+    /// single pbuf with headroom exposes it only while `send` runs. A chain,
+    /// or a pbuf without headroom, is copied after the headroom of a pool
+    /// pbuf, whose payload starts aligned.
     fn c_netif_linkoutput(netif_c: [*c]lwip.netif, pbuf_c: [*c]lwip.pbuf) callconv(.c) lwip.err_t {
         const netif: *lwip.netif = netif_c;
-        var pbuf: *lwip.pbuf = pbuf_c;
+        const frame: *lwip.pbuf = pbuf_c;
         const self: *Self = @fieldParentPtr("netif", netif);
+        const headroom = config.pbuf_header_length;
 
-        if (config.pbuf_header_length > 0 and lwip.pbuf_header(pbuf, config.pbuf_header_length) != 0) {
-            log.err("can't get pbuf headroom len: {}, tot_len: {} ", .{ pbuf.len, pbuf.tot_len });
+        if (frame.next == null and lwip.pbuf_add_header(frame, headroom) == 0) {
+            defer _ = lwip.pbuf_remove_header(frame, headroom);
+            return self.send_frame(frame);
+        }
+
+        const copy: *lwip.pbuf = lwip.pbuf_alloc(
+            lwip.PBUF_RAW,
+            frame.tot_len + headroom,
+            lwip.PBUF_POOL,
+        ) orelse return lwip.ERR_MEM;
+        defer _ = lwip.pbuf_free(copy);
+        if (copy.next != null) {
+            log.err("frame does not fit a pool pbuf tot_len: {}", .{frame.tot_len});
             return lwip.ERR_ARG;
         }
+        const bytes = payload_bytes(copy);
+        _ = lwip.pbuf_copy_partial(frame, bytes[headroom..].ptr, frame.tot_len, 0);
+        return self.send_frame(copy);
+    }
 
-        if (pbuf.next != null) {
-            // clone chain into single packet buffer
-            pbuf = lwip.pbuf_clone(lwip.PBUF_RAW, lwip.PBUF_POOL, pbuf) orelse return lwip.ERR_MEM;
-        }
-        defer {
-            // free local pbuf clone (if clone was made)
-            if (pbuf_c.*.next != null) _ = lwip.pbuf_free(pbuf);
-        }
-
+    fn send_frame(self: *Self, pbuf: *lwip.pbuf) lwip.err_t {
         self.link.vtable.send(self.link.ptr, payload_bytes(pbuf)) catch |err| {
             return switch (err) {
                 error.OutOfMemory => lwip.ERR_MEM,
@@ -146,11 +168,21 @@ pub const Interface = struct {
         return lwip.ERR_OK;
     }
 
+    /// True when the interface is up, the link is up and it has an IPv4
+    /// address or a valid IPv6 address beyond link-local scope.
     pub fn ready(self: *Self) bool {
         const netif = &self.netif;
-        return (netif.flags & lwip.NETIF_FLAG_UP > 0) and
-            (netif.flags & lwip.NETIF_FLAG_LINK_UP > 0) and
-            (netif.ip_addr.u_addr.ip4.addr != 0 or netif.ip_addr.u_addr.ip6.addr[0] != 0);
+        if (netif.flags & lwip.NETIF_FLAG_UP == 0 or netif.flags & lwip.NETIF_FLAG_LINK_UP == 0) {
+            return false;
+        }
+        // lwIP keeps the IPv4 address in ip_addr and IPv6 addresses in ip6_addr.
+        if (netif.ip_addr.u_addr.ip4.addr != 0) return true;
+        for (netif.ip6_addr, netif.ip6_addr_state) |addr, state| {
+            const first_word = std.mem.bigToNative(u32, addr.u_addr.ip6.addr[0]);
+            const link_local = first_word & 0xffc0_0000 == 0xfe80_0000;
+            if (state & lwip.IP6_ADDR_VALID != 0 and !link_local) return true;
+        }
+        return false;
     }
 
     /// Must be called periodically if poll is not called (e.g when using rx
@@ -172,6 +204,7 @@ pub const Interface = struct {
                 config.pbuf_length,
                 lwip.PBUF_POOL,
             ) orelse return error.OutOfMemory;
+            errdefer _ = lwip.pbuf_free(pbuf);
             assert_panic(
                 pbuf.next == null and pbuf.len == pbuf.tot_len and pbuf.len == config.pbuf_length,
                 "net.Interface.pool invalid pbuf allocation",
@@ -193,14 +226,12 @@ pub const Interface = struct {
                 break;
             }
 
-            errdefer _ = lwip.pbuf_free(pbuf); // netif.input: takes ownership of pbuf on success
-            // set payload header and len
-            if (rsp.head > 0 and lwip.pbuf_header(pbuf, -@as(lwip.s16_t, @intCast(rsp.head))) != 0) {
-                return error.InvalidPbufHead;
-            }
+            if (rsp.head > pbuf.len) return error.InvalidPbufHead;
+            if (rsp.len > pbuf.len - rsp.head) return error.InvalidPbufLength;
+            if (lwip.pbuf_remove_header(pbuf, rsp.head) != 0) return error.InvalidPbufHead;
             pbuf.len = @intCast(rsp.len);
             pbuf.tot_len = @intCast(rsp.len);
-            // pass data to the lwip input function
+            // Successful input takes ownership.
             try c_err(netif.input.?(pbuf, netif));
             self.stat.recv_packets +%= 1;
             self.stat.recv_bytes +%= rsp.len;
@@ -272,8 +303,8 @@ pub const Udp = struct {
             self.on_recv == null,
             "net.Udp.bind already bound",
         );
-        self.on_recv = on_recv;
         try c_err(lwip.udp_bind(self.pcb, lwip.IP_ADDR_ANY, port));
+        self.on_recv = on_recv;
         lwip.udp_recv(self.pcb, Self.c_on_recv, self);
     }
 
@@ -406,14 +437,18 @@ pub const tcp = struct {
                 return lwip.ERR_OK;
             }
 
+            // Credit the window before on_recv runs: tcp_close resets the
+            // connection and drops queued output if received data is still
+            // uncredited, and on_recv may close.
+            if (self.pcb) |pcb| {
+                lwip.tcp_recved(pcb, c_pbuf.*.tot_len);
+            }
             var pbuf: *lwip.pbuf = c_pbuf;
             while (true) {
                 if (self.on_recv) |cb| cb(self, payload_bytes(pbuf));
-                if (pbuf.next == null) break;
+                // Stop at the end of the chain or once on_recv has closed.
+                if (pbuf.next == null or self.pcb == null) break;
                 pbuf = pbuf.next;
-            }
-            if (self.pcb) |pcb| {
-                lwip.tcp_recved(pcb, c_pbuf.*.tot_len);
             }
             return lwip.ERR_OK;
         }
@@ -424,14 +459,28 @@ pub const tcp = struct {
             return lwip.ERR_OK;
         }
 
+        /// Copies `bytes` into the send queue. An error means nothing was
+        /// queued, so the same bytes can be sent again.
         pub fn send(self: *Self, bytes: []const u8) !void {
             const pcb = self.pcb orelse return Error.NotConnected;
-            try c_err(lwip.tcp_write(pcb, bytes.ptr, @intCast(bytes.len), lwip.TCP_WRITE_FLAG_COPY));
-            try c_err(lwip.tcp_output(pcb));
+            // tcp_write takes a u16 length.
+            const len = std.math.cast(u16, bytes.len) orelse return Error.BufferError;
+            try c_err(lwip.tcp_write(pcb, bytes.ptr, len, lwip.TCP_WRITE_FLAG_COPY));
+            // The bytes stay queued if output fails; lwIP's slow timer and
+            // incoming segments call tcp_output again.
+            if (to_error(lwip.tcp_output(pcb))) |err| log.debug("tcp output deferred {}", .{err});
         }
 
+        /// The wrapper gets no further callbacks for this connection and can
+        /// be reused once `close` returns, although lwIP keeps the PCB until
+        /// the FIN exchange ends.
         pub fn close(self: *Self) !void {
             const pcb = self.pcb orelse return Error.NotConnected;
+            // A closing PCB can still report acknowledged data or a reset.
+            lwip.tcp_arg(pcb, null);
+            lwip.tcp_recv(pcb, null);
+            lwip.tcp_sent(pcb, null);
+            lwip.tcp_err(pcb, null);
             self.pcb = null;
             self.state = .closed;
             c_err(lwip.tcp_close(pcb)) catch |err| {
@@ -475,9 +524,10 @@ pub const tcp = struct {
 
             errdefer _ = lwip.tcp_close(pcb);
             try c_err(lwip.tcp_bind(pcb, lwip.IP_ADDR_ANY, port));
-            self.pcb = lwip.tcp_listen(pcb);
-            lwip.tcp_arg(self.pcb, self);
-            lwip.tcp_accept(self.pcb, c_on_accept);
+            const listener = lwip.tcp_listen(pcb) orelse return Error.OutOfMemory;
+            lwip.tcp_arg(listener, self);
+            lwip.tcp_accept(listener, c_on_accept);
+            self.pcb = listener;
         }
 
         fn c_on_accept(
@@ -506,18 +556,39 @@ pub const Endpoint = struct {
     port: u16 = 0,
 
     pub fn format(self: Endpoint, writer: anytype) !void {
-        const ip4_addr: *const lwip.ip4_addr_t = @ptrCast(&self.addr);
-        try writer.writeAll(std.mem.sliceTo(lwip.ip4addr_ntoa(ip4_addr), 0));
-        var buf: [16]u8 = undefined;
-        try writer.writeAll(std.mem.print(&buf, ":{}", .{self.port}) catch "");
+        var buf: [lwip.IPADDR_STRLEN_MAX]u8 = undefined;
+        const text = lwip.ipaddr_ntoa_r(&self.addr, &buf, buf.len) orelse unreachable;
+        const address = std.mem.sliceTo(text, 0);
+        if (self.addr.type == lwip.IPADDR_TYPE_V6) {
+            try writer.print("[{s}]:{d}", .{ address, self.port });
+        } else {
+            try writer.print("{s}:{d}", .{ address, self.port });
+        }
     }
 
     pub fn parse(ip: []const u8, port: u16) !Endpoint {
         var target: Endpoint = .{ .port = port };
-        if (lwip.ipaddr_aton(ip.ptr, &target.addr) != 1) return error.IpAddrParse;
+        var buf: [lwip.IPADDR_STRLEN_MAX]u8 = undefined;
+        const text = try terminate_ip_text(ip, &buf);
+        if (lwip.ipaddr_aton(text.ptr, &target.addr) != 1) return error.IpAddrParse;
         return target;
     }
 };
+
+fn parse_ipv4(ip: []const u8) error{IpAddrParse}!lwip.ip4_addr {
+    var buf: [lwip.IPADDR_STRLEN_MAX]u8 = undefined;
+    var addr: lwip.ip4_addr = undefined;
+    const text = try terminate_ip_text(ip, &buf);
+    if (lwip.ip4addr_aton(text.ptr, &addr) != 1) return error.IpAddrParse;
+    return addr;
+}
+
+fn terminate_ip_text(ip: []const u8, buf: *[lwip.IPADDR_STRLEN_MAX]u8) error{IpAddrParse}![:0]const u8 {
+    if (ip.len >= buf.len or std.mem.findScalar(u8, ip, 0) != null) return error.IpAddrParse;
+    @memcpy(buf[0..ip.len], ip);
+    buf[ip.len] = 0;
+    return buf[0..ip.len :0];
+}
 
 pub const Error = error{
     /// Out of memory error.
