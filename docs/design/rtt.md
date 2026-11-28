@@ -13,10 +13,11 @@ framing, or Espressif's `app_trace`, which is a different protocol.
 
 ## Code map
 
-- `modules/rtt/src/rtt.zig:RTT(Config)`: one control block per instance, exported as the symbol
-  `RttControlBlock`; `init`, `write`, `writer`, `read`, `reader`.
+- `modules/rtt/src/rtt.zig:RTT(Config)`: one instance per image (and no other RTT implementation,
+  such as SEGGER's C sources, in the same image, since both define the symbol), exported as
+  `_SEGGER_RTT` (SEGGER's name, which host tools look up) and `RttControlBlock`; `init`, `write`, `writer`, `read`, `reader`, `bytes_available`, `mode`, `set_mode`.
 - `modules/rtt/src/rtt.zig:channel.Up` / `channel.Down`: the ring buffers (`write_available`,
-  `available_space`, `read_available`, `bytes_available`).
+  `read_available`, `bytes_available`).
 - `modules/rtt/src/rtt.zig:Header.init`: writes the `"SEGGER RTT"` id last, behind a barrier.
 - `modules/rtt/src/lock.zig:default`: the per-architecture lock chosen at compile time;
   `GenericLock`/`AnyLock` for a custom one, `empty` for none.
@@ -35,10 +36,13 @@ framing, or Espressif's `app_trace`, which is a different protocol.
   flag, never the control block, which holds whatever RAM held at reset.
 - Every target-side change to a ring buffer runs under `Config.exclusive_access`, and the lock
   excludes every other context on the same core that can call RTT, interrupt handlers included.
-  `bytes_available` reads without the lock; its result is a snapshot.
-- The target writes only `up.write_offset`, `down.read_offset` and, in `init`, the descriptors.
+  `bytes_available` checks the phase and reads the down offsets under the lock. Its result is a
+  snapshot because the host can publish data at any time.
+- Outside `init`, the target writes only `up.write_offset`, `down.read_offset`, and the mode
+  bits in `flags`.
   It reads each host-owned offset (`up.read_offset`, `down.write_offset`) with one volatile load
-  per call and uses that one value throughout the call.
+  per attempt and uses that one value throughout the attempt. A blocking write retries with a
+  fresh snapshot after releasing and reacquiring the lock.
 - The control block lives in host-writable RAM, so the target never takes a channel's buffer
   address or size from it: it uses the comptime size and the address of its own buffer storage.
   Any offset loaded from the block (host-owned or its own) at or above that size means "no space"
@@ -46,7 +50,7 @@ framing, or Espressif's `app_trace`, which is a different protocol.
 - The producer publishes data before the offset: copy, barrier, then store the new write offset.
   The consumer loads the write offset, barrier, copies, barrier, then stores the read offset.
 - One byte always stays free: no write path stores a `write_offset` equal to `read_offset`, so
-  equal offsets always mean empty.
+  equal offsets always mean empty. Up and down rings need at least two bytes in every mode.
 - `flags` mode bits the target does not know (3) behave as `no_block_skip`.
 - On the Cortex-M BASEPRI path (v7-M, v7E-M, v8-M Mainline) the lock masks only priorities
   numerically at or above `MAX_ISR_PRIORITY` (0x20): an interrupt with a higher urgency must not
@@ -80,37 +84,44 @@ target RAM at any instant, between any two target instructions, with no interrup
 | --- | --- | --- | --- |
 | `header.*`, channel `name`, `buffer`, `size` | target, in `init` only | host | written while the id is invalid; barrier before the id |
 | `up.write_offset` | target | host | target: lock |
-| `up.read_offset` | host | target | one volatile load per call, inside the lock; range-checked |
+| `up.read_offset` | host | target | one volatile load per attempt, inside the lock; range-checked |
 | `up` bytes from `read_offset` up to `write_offset` | target, before publishing | host | barrier before the `write_offset` store |
-| `down.write_offset` | host | target | one volatile load per call, inside the lock; range-checked; barrier after the load |
+| `down.write_offset` | host | target | one volatile load per call, inside the lock; range-checked; barrier before reading payload |
 | `down.read_offset` | target | host | target: lock; stored after the copy |
 | `down` bytes from `read_offset` up to `write_offset` | host | target | the host writes data before its offset |
-| `flags` | target in `init` (`flags = mode`, whole word) and `set_mode`; a host may write the mode bits | target | none; unknown mode bits behave as `no_block_skip` |
+| `flags` | target in `init` (`flags = mode`, whole word) and `set_mode`; a host may write the mode bits | target | target: lock; unknown mode bits behave as `no_block_skip` |
 | lock save state (`lock.zig:default`) | the lock, with interrupts masked | the lock | outermost-only, see below |
-| `initialised` flag | target, last step of `init` | `write`, `read` | target-private, not in the control block |
+| `initialised` flag | target, last step of `init` | target operations that access the block | target-private, not in the control block |
 
 ### Events × phases
 
 | Event | `unset` | `initialising` | `live` | Cleared |
 | --- | --- | --- | --- | --- |
 | host scans RAM for the id | nothing, or a stale block | nothing (id invalid) | finds the block | n/a |
-| host writes an offset of a stale block | harmless: `init` rewrites every offset | memory-safe; a host that cached the block's address may land a stale offset after `init` wrote it, and pass one burst of stale bytes (the host reads them on up, the application on down) | normal flow | by the next read of that channel |
-| host advances `up.read_offset` | n/a | n/a | frees space at the target's next load | n/a |
-| host writes into `down`, advances `down.write_offset` | n/a | n/a | data at the target's next `read` | by `read` |
-| host writes `flags` | n/a | overwritten by `init` | mode change at the next call; 3 behaves as skip | n/a |
-| host writes an offset at or above `size` | n/a | n/a | treated as full (up) or empty (down) | when the host writes a valid one |
+| host writes an offset of a stale block | harmless: `init` rewrites every offset | a write before `init` stores that offset is overwritten; one that lands after survives and is range-checked. An in-range stale offset can expose a burst of stale bytes to the host on up or to the application on down. | normal flow | by the next read of that channel |
+| host advances `up.read_offset` | n/a | an advance before `init` stores `up.read_offset` is overwritten; one that lands after survives, the same as in `live` | frees space at the target's next load | n/a |
+| host writes into `down`, advances `down.write_offset` | n/a | `init` leaves payload bytes in place. It overwrites an offset advance that lands before it stores `down.write_offset`, so that advance no longer publishes the bytes. An advance that lands after survives, the same as in `live`. | data at the target's next `read` | by `read` |
+| host writes `flags` | n/a | a write that lands before `init` stores flags is overwritten; one that lands after survives, the same as a write in `live` | mode change at the next call; 3 behaves as skip | n/a |
+| host writes an offset at or above `size` | n/a | a write before `init` stores that offset is overwritten; one that lands after is treated as full (up) or empty (down), the same as in `live` | treated as full (up) or empty (down) | when the host writes a valid one |
 | interrupt that calls RTT while foreground holds the lock | n/a (calls return 0) | held off by the lock | held off by the lock | at `unlock` |
-| exception (fault, `ecall`) taken inside the lock whose handler calls RTT | n/a | nested lock; outermost unlock restores | nested lock; the interrupted call then stores its cached offset, so the two writes' bytes may be mixed or lost (up), or the same bytes delivered twice (down) | at the outermost `unlock` |
+| exception (fault, `ecall`) taken inside the lock whose handler calls RTT | n/a | nested lock; reads and writes return 0 while the block is being rebuilt | nested lock; the interrupted call then stores its cached offset, so the two writes' bytes may be mixed or lost (up), or the same bytes delivered twice (down) | at the outermost `unlock` |
 | debug halt inside the lock | n/a | harmless | harmless: offsets stay consistent | at resume |
-| panic while the lock is held, panic handler logs through RTT | n/a | nested lock; data may interleave with the interrupted write | same; in `block_if_full` the handler may spin forever with no host | n/a |
+| panic while the lock is held, panic handler logs through RTT | n/a | nested lock; transfers to the block are dropped while it is being rebuilt | nested lock; data may interleave with the interrupted write; in `block_if_full` the handler may spin forever with no host | n/a |
 
 ### Entry points × phases
 
 | Call | `unset` | `initialising` | `live` |
 | --- | --- | --- | --- |
-| `init` | run; sets the `initialised` flag inside the lock, before unlocking | n/a: only one context calls it | re-initialises under the lock: drops unread data |
-| `write`, `writer` | return 0, drop data | an interrupt's call is held off by the lock | run, per channel mode |
-| `read`, `reader` | return 0 | held off by the lock | `read` never blocks. `Reader.stream` returns 0 bytes when empty, which `std.Io.Reader` defines as "not end of stream", so `reader` calls that must fill (`take*`, `peek*`, `fill`) wait until the host sends data |
+| `init` | run; sets the `initialised` flag inside the lock, before unlocking | n/a: only one context calls it | re-initialises the control block under the lock, dropping unread ring data. A subsequent flush writes any bytes still buffered by a Writer to the new block. Bytes already prefetched by a Reader stay readable. |
+| `write` | returns 0 | held off by the lock (an exception nested in `init` gets 0) | runs, per channel mode |
+| `writer` (create the adapter) and buffering into it | runs; bytes stay in the caller's buffer | runs; bytes stay in the caller's buffer | runs |
+| Writer flush (drain to the ring) | drops the bytes | an exception nested in `init` drops the bytes | runs, per channel mode |
+| `read` | returns 0 | held off by the lock (an exception nested in `init` gets 0) | never blocks; returns what the ring holds, up to the slice length |
+| `reader` (create the adapter) | runs; no ring access | runs; no ring access | runs; no ring access |
+| `Reader.stream` | returns 0 bytes | returns 0 bytes | returns 0 bytes when the ring is empty, which `std.Io.Reader` defines as "not end of stream" |
+| `Reader` fill calls (`take*`, `peek*`, `fill`) | wait until `init` runs and the host sends data; they never return if the waiting context is the one that must call `init` | same | wait until the host sends data |
+| `bytes_available` | return 0 | return 0 for a nested call | snapshot the down ring, leaving its read offset intact |
+| `mode`, `set_mode` | `mode` returns null and `set_mode` has no effect | same for a nested call | read the mode or update only the mode bits for the selected direction and channel |
 
 ### Lock and nesting
 
@@ -126,8 +137,8 @@ priority rule above.
 
 | Quantity | Value | Source | Used in |
 | --- | --- | --- | --- |
-| interrupts masked per `write` in `no_block_skip` / `no_block_trim` | one copy of at most the write length, bounded by the buffer size | `rtt.zig:channel.Up.write` | choose buffer and write sizes on targets with interrupt deadlines (radio) |
-| interrupts masked per attempt in `block_if_full` | one copy; the lock is released between attempts, so interrupts run while it waits | `rtt.zig:channel.Up.write_blocking` | with no host attached the caller waits forever with interrupts enabled; an interrupt's write may land between two chunks of a foreground write |
+| interrupts masked per `write` in `no_block_skip` / `no_block_trim` | one copy of at most the write length, bounded by the buffer size | `rtt.zig:RTT.write` | choose buffer and write sizes on targets with interrupt deadlines (radio) |
+| interrupts masked per attempt in `block_if_full` | one copy; the lock is released between attempts, so interrupts run while it waits | `rtt.zig:RTT.write` | with no host attached the caller waits forever with interrupts enabled; an interrupt's write may land between two chunks of a foreground write |
 | interrupts masked per `read` | one copy of at most the read length | `rtt.zig:channel.Down.read_available` | same as the first row |
 | host polling interval | set by the host tool (OpenOCD `rtt polling_interval`, probe-rs) | tool docs | sizing the up buffer for the log rate |
 
@@ -137,7 +148,7 @@ The implementation adds these host tests in `modules/rtt` (`zig build test`).
 
 | Clause | Rule | Host test |
 | --- | --- | --- |
-| SEGGER RTT control block | 16-byte id, `MaxNumUpBuffers`, `MaxNumDownBuffers`, then the up and down descriptors (name, buffer, size, WrOff, RdOff, Flags) | `control block layout` |
+| SEGGER RTT control block | 16-byte id, then pointer-width `MaxNumUpBuffers` and `MaxNumDownBuffers` and descriptors (name, buffer, size, WrOff, RdOff, Flags) | `control block layout` |
 | SEGGER RTT ring buffer | `WrOff == RdOff` means empty; the writer leaves one byte free, with `RdOff == 0` included, in every mode | `write never fills the last byte`, one per mode |
 | SEGGER RTT ring buffer | only the producer writes `WrOff`, only the consumer writes `RdOff` | by inspection (ownership table) |
 | SEGGER RTT flags | `Flags[1:0]` is the mode; `Flags[31:24]` is zero after `init` | `init writes flags` |
@@ -176,8 +187,11 @@ also a compiler barrier.
 
 ## Host side
 
-The control block's address is the ELF symbol `RttControlBlock`. probe-rs reads it from the ELF
-itself; with OpenOCD, pass it to `rtt setup <address> <size> "SEGGER RTT"`, then `rtt start` and
+The control block's address is the ELF symbol `_SEGGER_RTT`, the name SEGGER's sources use and
+probe-rs looks up (on the ESP32-C3/C6 probe-rs does not scan RAM for the id, so the symbol is
+required there); `RttControlBlock` is the same object. Observed with probe-rs 0.32: on the
+ESP32-C3/C6 it reports "this target does not support automatic scanning" without the symbol, and its
+attach halts the core briefly to disable the watchdogs, then lets it run. With OpenOCD, pass it to `rtt setup <address> <size> "SEGGER RTT"`, then `rtt start` and
 `rtt server start <port> 0`, and read the TCP port. OpenOCD's RTT needs background memory access,
 "the target memory can be accessed by the debugger while the target is running"
 ([OpenOCD manual, General Commands](https://openocd.org/doc/html/General-Commands.html)). On these
@@ -195,7 +209,9 @@ hart halted, so an RTT session on RISC-V sets `riscv mem_access sysbus` first (a
 the manual's [`riscv mem_access`](https://openocd.org/doc/html/Architecture-and-Core-Commands.html)
 entry, to be confirmed on the bench). Espressif's
 [openocd-esp32](https://github.com/espressif/openocd-esp32) defaults to `sysbus progbuf`
-(`tcl/target/esp_common.cfg`); Raspberry Pi's `rp2350-riscv.cfg` does not set it.
+(`tcl/target/esp_common.cfg`); Raspberry Pi's `rp2350-riscv.cfg` does not set it. Observed with openocd-esp32
+v0.12.0-esp32-20260831: `help rtt` lists only `rtt server`, not `rtt setup`/`rtt start`, with the
+ESP32-C3/C6 targets, so on those chips the host is probe-rs.
 [probe-rs](https://github.com/probe-rs/probe-rs) uses SBA for RISC-V memory reads whenever the
 debug module reports it (`probe-rs/src/architecture/riscv/communication_interface.rs`) and does
 not halt the core for RTT.

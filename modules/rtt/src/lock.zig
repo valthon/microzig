@@ -230,3 +230,36 @@ pub const empty = struct {
         return generic_lock.any();
     }
 };
+
+test "nested lock" {
+    const Mask = struct {
+        var enabled: bool = true;
+        var restores: usize = 0;
+
+        fn disable() usize {
+            const saved = enabled;
+            enabled = false;
+            return @intFromBool(saved);
+        }
+
+        fn restore(saved: usize) void {
+            restores += 1;
+            enabled = saved != 0;
+        }
+    };
+    const access = NestedLock(Mask).get();
+
+    for ([_]bool{ true, false }) |initial_state| {
+        Mask.enabled = initial_state;
+        Mask.restores = 0;
+        access.lock_fn(access.context);
+        try std.testing.expect(!Mask.enabled);
+        access.lock_fn(access.context);
+        access.unlock_fn(access.context);
+        try std.testing.expect(!Mask.enabled);
+        try std.testing.expectEqual(0, Mask.restores);
+        access.unlock_fn(access.context);
+        try std.testing.expectEqual(initial_state, Mask.enabled);
+        try std.testing.expectEqual(1, Mask.restores);
+    }
+}
