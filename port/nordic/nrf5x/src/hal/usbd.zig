@@ -132,6 +132,7 @@ pub const USBD = struct {
         .ep_listen = ep_listen,
         .ep_open = ep_open,
         .ep_close_all = ep_close_all,
+        .ep_set_stall = ep_set_stall,
         .set_address = set_address,
         // The data stage of a control write goes to the controller (see `poll`).
         .control_out_data = true,
@@ -493,6 +494,9 @@ pub const USBD = struct {
     }
 
     fn teardown(self: *Self) void {
+        self.interface.halted = .{};
+        self.interface.opened = .{};
+
         // Upon VBUS removal detection, it is recommended to
         // let on-going EasyDMA transfers finish before disabling USBD
         //
@@ -960,8 +964,71 @@ pub const USBD = struct {
             cpu.interrupt.set_pending(.USBD);
     }
 
+    // mdk/nrf52840_bitfields.h: USBD_EPSTALL_IO_Pos and USBD_DTOGGLE_IO_Pos
+    // share the same position. Both registers put EP at bit 0.
+    const endpoint_io_pos = 7;
+    // mdk/nrf52840_bitfields.h: USBD_DTOGGLE_VALUE_Pos and USBD_DTOGGLE_VALUE_Data0.
+    const dtoggle_data0 = @as(u32, 1) << 8;
+    // mdk/nrf52840_bitfields.h: USBD_EPSTALL_STALL_Pos.
+    const epstall_stall_pos = 8;
+    // mdk/nrf52840_bitfields.h: USBD_HALTED_EPOUT_GETSTATUS_Halted.
+    const epout_halted = 1;
+
+    fn select_endpoint(ep: usb.types.Endpoint) u32 {
+        return @as(u32, @backingInt(ep.num)) | (@as(u32, @backingInt(ep.dir)) << endpoint_io_pos);
+    }
+
+    fn reset_data_toggle(ep: usb.types.Endpoint) void {
+        // nRF52840 PS, USBD, "Bulk and interrupt transactions". Select the
+        // endpoint with Nop first, as nrfx's nrf_usbd_dtoggle_set does.
+        const select = select_endpoint(ep);
+        peripherals.USBD.DTOGGLE.write_raw(select);
+        peripherals.USBD.DTOGGLE.write_raw(select | dtoggle_data0);
+    }
+
+    fn write_endpoint_stall(ep: usb.types.Endpoint, stalled: bool) void {
+        // nRF52840 PS, USBD, "Bulk and interrupt transactions" (EPSTALL).
+        peripherals.USBD.EPSTALL.write_raw(select_endpoint(ep) | (@as(u32, @intFromBool(stalled)) << epstall_stall_pos));
+    }
+
+    fn ep_set_stall(itf: *usb.DeviceInterface, ep: usb.types.Endpoint, stalled: bool) usb.DeviceInterface.StallError!void {
+        const self: *Self = @fieldParentPtr("interface", itf);
+        const was_enabled = cpu.interrupt.is_enabled(.USBD);
+        defer if (was_enabled and !self.dma.faulted) cpu.interrupt.enable(.USBD);
+        usbd_interrupt_off();
+        if (self.dma.faulted or peripherals.USBD.EVENTS_USBRESET.raw != 0)
+            return error.Unavailable;
+
+        if (stalled) {
+            // EPSTALL cannot be written in low power mode (nRF52840 PS, USBD, "USB register
+            // access limitations"), so wake the peripheral first, as a class write does.
+            const was_low_power = self.low_power;
+            if (was_low_power and !self.leave_low_power()) return error.Timeout;
+            if (peripherals.USBD.EVENTS_USBRESET.raw != 0) return error.Unavailable;
+            write_endpoint_stall(ep, true);
+            if (was_low_power and !bus_active()) self.enter_low_power();
+            return;
+        }
+
+        // Host CLEAR_FEATURE arrives in SETUP, after poll has left low power.
+        std.debug.assert(!self.low_power);
+        const i = @backingInt(ep.num);
+        const out_status = @as(u32, 1) << @intCast(16 + @as(u5, i)); // EPDATASTATUS.EPOUTn is bit 16+n
+        if (ep.dir == .out and peripherals.USBD.HALTED.EPOUT[i].raw & epout_halted != 0 and
+            !self.out.waiting[i] and peripherals.USBD.EPDATASTATUS.raw & out_status == 0)
+        {
+            // nRF52840 PS, USBD, "Bulk and interrupt transactions" (SIZE, EPDATASTATUS).
+            // Release an empty OUT slot before unstalling, as in nrfx_usbd_ep_stall_clear.
+            peripherals.USBD.SIZE.EPOUT[i].write_raw(0);
+        }
+        reset_data_toggle(ep);
+        write_endpoint_stall(ep, false);
+    }
+
     fn ep_open(itf: *usb.DeviceInterface, desc: *const usb.descriptor.Endpoint) void {
         const self: *Self = @fieldParentPtr("interface", itf);
+        // Configuration init opens endpoints after poll has left low power for SETUP or reset.
+        std.debug.assert(!self.low_power);
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled and !self.dma.faulted) cpu.interrupt.enable(.USBD);
         usbd_interrupt_off();
@@ -975,14 +1042,8 @@ pub const USBD = struct {
         // core/usb.zig), and enabling an endpoint that is already enabled changes nothing,
         // so what that configuration left behind is undone here.
         if (ep.num != .ep0) {
-            // Both sides start a configuration at DATA0 (USB 2.0, 9.1.1.5). "Controlling the
-            // data toggle of data IN or OUT endpoint n (n=1..7) is done through register
-            // DTOGGLE" (nRF52840 PS, USBD, "Bulk and interrupt transactions"): EP in bits
-            // 0-2, IO in bit 7 (1 = IN), VALUE in bits 8-9 (0 = Nop, 1 = Data0). Like nrfx's
-            // `nrf_usbd_dtoggle_set`, select the endpoint with a Nop write first.
-            const select: u32 = @as(u32, i) | (@as(u32, @intFromBool(ep.dir == .in)) << 7);
-            peripherals.USBD.DTOGGLE.write_raw(select);
-            peripherals.USBD.DTOGGLE.write_raw(select | (1 << 8));
+            // Both sides start a configuration at DATA0 (USB 2.0, 9.1.1.5).
+            reset_data_toggle(ep);
         }
         switch (ep.dir) {
             .in => {
@@ -1009,6 +1070,7 @@ pub const USBD = struct {
                 if (ep.num != .ep0) peripherals.USBD.SIZE.EPOUT[i].write_raw(0);
             },
         }
+        if (ep.num != .ep0) write_endpoint_stall(ep, false);
 
         const attr = desc.attributes;
         log.debug(
@@ -1030,7 +1092,13 @@ pub const USBD = struct {
         // endpoints do not respond. Disarm via the approved nrfx sequence as well.
         peripherals.USBD.EPINEN.write_raw(1);
         peripherals.USBD.EPOUTEN.write_raw(1);
-        for (1..NUM_EP) |i| errata.disarm_in(@intCast(i));
+        for (1..NUM_EP) |i| {
+            errata.disarm_in(@intCast(i));
+            const num: usb.types.Endpoint.Num = @fromBackingInt(@as(u4, @intCast(i)));
+            for ([_]usb.types.Endpoint{ .in(num), .out(num) }) |ep| {
+                if (itf.halted.contains(ep)) write_endpoint_stall(ep, false);
+            }
+        }
         peripherals.USBD.EPDATASTATUS.write_raw(0xFFFEFFFE);
         self.in_busy = @splat(false);
         self.in_pending = @splat(null);
@@ -1218,6 +1286,144 @@ pub const testing = if (@import("builtin").is_test) struct {
             try std.testing.expectEqual(0, peripherals.USBD.EVENTCAUSE.raw & CAUSE_USBWUALLOWED);
         }
     }
+
+    pub fn halt_out_clear() !void {
+        microzig.testing_io.reset();
+        const regs = peripherals.USBD;
+        const ep: usb.types.Endpoint = .out(.ep2);
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
+        dev.interface.opened.set(ep, true);
+        _ = dev.out.listen(2);
+
+        // Empty stalled slot, arrived but unprocessed event, waiting packet, then
+        // unconditional toggle reset on an endpoint that was never stalled.
+        for (0..4) |scenario| {
+            if (scenario != 3) {
+                try dev.interface.ep_halt(ep);
+                try std.testing.expectEqual(0x102, regs.EPSTALL.raw);
+            }
+            dev.out.waiting[2] = scenario == 2;
+            regs.EPDATASTATUS.raw = if (scenario == 1) 1 << 18 else 0;
+            regs.SIZE.EPOUT[2].raw = 7;
+            regs.DTOGGLE.raw = 0;
+            regs.EPSTALL.raw = 0;
+            microzig.testing_io.toggle_at_stall_write = 0;
+            const stall_writes = microzig.testing_io.stall_writes;
+            try USBD.ep_set_stall(&dev.interface, ep, false);
+            // Each clear writes DTOGGLE and EPSTALL afresh, halted or not.
+            try std.testing.expectEqual(stall_writes + 1, microzig.testing_io.stall_writes);
+            try std.testing.expectEqual(0x102, regs.DTOGGLE.raw);
+            try std.testing.expectEqual(0x002, regs.EPSTALL.raw);
+            try std.testing.expectEqual(0x102, microzig.testing_io.toggle_at_stall_write);
+            try std.testing.expectEqual(@as(u32, if (scenario == 0) 0 else 7), microzig.testing_io.out_size_at_stall_write);
+            try std.testing.expectEqual(scenario == 2, dev.out.waiting[2]);
+            try std.testing.expectEqual(@as(u32, if (scenario == 1) 1 << 18 else 0), regs.EPDATASTATUS.raw);
+            try std.testing.expect(dev.out.listening[2]);
+            dev.interface.halted.set(ep, false);
+        }
+    }
+
+    pub fn halt_in_clear() !void {
+        microzig.testing_io.reset();
+        const regs = peripherals.USBD;
+        const ep: usb.types.Endpoint = .in(.ep2);
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
+        dev.interface.opened.set(ep, true);
+        dev.in_busy[2] = true;
+        try dev.interface.ep_halt(ep);
+        try std.testing.expectEqual(0x182, regs.EPSTALL.raw);
+
+        regs.DTOGGLE.raw = 0x282; // IN EP2, DATA1
+        try USBD.ep_set_stall(&dev.interface, ep, false);
+        try std.testing.expectEqual(0x082, regs.EPSTALL.raw);
+        try std.testing.expectEqual(0x182, microzig.testing_io.toggle_at_stall_write); // IN EP2, DATA0
+        try std.testing.expect(dev.in_busy[2]);
+    }
+
+    pub fn halt_wake() !void {
+        const io = microzig.testing_io;
+        io.reset();
+        const ep: usb.types.Endpoint = .in(.ep1);
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected, .low_power = true };
+        dev.interface.opened.set(ep, true);
+        io.wake_ready = true;
+
+        try dev.interface.ep_halt(ep);
+        try std.testing.expect(dev.interface.halted.contains(ep));
+        try std.testing.expectEqual(1, io.stall_writes);
+        try std.testing.expectEqual(1, io.force_normal_writes_at_stall);
+        try std.testing.expectEqual(0x181, peripherals.USBD.EPSTALL.raw);
+    }
+
+    pub fn halt_wake_timeout() !void {
+        const io = microzig.testing_io;
+        io.reset();
+        const ep: usb.types.Endpoint = .in(.ep1);
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected, .low_power = true };
+        dev.interface.opened.set(ep, true);
+        dev.in_busy[1] = true; // Already loaded before suspend.
+
+        try std.testing.expectError(error.Timeout, dev.interface.ep_halt(ep));
+        try std.testing.expectEqual(1, io.force_normal_writes);
+        try std.testing.expect(dev.low_power);
+        try std.testing.expect(!dev.interface.halted.contains(ep));
+        try std.testing.expectEqual(0, io.stall_writes);
+
+        peripherals.USBD.EVENTCAUSE.raw = CAUSE_RESUME;
+        var ctl: CDC_Controller = .{};
+        dev.poll(&ctl);
+        try std.testing.expect(!dev.low_power);
+        try std.testing.expect(dev.in_busy[1]);
+        try std.testing.expect(!dev.interface.halted.contains(ep));
+        try std.testing.expectEqual(0, io.stall_writes);
+    }
+
+    pub fn halt_retirement() !void {
+        const io = microzig.testing_io;
+        io.reset();
+        const regs = peripherals.USBD;
+        const ep: usb.types.Endpoint = .out(.ep2);
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
+        dev.interface.opened.set(ep, true);
+
+        regs.EVENTS_USBRESET.raw = 1;
+        try std.testing.expectError(error.Unavailable, dev.interface.ep_halt(ep));
+        try std.testing.expectError(error.Unavailable, USBD.ep_set_stall(&dev.interface, ep, false));
+        try std.testing.expect(!dev.interface.halted.contains(ep));
+
+        regs.EVENTS_USBRESET.raw = 0;
+        dev.dma.faulted = true;
+        try std.testing.expectError(error.Unavailable, dev.interface.ep_halt(ep));
+        try std.testing.expectError(error.Unavailable, USBD.ep_set_stall(&dev.interface, ep, false));
+        try std.testing.expect(!dev.interface.halted.contains(ep));
+        dev.dma.faulted = false;
+
+        dev.low_power = true;
+        io.wake_ready = true;
+        io.reset_on_wake = true;
+        try std.testing.expectError(error.Unavailable, dev.interface.ep_halt(ep));
+        try std.testing.expect(!dev.low_power);
+        try std.testing.expect(!dev.interface.halted.contains(ep));
+        try std.testing.expectEqual(0, io.stall_writes);
+        try std.testing.expectEqual(0, regs.DTOGGLE.raw);
+
+        var ctl: CDC_Controller = .{};
+        dev.poll(&ctl);
+        try std.testing.expectEqual(0, regs.EVENTS_USBRESET.raw);
+        try std.testing.expectEqual(0, io.stall_writes);
+
+        try dev.interface.ep_halt(ep);
+        USBD.ep_close_all(&dev.interface);
+        try std.testing.expectEqual(0, regs.HALTED.EPOUT[2].raw);
+
+        dev.interface.halted.set(ep, true);
+        dev.low_power = true;
+        dev.teardown();
+        try std.testing.expectError(error.NotOpen, dev.interface.ep_halt(ep));
+        try std.testing.expect(!dev.interface.opened.contains(ep));
+        try std.testing.expect(!dev.interface.halted.contains(ep));
+    }
+
     pub fn configuration_reselection() !void {
         microzig.testing_io.reset();
         var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
