@@ -39,12 +39,11 @@ pub const Interface = struct {
             gw: lwip.ip4_addr,
 
             pub fn init(ip: []const u8, netmask: []const u8, gw: []const u8) !Fixed {
-                var f: Fixed = undefined;
-                if (lwip.ip4addr_aton(ip.ptr, &f.ip) != 1 or
-                    lwip.ip4addr_aton(netmask.ptr, &f.netmask) != 1 or
-                    lwip.ip4addr_aton(gw.ptr, &f.gw) != 1)
-                    return error.IpAddrParse;
-                return f;
+                return .{
+                    .ip = try parse_ipv4(ip),
+                    .netmask = try parse_ipv4(netmask),
+                    .gw = try parse_ipv4(gw),
+                };
             }
         };
     };
@@ -519,10 +518,27 @@ pub const Endpoint = struct {
 
     pub fn parse(ip: []const u8, port: u16) !Endpoint {
         var target: Endpoint = .{ .port = port };
-        if (lwip.ipaddr_aton(ip.ptr, &target.addr) != 1) return error.IpAddrParse;
+        var buf: [lwip.IPADDR_STRLEN_MAX]u8 = undefined;
+        const text = try terminate_ip_text(ip, &buf);
+        if (lwip.ipaddr_aton(text.ptr, &target.addr) != 1) return error.IpAddrParse;
         return target;
     }
 };
+
+fn parse_ipv4(ip: []const u8) error{IpAddrParse}!lwip.ip4_addr {
+    var buf: [lwip.IPADDR_STRLEN_MAX]u8 = undefined;
+    var addr: lwip.ip4_addr = undefined;
+    const text = try terminate_ip_text(ip, &buf);
+    if (lwip.ip4addr_aton(text.ptr, &addr) != 1) return error.IpAddrParse;
+    return addr;
+}
+
+fn terminate_ip_text(ip: []const u8, buf: *[lwip.IPADDR_STRLEN_MAX]u8) error{IpAddrParse}![:0]const u8 {
+    if (ip.len >= buf.len or std.mem.findScalar(u8, ip, 0) != null) return error.IpAddrParse;
+    @memcpy(buf[0..ip.len], ip);
+    buf[ip.len] = 0;
+    return buf[0..ip.len :0];
+}
 
 pub const Error = error{
     /// Out of memory error.

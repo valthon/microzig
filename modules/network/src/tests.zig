@@ -96,6 +96,28 @@ test "endpoint formatting uses the address family" {
     try testing.expectEqualStrings("[2001:DB8::1]:443", try std.fmt.bufPrint(&buf, "{f}", .{ipv6}));
 }
 
+test "endpoint parsing stops at the slice boundary" {
+    var ipv4 = "192.0.2.12".*;
+    var ipv6 = "2001:DB8::12".*;
+    const expected_v4 = try net.Endpoint.parse("192.0.2.1", 80);
+    const expected_v6 = try net.Endpoint.parse("2001:DB8::1", 80);
+    const actual_v4 = try net.Endpoint.parse(ipv4[0 .. ipv4.len - 1], 80);
+    const actual_v6 = try net.Endpoint.parse(ipv6[0 .. ipv6.len - 1], 80);
+    try testing.expectEqual(expected_v4.addr.u_addr.ip4.addr, actual_v4.addr.u_addr.ip4.addr);
+    try testing.expectEqual(expected_v6.addr.u_addr.ip6.addr, actual_v6.addr.u_addr.ip6.addr);
+    try testing.expectError(error.IpAddrParse, net.Endpoint.parse("192.0.2.1\x00suffix", 80));
+}
+
+test "fixed IPv4 options parse each bounded slice" {
+    const Fixed = net.Interface.Options.Fixed;
+    var ip = "192.0.2.12".*;
+    var mask = "255.255.255.00".*;
+    var gw = "192.0.2.23".*;
+    const expected = try Fixed.init("192.0.2.1", "255.255.255.0", "192.0.2.2");
+    const actual = try Fixed.init(ip[0 .. ip.len - 1], mask[0 .. mask.len - 1], gw[0 .. gw.len - 1]);
+    try testing.expectEqual(expected, actual);
+}
+
 const Link = @FieldType(net.Interface, "link");
 
 /// Records each frame passed to `send`. With `loopback` set, `recv` returns
