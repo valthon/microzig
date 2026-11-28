@@ -168,11 +168,21 @@ pub const Interface = struct {
         return lwip.ERR_OK;
     }
 
+    /// True when the interface is up, the link is up and it has an IPv4
+    /// address or a valid IPv6 address beyond link-local scope.
     pub fn ready(self: *Self) bool {
         const netif = &self.netif;
-        return (netif.flags & lwip.NETIF_FLAG_UP > 0) and
-            (netif.flags & lwip.NETIF_FLAG_LINK_UP > 0) and
-            (netif.ip_addr.u_addr.ip4.addr != 0 or netif.ip_addr.u_addr.ip6.addr[0] != 0);
+        if (netif.flags & lwip.NETIF_FLAG_UP == 0 or netif.flags & lwip.NETIF_FLAG_LINK_UP == 0) {
+            return false;
+        }
+        // lwIP keeps the IPv4 address in ip_addr and IPv6 addresses in ip6_addr.
+        if (netif.ip_addr.u_addr.ip4.addr != 0) return true;
+        for (netif.ip6_addr, netif.ip6_addr_state) |addr, state| {
+            const first_word = std.mem.bigToNative(u32, addr.u_addr.ip6.addr[0]);
+            const link_local = first_word & 0xffc0_0000 == 0xfe80_0000;
+            if (state & lwip.IP6_ADDR_VALID != 0 and !link_local) return true;
+        }
+        return false;
     }
 
     /// Must be called periodically if poll is not called (e.g when using rx

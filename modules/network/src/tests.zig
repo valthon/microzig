@@ -322,3 +322,26 @@ test "TX returns the caller's pbuf unchanged" {
     try testing.expectEqual(head_before, view(head));
     try testing.expectEqual(tail_before, view(tail));
 }
+
+test "ready reports a routable IPv6 address without IPv4" {
+    var nic: net.Interface = .{ .link = undefined };
+    nic.netif.flags = lwip.NETIF_FLAG_UP | lwip.NETIF_FLAG_LINK_UP;
+    try testing.expect(!nic.ready());
+
+    // Link-local scope alone is not enough to reach a configured host.
+    nic.netif.ip6_addr[0] = (try net.Endpoint.parse("fe80::1", 0)).addr;
+    nic.netif.ip6_addr_state[0] = lwip.IP6_ADDR_PREFERRED;
+    try testing.expect(!nic.ready());
+
+    // A global address counts once duplicate detection has finished.
+    nic.netif.ip6_addr[1] = (try net.Endpoint.parse("2001:DB8::2", 0)).addr;
+    nic.netif.ip6_addr_state[1] = lwip.IP6_ADDR_TENTATIVE;
+    try testing.expect(!nic.ready());
+    nic.netif.ip6_addr_state[1] = lwip.IP6_ADDR_PREFERRED;
+    try testing.expect(nic.ready());
+    nic.netif.ip6_addr_state[1] = lwip.IP6_ADDR_DEPRECATED;
+    try testing.expect(nic.ready());
+
+    nic.netif.flags = lwip.NETIF_FLAG_UP;
+    try testing.expect(!nic.ready());
+}

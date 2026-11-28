@@ -38,6 +38,8 @@ A failed DHCP start removes the new netif and preserves the existing default. It
 IPv6 output, sets the MAC and creates an IPv6 link-local address. Choose fixed IPv4 or
 let the interface supply its embedded DHCP state. The wrapper has no teardown API,
 so reserve these objects for the registered lifetime and treat initialization as one-time.
+`Interface.ready` reports an up netif with link up and either an IPv4 address or a
+valid IPv6 address outside link-local scope.
 
 Run raw API calls, RX, TX and timers in one foreground context. From a callback,
 defer `Interface.poll` and `Interface.tick` until the current stack call returns.
@@ -169,7 +171,6 @@ For RX, the wrapper checks that `head` and `len` describe a frame within the sup
 
 ## Open questions
 
-- `modules/network/src/root.zig:Interface.ready` checks a word of the primary address union and misses the separate IPv6 slots. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Connection.close` sets `.closed` while the old PCB can still call the wrapper on data ACKs or reset during FIN processing, so `.closed` is unsafe as a reuse signal. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` recycles session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))
