@@ -121,8 +121,12 @@ Ethernet header to the IP parser.
 
 ESP registration and `netif_set_up` leave the link down. The application calls
 `netif_set_link_up` through `netifapi_netif_common` after station association or AP
-start. This releases a DHCP client waiting for link up. The coexistence example
-releases DHCP and calls `netif_set_link_down` before tearing Wi-Fi down.
+start. This releases a DHCP client waiting for link up. In the coexistence example,
+shutdown releases DHCP while TX is available, closes the TX gate under the core lock,
+then calls `netif_set_link_down` before deinitializing Wi-Fi. Acquiring the core lock
+drains any admitted `linkoutput`, and the closed gate rejects later output, including
+pending ARP retries. The TCP server closes its gate under the same lock on exit from
+`serve`, before deinitializing Wi-Fi.
 
 On bare metal, TX can run during a send, while input is processed or when timers
 are serviced. If the first TX pbuf cannot expose the configured headroom,
@@ -149,8 +153,8 @@ within the remaining buffer.
   and `examples/espressif/esp/src/selftest_wifi_checks.zig:exercise`. They use release/acquire
   to publish the registered netif across tasks. `examples/espressif/esp/src/tcp_server.zig:serve` shows
   station DHCP. `examples/espressif/esp/src/softap.zig:main` registers the AP with a
-  static IPv4 address, mask and gateway. `examples/espressif/esp/src/selftest_coex_wifi_ble.zig:cycle_wifi` keeps the
-  registered netif alive, gates TX with `wifi_live`, and reinitializes the same `Wifi` handle.
+  static IPv4 address, mask and gateway. `examples/espressif/esp/src/selftest_coex_wifi_ble.zig:cycle_wifi`
+  keeps the netif registered, reinitializes the same `Wifi` handle, and reopens TX after association.
 
 ## Shared patterns
 
@@ -166,7 +170,8 @@ within the remaining buffer.
 - `zig build test` in `examples/espressif/esp/` runs "DHCP allocation, renewal, collision, release, exhaustion and expiry"
   in `examples/espressif/esp/src/softap_dhcp.zig`, covering the AP's lease logic.
 - The ESP example host tests exercise the C exports for ISR mailbox posting and TCP/IP
-  core lock ownership.
+  core lock ownership. They also exercise the TCP server bind failure and coexistence
+  shutdown with a paused send and pending link output.
 - The ESP port README records station DHCP and TCP echo between an ESP32-C3 and a XIAO ESP32-C6
   in both roles. Build the images in `examples/espressif/esp/` with `-Dexample=selftest_wifi_softap_echo` and `-Dexample=softap`.
   [ESP Wi-Fi self-tests](../../port/espressif/esp/README.md#wi-fi-station-and-rtos)
@@ -189,5 +194,3 @@ within the remaining buffer.
 - `modules/network/src/root.zig:Endpoint.parse` and `Interface.Options.Fixed.init` pass slice pointers to C parsers that expect NUL termination. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Endpoint.format` always formats the address as IPv4. ([#64](https://github.com/valthon/microzig/issues/64))
 - `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
-- `examples/espressif/esp/src/tcp_server.zig:run_server` can deinitialize Wi-Fi after a server error with the netif still up and registered, allowing TX to overlap teardown. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/selftest_coex_wifi_ble.zig:cycle_wifi` clears the TX gate without synchronizing with a `linkoutput` already inside that gate before deinit. ([#81](https://github.com/valthon/microzig/issues/81))

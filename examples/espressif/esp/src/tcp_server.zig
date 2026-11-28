@@ -66,6 +66,7 @@ var maybe_netif: std.atomic.Value(?*lwip.c.netif) = .init(null);
 // lwIP retains these for the boot, including after a server error.
 var heap_allocator: microzig.Allocator = undefined;
 var station_netif: lwip.c.netif = undefined;
+var tx_gate: @import("lwip/tx_gate.zig") = .{};
 
 var wifi_ready_signal: rtos.Signal(void) = .{};
 var ap_started: std.atomic.Value(bool) = .init(false);
@@ -131,6 +132,8 @@ fn run_server(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: 
 fn serve(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip.c.netif) !void {
     exports.gpa = gpa;
     lwip.c.tcpip_init(null, null);
+    // Drain linkoutput and refuse later output before run_server deinitializes Wi-Fi.
+    defer tx_gate.set_enabled(false);
 
     try lwip.c_err(lwip.c.netifapi_netif_add(
         netif,
@@ -190,6 +193,7 @@ fn serve(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip
 
         try connect_sta(station);
     }
+    tx_gate.set_enabled(true);
     try lwip.c_err(lwip.c.netifapi_netif_common(netif, lwip.c.netif_set_link_up, null));
 
     if (lifecycle_selftest) {
@@ -454,6 +458,7 @@ fn netif_init(netif_ptr: [*c]lwip.c.struct_netif) callconv(.c) lwip.c.err_t {
 var packet_buf: [1600]u8 = undefined;
 
 fn netif_output(_: [*c]lwip.c.struct_netif, pbuf_c: [*c]lwip.c.struct_pbuf) callconv(.c) lwip.c.err_t {
+    if (!tx_gate.enabled) return lwip.c.ERR_IF;
     const pbuf: *lwip.c.struct_pbuf = pbuf_c;
     std.debug.assert(pbuf.tot_len < packet_buf.len);
 
@@ -486,3 +491,10 @@ const IP_Formatter = struct {
         try writer.writeAll(std.mem.sliceTo(lwip.c.ip4addr_ntoa(@as(*const lwip.c.ip4_addr_t, @ptrCast(&addr.addr))), 0));
     }
 };
+
+test "failed TCP bind drains linkoutput before Wi-Fi deinit" {
+    lwip.c.TxTest.reset(.tcp_listener_delete);
+    defer lwip.c.TxTest.finish();
+    try std.testing.expectError(error.AddressInUse, run_server(false, std.testing.allocator, &station_netif));
+    try lwip.c.TxTest.expect_drained();
+}
