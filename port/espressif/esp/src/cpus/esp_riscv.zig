@@ -4,6 +4,8 @@ const microzig = @import("microzig");
 const cpu_config = @import("cpu-config");
 const riscv32_common = @import("riscv32-common");
 
+pub const rtt = @import("rtt");
+
 /// Interrupt matrix and cpu interrupt controller registers, which are laid out differently
 /// from chip to chip even though the cpu itself is the same.
 const chip_specific = switch (cpu_config.chip) {
