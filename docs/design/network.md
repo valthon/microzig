@@ -106,7 +106,7 @@ Ethernet header to the IP parser.
 | Drain | Zero length or `next_packet_available = false` ends the poll, and a frame with true or null triggers another receive. | `port/espressif/esp/src/hal/radio/wifi.zig:recv_cb_sta` and `port/espressif/esp/src/hal/radio/wifi.zig:recv_cb_ap` free the vendor buffer after the callback returns. |
 | Link state | The receive result drives link up and down. | The application task reports link changes through netifapi. |
 | Input | `Interface.poll` adjusts the pbuf and passes the frame to the stack. | Call the registered input function with the copy. |
-| Ownership | The wrapper frees an empty pbuf or one rejected by input. Successful input transfers ownership to lwIP. | lwIP takes the pbuf on successful input, and the adapter frees it on copy or input error. |
+| Ownership | The wrapper frees the pbuf on empty RX, driver error, invalid range or rejected input. Successful input transfers ownership to lwIP. | lwIP takes the pbuf on successful input, and the adapter frees it on copy or input error. |
 | Transmit | `Interface.c_netif_linkoutput` exposes headroom in the original first pbuf before cloning a chain. | Flatten the whole chain into transmit scratch without freeing or modifying the input pbuf. |
 | TX lifetime | `send` may fill the reserved prefix and borrows the slice until return. | Reuse scratch only once the driver releases its borrow. A new asynchronous adapter must copy into owned storage or retain a buffer until completion. |
 | TX failure | `OutOfMemory`, `LinkDown` and `InternalError` become `ERR_MEM`, `ERR_IF` and `ERR_ARG`. | The examples map `send_packet` failure to `ERR_IF`. |
@@ -121,8 +121,7 @@ are serviced. If the first TX pbuf cannot expose the configured headroom,
 `linkoutput` returns `ERR_ARG` before cloning or calling `send`, even if a clone would
 fit in the pool buffer. The wrapper frees its temporary clone. Preserve the Ethernet
 bytes and release the driver's borrow before returning from `send`.
-For RX, keep `head` representable as a signed 16-bit header adjustment and `len`
-within the remaining buffer.
+For RX, the wrapper checks that `head` and `len` describe a frame within the supplied buffer.
 
 ## Prior art
 
@@ -161,14 +160,14 @@ within the remaining buffer.
   in both roles. Build the images in `examples/espressif/esp/` with `-Dexample=selftest_wifi_softap_echo` and `-Dexample=softap`.
   [ESP Wi-Fi self-tests](../../port/espressif/esp/README.md#wi-fi-station-and-rtos)
 - The network host tests check TCP send limits against the compiled lwIP configuration.
+- The network host tests check that RX driver errors and invalid frame ranges return the
+  pbuf to the pool.
 - No host test checks build configuration, pbuf failure ownership, TX headroom and
   scratch lifetime, core-lock use, callback and close ordering, netif flags and link handoff,
   allocator lifetime and concurrency, timers, sys_arch waits or Pico ISR handoff and re-arm.
 
 ## Open questions
 
-- `modules/network/src/root.zig:Interface.poll` can return on a receive error before installing pbuf cleanup. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Interface.poll` trusts the frame length without checking it against the remaining pbuf. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Interface.c_netif_linkoutput` extends the original pbuf for headroom without restoring it. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Interface.ready` checks a word of the primary address union and misses the separate IPv6 slots. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))

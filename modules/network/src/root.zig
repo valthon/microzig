@@ -181,6 +181,7 @@ pub const Interface = struct {
                 config.pbuf_length,
                 lwip.PBUF_POOL,
             ) orelse return error.OutOfMemory;
+            errdefer _ = lwip.pbuf_free(pbuf);
             assert_panic(
                 pbuf.next == null and pbuf.len == pbuf.tot_len and pbuf.len == config.pbuf_length,
                 "net.Interface.pool invalid pbuf allocation",
@@ -202,14 +203,12 @@ pub const Interface = struct {
                 break;
             }
 
-            errdefer _ = lwip.pbuf_free(pbuf); // netif.input: takes ownership of pbuf on success
-            // set payload header and len
-            if (rsp.head > 0 and lwip.pbuf_header(pbuf, -@as(lwip.s16_t, @intCast(rsp.head))) != 0) {
-                return error.InvalidPbufHead;
-            }
+            if (rsp.head > pbuf.len) return error.InvalidPbufHead;
+            if (rsp.len > pbuf.len - rsp.head) return error.InvalidPbufLength;
+            if (lwip.pbuf_remove_header(pbuf, rsp.head) != 0) return error.InvalidPbufHead;
             pbuf.len = @intCast(rsp.len);
             pbuf.tot_len = @intCast(rsp.len);
-            // pass data to the lwip input function
+            // Successful input takes ownership.
             try c_err(netif.input.?(pbuf, netif));
             self.stat.recv_packets +%= 1;
             self.stat.recv_bytes +%= rsp.len;

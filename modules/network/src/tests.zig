@@ -209,3 +209,35 @@ test "DHCP start failure preserves the default and unregisters the failed interf
     defer lwip.netif_remove(&failed.netif);
     try testing.expect(lwip.netif_default == &failed.netif);
 }
+
+test "RX driver errors return the allocated pbuf to the pool" {
+    try init_stack();
+    var test_link: TestLink = .{ .receive = error.TestReceiveFailed };
+    var nic: net.Interface = .{ .link = test_link.link() };
+    const pool = lwip.lwip_stats.memp[lwip.MEMP_PBUF_POOL];
+    const used = pool.*.used;
+    for (0..lwip.PBUF_POOL_SIZE + 1) |_| {
+        try testing.expectError(error.TestReceiveFailed, nic.poll());
+        try testing.expectEqual(used, pool.*.used);
+    }
+}
+
+fn reject_input(_: [*c]lwip.pbuf, _: [*c]lwip.netif) callconv(.c) lwip.err_t {
+    return lwip.ERR_IF;
+}
+
+test "RX rejects ranges that extend past the pbuf" {
+    try init_stack();
+    var test_link: TestLink = .{};
+    var nic: net.Interface = .{ .link = test_link.link() };
+    nic.netif.input = reject_input;
+    const pool = lwip.lwip_stats.memp[lwip.MEMP_PBUF_POOL];
+    const used = pool.*.used;
+
+    test_link.receive = .{ .head = lwip.PBUF_POOL_BUFSIZE, .len = 1, .link_state = .down };
+    try testing.expectError(error.InvalidPbufLength, nic.poll());
+    try testing.expectEqual(used, pool.*.used);
+    test_link.receive = .{ .head = lwip.PBUF_POOL_BUFSIZE + 1, .len = 1, .link_state = .down };
+    try testing.expectError(error.InvalidPbufHead, nic.poll());
+    try testing.expectEqual(used, pool.*.used);
+}
