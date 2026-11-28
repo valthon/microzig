@@ -36,8 +36,8 @@ pub fn main() !void {
     });
 
     nrf.uart.init_logger(uart);
-    defer i2c0.reset();
-    defer i2c0dma.reset();
+    var twi_active = true;
+    defer if (twi_active) i2c0.reset();
 
     // ------------------------ TMP117 w/driver ------------------------
     std.log.info("I2C temp sensor (using driver)", .{});
@@ -92,24 +92,32 @@ pub fn main() !void {
     i2c0.reset();
 
     // ------------------------ TMP117 raw (DMA) ------------------------
+    twi_active = false;
     std.log.info("I2C temp sensor (raw writes w/DMA)", .{});
 
     try i2c0dma.apply(.{
         .scl_pin = gpio.num(0, 9),
         .sda_pin = gpio.num(0, 10),
     });
+    errdefer i2c0dma.reset();
+
+    // Keep DMA buffers in RAM if BusStuck outlives main.
+    const Dma = struct {
+        var config = [3]u8{ 1, 0, 0 };
+        var register = [1]u8{0}; // Temperature register
+        var temperature: [2]u8 = undefined;
+    };
 
     std.log.info("Writing config", .{});
-    try i2c0dma.write_blocking(@fromBackingInt(temp_sensor_address), &cbuf, null);
+    try i2c0dma.write_blocking(@fromBackingInt(temp_sensor_address), &Dma.config, null);
 
     std.log.info("Reading temp", .{});
     for (0..5) |_| {
-        const write_buf = [_]u8{0}; // Read temperature register
-        try i2c0dma.write_then_read_blocking(@fromBackingInt(temp_sensor_address), &write_buf, &temp_buf, null);
-        const temp_u = std.mem.readInt(u16, &temp_buf, .big);
+        try i2c0dma.write_then_read_blocking(@fromBackingInt(temp_sensor_address), &Dma.register, &Dma.temperature, null);
+        const temp_u = std.mem.readInt(u16, &Dma.temperature, .big);
         const temp = @as(f32, @floatFromInt(temp_u)) * 7.8125E-3;
         std.log.info("Temp: {d:0.2}°C", .{temp});
         sleep_ms(500);
     }
-    i2c0dma.reset();
+    try i2c0dma.deinit();
 }

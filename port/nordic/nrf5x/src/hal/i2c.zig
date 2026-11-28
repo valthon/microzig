@@ -1,13 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
-const microzig = @import("microzig");
+const hal = @import("../hal.zig");
+const microzig = if (builtin.is_test) hal.serial_test else @import("microzig");
 const mdf = microzig.drivers;
 const peripherals = microzig.chip.peripherals;
 const compatibility = @import("compatibility.zig");
 const drivers = mdf.base;
 
 const gpio = @import("gpio.zig");
-const time = @import("time.zig");
+const time = if (builtin.is_test) hal.serial_test else @import("time.zig");
 
 const version: enum {
     nrf5283x,
@@ -35,7 +37,7 @@ const Config = struct {
 
 pub const Address = drivers.I2C_Device.Address;
 pub const AddressError = drivers.I2C_Device.Address.Error;
-pub const Error = drivers.I2C_Device.Error || error{Overrun};
+pub const Error = drivers.I2C_Device.Error || error{ BusStuck, Overrun };
 
 pub fn num(n: u1) I2C {
     return @fromBackingInt(n);
@@ -63,8 +65,11 @@ pub const I2C = enum(u1) {
         });
     }
 
+    /// Returns BusStuck while the shared instance is still recovering EasyDMA.
     pub fn apply(i2c: I2C, config: Config) !void {
+        try hal.wait_for_shared_dma(@backingInt(i2c));
         i2c.disable();
+        hal.clear_shared_dma_registers(@backingInt(i2c));
         defer i2c.enable();
 
         const regs = i2c.get_regs();
@@ -101,9 +106,18 @@ pub const I2C = enum(u1) {
         });
     }
 
-    /// Disables I2C, returns peripheral registers to reset state.
+    /// Resets the peripheral when possible. Use deinit to report a stuck bus.
     pub fn reset(i2c: I2C) void {
+        i2c.deinit() catch {
+            std.log.warn("TWI reset deferred while EasyDMA recovery is pending", .{});
+        };
+    }
+
+    /// Disables I2C and resets its registers once the shared instance is free.
+    pub fn deinit(i2c: I2C) error{BusStuck}!void {
+        try hal.wait_for_shared_dma(@backingInt(i2c));
         i2c.disable();
+        hal.clear_shared_dma_registers(@backingInt(i2c));
         const regs = i2c.get_regs();
         regs.SHORTS.raw = 0x00000000;
         regs.INTENSET.raw = 0x00000000;
@@ -134,8 +148,10 @@ pub const I2C = enum(u1) {
         const regs = i2c.get_regs();
         regs.TXD.write(.{ .TXD = byte });
         while (!i2c.tx_sent()) {
-            if (deadline.is_reached_by(time.get_time_since_boot()))
+            if (deadline.is_reached_by(time.get_time_since_boot())) {
+                i2c.stop_on_timeout();
                 return Error.Timeout;
+            }
             try i2c.check_and_clear_error();
             std.mem.doNotOptimizeAway(0);
         }
@@ -145,8 +161,10 @@ pub const I2C = enum(u1) {
     fn read_byte(i2c: I2C, deadline: mdf.time.Deadline) Error!u8 {
         const regs = i2c.get_regs();
         while (!i2c.rx_ready()) {
-            if (deadline.is_reached_by(time.get_time_since_boot()))
+            if (deadline.is_reached_by(time.get_time_since_boot())) {
+                i2c.stop_on_timeout();
                 return Error.Timeout;
+            }
             try i2c.check_and_clear_error();
             std.mem.doNotOptimizeAway(0);
         }
@@ -160,11 +178,38 @@ pub const I2C = enum(u1) {
         regs.SHORTS.raw = 0x00000000;
     }
 
+    fn stop_on_timeout(i2c: I2C) void {
+        const regs = i2c.get_regs();
+        if (regs.EVENTS_STOPPED.read().EVENTS_STOPPED == .Generated) return;
+        const frequency: u32 = switch (regs.FREQUENCY.read().FREQUENCY) {
+            .K250 => 250_000,
+            .K400 => 400_000,
+            else => 100_000,
+        };
+        const cleanup = mdf.time.Deadline.init_relative(time.get_time_since_boot(), .from_us(hal.stop_budget_us(frequency, 9)));
+
+        // nRF52840 Product Specification, TWI, "Master read sequence" and
+        // "Low power": STOP ends the bus transaction and STOPPED acknowledges it.
+        // Clear the byte-boundary suspend shortcut before resuming to stop.
+        // The disable fallback follows nrfx v3.11.0 drivers/src/nrfx_twi.c,
+        // twi_tx_start_transfer and twi_rx_start_transfer, which cycle ENABLE
+        // if their hardware wait expires. set_address re-enables it on reuse.
+        i2c.clear_shorts();
+        regs.TASKS_RESUME.write(.{ .TASKS_RESUME = .Trigger });
+        regs.TASKS_STOP.write(.{ .TASKS_STOP = .Trigger });
+        hal.wait_for_stop(regs, cleanup, time.get_time_since_boot, false) catch {
+            regs.ENABLE.write(.{ .ENABLE = .Disabled });
+            @import("microzig").cpu.dsb();
+        };
+    }
+
     fn clear_events(i2c: I2C) void {
         const regs = i2c.get_regs();
         regs.EVENTS_SUSPENDED.raw = 0;
         regs.EVENTS_STOPPED.raw = 0;
         regs.EVENTS_ERROR.raw = 0;
+        regs.EVENTS_TXDSENT.raw = 0;
+        regs.EVENTS_RXDREADY.raw = 0;
     }
 
     fn clear_errors(i2c: I2C) void {
@@ -191,7 +236,10 @@ pub const I2C = enum(u1) {
             addr.check_reserved() catch |err| if (err != AddressError.GeneralCall)
                 return Error.IllegalAddress;
 
+        try hal.wait_for_shared_dma(@backingInt(i2c));
+        const was_enabled = i2c.get_regs().ENABLE.read().ENABLE == .Enabled;
         i2c.disable();
+        if (!was_enabled) hal.clear_shared_dma_registers(@backingInt(i2c));
         defer i2c.enable();
         i2c.get_regs().ADDRESS.write(.{
             .ADDRESS = @backingInt(addr),
@@ -343,7 +391,7 @@ pub const I2C = enum(u1) {
     }
 
     /// Attempts to write number of bytes provided to target device and then immediately read bytes
-    /// following a repeated start command (or Start + Stop if repeated start is disabled). Blocks
+    /// following a repeated start command. Blocks
     /// until one of the following occurs:
     /// - Bytes have been transmitted and read successfully
     /// - An error occurs and the transaction is aborted
@@ -396,7 +444,8 @@ pub const I2C = enum(u1) {
             regs.SHORTS.modify(.{ .BB_STOP = .Enabled });
         }
 
-        // We start the RX task without stopping the TX task
+        // nRF52840 Product Specification, TWI, "Master repeated start sequence":
+        // STARTRX after TX begins the read phase without a STOP between phases.
         regs.TASKS_STARTRX.write(.{ .TASKS_STARTRX = .Trigger });
 
         // Read bytes

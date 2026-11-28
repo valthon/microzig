@@ -1,13 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
-const microzig = @import("microzig");
+const hal = @import("../hal.zig");
+const microzig = if (builtin.is_test) hal.serial_test else @import("microzig");
 const mdf = microzig.drivers;
 const drivers = mdf.base;
 const peripherals = microzig.chip.peripherals;
 const compatibility = @import("compatibility.zig");
 
 const gpio = @import("gpio.zig");
-const time = @import("time.zig");
+const time = if (builtin.is_test) hal.serial_test else @import("time.zig");
 
 const version: enum {
     nrf5283x,
@@ -38,6 +40,7 @@ const Config = struct {
 pub const Address = drivers.I2C_Device.Address;
 pub const AddressError = drivers.I2C_Device.Address.Error;
 pub const Error = drivers.I2C_Device.Error || error{
+    BusStuck,
     Overrun,
     Receive,
     TooMuchData,
@@ -49,6 +52,10 @@ pub fn num(n: u1) I2C {
     return @fromBackingInt(n);
 }
 
+/// After error.BusStuck, the previous transfer's buffers remain owned by
+/// EasyDMA. Keep them alive and untouched until a subsequent transfer,
+/// wait_for_dma, apply, or deinit on the same instance returns without
+/// error.BusStuck.
 pub const I2C = enum(u1) {
     _,
 
@@ -72,7 +79,9 @@ pub const I2C = enum(u1) {
     }
 
     pub fn apply(i2c: I2C, config: Config) !void {
+        try hal.wait_for_shared_dma(@backingInt(i2c));
         i2c.disable();
+        hal.clear_shared_dma_registers(@backingInt(i2c));
         defer i2c.enable();
 
         const regs = i2c.get_regs();
@@ -117,9 +126,17 @@ pub const I2C = enum(u1) {
         i2c.disable_interrupts();
     }
 
-    /// Disables I2C, returns peripheral registers to reset state.
+    /// Resets the peripheral when possible. Use deinit to report a stuck bus
+    /// to the caller.
     pub fn reset(i2c: I2C) void {
+        i2c.deinit() catch |err| std.log.err("TWIM reset failed: {s}", .{@errorName(err)});
+    }
+
+    /// Disables I2C and resets its configuration after EasyDMA releases RAM.
+    pub fn deinit(i2c: I2C) error{BusStuck}!void {
+        try hal.wait_for_shared_dma(@backingInt(i2c));
         i2c.disable();
+        hal.clear_shared_dma_registers(@backingInt(i2c));
         const regs = i2c.get_regs();
         regs.SHORTS.raw = 0x00000000;
         regs.INTENSET.raw = 0x00000000;
@@ -150,7 +167,7 @@ pub const I2C = enum(u1) {
             return Error.TooMuchData;
 
         const regs = i2c.get_regs();
-        regs.TXD.PTR.write(.{ .PTR = @intFromPtr(buf.ptr) });
+        regs.TXD.PTR.write(.{ .PTR = @truncate(@intFromPtr(buf.ptr)) });
         regs.TXD.MAXCNT.write(.{ .MAXCNT = @truncate(buf.len) });
     }
 
@@ -163,16 +180,18 @@ pub const I2C = enum(u1) {
         const rx_cnt_type = @FieldType(@FieldType(@FieldType(I2cRegs, "RXD"), "MAXCNT").underlying_type, "MAXCNT");
         if (std.math.cast(rx_cnt_type, buf.len) == null)
             return Error.TooMuchData;
-        regs.RXD.PTR.write(.{ .PTR = @intFromPtr(buf.ptr) });
+        regs.RXD.PTR.write(.{ .PTR = @truncate(@intFromPtr(buf.ptr)) });
         regs.RXD.MAXCNT.write(.{ .MAXCNT = @truncate(buf.len) });
     }
 
     /// Set the target I2C device address for the next transaction.
     /// Temporarily disables the peripheral to update the address register.
-    fn set_address(i2c: I2C, addr: Address) void {
+    fn set_address(i2c: I2C, addr: Address) Error!void {
+        const regs = i2c.get_regs();
+        if (regs.ENABLE.read().ENABLE != .Enabled) return Error.UnknownAbort;
         i2c.disable();
         defer i2c.enable();
-        i2c.get_regs().ADDRESS.write(.{
+        regs.ADDRESS.write(.{
             .ADDRESS = @backingInt(addr),
         });
     }
@@ -246,25 +265,78 @@ pub const I2C = enum(u1) {
             return Error.Transmit;
     }
 
-    /// Wait until the I2C task completes, is suspended, encounters an error, or times out.
-    /// Automatically triggers a stop on error and handles the stop event.
+    fn current_transfer_has_dma(regs: *volatile I2cRegs) bool {
+        // Within a transaction each START has a non-null pointer, including
+        // for address-only writes. Completion clears the pointers.
+        return regs.TXD.PTR.read().PTR != 0 or regs.RXD.PTR.read().PTR != 0;
+    }
+
+    fn release_dma(regs: *volatile I2cRegs) void {
+        regs.TXD.PTR.write(.{ .PTR = 0 });
+        regs.RXD.PTR.write(.{ .PTR = 0 });
+    }
+
+    /// Waits for an outstanding STOP before the caller reuses its DMA buffers.
+    pub fn wait_for_dma(i2c: I2C) error{BusStuck}!void {
+        return hal.wait_for_shared_dma(@backingInt(i2c));
+    }
+
+    /// Completes an already-requested TWIM STOP for the shared recovery guard.
+    pub fn finish_dma_stop(i2c: I2C) error{BusStuck}!void {
+        const regs = i2c.get_regs();
+        const frequency: u32 = switch (regs.FREQUENCY.read().FREQUENCY) {
+            .K250 => 250_000,
+            .K400 => 400_000,
+            else => 100_000,
+        };
+        // A TWI byte includes an ACK/NACK clock in addition to its eight bits.
+        const cleanup = mdf.time.Deadline.init_relative(time.get_time_since_boot(), .from_us(hal.stop_budget_us(frequency, 9)));
+        try hal.wait_for_stop(regs, cleanup, time.get_time_since_boot, false);
+        release_dma(regs);
+    }
+
+    fn finish_if_stopped(regs: *volatile I2cRegs) bool {
+        if (regs.EVENTS_STOPPED.read().EVENTS_STOPPED != .Generated) return false;
+        release_dma(regs);
+        regs.EVENTS_STOPPED.raw = 0;
+        return true;
+    }
+
+    /// Returns true if recovery had to request a software STOP.
+    fn stop_if_pending(i2c: I2C) error{BusStuck}!bool {
+        const regs = i2c.get_regs();
+        if (finish_if_stopped(regs)) return false;
+
+        i2c.clear_shorts();
+        // nRF52840 PS v1.2 §§6.31.1, 6.31.3, 6.31.5: RESUME before
+        // STOP if suspended. Wait for STOPPED before touching DMA or ENABLE.
+        regs.TASKS_RESUME.write(.{ .TASKS_RESUME = .Trigger });
+        regs.TASKS_STOP.write(.{ .TASKS_STOP = .Trigger });
+        try hal.finish_dma_stop(@backingInt(i2c), .twim);
+        return true;
+    }
+
+    fn abort_transfer(i2c: I2C) error{BusStuck}!void {
+        if (current_transfer_has_dma(i2c.get_regs())) _ = try i2c.stop_if_pending();
+    }
+
+    /// Wait for the current chunk. On error or timeout, stop the entire transfer.
     fn wait(i2c: I2C, deadline: mdf.time.Deadline) Error!void {
         const regs = i2c.get_regs();
         while (true) {
-            if (regs.EVENTS_SUSPENDED.read().EVENTS_SUSPENDED == .Generated or
-                regs.EVENTS_STOPPED.read().EVENTS_STOPPED == .Generated)
-            {
-                regs.EVENTS_STOPPED.raw = 0;
-                break;
-            }
-            // Stop the task on error, but we need to keep waiting until the stop event
+            const now = time.get_time_since_boot();
+            if (finish_if_stopped(regs)) return;
             if (regs.EVENTS_ERROR.read().EVENTS_ERROR == .Generated) {
-                regs.EVENTS_ERROR.raw = 0;
-                regs.TASKS_STOP.write(.{ .TASKS_STOP = .Trigger });
+                // The caller reads ERRORSRC to report the bus error after STOPPED.
+                return i2c.abort_transfer();
             }
-            if (deadline.is_reached_by(time.get_time_since_boot())) {
-                regs.TASKS_STOP.write(.{ .TASKS_STOP = .Trigger });
-                return Error.Timeout;
+            if (regs.EVENTS_SUSPENDED.read().EVENTS_SUSPENDED == .Generated) {
+                regs.EVENTS_SUSPENDED.raw = 0;
+                return;
+            }
+            if (deadline.is_reached_by(now)) {
+                if (try i2c.stop_if_pending()) return Error.Timeout;
+                return;
             }
         }
     }
@@ -290,6 +362,7 @@ pub const I2C = enum(u1) {
     ///       in a separate memory.
     ///
     pub fn writev_blocking(i2c: I2C, addr: Address, chunks: []const []const u8, timeout: ?mdf.time.Duration) Error!void {
+        try hal.wait_for_shared_dma(@backingInt(i2c));
         addr.check_reserved() catch |err| switch (err) {
             AddressError.GeneralCall => {},
             else => return Error.IllegalAddress,
@@ -301,7 +374,7 @@ pub const I2C = enum(u1) {
         const regs = i2c.get_regs();
         const deadline = mdf.time.Deadline.init_relative(time.get_time_since_boot(), timeout);
 
-        i2c.set_address(addr);
+        try i2c.set_address(addr);
 
         i2c.clear_shorts();
         i2c.clear_events();
@@ -310,7 +383,10 @@ pub const I2C = enum(u1) {
 
         for (0.., chunks) |i, chunk| {
             const stop = i == chunks.len - 1;
-            try i2c.set_tx_buffer(chunk);
+            i2c.set_tx_buffer(chunk) catch |err| {
+                try i2c.abort_transfer();
+                return err;
+            };
 
             // Set it up to automatically stop after sending the last byte of this DMA transaction,
             // but only if we are on the last chunk. Otherwise, instead we want to suspend so that
@@ -341,8 +417,14 @@ pub const I2C = enum(u1) {
                     regs.TASKS_SUSPEND.write(.{ .TASKS_SUSPEND = .Trigger });
 
             try i2c.wait(deadline);
-            _ = try i2c.check_error();
-            try i2c.check_tx(chunk.len);
+            _ = i2c.check_error() catch |err| {
+                try i2c.abort_transfer();
+                return err;
+            };
+            i2c.check_tx(chunk.len) catch |err| {
+                try i2c.abort_transfer();
+                return err;
+            };
         }
     }
 
@@ -355,6 +437,7 @@ pub const I2C = enum(u1) {
     /// NOTE: readv_blocking is unsupported because of a bug in the chip, where subsequent reads
     /// cannot be performed without sending an extra START event.
     pub fn read_blocking(i2c: I2C, addr: Address, dst: []u8, timeout: ?mdf.time.Duration) Error!void {
+        try hal.wait_for_shared_dma(@backingInt(i2c));
         addr.check_reserved() catch return Error.IllegalAddress;
 
         // TODO: We can handle this if for some reason we want to send a start and immediate stop?
@@ -364,7 +447,7 @@ pub const I2C = enum(u1) {
         const regs = i2c.get_regs();
         const deadline = mdf.time.Deadline.init_relative(time.get_time_since_boot(), timeout);
 
-        i2c.set_address(addr);
+        try i2c.set_address(addr);
 
         i2c.clear_shorts();
         i2c.clear_events();
@@ -396,6 +479,7 @@ pub const I2C = enum(u1) {
     /// This is useful for the common scenario of writing an address to a target device, and then
     /// immediately reading bytes from that address
     pub fn write_then_read_blocking(i2c: I2C, addr: Address, data: []const u8, dst: []u8, timeout: ?mdf.time.Duration) Error!void {
+        try hal.wait_for_shared_dma(@backingInt(i2c));
         addr.check_reserved() catch return Error.IllegalAddress;
 
         // TODO: We can handle this actually
@@ -407,7 +491,7 @@ pub const I2C = enum(u1) {
         const regs = i2c.get_regs();
         const deadline = mdf.time.Deadline.init_relative(time.get_time_since_boot(), timeout);
 
-        i2c.set_address(addr);
+        try i2c.set_address(addr);
 
         i2c.clear_shorts();
         i2c.clear_events();
@@ -416,7 +500,11 @@ pub const I2C = enum(u1) {
         i2c.disable_interrupts();
 
         try i2c.set_tx_buffer(data);
-        try i2c.set_rx_buffer(dst);
+        i2c.set_rx_buffer(dst) catch |err| {
+            // STARTTX has yet to be triggered. Release the prepared TX pointer.
+            release_dma(regs);
+            return err;
+        };
 
         // Set it up to automatically start a read after it's finished writing, and stop after it's
         // finished reading.

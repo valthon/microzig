@@ -10,6 +10,8 @@ const i2cdma = nrf.i2cdma;
 const uart = nrf.uart.num(0);
 const i2c0 = i2c.num(0);
 const i2c0dma = i2cdma.num(0);
+// Keep the destination in RAM if a stuck STOP outlives main.
+var dma_rx: [1]u8 = undefined;
 
 pub const panic = microzig.panic;
 
@@ -31,9 +33,6 @@ pub fn main() !void {
     });
 
     nrf.uart.init_logger(uart);
-
-    defer i2c0.reset();
-    defer i2c0dma.reset();
 
     // ------------------------ BUS SCAN ------------------------
     std.log.info("I2C bus scan", .{});
@@ -64,11 +63,12 @@ pub fn main() !void {
         .scl_pin = gpio.num(0, 9),
         .sda_pin = gpio.num(0, 10),
     });
+    errdefer i2c0dma.reset();
     for (0..std.math.maxInt(u7)) |addr| {
         const a: i2cdma.Address = @fromBackingInt(@intCast(addr));
 
-        var rx_data: [1]u8 = undefined;
-        _ = i2c0dma.read_blocking(a, &rx_data, null) catch |e| {
+        _ = i2c0dma.read_blocking(a, &dma_rx, null) catch |e| {
+            if (e == error.BusStuck) return e;
             if (e != i2c.Error.DeviceNotPresent and
                 e != i2c.Error.IllegalAddress)
                 std.log.info("Error {any}", .{e});
@@ -77,7 +77,7 @@ pub fn main() !void {
 
         std.log.info("I2C device found at address {X}.", .{addr});
     }
-    i2c0dma.reset();
+    try i2c0dma.deinit();
 
     std.log.info("Done!", .{});
 }
