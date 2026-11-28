@@ -66,17 +66,25 @@ pub const Pin = packed struct(u8) {
         };
     }
 
-    // TODO:
+    inline fn config_offset(gpio: Pin) u5 {
+        const index: u3 = @truncate(gpio.number);
+        return @as(u5, index) << 2;
+    }
+
+    inline fn read_pin_config(gpio: Pin) u4 {
+        const port = gpio.get_port();
+        const config = if (gpio.number < 8) port.CFGLR.raw else port.CFGHR.raw;
+        return @truncate(config >> gpio.config_offset());
+    }
+
     inline fn write_pin_config(gpio: Pin, config: u32) void {
         const port = gpio.get_port();
-        if (gpio.number <= 7) {
-            const offset = @as(u5, gpio.number) << 2; // number * 4
-            port.CFGLR.raw &= ~(@as(u32, 0b1111) << offset);
-            port.CFGLR.raw |= config << offset;
+        const offset = gpio.config_offset();
+        const mask_bits = @as(u32, 0b1111) << offset;
+        if (gpio.number < 8) {
+            port.CFGLR.write_raw((port.CFGLR.raw & ~mask_bits) | (config << offset));
         } else {
-            const offset = (@as(u5, gpio.number) - 8) << 2; // number * 4
-            port.CFGHR.raw &= ~(@as(u32, 0b1111) << offset);
-            port.CFGHR.raw |= config << offset;
+            port.CFGHR.write_raw((port.CFGHR.raw & ~mask_bits) | (config << offset));
         }
     }
 
@@ -143,13 +151,36 @@ pub const Pin = packed struct(u8) {
         }
     }
 
+    /// Apply pull to digital inputs. Other modes have no internal pull.
     pub inline fn set_pull(gpio: Pin, pull: Pull) void {
-        var port = gpio.get_port();
-        switch (pull) {
-            .up => port.BSHR.raw = gpio.mask(),
-            .down => port.BCR.raw = gpio.mask(),
-            .disabled => gpio.set_input_mode(.floating),
+        gpio.try_set_pull(pull) catch return;
+    }
+
+    pub inline fn try_set_pull(gpio: Pin, pull: Pull) error{Unsupported}!void {
+        const config = gpio.read_pin_config();
+        const mode = (try input_mode_for_pull(config, pull)) orelse return;
+        gpio.apply_input_pull(config, mode, pull);
+    }
+
+    /// Select digital input mode and apply the requested pull.
+    pub inline fn set_input_pull(gpio: Pin, pull: Pull) void {
+        const config = gpio.read_pin_config();
+        const mode = input_mode_for_pull(config, pull) catch blk: {
+            // Release the pin before writing the latch that selects up or down.
+            gpio.set_input_mode(.floating);
+            break :blk .pull;
+        };
+        gpio.apply_input_pull(config, mode orelse .floating, pull);
+    }
+
+    inline fn apply_input_pull(gpio: Pin, config: u4, mode: InputMode, pull: Pull) void {
+        if (pull != .disabled) {
+            const high = gpio.get_port().OUTDR.raw & gpio.mask() != 0;
+            const want_high = pull == .up;
+            if (high != want_high) gpio.put(@intFromBool(want_high));
         }
+        if (config != @as(u4, @backingInt(mode)) << 2)
+            gpio.set_input_mode(mode);
     }
 
     pub inline fn read(gpio: Pin) u1 {
@@ -174,3 +205,37 @@ pub const Pin = packed struct(u8) {
         port.OUTDR.raw ^= gpio.mask(); // mask: 0 => stay, 1 => flip
     }
 };
+
+// CH32F/V20x_V30x_V31x RM §10.3.1.1–2: MODE selects input or output.
+// Only the digital input configurations support switching the internal pull.
+fn input_mode_for_pull(config: u4, pull: Pull) error{Unsupported}!?InputMode {
+    if (config & 0b11 != 0) return no_pull_available(pull);
+    const mode: InputMode = @fromBackingInt(@as(u2, @truncate(config >> 2)));
+    return switch (mode) {
+        .floating, .pull => if (pull == .disabled) .floating else .pull,
+        .analog, .reserved => no_pull_available(pull),
+    };
+}
+
+fn no_pull_available(pull: Pull) error{Unsupported}!?InputMode {
+    if (pull != .disabled) return error.Unsupported;
+    return null;
+}
+
+test "GPIO rejects explicit pulls outside digital input modes" {
+    const testing = @import("std").testing;
+    for (0..16) |raw| {
+        const config: u4 = @intCast(raw);
+        if (config == 0b0100 or config == 0b1000) continue;
+        try testing.expectEqual(null, try input_mode_for_pull(config, .disabled));
+        try testing.expectError(error.Unsupported, input_mode_for_pull(config, .up));
+        try testing.expectError(error.Unsupported, input_mode_for_pull(config, .down));
+    }
+}
+
+test "GPIO digital input can enable and disable pull" {
+    const expect_equal = @import("std").testing.expectEqual;
+    try expect_equal(InputMode.pull, (try input_mode_for_pull(0b0100, .up)).?);
+    try expect_equal(InputMode.pull, (try input_mode_for_pull(0b0100, .down)).?);
+    try expect_equal(InputMode.floating, (try input_mode_for_pull(0b1000, .disabled)).?);
+}
