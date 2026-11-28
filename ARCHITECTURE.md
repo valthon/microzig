@@ -82,6 +82,7 @@ Device-independent drivers that talk to hardware through base interface abstract
 - _base/_: Interface types using a pointer+vtable pattern:
   - _Digital_IO.zig_: GPIO pin abstraction (direction, bias, read/write).
   - _I2C_Device.zig_: I2C bus communication.
+  - _IEEE802154_Radio.zig_: Asynchronous 2.4 GHz IEEE 802.15.4 radio and frame metadata.
   - _StreamDevice.zig_: Byte-stream I/O (UART-like).
   - _DatagramDevice.zig_: Packet-based I/O.
   - _BlockMemory.zig_: Block storage.
@@ -139,6 +140,39 @@ firmware targets. Examples often show off different parts of the HAL.
 
 _sim/aviron/_ is an AVR instruction-level simulator for testing AVR firmware without hardware.
 
+## IEEE 802.15.4, Thread and Zigbee
+
+A port driver implements `drivers.base.IEEE802154_Radio`. That interface is the
+hardware boundary for future libraries in `modules/`. An OpenThread wrapper can
+implement `otPlatRadio*` over it for on-device minimal and full Thread devices
+(MTD and FTD), or for a radio coprocessor (RCP) running Spinel with the Thread
+stack on the host. A Zigbee stack can use the same interface for end devices,
+routers and coordinators. A sniffer can publish pcap records over USB CDC.
+
+The OpenThread wrapper polls one `tx_started` event per on-air attempt,
+including offloaded retries. For each event it sets
+`otRadioFrame.mInfo.mTxInfo.mTimestamp` to the end-of-SFD timestamp before
+calling `otPlatRadioTxStarted` on the OpenThread thread. It handles the final
+result separately through `tx_done`.
+
+If a driver leaves `ack_timeout` false, the adapter gets `.sent` when an
+attempt finishes and matches ordinary RX ACK events on the transmit channel
+under a software deadline. Driver-managed retries require driver-managed
+ACK matching and timeouts.
+
+| Role | Radio functions and capabilities |
+| --- | --- |
+| Thread MTD and Zigbee end device | Address filtering and immediate ACKs. Sleep and receive on demand for sleepy devices. CSMA, retries and ACK timeouts, with software fallback where supported by the stack. |
+| Thread FTD, including routers and border routers, and Zigbee routers and coordinators | The common MAC functions plus continuous RX for always-listening roles, source match and frame pending for sleepy children, and energy scan for channel selection. Zigbee PAN coordinators also need destinationless filtering on their PAN. |
+| Thread with CSL enabled | Timed TX and RX for CSL. |
+| OpenThread RCP with Spinel | The functions required by the host's Thread role. The wrapper reports the radio's capabilities to the host. |
+| Sniffer | Promiscuous RX with channel changes, optional bad-FCS delivery, received FCS, monotonic timestamps, RSSI and LQI. |
+
+Enhanced ACKs and TX security offload have reserved capability bits. Their
+API and OpenThread mappings will be defined alongside the first implementations.
+No Thread or Zigbee stack, OpenThread wrapper, or sniffer library is implemented
+yet.
+
 ## Build Flow: SVD to `blink`
 
 The path from a vendor hardware description to running firmware:
@@ -191,8 +225,8 @@ conversion step (e.g. to _uf2_ or _bin_) and copies the result to _zig-out/firmw
   Add patches in the port's _patches/_ directory to make corrections.
 - **No global mutable state in libraries.** Embedded code uses explicit initialization and passed
   handles. A narrow exception permits one synchronized routing pointer in a port HAL
-  when a vendor C callback ABI has no context argument and the peripheral has a single
-  owner. The caller still explicitly initializes a stationary handle that owns all queues
+  when a vendor C callback or interrupt vector has no context argument and the
+  peripheral has a single owner. The caller still explicitly initializes a stationary handle that owns all queues
   and operation state; a second owner is rejected, and teardown must prevent outstanding
   completions from reaching a subsequent owner. This is not an exception for global
   allocators or general library state. ESP Wi-Fi, ESP-NOW, and IEEE 802.15.4 callbacks use this
