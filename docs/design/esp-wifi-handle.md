@@ -39,8 +39,8 @@ All in `port/espressif/esp/src/hal/radio/`:
 - A failed `init` releases ownership unless it returns `WifiRollbackPending`; a failed `deinit`
   keeps it. Either way the caller retries with `deinit`.
 - The globals left in `wifi.zig` are `owner` and what the blob holds the address of:
-  `g_wifi_osi_funcs`, `g_wifi_feature_caps` and `boot_locks` (the blob keeps pointers to its API
-  and global locks for the whole boot).
+  `g_wifi_osi_funcs` and `boot_locks` (the blob keeps pointers to its API and global locks for
+  the whole boot). The feature capabilities reach the blob by value, in the init configuration.
 
 ## Design tables
 

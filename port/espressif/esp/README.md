@@ -1162,7 +1162,8 @@ zig build -Doptimize=ReleaseSmall -Dexample=selftest_wifi_lifecycle -Dwifi_ssid=
 Defaults remain SSID `SSID` and an empty password. `-Dwifi_auth` sets the weakest AP
 authentication the station accepts, as a `hal.radio.wifi.AuthMethod` name; it defaults to
 `wpa2_personal` when a passphrase is given and `none` without one, so a station with a
-passphrase is configured to reject an open AP of the same name. This authentication
+passphrase is configured to reject an open AP of the same name. `wpa3_personal` is a build
+error, as the port has no WPA3 (see "Wi-Fi initialization and limits"). This authentication
 policy has build-rejection logs for an invalid auth name and a missing passphrase, and
 its runtime check ran on hardware: `selftest_wifi_open_ap` (below) passed 3/3 in 3 of 3
 boots each on the C3, Super Mini ESP32-C6 and XIAO ESP32-C6 (board build), 2026-11-20. A non-`none` value without a
@@ -1316,8 +1317,9 @@ these self-tests. The open-AP test's dummy station password is never an AP crede
 #### SoftAP (C3 and C6)
 
 `softap` is a standalone WPA2-PSK/CCMP AP on channel 6, limited to four associated
-stations. It uses only WPA2 Personal; open, WEP, WPA/WPA2 mixed, WPA3 and enterprise
-modes are not offered by this example. STA and `tcp_server` are unchanged.
+stations. It uses only WPA2 Personal; open, WEP, WPA/WPA2 mixed and enterprise modes are
+not offered by this example, and WPA3 is not offered by the port (see "Wi-Fi initialization
+and limits"). STA and `tcp_server` are unchanged.
 Build from `examples/espressif/esp` with the pinned Zig:
 
 ```sh
@@ -1358,6 +1360,15 @@ pings in 3 of 3 boots each. TCP echo on port 7 ran through `selftest_wifi_softap
 including the XIAO ESP32-C6 board build as AP.
 
 #### Wi-Fi initialization and limits
+
+There is no WPA3. The C3 and C6 `libwpa_supplicant.a` linked from `esp-wifi-sys` were built without
+SAE (their `sae.c` and `esp_wpa3.c` objects are present but define no symbols, nothing defines a
+`crypto_ec_*` function, and `esp_supplicant_init` registers no WPA3 callbacks), so the port does not
+set `WIFI_ENABLE_WPA3_SAE` in the `feature_caps` it passes to `esp_wifi_init_internal`. An access
+point with `wpa3_personal` or `wpa2_wpa3_personal` authentication, or a station threshold of
+`wpa3_personal`, is `error.InvalidConfig`. A station threshold of `wpa2_wpa3_personal` is accepted,
+since such an access point also offers WPA2. WPA3 needs a supplicant built with SAE and an
+elliptic-curve crypto backend.
 
 Only `.none` power save is supported on C6; modem/light sleep retention is not implemented.
 Wi-Fi initialization returns `CpuClockNotPll` unless the hardware CPU source is PLL

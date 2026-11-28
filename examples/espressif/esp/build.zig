@@ -19,7 +19,12 @@ pub fn build(b: *std.Build) void {
         if (wifi_password.len != 0) "wpa2_personal" else "none";
     // tcp_server (also imported by selftest_wifi_lifecycle) validates this
     // with std.meta.stringToEnum(AuthMethod, ...). Keep the enum as the only
-    // source of accepted names instead of maintaining a second list here.
+    // source of accepted names instead of maintaining a second list here. The
+    // one exception is a name the enum has but the port rejects: a station
+    // threshold of wpa3_personal is error.InvalidConfig at run time, so fail
+    // the build instead.
+    if (std.mem.eql(u8, wifi_auth, "wpa3_personal"))
+        std.process.fatal("-Dwifi_auth=wpa3_personal: the ESP Wi-Fi supplicant has no SAE (WPA3)", .{});
     if (wifi_password.len == 0 and !std.mem.eql(u8, wifi_auth, "none"))
         std.process.fatal("-Dwifi_auth={s} needs -Dwifi_password", .{wifi_auth});
     const expected_mac_text = b.option([]const u8, "expected_mac", "selftest_c6_core: the board's efuse MAC (aa:bb:cc:dd:ee:ff); unset reports SKIP");
