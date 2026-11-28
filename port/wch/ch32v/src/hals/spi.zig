@@ -33,7 +33,7 @@ const microzig = @import("microzig");
 const mdf = microzig.drivers;
 const hal = microzig.hal;
 const gpio = hal.gpio;
-const dma = hal.dma;
+const dma = @import("dma.zig");
 
 const SPI1 = microzig.chip.peripherals.SPI1;
 const SPI2 = microzig.chip.peripherals.SPI2;
@@ -44,7 +44,10 @@ pub const Error = error{
     Timeout,
     Overrun,
     ModeFault,
+    Disabled,
     CrcError,
+    TransferTooLong,
+    DmaTransferFailed,
     NoData,
 };
 
@@ -163,16 +166,6 @@ pub const SPI = enum(u1) {
         spi.get_regs().CTLR1.modify(.{ .SPE = 1 });
     }
 
-    /// Check if TX buffer is empty
-    inline fn is_tx_empty(spi: SPI) bool {
-        return spi.get_regs().STATR.read().TXE == 1;
-    }
-
-    /// Check if RX buffer has data
-    inline fn is_rx_not_empty(spi: SPI) bool {
-        return spi.get_regs().STATR.read().RXNE == 1;
-    }
-
     /// Check if SPI is busy
     inline fn is_busy(spi: SPI) bool {
         return spi.get_regs().STATR.read().BSY == 1;
@@ -276,28 +269,45 @@ pub const SPI = enum(u1) {
         spi.disable();
     }
 
-    /// Wait for TX buffer to be empty with timeout
-    fn wait_tx_empty(spi: SPI, deadline: mdf.time.Deadline) Error!void {
-        var iterations: u32 = 0;
-        while (!spi.is_tx_empty()) {
-            try spi.check_errors();
-            iterations += 1;
-            if (iterations > 100_000) return Error.Timeout;
-            if (deadline.is_reached_by(hal.time.get_time_since_boot()))
-                return Error.Timeout;
+    fn begin_transfer(spi: SPI, timeout: ?mdf.time.Duration) Error!mdf.time.Deadline {
+        try require_enabled(spi.get_regs().CTLR1.read().SPE);
+        return .init_relative(hal.time.get_time_since_boot(), timeout orelse .from_ms(1000));
+    }
+
+    fn pulse_reset(spi: SPI) void {
+        const rcc = microzig.chip.peripherals.RCC;
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        // CH32F/V20x_V30x_V31x RM §3.4.4–5: pulse this SPI instance's APB reset.
+        switch (@backingInt(spi)) {
+            0 => {
+                rcc.APB2PRSTR.modify(.{ .SPI1RST = 1 });
+                rcc.APB2PRSTR.modify(.{ .SPI1RST = 0 });
+            },
+            1 => {
+                rcc.APB1PRSTR.modify(.{ .SPI2RST = 1 });
+                rcc.APB1PRSTR.modify(.{ .SPI2RST = 0 });
+            },
         }
     }
 
-    /// Wait for RX buffer to have data with timeout
-    fn wait_rx_not_empty(spi: SPI, deadline: mdf.time.Deadline) Error!void {
-        var iterations: u32 = 0;
-        while (!spi.is_rx_not_empty()) {
-            try spi.check_errors();
-            iterations += 1;
-            if (iterations > 100_000) return Error.Timeout;
-            if (deadline.is_reached_by(hal.time.get_time_since_boot()))
-                return Error.Timeout;
-        }
+    fn abort_transfer(spi: SPI) void {
+        restore_after_abort(spi, pulse_reset);
+    }
+
+    fn wait_for_flag(spi: SPI, comptime flag: enum { tx_empty, rx_not_empty, idle }, deadline: mdf.time.Deadline) Error!void {
+        const Poll = struct {
+            fn ready(bus: SPI) StatusError!bool {
+                const status = bus.get_regs().STATR.read();
+                try check_status(status);
+                return switch (flag) {
+                    .tx_empty => status.TXE == 1,
+                    .rx_not_empty => status.RXNE == 1,
+                    .idle => status.BSY == 0,
+                };
+            }
+        };
+        try hal.time.wait_until_ready(spi, Poll.ready, deadline, hal.time.get_time_since_boot, 100_000);
     }
 
     /// Wait for SPI to not be busy with timeout
@@ -321,29 +331,27 @@ pub const SPI = enum(u1) {
     ) Error!void {
         if (data.len == 0) return Error.NoData;
 
-        const deadline = mdf.time.Deadline.init_relative(
-            hal.time.get_time_since_boot(),
-            timeout orelse mdf.time.Duration.from_ms(1000),
-        );
+        const deadline = try spi.begin_transfer(timeout);
 
         const regs = spi.get_regs();
+        errdefer spi.abort_transfer();
 
         for (data) |byte| {
             // Wait for TX buffer empty
-            try spi.wait_tx_empty(deadline);
+            try spi.wait_for_flag(.tx_empty, deadline);
 
             // Write data
             regs.DATAR.modify(.{ .DR = byte });
 
             // Wait for RX buffer to have data (dummy read)
-            try spi.wait_rx_not_empty(deadline);
+            try spi.wait_for_flag(.rx_not_empty, deadline);
 
             // Discard received byte
             _ = regs.DATAR.read().DR;
         }
 
         // Wait for transmission to complete
-        try spi.wait_not_busy(deadline);
+        try spi.wait_for_flag(.idle, deadline);
     }
 
     /// Write multiple buffers blocking (vectored I/O)
@@ -356,30 +364,28 @@ pub const SPI = enum(u1) {
         const write_vec = microzig.utilities.SliceVector([]const u8).init(chunks);
         if (write_vec.size() == 0) return Error.NoData;
 
-        const deadline = mdf.time.Deadline.init_relative(
-            hal.time.get_time_since_boot(),
-            timeout orelse mdf.time.Duration.from_ms(1000),
-        );
+        const deadline = try spi.begin_transfer(timeout);
 
         const regs = spi.get_regs();
+        errdefer spi.abort_transfer();
         var iter = write_vec.iterator();
 
         while (iter.next_element()) |element| {
             // Wait for TX buffer empty
-            try spi.wait_tx_empty(deadline);
+            try spi.wait_for_flag(.tx_empty, deadline);
 
             // Write data
             regs.DATAR.modify(.{ .DR = element.value });
 
             // Wait for RX buffer to have data (dummy read)
-            try spi.wait_rx_not_empty(deadline);
+            try spi.wait_for_flag(.rx_not_empty, deadline);
 
             // Discard received byte
             _ = regs.DATAR.read().DR;
         }
 
         // Wait for transmission to complete
-        try spi.wait_not_busy(deadline);
+        try spi.wait_for_flag(.idle, deadline);
     }
 
     /// Read data blocking (polling mode)
@@ -391,29 +397,27 @@ pub const SPI = enum(u1) {
     ) Error!void {
         if (data.len == 0) return Error.NoData;
 
-        const deadline = mdf.time.Deadline.init_relative(
-            hal.time.get_time_since_boot(),
-            timeout orelse mdf.time.Duration.from_ms(1000),
-        );
+        const deadline = try spi.begin_transfer(timeout);
 
         const regs = spi.get_regs();
+        errdefer spi.abort_transfer();
 
         for (data) |*byte| {
             // Wait for TX buffer empty
-            try spi.wait_tx_empty(deadline);
+            try spi.wait_for_flag(.tx_empty, deadline);
 
             // Write dummy byte (0xFF)
             regs.DATAR.modify(.{ .DR = 0xFF });
 
             // Wait for RX buffer to have data
-            try spi.wait_rx_not_empty(deadline);
+            try spi.wait_for_flag(.rx_not_empty, deadline);
 
             // Read received byte
             byte.* = @truncate(regs.DATAR.read().DR);
         }
 
         // Wait for transmission to complete
-        try spi.wait_not_busy(deadline);
+        try spi.wait_for_flag(.idle, deadline);
     }
 
     /// Read multiple buffers blocking (vectored I/O)
@@ -425,30 +429,28 @@ pub const SPI = enum(u1) {
         const read_vec = microzig.utilities.SliceVector([]u8).init(chunks);
         if (read_vec.size() == 0) return Error.NoData;
 
-        const deadline = mdf.time.Deadline.init_relative(
-            hal.time.get_time_since_boot(),
-            timeout orelse mdf.time.Duration.from_ms(1000),
-        );
+        const deadline = try spi.begin_transfer(timeout);
 
         const regs = spi.get_regs();
+        errdefer spi.abort_transfer();
         var iter = read_vec.iterator();
 
         while (iter.next_element_ptr()) |element| {
             // Wait for TX buffer empty
-            try spi.wait_tx_empty(deadline);
+            try spi.wait_for_flag(.tx_empty, deadline);
 
             // Write dummy byte (0xFF)
             regs.DATAR.modify(.{ .DR = 0xFF });
 
             // Wait for RX buffer to have data
-            try spi.wait_rx_not_empty(deadline);
+            try spi.wait_for_flag(.rx_not_empty, deadline);
 
             // Read received byte
             element.value_ptr.* = @truncate(regs.DATAR.read().DR);
         }
 
         // Wait for transmission to complete
-        try spi.wait_not_busy(deadline);
+        try spi.wait_for_flag(.idle, deadline);
     }
 
     /// Simultaneous read and write blocking (full duplex)
@@ -461,29 +463,27 @@ pub const SPI = enum(u1) {
         if (tx_data.len == 0 or rx_data.len == 0) return Error.NoData;
         if (tx_data.len != rx_data.len) return Error.NoData;
 
-        const deadline = mdf.time.Deadline.init_relative(
-            hal.time.get_time_since_boot(),
-            timeout orelse mdf.time.Duration.from_ms(1000),
-        );
+        const deadline = try spi.begin_transfer(timeout);
 
         const regs = spi.get_regs();
+        errdefer spi.abort_transfer();
 
         for (tx_data, rx_data) |tx_byte, *rx_byte| {
             // Wait for TX buffer empty
-            try spi.wait_tx_empty(deadline);
+            try spi.wait_for_flag(.tx_empty, deadline);
 
             // Write data
             regs.DATAR.modify(.{ .DR = tx_byte });
 
             // Wait for RX buffer to have data
-            try spi.wait_rx_not_empty(deadline);
+            try spi.wait_for_flag(.rx_not_empty, deadline);
 
             // Read received byte
             rx_byte.* = @truncate(regs.DATAR.read().DR);
         }
 
         // Wait for transmission to complete
-        try spi.wait_not_busy(deadline);
+        try spi.wait_for_flag(.idle, deadline);
     }
 
     // ========================================================================
@@ -503,39 +503,13 @@ pub const SPI = enum(u1) {
 
         if (data.len == 0) return Error.NoData;
 
-        const deadline = mdf.time.Deadline.init_relative(
-            hal.time.get_time_since_boot(),
-            timeout orelse mdf.time.Duration.from_ms(1000),
-        );
+        const deadline = try spi.begin_transfer(timeout);
 
-        const regs = spi.get_regs();
+        const count = try dma.checked_transfer_count(data.len);
+        const target: dma.PeripheralTarget = .{ .addr = @intFromPtr(&spi.get_regs().DATAR) };
 
-        // SPI DMA requires both TX and RX to be active
-        // Use dummy RX buffer to discard received data
-        var dummy_rx: u8 = 0;
-        const rx_target = dma.PeripheralTarget{ .addr = @intFromPtr(&regs.DATAR) };
-        const tx_target = dma.PeripheralTarget{ .addr = @intFromPtr(&regs.DATAR) };
-
-        // Setup RX DMA (discard to dummy buffer)
-        dma_cfg.rx_channel.setup_transfer(
-            @as([*]u8, @ptrCast(&dummy_rx))[0..data.len],
-            rx_target,
-            .{ .priority = dma_cfg.priority },
-        );
-
-        // Setup TX DMA (real data)
-        dma_cfg.tx_channel.setup_transfer(
-            tx_target,
-            data,
-            .{ .priority = dma_cfg.priority },
-        );
-
-        // Wait for both channels to complete
-        dma_cfg.tx_channel.wait_for_finish_blocking();
-        dma_cfg.rx_channel.wait_for_finish_blocking();
-
-        // Wait for SPI to finish transmission
-        try spi.wait_not_busy(deadline);
+        var dummy_rx: u8 = undefined;
+        try transfer_dma(spi, dma_cfg, target, .{ .rx = &dummy_rx, .tx = data }, count, deadline, hal.time.get_time_since_boot);
     }
 
     /// Read data using DMA
@@ -584,6 +558,20 @@ pub const SPI = enum(u1) {
 
         // Wait for SPI to finish transmission
         try spi.wait_not_busy(deadline);
+    }
+
+    fn poll_errors(spi: SPI) StatusError!void {
+        try check_status(spi.get_regs().STATR.read());
+    }
+
+    fn wait_for_dma(spi: SPI, comptime config: Config.DMA_Config, deadline: mdf.time.Deadline) Error!void {
+        const Poll = struct {
+            fn ready(bus: SPI) Error!bool {
+                return dma.poll_peripheral_transfer(bus, poll_errors, .{ config.tx_channel, config.rx_channel });
+            }
+        };
+        try hal.time.wait_until_ready(spi, Poll.ready, deadline, hal.time.get_time_since_boot, null);
+        try spi.wait_for_flag(.idle, deadline);
     }
 
     /// Write data with automatic DMA/polling selection based on threshold
@@ -668,3 +656,211 @@ pub const SPI = enum(u1) {
         return spi.readv_blocking(chunks, timeout);
     }
 };
+
+const StatusError = error{ Overrun, ModeFault, CrcError };
+
+// CH32F/V20x_V30x_V31x RM §20.2.7: check error flags in both polling and DMA.
+fn check_status(status: anytype) StatusError!void {
+    if (status.MODF != 0) return error.ModeFault;
+    if (status.OVR != 0) return error.Overrun;
+    if (status.CRCERR != 0) return error.CrcError;
+}
+
+fn transfer_dma(
+    spi: anytype,
+    comptime config: anytype,
+    target: dma.PeripheralTarget,
+    buffers: anytype,
+    count: u16,
+    deadline: anytype,
+    comptime now: anytype,
+) !void {
+    const priority: dma.TransferConfig = .{ .priority = config.priority };
+    var tx_started = false;
+    errdefer if (tx_started) spi.abort_transfer();
+
+    // RM §20.2.6: RXNE and TXE drive separate requests. Arm RX before
+    // TX can clock a frame, checking the deadline before each channel.
+    // Time can still advance between a deadline sample and the separate
+    // channel-enable write that lets DMA service the request.
+    try deadline.check(now());
+    if (@TypeOf(buffers.rx) == *u8) {
+        config.rx_channel.setup_fixed_transfer(buffers.rx, target, count, priority);
+    } else {
+        config.rx_channel.setup_transfer(buffers.rx, target, priority);
+    }
+    defer config.rx_channel.stop();
+
+    try deadline.check(now());
+    if (@TypeOf(buffers.tx) == *const u8) {
+        config.tx_channel.setup_fixed_transfer(target, buffers.tx, count, priority);
+    } else {
+        config.tx_channel.setup_transfer(target, buffers.tx, priority);
+    }
+    tx_started = true;
+    defer config.tx_channel.stop();
+
+    try spi.wait_for_dma(config, deadline);
+}
+
+fn require_enabled(spe: u1) error{Disabled}!void {
+    if (spe == 0) return error.Disabled;
+}
+
+// Reset after stopping DMA so neither an in-flight frame nor a buffered RX
+// word survives an abort. Restore SPI master configuration before the next call.
+fn restore_after_abort(spi: anytype, comptime pulse_reset: anytype) void {
+    const regs = spi.get_regs();
+    var control = regs.CTLR1.read();
+    const requests = regs.CTLR2.read();
+    const polynomial = regs.CRCR.read();
+
+    pulse_reset(spi);
+
+    // MODF can clear MSTR and SPE. HAL transfers always use master mode.
+    control.MSTR = 1;
+    control.SPE = 0;
+    control.CRCNEXT = 0;
+    regs.CTLR1.write(control);
+    regs.CRCR.write(polynomial);
+    regs.CTLR2.write(requests);
+    control.SPE = 1;
+    regs.CTLR1.write(control);
+}
+
+test "SPI abort discards pending RX and restores master configuration" {
+    const Fake = struct {
+        fn Register(comptime T: type) type {
+            return struct {
+                value: T,
+
+                fn read(reg: @This()) T {
+                    return reg.value;
+                }
+
+                fn write(reg: *@This(), value: T) void {
+                    reg.value = value;
+                }
+            };
+        }
+
+        const Control = struct { MSTR: u1 = 0, SPE: u1 = 0, CRCNEXT: u1 = 0, prescaler: u3 = 0 };
+        CTLR1: Register(Control) = .{ .value = .{} },
+        CTLR2: Register(u8) = .{ .value = 0 },
+        CRCR: Register(u16) = .{ .value = 0 },
+        pending_rx: bool = false,
+        frame_in_flight: bool = false,
+
+        fn get_regs(bus: *@This()) *@This() {
+            return bus;
+        }
+
+        fn pulse_reset(bus: *@This()) void {
+            bus.* = .{};
+        }
+    };
+
+    var bus: Fake = .{
+        .CTLR1 = .{ .value = .{ .CRCNEXT = 1, .prescaler = 4 } },
+        .CTLR2 = .{ .value = 3 },
+        .CRCR = .{ .value = 7 },
+        .pending_rx = true,
+        .frame_in_flight = true,
+    };
+    restore_after_abort(&bus, Fake.pulse_reset);
+    const testing = @import("std").testing;
+    try testing.expect(!bus.pending_rx and !bus.frame_in_flight);
+    try testing.expectEqual(Fake.Control{ .MSTR = 1, .SPE = 1, .prescaler = 4 }, bus.CTLR1.value);
+    try testing.expectEqual(3, bus.CTLR2.value);
+    try testing.expectEqual(7, bus.CRCR.value);
+}
+
+test "SPI rejects a disabled instance at transfer admission" {
+    try @import("std").testing.expectError(error.Disabled, require_enabled(0));
+    try require_enabled(1);
+}
+
+test "SPI DMA checks expiry before either channel and rolls back a partial arm" {
+    const Fake = struct {
+        const Deadline = struct {
+            expires_at: u8,
+
+            fn check(deadline: @This(), current: u8) error{Timeout}!void {
+                if (current >= deadline.expires_at) return error.Timeout;
+            }
+        };
+        const Channel = enum {
+            rx,
+            tx,
+
+            fn setup_transfer(ch: @This(), _: anytype, _: anytype, comptime _: dma.TransferConfig) void {
+                armed[@backingInt(ch)] = true;
+                starts += 1;
+            }
+
+            fn setup_fixed_transfer(ch: @This(), write: anytype, read: anytype, _: u16, comptime transfer_config: dma.TransferConfig) void {
+                ch.setup_transfer(write, read, transfer_config);
+            }
+
+            fn stop(ch: @This()) void {
+                armed[@backingInt(ch)] = false;
+            }
+        };
+        const config = .{ .rx_channel = Channel.rx, .tx_channel = Channel.tx, .priority = dma.Priority.Medium };
+        var tick: u8 = 0;
+        var starts: u8 = 0;
+        var armed: [2]bool = @splat(false);
+        var aborts: u8 = 0;
+        var abort_while_armed = false;
+
+        fn now() u8 {
+            defer tick += 1;
+            return tick;
+        }
+
+        fn abort_transfer(_: @This()) void {
+            aborts += 1;
+            abort_while_armed = armed[0] or armed[1];
+        }
+
+        fn wait_for_dma(_: @This(), comptime _: @TypeOf(config), _: Deadline) error{ModeFault}!void {
+            return error.ModeFault;
+        }
+    };
+
+    const testing = @import("std").testing;
+    const spi: Fake = .{};
+    const target: dma.PeripheralTarget = .{ .addr = 0 };
+    var byte: u8 = 0xff;
+    var data: [2]u8 = .{ 0, 0 };
+    const write_buffers = .{ .rx = &byte, .tx = @as([]const u8, &data) };
+    const read_buffers = .{ .rx = @as([]u8, &data), .tx = @as(*const u8, &byte) };
+    inline for (.{ write_buffers, read_buffers }) |buffers| {
+        Fake.tick = 0;
+        try testing.expectError(
+            error.Timeout,
+            transfer_dma(spi, Fake.config, target, buffers, data.len, Fake.Deadline{ .expires_at = 0 }, Fake.now),
+        );
+        try testing.expectEqual(0, Fake.starts);
+        try testing.expectEqual(0, Fake.aborts);
+    }
+
+    Fake.tick = 0;
+    try testing.expectError(
+        error.Timeout,
+        transfer_dma(spi, Fake.config, target, read_buffers, data.len, Fake.Deadline{ .expires_at = 1 }, Fake.now),
+    );
+    try testing.expectEqual(1, Fake.starts);
+    try testing.expectEqual([2]bool{ false, false }, Fake.armed);
+    try testing.expectEqual(0, Fake.aborts);
+
+    Fake.tick = 0;
+    try testing.expectError(
+        error.ModeFault,
+        transfer_dma(spi, Fake.config, target, read_buffers, data.len, Fake.Deadline{ .expires_at = 5 }, Fake.now),
+    );
+    try testing.expectEqual(3, Fake.starts);
+    try testing.expectEqual([2]bool{ false, false }, Fake.armed);
+    try testing.expectEqual(1, Fake.aborts);
+    try testing.expect(!Fake.abort_while_armed);
+}
