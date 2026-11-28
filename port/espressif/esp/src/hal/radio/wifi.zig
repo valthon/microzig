@@ -407,11 +407,20 @@ pub const Wifi = struct {
     }
 
     /// In a coexistence image the lifecycle claim covers the mode change and every
-    /// interface configuration, so no other lifecycle call runs between them.
+    /// interface configuration, so no other lifecycle call runs between them. A configuration
+    /// that fails validation returns `error.InvalidConfig` before the mode changes.
     pub fn apply(self: *Wifi, config: Config) ConfigError!void {
         if (radio.coex_enabled) try self.begin_lifecycle() else try self.require_operational();
         defer if (radio.coex_enabled) self.finish_lifecycle();
         if (radio.coex_enabled) try require_running_session();
+        switch (config) {
+            .ap => |ap_config| try check_access_point_config(ap_config),
+            .sta => |sta_config| try check_station_config(sta_config),
+            .ap_sta => |ap_sta_config| {
+                try check_access_point_config(ap_sta_config.ap);
+                try check_station_config(ap_sta_config.sta);
+            },
+        }
         switch (config) {
             .ap => |ap_config| {
                 try set_mode_unclaimed(.ap);
@@ -452,12 +461,7 @@ pub const Wifi = struct {
     /// station, it was accepted and a `StaDisconnected` (reason 8) followed within milliseconds.
     pub fn apply_station_config(self: *const Wifi, config: Config.Station) ConfigError!void {
         try self.require_operational();
-        if (config.ssid.len > 32) {
-            return error.InvalidConfig;
-        }
-        if (config.password.len > 64) {
-            return error.InvalidConfig;
-        }
+        try check_station_config(config);
 
         var sta_cfg: c_patched.wifi_sta_config_t = .{
             .scan_method = @backingInt(config.scan_method),
@@ -922,7 +926,7 @@ const InitBackend = struct {
             .coex => try c_err(c.coex_init()),
             .adapter => try install_boot_locks(),
             .driver => {
-                const init_config = make_init_config(config);
+                const init_config = make_init_config(config, &g_wifi_osi_funcs, c.g_wifi_default_wpa_crypto_funcs);
                 try c_err(c.esp_wifi_init_internal(&init_config));
             },
             .mode => try c_err(c.esp_wifi_set_mode(c.WIFI_MODE_NULL)),
@@ -1116,13 +1120,34 @@ inline fn set_mode_unclaimed(mode: WifiMode) InternalError!void {
     try c_err(if (callbacks.host_test) HostWifi.esp_wifi_set_mode(@backingInt(mode)) else c.esp_wifi_set_mode(@backingInt(mode)));
 }
 
-fn apply_access_point_config(config: Config.AccessPoint) ConfigError!void {
+fn check_station_config(config: Config.Station) error{InvalidConfig}!void {
     if (config.ssid.len > 32) {
         return error.InvalidConfig;
     }
     if (config.password.len > 64) {
         return error.InvalidConfig;
     }
+    // A WPA3-only threshold matches only access points that need SAE (see `wifi_feature_caps`).
+    if (config.auth_method == .wpa3_personal) {
+        return error.InvalidConfig;
+    }
+}
+
+fn check_access_point_config(config: Config.AccessPoint) error{InvalidConfig}!void {
+    if (config.ssid.len > 32) {
+        return error.InvalidConfig;
+    }
+    if (config.password.len > 64) {
+        return error.InvalidConfig;
+    }
+    // Both would advertise SAE, which the linked supplicant cannot run (see `wifi_feature_caps`).
+    if (config.auth_method == .wpa3_personal or config.auth_method == .wpa2_wpa3_personal) {
+        return error.InvalidConfig;
+    }
+}
+
+fn apply_access_point_config(config: Config.AccessPoint) ConfigError!void {
+    try check_access_point_config(config);
 
     var ap_cfg: c_patched.wifi_ap_config_t = .{
         .ssid_len = @intCast(config.ssid.len),
@@ -1643,10 +1668,14 @@ pub const AuthMethod = enum(u32) {
     /// WPA2 Enterprise authentication.
     wpa2_enterprise = c.WIFI_AUTH_WPA2_ENTERPRISE,
 
-    /// WPA3 Personal authentication.
+    /// WPA3 Personal authentication. Not supported: the linked supplicant has no SAE (see
+    /// `wifi_feature_caps`), so an access point or a station threshold of this value is
+    /// `error.InvalidConfig`. Scan records may still report it.
     wpa3_personal = c.WIFI_AUTH_WPA3_PSK,
 
-    /// WPA2/WPA3 Personal authentication (supports both).
+    /// WPA2/WPA3 Personal authentication (supports both). An access point cannot offer it
+    /// (`error.InvalidConfig`), as it would advertise SAE. A station threshold of this value is
+    /// accepted, since such an access point also offers WPA2, and scan records may report it.
     wpa2_wpa3_personal = c.WIFI_AUTH_WPA2_WPA3_PSK,
 
     /// WLAN Authentication and Privacy Infrastructure (WAPI).
@@ -1654,15 +1683,19 @@ pub const AuthMethod = enum(u32) {
 };
 
 fn export_symbols() void {
-    @export(&g_wifi_feature_caps, .{ .name = "g_wifi_feature_caps" });
     @export(&g_wifi_osi_funcs, .{ .name = "g_wifi_osi_funcs" });
 }
 
 // ESP-IDF v5.5.1's station_example_main.c passes a stack-local config in wifi_init_sta.
-fn make_init_config(config: InitConfig) c.wifi_init_config_t {
+// The blob tables are parameters so host tests can build a configuration without linking them.
+fn make_init_config(
+    config: InitConfig,
+    osi_funcs: *c.wifi_osi_funcs_t,
+    wpa_crypto_funcs: c.wpa_crypto_funcs_t,
+) c.wifi_init_config_t {
     return .{
-        .osi_funcs = &g_wifi_osi_funcs,
-        .wpa_crypto_funcs = c.g_wifi_default_wpa_crypto_funcs,
+        .osi_funcs = osi_funcs,
+        .wpa_crypto_funcs = wpa_crypto_funcs,
         .static_rx_buf_num = config.static_rx_buf_num,
         .dynamic_rx_buf_num = config.dynamic_rx_buf_num,
         .tx_buf_type = c.CONFIG_ESP_WIFI_TX_BUFFER_TYPE,
@@ -1683,7 +1716,7 @@ fn make_init_config(config: InitConfig) c.wifi_init_config_t {
         .wifi_task_core_id = 0,
         .beacon_max_len = c.WIFI_SOFTAP_BEACON_MAX_LEN,
         .mgmt_sbuf_num = c.WIFI_MGMT_SBUF_NUM,
-        .feature_caps = g_wifi_feature_caps,
+        .feature_caps = wifi_feature_caps,
         .sta_disconnected_pm = false,
         .espnow_max_encrypt_num = c.CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM,
         .tx_hetb_queue_num = 3,
@@ -1692,7 +1725,7 @@ fn make_init_config(config: InitConfig) c.wifi_init_config_t {
     };
 }
 
-const wifi_enable_wpa3_sae: u64 = 1 << 0;
+const wifi_enable_wpa3_sae: u64 = 1 << 0; // not set, see wifi_feature_caps
 const wifi_enable_enterprise: u64 = 1 << 7;
 // const wifi_ftm_initiator: u64 = 1 << 2;
 // const wifi_ftm_responder: u64 = 1 << 3;
@@ -1700,8 +1733,19 @@ const wifi_enable_enterprise: u64 = 1 << 7;
 // const wifi_enable_gmac: u64 = 1 << 5;
 // const wifi_enable_11r: u64 = 1 << 6;
 
-// Exported storage for the blob's g_wifi_feature_caps ABI symbol.
-var g_wifi_feature_caps: u64 = wifi_enable_wpa3_sae | wifi_enable_enterprise;
+// The blob reads these capabilities only from wifi_init_config_t.feature_caps (make_init_config),
+// as ESP-IDF v5.5.1's WIFI_INIT_CONFIG_DEFAULT passes WIFI_FEATURE_CAPS (esp_wifi.h), which
+// includes WIFI_ENABLE_WPA3_SAE only with CONFIG_ESP_WIFI_ENABLE_WPA3_SAE. The linked C3 and C6
+// libwpa_supplicant.a were built without SAE. Their sae.c and esp_wpa3.c objects are present but
+// define no symbols (ESP-IDF compiles both unconditionally; sae.c's body is guarded by
+// CONFIG_WPA3_SAE, esp_wpa3.c's by CONFIG_WPA3_SAE and CONFIG_SAE), nothing defines a
+// crypto_ec_* function, and
+// esp_supplicant_init references neither esp_wifi_register_wpa3_cb nor
+// esp_wifi_register_wpa3_ap_cb. esp_wpa_main.c calls both unconditionally; esp_wpa3_i.h stubs the
+// first out without CONFIG_WPA3_SAE and the second without CONFIG_SAE
+// (CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT). Advertising SAE would let the blob choose an SAE handshake
+// that no supplicant callback runs.
+const wifi_feature_caps: u64 = wifi_enable_enterprise;
 
 // The blob retains this OS adapter table through its C ABI.
 var g_wifi_osi_funcs: c.wifi_osi_funcs_t = osi_funcs: {
@@ -3179,6 +3223,51 @@ test "apply holds the lifecycle claim from the mode change through every interfa
     try std.testing.expect(!wifi.lifecycle_active.load(.acquire));
     try wifi.deinit();
     _ = EventLog.take();
+}
+
+test "apply rejects every configuration that needs SAE before the mode changes" {
+    var wifi: Wifi = .{};
+    const saved = EventLog.install();
+    defer saved.restore();
+    errdefer EventLog.end_failed_session(&wifi);
+    HostWifi.configured_len = 0;
+    try wifi.init(host_session_allocator, .{});
+    try wifi.apply(.{ .sta = .{ .ssid = "net", .password = "passphrase", .auth_method = .wpa2_personal } });
+    try std.testing.expectEqual(@as(usize, 1), HostWifi.configured_len);
+
+    const ap: Config.AccessPoint = .{ .ssid = "ap", .password = "passphrase", .channel = 6, .max_connections = 1 };
+    for ([_]AuthMethod{ .wpa3_personal, .wpa2_wpa3_personal }) |auth_method| {
+        var sae_ap = ap;
+        sae_ap.auth_method = auth_method;
+        try std.testing.expectError(error.InvalidConfig, wifi.apply(.{ .ap = sae_ap }));
+        try std.testing.expectError(error.InvalidConfig, wifi.apply(.{ .ap_sta = .{ .ap = sae_ap, .sta = .{ .ssid = "net" } } }));
+    }
+    const wpa3_sta: Config.Station = .{ .ssid = "net", .password = "passphrase", .auth_method = .wpa3_personal };
+    try std.testing.expectError(error.InvalidConfig, wifi.apply(.{ .sta = wpa3_sta }));
+    try std.testing.expectError(error.InvalidConfig, wifi.apply(.{ .ap_sta = .{ .ap = ap, .sta = wpa3_sta } }));
+    try std.testing.expectError(error.InvalidConfig, wifi.apply_station_config(wpa3_sta));
+    // Neither the mode nor an interface configuration changed.
+    try std.testing.expectEqual(WifiMode.sta, try wifi.get_mode());
+    try std.testing.expectEqual(@as(usize, 1), HostWifi.configured_len);
+
+    // From AP mode, a rejected station configuration leaves the mode at AP.
+    try wifi.apply(.{ .ap = ap });
+    try std.testing.expectEqual(@as(usize, 2), HostWifi.configured_len);
+    try std.testing.expectError(error.InvalidConfig, wifi.apply(.{ .sta = wpa3_sta }));
+    try std.testing.expectEqual(WifiMode.ap, try wifi.get_mode());
+    try std.testing.expectEqual(@as(usize, 2), HostWifi.configured_len);
+
+    // A WPA2/WPA3 access point also offers WPA2, so it stays a valid station threshold.
+    try wifi.apply(.{ .sta = .{ .ssid = "net", .password = "passphrase", .auth_method = .wpa2_wpa3_personal } });
+    try std.testing.expectEqual(@as(usize, 3), HostWifi.configured_len);
+    try wifi.deinit();
+    try std.testing.expectEqual(0, EventLog.take().len);
+}
+
+test "the driver init configuration does not advertise WPA3 SAE" {
+    var osi_funcs: c.wifi_osi_funcs_t = undefined;
+    const init_config = make_init_config(.{}, &osi_funcs, undefined);
+    try std.testing.expectEqual(@as(u64, 0), init_config.feature_caps & wifi_enable_wpa3_sae);
 }
 
 test "public Wi-Fi calls wait for a pending teardown or another lifecycle owner" {
