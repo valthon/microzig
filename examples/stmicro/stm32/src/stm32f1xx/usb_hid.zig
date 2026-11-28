@@ -181,6 +181,7 @@ fn set_addr(receive_addr: u7, epc: EpControl) void {
 }
 
 fn ep0_setup(epc: EpControl, _: ?*anyopaque) void {
+    device_addr = null;
     const setup = epc.read_buffer(&EP0_RX_BUFFER) catch unreachable;
     if (setup.len == 0) {
         return;
@@ -206,6 +207,7 @@ fn ep0_rx(epc: EpControl, _: ?*anyopaque) void {
 
 fn ep0_tx(epc: EpControl, _: ?*anyopaque) void {
     if (device_addr) |addr| {
+        device_addr = null;
         usb_ll.set_addr(addr);
     }
     epc.set_status(.RX, .Valid, .no_change) catch unreachable;
@@ -242,21 +244,33 @@ const endpoint1 = usb_ll.Endpoint{
     .tx_callback = ep1_tx,
 };
 
+fn bus_reset(_: ?*anyopaque) void {
+    device_addr = null;
+    config = false;
+    to_report = false;
+    usb_ll.default_reset_handler();
+}
+
 const USB_conf = usb_ll.Config{
     .endpoints = &.{ endpoint0, endpoint1 },
     .RX_buffer = &USB_RX_BUFFER,
+    .reset_callback = bus_reset,
 };
 
 //TODO: full HID report function
 fn report(keys: []const u8) void {
     const len = @min(keys.len, 5);
-    const epc = usb_ll.EpControl.EPC1;
-    const report_flag: *volatile bool = &to_report;
-    if (!config) return;
-    while (report_flag.*) {}
-    std.mem.copyForwards(u8, hid_send[3..], keys[0..len]);
-    report_flag.* = true;
-    epc.USB_send(&hid_send, .no_change) catch unreachable;
+    while (true) {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        if (!config) return;
+        if (to_report) continue;
+
+        std.mem.copyForwards(u8, hid_send[3..], keys[0..len]);
+        to_report = true;
+        EpControl.EPC1.USB_send(&hid_send, .no_change) catch unreachable;
+        return;
+    }
 }
 
 pub fn main() !void {
@@ -296,4 +310,40 @@ pub fn main() !void {
         report(&.{0x28});
         report(&.{ 0, 0, 0, 0, 0, 0 });
     }
+}
+
+test "HID retires pending state on SETUP, completion and reset" {
+    const host = microzig.testing_usb;
+    try host.start(USB_conf);
+    defer host.stop();
+
+    usb_ll.set_addr(0);
+    host.load_ep0(&.{ 0, 5, 42, 0, 0, 0, 0, 0 });
+    ep0_setup(.EPC0, null);
+    try std.testing.expectEqual(@as(u7, 0), host.address());
+
+    host.load_ep0(&.{ 0, 9, 1, 0, 0, 0, 0, 0 });
+    ep0_setup(.EPC0, null);
+    ep0_tx(.EPC0, null);
+    try std.testing.expectEqual(@as(u7, 0), host.address());
+
+    // HID status completion applies an address once.
+    host.load_ep0(&.{ 0, 5, 42, 0, 0, 0, 0, 0 });
+    ep0_setup(.EPC0, null);
+    ep0_tx(.EPC0, null);
+    try std.testing.expectEqual(@as(u7, 42), host.address());
+    try std.testing.expectEqual(@as(?u7, null), device_addr);
+
+    // HID bus reset clears the session and releases a pending report.
+    usb_ll.set_addr(12);
+    device_addr = 42;
+    config = true;
+    to_report = true;
+    host.raise_reset();
+    microzig_options.interrupts.USB_LP_CAN1_RX0.c();
+
+    try std.testing.expectEqual(@as(u7, 0), host.address());
+    try std.testing.expectEqual(@as(?u7, null), device_addr);
+    try std.testing.expect(!config);
+    try std.testing.expect(!to_report);
 }
