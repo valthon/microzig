@@ -1539,7 +1539,10 @@ pub fn read_mac(mac: [*c]u8, typ: c_uint) callconv(.c) c_int {
 }
 
 pub fn timer_arm(ets_timer_ptr: ?*anyopaque, ms: u32, repeat: bool) callconv(.c) void {
-    timer_arm_us(ets_timer_ptr, ms * 1_000, repeat);
+    log.debug("timer_arm {?} {} {}", .{ ets_timer_ptr, ms, repeat });
+
+    const ets_timer: *c.ets_timer = @ptrCast(@alignCast(ets_timer_ptr));
+    timer.arm(ets_timer, .from_ms(ms), repeat);
 }
 
 pub fn timer_disarm(ets_timer_ptr: ?*anyopaque) callconv(.c) void {
@@ -1561,9 +1564,8 @@ pub fn timer_setfn(ets_timer_ptr: ?*anyopaque, callback_ptr: ?*anyopaque, arg: ?
 
     const ets_timer: *c.ets_timer = @ptrCast(@alignCast(ets_timer_ptr));
     const callback: timer.CallbackFn = @ptrCast(@alignCast(callback_ptr));
-    timer.setfn(callback_allocator(), ets_timer, callback, arg) catch {
-        log.warn("failed to allocate timer", .{});
-    };
+    // The void ABI cannot report a failed registration to the caller.
+    timer.setfn(callback_allocator(), ets_timer, callback, arg) catch @panic("radio timer_setfn: out of memory");
 }
 
 pub fn timer_arm_us(ets_timer_ptr: ?*anyopaque, us: u32, repeat: bool) callconv(.c) void {

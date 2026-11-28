@@ -372,7 +372,12 @@ pub fn build(b: *std.Build) void {
                 .filters = switch (radios) {
                     .coex => &.{},
                     .wifi_disabled => &.{"public Wi-Fi init validates options before acquiring a session"},
-                    .wifi_only => &.{"hal.radio.wifi.test."},
+                    .wifi_only => &.{
+                        "hal.radio.wifi.test.",
+                        "timer worker rescans",
+                        "timer worker dispatches",
+                        "timer worker stops",
+                    },
                     .ble_only => &.{"BLE-only task ABI removes a timed waiter and reclaims the task"},
                 },
             });
@@ -392,7 +397,9 @@ pub fn build(b: *std.Build) void {
                 .{ "rejects the hardware stop", "Wi-Fi stop: the PP queue rejected the hardware stop (ESP_ERR_WIFI_POST)" },
                 .{ "rejects both stops", "Wi-Fi stop: the PP queue rejected the interface stop and the hardware stop (ESP_ERR_WIFI_POST)" },
                 .{ "fails after the interfaces stopped", "Wi-Fi stop failed after the interfaces stopped" },
+                .{ "timer setfn panics when allocation fails", "radio timer_setfn: out of memory" },
             } else &.{
+                .{ "timer worker cannot release its own final reference", "radio timer worker cannot release its own final reference" },
                 .{ "ISR queue send and yield are silent with OSI debug logging enabled", "" },
             };
             const probe_filters = b.allocator.alloc([]const u8, probes.len) catch @panic("out of memory");
