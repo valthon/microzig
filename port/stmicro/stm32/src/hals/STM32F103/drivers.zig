@@ -184,16 +184,7 @@ pub const I2C_Device = struct {
     }
 
     pub fn write_then_read(dev: I2C_Device, address: I2CAddress, src: []const u8, dst: []u8, timeout: ?Duration) I2CError!void {
-        dev.bus.write_then_read_blocking(.from_generic(address), src, dst, timeout) catch |err| switch (err) {
-            I2C.Error.ArbitrationLoss => I2CError.UnknownAbort,
-            I2C.Error.BusError => I2CError.UnknownAbort,
-            I2C.Error.BusTimeout => I2CError.Timeout,
-            I2C.Error.UnrecoverableError => {
-                dev.bus.runtime_apply(dev.config) catch {};
-                return I2CError.UnknownAbort;
-            },
-            else => |e| e,
-        };
+        return dev.writev_then_readv(address, &.{src}, &.{dst}, timeout);
     }
 
     pub fn writev_then_readv(
@@ -254,3 +245,7 @@ pub const I2C_Device = struct {
         return dev.writev_then_readv(address, write_chunks, read_chunks, dev.timeout);
     }
 };
+
+test "F103 concrete write_then_read compiles" {
+    @import("std").mem.doNotOptimizeAway(&I2C_Device.write_then_read);
+}
