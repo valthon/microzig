@@ -79,7 +79,7 @@ pub const I2C_DatagramDevice = struct {
         write_chunks: []const []const u8,
         read_chunks: []const []u8,
     ) !void {
-        try dev.bus.writev_then_readv_blocking(dev.address, write_chunks, read_chunks, null);
+        try dev.bus.writev_then_readv_blocking(dev.address, write_chunks, read_chunks, dev.timeout);
     }
 
     const vtable = DatagramDevice.VTable{
@@ -150,7 +150,7 @@ pub const I2C_DatagramDevice = struct {
             => error.IoError,
 
             error.Timeout => error.Timeout,
-            error.NoData => {},
+            error.NoData => empty_combined_transfer(write_chunks, read_chunks),
         };
     }
 };
@@ -251,6 +251,11 @@ pub const I2C_Device = struct {
         return dev.writev_then_readv(address, write_chunks, read_chunks);
     }
 };
+
+fn empty_combined_transfer(write_chunks: []const []const u8, read_chunks: []const []u8) error{Unsupported}!void {
+    for (write_chunks) |chunk| if (chunk.len != 0) return error.Unsupported;
+    for (read_chunks) |chunk| if (chunk.len != 0) return error.Unsupported;
+}
 
 ///
 /// Implementation of a time device

@@ -37,6 +37,7 @@ comptime {
         _ = &drivers.SPI_Device.writev;
         _ = &drivers.SPI_Device.read;
         _ = &drivers.SPI_Device.readv;
+        _ = &drivers.I2C_DatagramDevice.datagram_device;
         _ = &i2cdma.I2C.read_blocking;
         _ = &i2cdma.I2C.writev_blocking;
         _ = &i2cdma.I2C.write_then_read_blocking;
@@ -327,6 +328,32 @@ pub const serial_test = struct {
         }
     }
 };
+
+test "concrete and erased I2C datagrams apply deadlines and handle empty phases" {
+    const fake = serial_test;
+    const address: i2c.Address = @fromBackingInt(0x42);
+    var adapter = drivers.I2C_DatagramDevice.init(i2c.num(0), address, .from_us(100));
+    const erased = adapter.datagram_device();
+    var dst: [2]u8 = undefined;
+
+    fake.reset(.twi);
+    try std.testing.expectError(error.Unsupported, erased.writev_then_readv(&.{""}, &.{ &.{}, &dst }));
+    try std.testing.expectError(error.Unsupported, erased.writev_then_readv(&.{"w"}, &.{&.{}}));
+    try erased.writev_then_readv(&.{""}, &.{&.{}});
+    try std.testing.expectEqual(@as(u32, 0), fake.twi.TASKS_STARTTX.raw);
+
+    try std.testing.expectError(error.Timeout, adapter.writev_then_readv(&.{"w"}, &.{dst[0..1]}));
+    try std.testing.expect(fake.bus.twi_stop_at != null);
+    try std.testing.expectEqual(@as(u32, 1), fake.twi.EVENTS_STOPPED.raw);
+
+    fake.reset(.twi);
+    fake.bus.twi_tx_at = 50;
+    try std.testing.expectError(error.Timeout, erased.writev_then_readv(&.{"w"}, &.{&dst}));
+    try std.testing.expect(fake.twi.TASKS_STARTRX.raw != 0);
+    try std.testing.expect(fake.bus.twi_resumed_with_shorts_cleared);
+    try std.testing.expectEqual(@as(u32, 1), fake.twi.EVENTS_STOPPED.raw);
+    try std.testing.expectEqual(.Enabled, fake.twi.ENABLE.read().ENABLE);
+}
 
 test "TWI disables a stuck controller and the next transfer can re-enable it" {
     const fake = serial_test;
