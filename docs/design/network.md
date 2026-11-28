@@ -139,7 +139,9 @@ For RX, the wrapper checks that `head` and `len` describe a frame within the sup
   bus status word. Preserve the four-byte alignment and accessible tail padding
   for the TX adapter's word-rounded transfer. The driver reports association as
   link state and checks firmware credit before writing TX.
-- In `examples/raspberrypi/rp2xxx/src/net/irq.zig:main`, GPIO masks the source and posts a wake.
+- In `examples/raspberrypi/rp2xxx/src/net/irq.zig:main`, GPIO masks the source and posts a wake,
+  and the foreground reads and clears the wake flags in one critical section
+  (`examples/raspberrypi/rp2xxx/src/net/irq.zig:take_wakeup_source`).
   The HAL also masks the pin around SPI transfers and restores its previous state. Foreground drains RX, and
   `drivers/src/wireless/cyw43439/wifi.zig:read` asks the HAL to re-arm when the interrupt
   is set, no packet remains and join state is other than `.none`.
@@ -180,7 +182,6 @@ For RX, the wrapper checks that `head` and `len` describe a frame within the sup
 
 ## Open questions
 
-- `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/espressif/esp/src/tcp_server.zig:run` can return from an ordinary server error even after successful Wi-Fi teardown, while lwIP still references the stack-local netif and allocator. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/tcp_server.zig:run_server` can deinitialize Wi-Fi after a server error with the netif still up and registered, allowing TX to overlap teardown. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/tcp_server.zig:maybe_netif` is shared with the vendor task without synchronized publication. ([#81](https://github.com/valthon/microzig/issues/81))
