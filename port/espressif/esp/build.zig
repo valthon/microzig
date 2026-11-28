@@ -346,16 +346,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run platform agnostic unit tests");
     if (b.lazyDependency("esp-wifi-sys", .{})) |sys| {
         const headers = wifi_headers(b, sys, "esp32c6", target);
-        const HostRadios = enum { coex, wifi_disabled, wifi_only };
-        for ([_]HostRadios{ .coex, .wifi_disabled, .wifi_only }) |radios| {
-            const options = b.addOptions();
-            options.addOption(bool, "wifi", radios != .wifi_disabled);
-            options.addOption(bool, "coex", radios != .wifi_only);
+        const HostRadios = enum { coex, wifi_disabled, wifi_only, ble_only };
+        for ([_]HostRadios{ .coex, .wifi_disabled, .wifi_only, .ble_only }) |radios| {
             const host_microzig = b.createModule(.{
-                .root_source_file = b.path("src/hal/usb_serial_jtag/test_microzig.zig"),
+                .root_source_file = b.path(if (radios == .ble_only)
+                    "src/hal/radio/test_ble_host.zig"
+                else
+                    "src/hal/usb_serial_jtag/test_microzig.zig"),
             });
-            host_microzig.addOptions("test-radio-options", options);
-            host_microzig.addImport("core-allocator", b.createModule(.{ .root_source_file = b.path("../../../core/src/allocator.zig") }));
+            if (radios != .ble_only) {
+                const options = b.addOptions();
+                options.addOption(bool, "wifi", radios != .wifi_disabled);
+                options.addOption(bool, "coex", radios != .wifi_only);
+                host_microzig.addOptions("test-radio-options", options);
+                host_microzig.addImport("core-allocator", b.createModule(.{ .root_source_file = b.path("../../../core/src/allocator.zig") }));
+            }
             host_microzig.addImport("drivers", b.createModule(.{ .root_source_file = b.path("../../../drivers/src/root.zig") }));
             const unit_tests = b.addTest(.{
                 .name = b.fmt("hal-host-{s}", .{@tagName(radios)}),
@@ -367,7 +372,13 @@ pub fn build(b: *std.Build) void {
                 .filters = switch (radios) {
                     .coex => &.{},
                     .wifi_disabled => &.{"public Wi-Fi init validates options before acquiring a session"},
-                    .wifi_only => &.{"hal.radio.wifi.test."},
+                    .wifi_only => &.{
+                        "hal.radio.wifi.test.",
+                        "timer worker rescans",
+                        "timer worker dispatches",
+                        "timer worker stops",
+                    },
+                    .ble_only => &.{"BLE-only task ABI removes a timed waiter and reclaims the task"},
                 },
             });
             host_microzig.addImport("hal-under-test", unit_tests.root_module);
@@ -377,21 +388,30 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
             }));
             test_step.dependOn(&b.addRunArtifact(unit_tests).step);
-            if (radios != .coex) continue;
+            if (radios != .coex and radios != .wifi_only) continue;
 
-            // The public Wi-Fi stop panics, one process each.
-            const stop_panic_tests = b.addTest(.{
-                .name = "wifi-stop-panics",
-                .root_module = unit_tests.root_module,
-                .test_runner = .{ .path = b.path("src/hal/radio/stop_panic_runner.zig"), .mode = .simple },
-            });
-            for ([_][2][]const u8{
+            // Run expected panics and the debug logging probe in isolated processes.
+            const RadioProbe = [2][]const u8;
+            const probes: []const RadioProbe = if (radios == .coex) &.{
                 .{ "rejects the interface stop", "Wi-Fi stop: the PP queue rejected the interface stop (ESP_ERR_WIFI_POST)" },
                 .{ "rejects the hardware stop", "Wi-Fi stop: the PP queue rejected the hardware stop (ESP_ERR_WIFI_POST)" },
                 .{ "rejects both stops", "Wi-Fi stop: the PP queue rejected the interface stop and the hardware stop (ESP_ERR_WIFI_POST)" },
                 .{ "fails after the interfaces stopped", "Wi-Fi stop failed after the interfaces stopped" },
-            }) |case| {
-                const run = b.addRunArtifact(stop_panic_tests);
+                .{ "timer setfn panics when allocation fails", "radio timer_setfn: out of memory" },
+            } else &.{
+                .{ "timer worker cannot release its own final reference", "radio timer worker cannot release its own final reference" },
+                .{ "ISR queue send and yield are silent with OSI debug logging enabled", "" },
+            };
+            const probe_filters = b.allocator.alloc([]const u8, probes.len) catch @panic("out of memory");
+            for (probes, probe_filters) |probe, *filter| filter.* = probe[0];
+            const probe_tests = b.addTest(.{
+                .name = b.fmt("radio-probes-{s}", .{@tagName(radios)}),
+                .root_module = unit_tests.root_module,
+                .filters = probe_filters,
+                .test_runner = .{ .path = b.path("src/hal/radio/stop_panic_runner.zig"), .mode = .simple },
+            });
+            for (probes) |case| {
+                const run = b.addRunArtifact(probe_tests);
                 run.addArgs(&case);
                 test_step.dependOn(&run.step);
             }

@@ -4,12 +4,13 @@ const log = std.log.scoped(.rtos);
 
 const microzig = @import("microzig");
 const enter_critical_section = microzig.interrupt.enter_critical_section;
-const TrapFrame = microzig.cpu.TrapFrame;
+const host_test = @import("radio/callback_context.zig").host_test;
+const TrapFrame = if (host_test) void else microzig.cpu.TrapFrame;
 const rtos_options = microzig.options.hal.rtos;
 const radios = microzig.options.hal.radio.radios;
 const coex_enabled = radios.coexistence();
-// The Wi-Fi blob can detach its packet worker on either radio selection.
-const task_teardown_enabled = coex_enabled or radios.wifi;
+// Wi-Fi and BLE blobs can detach their workers by handle.
+const task_teardown_enabled = radios.wifi or radios.ble;
 
 const system = @import("system.zig");
 const systimer = @import("systimer.zig");
@@ -100,7 +101,7 @@ var idle_stack: [STACK_ALIGN.forward(EXTRA_STACK_SIZE)]u8 align(STACK_ALIGN.toBy
 var idle_task: Task = .{
     .name = "idle",
     .context = .{
-        .pc = &idle,
+        .pc = if (host_test) null else &idle,
         .sp = idle_stack[idle_stack.len..].ptr,
         .fp = null,
     },
@@ -156,11 +157,7 @@ pub fn init() void {
     const cs = enter_critical_section();
     defer cs.leave();
 
-    rtos_state = .{
-        .current_task = &main_task,
-        .current_sleep_queue = &rtos_state.sleep_queues[0],
-        .overflow_sleep_queue = &rtos_state.sleep_queues[1],
-    };
+    init_scheduler(&main_task);
     if (rtos_options.paint_stack_byte) |paint_byte| {
         @memset(&idle_stack, paint_byte);
     }
@@ -185,6 +182,45 @@ pub fn init() void {
     microzig.cpu.interrupt.set_priority(rtos_options.interrupt, .lowest);
     microzig.cpu.interrupt.enable(rtos_options.interrupt);
 }
+
+fn init_scheduler(caller: *Task) void {
+    rtos_state = .{
+        .current_task = caller,
+        .current_sleep_queue = &rtos_state.sleep_queues[0],
+        .overflow_sleep_queue = &rtos_state.sleep_queues[1],
+    };
+}
+
+/// Host tests drive the real ready and sleep queues without switching stacks.
+pub const TestScheduler = struct {
+    pub fn init(caller: *Task) void {
+        comptime assert(host_test);
+        caller.state = .running;
+        init_scheduler(caller);
+    }
+
+    pub fn park(queue: *PriorityWaitQueue, waiter: *PriorityWaitQueue.Waiter) void {
+        comptime assert(host_test);
+        const task = waiter.task;
+        assert(task.state == .ready);
+        const caller = rtos_state.current_task;
+
+        rtos_state.ready_queue.remove(task);
+        caller.state = .ready;
+        rtos_state.ready_queue.put(caller);
+        rtos_state.current_task = task;
+        task.state = .running;
+
+        queue.enqueue(waiter);
+        _ = yield_inner(.{ .sleep = .from_ticks(1) });
+        assert(rtos_state.current_task == caller);
+    }
+
+    pub fn has_sleepers() bool {
+        comptime assert(host_test);
+        return rtos_state.sleep_queues[0].first != null or rtos_state.sleep_queues[1].first != null;
+    }
+};
 
 fn idle() linksection(".ram_text") callconv(.naked) void {
     // interrupts are initially disabled in new tasks
@@ -244,7 +280,10 @@ pub fn spawn(
 
     const args_start = args_align.forward(@sizeOf(Task));
     const stack_start = STACK_ALIGN.forward(args_start + @sizeOf(Args));
-    const stack_end = STACK_ALIGN.forward(stack_start + options.stack_size + EXTRA_STACK_SIZE);
+    const stack_payload_end = std.math.add(usize, stack_start, options.stack_size) catch return error.OutOfMemory;
+    const padding = STACK_ALIGN.toByteUnits() - 1;
+    const padded_end = std.math.add(usize, stack_payload_end, EXTRA_STACK_SIZE + padding) catch return error.OutOfMemory;
+    const stack_end = STACK_ALIGN.backward(padded_end);
 
     const alloc_size = stack_end;
     const raw_alloc = try gpa.alignedAlloc(u8, alloc_align, alloc_size);
@@ -255,15 +294,15 @@ pub fn spawn(
     task_args.* = args;
 
     const stack: []u8 = raw_alloc[stack_start..stack_end];
-    if (rtos_options.paint_stack_byte) |paint_byte| {
-        @memset(stack, paint_byte);
+    if (!host_test) {
+        if (rtos_options.paint_stack_byte) |paint_byte| @memset(stack, paint_byte);
     }
 
     task.* = .{
         .name = options.name,
         .context = .{
             .sp = stack[stack.len..].ptr,
-            .pc = &TypeErased.call,
+            .pc = if (host_test) null else &TypeErased.call,
             .fp = null,
         },
         .stack = stack,
@@ -358,6 +397,7 @@ pub inline fn yield(action: YieldAction) void {
 }
 
 pub inline fn yield_from_cs(action: YieldAction) void {
+    if (host_test) @panic("host RTOS cannot switch stacks");
     const current_task, const next_task = yield_inner(action);
     context_switch(&current_task.context, &next_task.context);
 }
@@ -491,6 +531,11 @@ inline fn context_switch(prev_context: *Context, next_context: *Context) void {
 }
 
 pub fn yield_from_isr() linksection(".ram_text") void {
+    const root = @import("root");
+    if (@import("builtin").is_test and @hasDecl(root, "stop_panic_runner")) {
+        root.isr_yield_requests += 1;
+        return;
+    }
     rtos_options.cpu_interrupt.set_pending(true);
 }
 
@@ -717,7 +762,7 @@ pub fn log_task_info(task: *Task) void {
 }
 
 pub inline fn in_isr() bool {
-    return microzig.cpu.csr.mscratch.read_raw() != 0;
+    return if (host_test) microzig.radio_test.in_isr else microzig.cpu.csr.mscratch.read_raw() != 0;
 }
 
 pub const Task = struct {
@@ -943,18 +988,7 @@ pub const PriorityWaitQueue = struct {
             .priority = task.priority,
         };
 
-        var it = q.list.first;
-        while (it) |current_node| : (it = current_node.next) {
-            const current_waiter: *Waiter = @alignCast(@fieldParentPtr("node", current_node));
-            if (@backingInt(waiter.priority) > @backingInt(current_waiter.priority)) {
-                q.list.insert_before(&current_waiter.node, &waiter.node);
-                break;
-            }
-        } else {
-            q.list.append(&waiter.node);
-        }
-
-        if (task_teardown_enabled) task.active_wait = .{ .queue = q, .node = &waiter.node };
+        q.enqueue(&waiter);
         if (maybe_timeout_duration) |duration| {
             yield_from_cs(.{ .sleep = duration });
         } else {
@@ -967,6 +1001,21 @@ pub const PriorityWaitQueue = struct {
             task.active_wait = null;
         }
         q.list.remove(&waiter.node);
+    }
+
+    fn enqueue(q: *PriorityWaitQueue, waiter: *Waiter) void {
+        var it = q.list.first;
+        while (it) |current_node| : (it = current_node.next) {
+            const current_waiter: *Waiter = @alignCast(@fieldParentPtr("node", current_node));
+            if (@backingInt(waiter.priority) > @backingInt(current_waiter.priority)) {
+                q.list.insert_before(&current_waiter.node, &waiter.node);
+                break;
+            }
+        } else {
+            q.list.append(&waiter.node);
+        }
+
+        if (task_teardown_enabled) waiter.task.active_wait = .{ .queue = q, .node = &waiter.node };
     }
 };
 

@@ -21,6 +21,7 @@ const log = std.log.scoped(.esp_radio_osi);
 
 const coex_enabled = radio.coex_enabled;
 const coex = @import("coex.zig");
+const callback_context = @import("callback_context.zig");
 const phy_modems = @import("phy_modems.zig");
 const shared_heap = @import("shared_heap.zig");
 
@@ -49,7 +50,7 @@ pub var gpa: if (coex_enabled) void else std.mem.Allocator = if (coex_enabled) {
 pub var wifi_interrupt_handler: ?struct {
     f: *const fn (?*anyopaque) callconv(.c) void,
     arg: ?*anyopaque,
-} = undefined;
+} = null;
 
 extern fn vsnprintf(buffer: [*c]u8, len: usize, fmt: [*c]const u8, va_list: std.lang.VaList) callconv(.c) void;
 
@@ -124,18 +125,20 @@ pub fn __assert_func(
 pub fn malloc(len: usize) callconv(.c) ?*anyopaque {
     log.debug("malloc {}", .{len});
 
-    const buf = callback_allocator().rawAlloc(8 + len, .@"8", @returnAddress()) orelse {
+    if (len == 0) return null;
+    const alloc_len = std.math.add(usize, 8, len) catch return null;
+    const buf = callback_allocator().rawAlloc(alloc_len, .@"8", @returnAddress()) orelse {
         log.warn("failed to allocate memory: {}", .{len});
         return null;
     };
 
-    const alloc_len: *usize = @ptrCast(@alignCast(buf));
-    alloc_len.* = len;
+    const stored_len: *usize = @ptrCast(@alignCast(buf));
+    stored_len.* = len;
     return @ptrFromInt(@intFromPtr(buf) + 8);
 }
 
 pub fn calloc(number: usize, size: usize) callconv(.c) ?*anyopaque {
-    const total_size: usize = number * size;
+    const total_size = std.math.mul(usize, number, size) catch return null;
     if (malloc(total_size)) |ptr| {
         @memset(@as([*]u8, @ptrCast(ptr))[0..total_size], 0);
         return ptr;
@@ -280,6 +283,8 @@ pub fn set_isr(
 
     switch (n) {
         0, 1 => {
+            const cs = enter_critical_section();
+            defer cs.leave();
             wifi_interrupt_handler = if (f) |handler| .{
                 .f = @ptrCast(@alignCast(handler)),
                 .arg = arg,
@@ -310,7 +315,7 @@ pub fn ints_off(mask: u32) callconv(.c) void {
 }
 
 pub fn is_from_isr() callconv(.c) bool {
-    return true;
+    return callback_context.in_isr();
 }
 
 pub fn spin_lock_create() callconv(.c) ?*anyopaque {
@@ -342,18 +347,14 @@ pub fn wifi_int_restore(mux_ptr: ?*anyopaque, state: u32) callconv(.c) void {
     }
 }
 
-// In a coexistence image this callback and the two coex status-bit callbacks
-// log nothing at any level: this one runs in an interrupt, and
-// coex_callback_test checks all three. Single-radio images keep their logs.
 pub fn task_yield_from_isr() callconv(.c) void {
-    if (!coex_enabled) log.debug("task_yield_from_isr", .{});
-
     rtos.yield_from_isr();
 }
 
 pub fn semphr_create(max_value: u32, init_value: u32) callconv(.c) ?*anyopaque {
     log.debug("semphr_create {} {}", .{ max_value, init_value });
 
+    if (max_value == 0 or init_value > max_value) return null;
     const sem = callback_allocator().create(rtos.Semaphore) catch {
         log.warn("failed to allocate semaphore", .{});
         return null;
@@ -607,17 +608,20 @@ pub const QueueWrapper = struct {
     inner: rtos.TypeErasedQueue,
 };
 
+fn queue_buffer_len(capacity: u32, item_len: u32) ?usize {
+    if (capacity == 0 or item_len == 0) return null;
+    return std.math.mul(u32, capacity, item_len) catch null;
+}
+
 pub fn queue_create(capacity: u32, item_len: u32) callconv(.c) ?*anyopaque {
     log.debug("queue_create {} {}", .{ capacity, item_len });
 
-    const new_cap, const new_item_len = if (capacity != 3 and item_len != 4)
-        .{ capacity, item_len }
-    else blk: {
-        log.warn("fixing queue item len", .{});
-        break :blk .{ 3, 8 };
-    };
+    // esp-wifi's WIFI-6676 workaround is for the supplicant message queue.
+    // The pinned C3/C6 eap_peer_sm_init already requests (3, 8).
+    const stored_item_len: u32 = if (capacity == 3 and item_len == 4) 8 else item_len;
 
-    const buf: []u8 = callback_allocator().alloc(u8, new_cap * new_item_len) catch {
+    const len = queue_buffer_len(capacity, stored_item_len) orelse return null;
+    const buf: []u8 = callback_allocator().alloc(u8, len) catch {
         log.warn("failed to allocate queue buffer", .{});
         return null;
     };
@@ -629,7 +633,7 @@ pub fn queue_create(capacity: u32, item_len: u32) callconv(.c) ?*anyopaque {
     };
 
     queue.* = .{
-        .item_len = new_item_len,
+        .item_len = stored_item_len,
         .inner = .init(buf),
     };
 
@@ -663,8 +667,6 @@ pub fn queue_send(ptr: ?*anyopaque, item_ptr: ?*anyopaque, block_time_tick: u32)
 }
 
 pub fn queue_send_from_isr(ptr: ?*anyopaque, item_ptr: ?*anyopaque, _hptw: ?*anyopaque) callconv(.c) i32 {
-    log.debug("queue_send_from_isr {?} {?} {?}", .{ ptr, item_ptr, _hptw });
-
     const queue: *QueueWrapper = @ptrCast(@alignCast(ptr));
     const item: [*]const u8 = @ptrCast(@alignCast(item_ptr));
 
@@ -758,10 +760,10 @@ fn task_create_common(
 ) i32 {
     _ = core_id; // autofix
 
+    if (stack_depth == 0) return 0;
+    const debug_stack_extra = if (builtin.mode == .debug) 6000 else 0;
+    const stack_size = std.math.add(u32, stack_depth, debug_stack_extra) catch return 0;
     const task_entry: *const fn (param: ?*anyopaque) callconv(.c) noreturn = @ptrCast(@alignCast(task_func));
-
-    // increase stack size if we are in debug mode
-    const stack_size: usize = stack_depth + if (builtin.mode == .debug) 6000 else 0;
     const task: *rtos.Task = rtos.spawn(callback_allocator(), task_wrapper, .{ task_entry, param }, .{
         .name = std.mem.span(name),
         .priority = @fromBackingInt(@truncate(prio)),
@@ -825,10 +827,22 @@ pub fn task_create(
 
 pub fn task_delete(handle: ?*anyopaque) callconv(.c) void {
     log.debug("task_delete {?}", .{handle});
-    if (handle != null) {
-        @panic("task_delete(non-null): not implemented");
-    }
-    rtos.yield(.exit);
+    // C6 libble_app.a r_ble_controller_disable+0xc loads the saved handle,
+    // skips NULL at +0x14, and calls ExtFuncs.task_delete at +0x20.
+    delete_blob_task(handle, rtos.get_current_task(), null, rtos.detach_task, rtos.yield);
+}
+
+fn delete_blob_task(
+    handle: ?*anyopaque,
+    current: *rtos.Task,
+    retained_worker: ?*rtos.Task,
+    comptime detach: anytype,
+    comptime yield: anytype,
+) void {
+    const task: *rtos.Task = @ptrCast(@alignCast(handle orelse return yield(.exit)));
+    if (task == current) return yield(.exit);
+    detach(task);
+    if (task != retained_worker) rtos.free_exited_task(callback_allocator(), task);
 }
 
 // C6 libnet80211.a esp_wifi_stop posts three stop steps to the PP task through
@@ -1090,12 +1104,9 @@ pub const WifiShutdown = struct {
     /// only the WPA2-Enterprise and WPS APIs create (the port has neither).
     /// Starting any of them would leak its stack and TCB for the boot.
     pub fn delete_task(self: *WifiShutdown, handle: ?*anyopaque, current: *rtos.Task, comptime detach: anytype, comptime yield: anytype) void {
-        const task: *rtos.Task = @ptrCast(@alignCast(handle orelse return yield(.exit)));
-        if (task == current) return yield(.exit);
-        detach(task);
-        // During shutdown the caller joins both the manual and the normal
-        // self-delete path, including rollback inside esp_wifi_init_internal.
-        if (task != self.worker) rtos.free_exited_task(callback_allocator(), task);
+        // Shutdown joins the PP task on both manual and self-delete paths,
+        // including rollback inside esp_wifi_init_internal.
+        delete_blob_task(handle, current, self.worker, detach, yield);
     }
 };
 
@@ -1528,7 +1539,10 @@ pub fn read_mac(mac: [*c]u8, typ: c_uint) callconv(.c) c_int {
 }
 
 pub fn timer_arm(ets_timer_ptr: ?*anyopaque, ms: u32, repeat: bool) callconv(.c) void {
-    timer_arm_us(ets_timer_ptr, ms * 1_000, repeat);
+    log.debug("timer_arm {?} {} {}", .{ ets_timer_ptr, ms, repeat });
+
+    const ets_timer: *c.ets_timer = @ptrCast(@alignCast(ets_timer_ptr));
+    timer.arm(ets_timer, .from_ms(ms), repeat);
 }
 
 pub fn timer_disarm(ets_timer_ptr: ?*anyopaque) callconv(.c) void {
@@ -1550,9 +1564,8 @@ pub fn timer_setfn(ets_timer_ptr: ?*anyopaque, callback_ptr: ?*anyopaque, arg: ?
 
     const ets_timer: *c.ets_timer = @ptrCast(@alignCast(ets_timer_ptr));
     const callback: timer.CallbackFn = @ptrCast(@alignCast(callback_ptr));
-    timer.setfn(callback_allocator(), ets_timer, callback, arg) catch {
-        log.warn("failed to allocate timer", .{});
-    };
+    // The void ABI cannot report a failed registration to the caller.
+    timer.setfn(callback_allocator(), ets_timer, callback, arg) catch @panic("radio timer_setfn: out of memory");
 }
 
 pub fn timer_arm_us(ets_timer_ptr: ?*anyopaque, us: u32, repeat: bool) callconv(.c) void {
@@ -1796,16 +1809,19 @@ test "PP rollback clears ROM aliases before freeing the queue and startup semaph
 pub fn wifi_create_queue(capacity: c_int, item_len: c_int) callconv(.c) ?*anyopaque {
     log.debug("wifi_create_queue {} {}", .{ capacity, item_len });
 
+    if (capacity <= 0 or item_len <= 0) return null;
+    const width: u32 = @intCast(item_len);
+    const len = queue_buffer_len(@intCast(capacity), width) orelse return null;
     std.debug.assert(wifi_queue_handle == null);
 
-    const buf: []u8 = callback_allocator().alloc(u8, @intCast(capacity * item_len)) catch {
+    const buf: []u8 = callback_allocator().alloc(u8, len) catch {
         log.warn("failed to allocate queue buffer", .{});
         return null;
     };
 
     wifi_queue = .{
         .inner = .init(buf),
-        .item_len = @intCast(item_len),
+        .item_len = width,
     };
     wifi_queue_handle = &wifi_queue;
 
@@ -1964,6 +1980,118 @@ pub fn coex_schm_flexible_period_get() callconv(.c) u8 {
     log.debug("coex_schm_flexible_period_get", .{});
 
     return if (coex_enabled) 1 else 0;
+}
+
+test "Wi-Fi ISR context queries distinguish tasks from interrupts" {
+    defer microzig.radio_test.in_isr = false;
+    try std.testing.expect(!is_from_isr());
+    microzig.radio_test.in_isr = true;
+    try std.testing.expect(is_from_isr());
+}
+
+test "Wi-Fi interrupt callback starts empty and can be uninstalled" {
+    const Handler = struct {
+        fn run(arg: ?*anyopaque) callconv(.c) void {
+            const called: *bool = @ptrCast(arg);
+            called.* = true;
+        }
+    };
+    try std.testing.expect(wifi_interrupt_handler == null);
+    var called = false;
+    set_isr(0, @ptrCast(@constCast(&Handler.run)), &called);
+    defer set_isr(0, null, null);
+    const handler = wifi_interrupt_handler.?;
+    handler.f(handler.arg);
+    try std.testing.expect(called);
+    set_isr(0, null, null);
+    try std.testing.expect(wifi_interrupt_handler == null);
+}
+
+test "queue send from ISR preserves the wake flag and reports a full queue" {
+    var buffer: [4]u8 = undefined;
+    var queue: QueueWrapper = .{ .item_len = 4, .inner = .init(&buffer) };
+    var item: [4]u8 = .{ 1, 2, 3, 4 };
+    var wake: u32 = 0x40;
+    try std.testing.expectEqual(1, queue_send_from_isr(&queue, &item, &wake));
+    try std.testing.expectEqualSlices(u8, &item, &buffer);
+    try std.testing.expectEqual(0, queue_send_from_isr(&queue, &item, &wake));
+    try std.testing.expectEqual(0x40, wake);
+}
+
+test "ISR queue send and yield are silent with OSI debug logging enabled" {
+    const root = @import("root");
+    if (!@hasDecl(root, "stop_panic_runner")) return error.SkipZigTest;
+
+    log.debug("verify OSI debug logging is enabled", .{});
+    try std.testing.expectEqual(1, root.osi_logs);
+    root.osi_logs = 0;
+    var buffer: [1]u8 = undefined;
+    var queue: QueueWrapper = .{ .item_len = 1, .inner = .init(&buffer) };
+    var item: u8 = 42;
+    var wake: u32 = 0;
+    try std.testing.expectEqual(1, queue_send_from_isr(&queue, &item, &wake));
+    task_yield_from_isr();
+    try std.testing.expectEqual(1, root.isr_yield_requests);
+    try std.testing.expectEqual(0, root.osi_logs);
+}
+
+test "queue creation widens only the legacy supplicant shape" {
+    var route: @import("shared_heap.zig").TestRoute = .{};
+    route.install(std.testing.allocator);
+    defer route.restore();
+
+    for ([_]struct { capacity: u32, requested: u32, stored: u32 }{
+        .{ .capacity = 10, .requested = 4, .stored = 4 },
+        .{ .capacity = 3, .requested = 12, .stored = 12 },
+        .{ .capacity = 3, .requested = 8, .stored = 8 },
+        .{ .capacity = 3, .requested = 4, .stored = 8 },
+    }) |shape| {
+        const handle = queue_create(shape.capacity, shape.requested) orelse return error.OutOfMemory;
+        defer queue_delete(handle);
+        const queue: *QueueWrapper = @ptrCast(@alignCast(handle));
+        try std.testing.expectEqual(shape.stored, queue.item_len);
+        try std.testing.expectEqual(shape.capacity * shape.stored, queue.inner.buffer.len);
+    }
+}
+
+test "OSI size validation rejects invalid requests before the allocator" {
+    var rejecting = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var route: @import("shared_heap.zig").TestRoute = .{};
+    route.install(rejecting.allocator());
+    defer route.restore();
+
+    try std.testing.expect(queue_create(0, 4) == null);
+    try std.testing.expect(queue_create(3, 0) == null);
+    try std.testing.expect(queue_create(1_073_741_825, 4) == null);
+    try std.testing.expect(queue_create(3, std.math.maxInt(u32) / 3 + 1) == null);
+    try std.testing.expect(wifi_create_queue(0, 4) == null);
+    try std.testing.expect(wifi_create_queue(3, 0) == null);
+    try std.testing.expect(wifi_create_queue(-3, -4) == null);
+    try std.testing.expect(wifi_create_queue(std.math.maxInt(c_int), 3) == null);
+
+    try std.testing.expect(malloc(0) == null);
+    try std.testing.expect(malloc(std.math.maxInt(usize) - 7) == null);
+    try std.testing.expect(calloc(0, 1) == null);
+    try std.testing.expect(calloc(std.math.maxInt(usize) / 2 + 1, 2) == null);
+    try std.testing.expect(calloc(1, std.math.maxInt(usize)) == null);
+    try std.testing.expect(wifi_zalloc(0) == null);
+    try std.testing.expect(wifi_realloc(null, std.math.maxInt(usize)) == null);
+    try std.testing.expect(semphr_create(0, 0) == null);
+    try std.testing.expect(semphr_create(1, 2) == null);
+    try std.testing.expect(!rejecting.has_induced_failure);
+}
+
+test "an overflowing OSI reallocation keeps the old allocation" {
+    var route: @import("shared_heap.zig").TestRoute = .{};
+    route.install(std.testing.allocator);
+    defer route.restore();
+
+    const old = wifi_malloc(8) orelse return error.OutOfMemory;
+    defer free(old);
+    const bytes: *[8]u8 = @ptrCast(old);
+    @memcpy(bytes, "retained");
+    try std.testing.expect(wifi_realloc(old, std.math.maxInt(usize)) == null);
+    try std.testing.expectEqualStrings("retained", bytes);
 }
 
 test "a deleted blob task is freed into the callback route, the PP task only by teardown" {
