@@ -488,10 +488,10 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             // Notify controller/drivers of IN completion.
             self.call_on_buffer(.in, ep, controller);
 
-            // After EP0 IN completes, re-arm EP0 OUT for the next SETUP.
-            // SETUP packets always use DATA0 toggle; the WCH USBFS hardware
-            // checks the toggle even for SETUP, so we must reset to DATA0.
-            if (ep == 0) {
+            // A control read still expects a DATA1 status OUT (USB 2.0
+            // §8.5.3). Leave RX armed as set by ep_writev; the expected
+            // PID is independent of TX (CH32FV2x_V3x RM v2.5, §23.2.2.8–9).
+            if (ep == 0 and self.control.direction == .out) {
                 self.arm_ep0_out_always();
             }
         }
@@ -830,4 +830,38 @@ test "USBFS bus reset discards pending SETUP" {
     dev.poll(false, &ctl);
     try std.testing.expectEqual(resets + 2, ctl.resets);
     try std.testing.expectEqual(setups, ctl.setups);
+}
+
+test "USBFS control read keeps DATA1 status OUT armed through IN completion" {
+    const Device = Polled(.{}, .{});
+    const Controller = struct {
+        completions: usize = 0,
+
+        pub fn on_setup_req(_: *@This(), itf: *usb.DeviceInterface, _: *const types.SetupPacket) void {
+            _ = Device.ep_writev(itf, .ep0, &.{&@as([64]u8, @splat(0xA1))});
+        }
+
+        pub fn on_buffer(self: *@This(), itf: *usb.DeviceInterface, comptime ep: types.Endpoint) void {
+            std.debug.assert(ep.dir == .in and ep.num == .ep0);
+            self.completions += 1;
+            if (self.completions == 1) _ = Device.ep_writev(itf, .ep0, &.{"B"});
+        }
+    };
+    var dev: Device = undefined;
+    dev.endpoints = @splat(@splat(.{}));
+    var setup: [8]u8 align(4) = .{ 0x80, 6, 0, 1, 0, 0, 65, 0 }; // GET_DESCRIPTOR, wLength=65
+    var tx: [64]u8 align(4) = undefined;
+    dev.st(.ep0, .out).buf = &setup;
+    dev.st(.ep0, .in).buf = &tx;
+    var ctl: Controller = .{};
+
+    dev.handle_transfer(0, TOKEN_SETUP, &ctl);
+    try std.testing.expectEqual(TOG_DATA1, current_rx_tog(0));
+    for (1..3) |completions| {
+        dev.handle_in(0, &ctl);
+        try std.testing.expectEqual(completions, ctl.completions);
+        const rx = EP_Regs[0].UEP_RX_CTRL.read();
+        try std.testing.expectEqual(RES_ACK, rx.RES);
+        try std.testing.expectEqual(TOG_DATA1, rx.TOG);
+    }
 }
