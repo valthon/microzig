@@ -1,7 +1,6 @@
 const std = @import("std");
 const microzig = @import("microzig");
-// Both generated chip maps call this USB_DEVICE. EP1/EP1_CONF are described
-// in C6 TRM v1.2 §32.7, registers 32.1/32.2 (FIFO protocol: §32.3.2).
+// Both generated chip maps call this USB_DEVICE.
 const USB_SERIAL_JTAG = microzig.chip.peripherals.USB_DEVICE;
 const builtin = @import("builtin");
 const host_test = builtin.is_test and builtin.target.os.tag != .freestanding;
@@ -18,15 +17,19 @@ const log_state = @import("usb_serial_jtag/state.zig");
 /// Keep detached for a host-visible interval AFTER this returns, then attach.
 /// This is not a light-sleep state backup and does not preserve endpoint state.
 pub const Reenumeration = struct {
-    conf0: @TypeOf(USB_SERIAL_JTAG.CONF0.read()),
+    conf0: if (host_test) void else @TypeOf(USB_SERIAL_JTAG.CONF0.read()),
 
     pub fn detach_and_reset() Reenumeration {
+        if (host_test) {
+            test_host.reset_controller();
+            return .{ .conf0 = {} };
+        }
         @import("compatibility.zig").require_esp32_c3("USB re-enumeration experiment");
         const cs = microzig.interrupt.enter_critical_section();
         defer cs.leave();
-        const saved = USB_SERIAL_JTAG.CONF0.read();
         // C3 TRM v1.4 §30.6 reg 30.2: pad enable and pull override are
         // separate controls. Remove both pull-ups, not just pad functionality.
+        const saved = USB_SERIAL_JTAG.CONF0.read();
         USB_SERIAL_JTAG.CONF0.modify(.{ .USB_PAD_ENABLE = 0, .PAD_PULL_OVERRIDE = 1, .DP_PULLUP = 0, .DM_PULLUP = 0 });
         const system = microzig.chip.peripherals.SYSTEM;
         // §16.3.5/§16.4, PERIP_CLK_EN0/PERIP_RST_EN0: USB_DEVICE reset;
@@ -48,10 +51,19 @@ pub const Reenumeration = struct {
         return .{ .conf0 = saved };
     }
 
+    /// Restore the saved pads. With logger holding enabled, SYSTIMER unit 0
+    /// must be running to timestamp the start of the hold.
     pub fn attach(self: Reenumeration) void {
         // Restore PHY selection, pin exchange, thresholds and pull policy.
+        // C3 TRM v1.4 §30.6 register 30.2 (CONF0).
         // The bus clock is already enabled, as in IDF sleep_console.c restore.
-        USB_SERIAL_JTAG.CONF0.write(self.conf0);
+        if (!host_test) USB_SERIAL_JTAG.CONF0.write(self.conf0);
+        const reattach_logger = if (host_test) HeldTestLogger else logger;
+        if (reattach_logger.hold_enabled) {
+            const cs = log_interrupt.enter_critical_section();
+            defer cs.leave();
+            reattach_logger.start_hold();
+        }
     }
 };
 
@@ -158,17 +170,18 @@ test "without an Attachment only a SOF or a pending bus reset counts" {
 }
 
 /// C3/C6 soft detach state. C6 TRM v1.2 §32.7 CONF0 (register 32.3),
-/// FRAM_NUM (32.17), INT_RAW/INT_CLR (32.12/32.15) have the same pad,
+/// FRAM_NUM (32.17), INT_RAW/INT_ENA/INT_CLR (32.12/32.14/32.15) have the same pad,
 /// pull-override, SOF and bus-reset fields used below. Preserve C6's additional
 /// USB_JTAG_BRIDGE_EN bit along with all caller interrupt enables.
+/// C3 TRM v1.4 §30.6 describes CONF0 (30.2) and INT_ENA (30.18).
 /// Serialize the entire begin/finish interval against all
 /// USB users; pending CDC/JTAG transfers may be lost. Masking interrupts alone
 /// does not exclude a preempted logger owner. Quiesce logging and other TX
 /// users before begin(), and keep them quiescent through finish().
 /// Requires running PLL/APB clocks (C3 TRM v1.4 §30.4) and SYSTIMER unit 0.
 pub const Disconnect = struct {
-    conf0: @TypeOf(USB_SERIAL_JTAG.CONF0.read()),
-    int_ena: @TypeOf(USB_SERIAL_JTAG.INT_ENA.read()),
+    conf0: if (host_test) struct { USB_PAD_ENABLE: u1 } else @TypeOf(USB_SERIAL_JTAG.CONF0.read()),
+    int_ena: if (host_test) void else @TypeOf(USB_SERIAL_JTAG.INT_ENA.read()),
     options: ReattachOptions,
     /// begin() counted a host as attached, so finish() waits for a bus reset.
     host_attached: bool,
@@ -230,36 +243,43 @@ pub const Disconnect = struct {
     /// A wait's result is recorded in options.attachment when one was given:
     /// a seen reset makes later begin() calls count the host as attached, a
     /// timeout ends that. This does not prove CDC traffic works. Restores
-    /// CONF0 and interrupt enables even on timeout. Call once.
+    /// CONF0 and interrupt enables even on timeout. If the pads were restored,
+    /// the logger hold starts after any bus-reset wait. Call once.
     pub fn finish(self: Disconnect) ?bool {
         if (self.conf0.USB_PAD_ENABLE == 0) return null;
-        const cs = microzig.interrupt.enter_critical_section();
+        const cs = log_interrupt.enter_critical_section();
         defer cs.leave();
-        defer USB_SERIAL_JTAG.INT_ENA.write(self.int_ena);
-        // ESP-IoT-Solution, "Using USB-Serial-JTAG pins as normal GPIO":
-        // https://docs.espressif.com/projects/esp-iot-solution/en/latest/usb/usb_overview/usb_serial_jtag.html
-        // begin() supplied override, D+ pulldown and the >=10 ms hold.
-        // Clear stale reset evidence BEFORE enabling pads (§30.6 regs 30.16/19).
-        USB_SERIAL_JTAG.INT_CLR.write(.{ .USB_BUS_RESET_INT_CLR = 1 });
-        // That page's pad enable, D+ pull-down off and D+ pull-up on, folded
-        // into one write: separate writes would leave the pad enabled with D+
-        // pulled down (SE0) in between. §30.6 register 30.2 documents these as
-        // independent R/W fields with no required write order.
-        var attach = USB_SERIAL_JTAG.CONF0.read();
-        attach.PHY_SEL = 0;
-        attach.USB_PAD_ENABLE = 1;
-        attach.DP_PULLDOWN = 0;
-        attach.DP_PULLUP = 1;
-        USB_SERIAL_JTAG.CONF0.write(attach);
-        // Then release the override, restoring the saved pull policy.
-        USB_SERIAL_JTAG.CONF0.write(self.conf0);
+        defer if (!host_test) USB_SERIAL_JTAG.INT_ENA.write(self.int_ena);
+        if (!host_test) {
+            // ESP-IoT-Solution, "Using USB-Serial-JTAG pins as normal GPIO":
+            // https://docs.espressif.com/projects/esp-iot-solution/en/latest/usb/usb_overview/usb_serial_jtag.html
+            // begin() supplied override, D+ pulldown and the >=10 ms hold.
+            // Clear stale reset evidence BEFORE enabling pads (§30.6 regs 30.16/19).
+            USB_SERIAL_JTAG.INT_CLR.write(.{ .USB_BUS_RESET_INT_CLR = 1 });
+            // That page's pad enable, D+ pull-down off and D+ pull-up on, folded
+            // into one write: separate writes would leave the pad enabled with D+
+            // pulled down (SE0) in between. §30.6 register 30.2 documents these as
+            // independent R/W fields with no required write order.
+            var attach = USB_SERIAL_JTAG.CONF0.read();
+            attach.PHY_SEL = 0;
+            attach.USB_PAD_ENABLE = 1;
+            attach.DP_PULLDOWN = 0;
+            attach.DP_PULLUP = 1;
+            USB_SERIAL_JTAG.CONF0.write(attach);
+            // Then release the override, restoring the saved pull policy.
+            USB_SERIAL_JTAG.CONF0.write(self.conf0);
+        }
+        const reattach_logger = if (host_test) HeldTestLogger else logger;
+        defer reattach_logger.start_hold();
         // §30.4: controller/CDC endpoints are self-initializing; there is no
         // firmware endpoint re-arm sequence. §30.3.2 FIFO flags determine readiness.
         // No peripheral reset here: preserve the caller's interrupt configuration.
         if (!self.host_attached) return null;
-        const deadline = Deadline.init_relative(time.get_time_since_boot(), self.options.bus_reset_timeout);
-        while (USB_SERIAL_JTAG.INT_RAW.read().USB_BUS_RESET_INT_RAW == 0) {
-            if (deadline.is_reached_by(time.get_time_since_boot())) {
+        const deadline = Deadline.init_relative(tx_clock.get_time_since_boot(), self.options.bus_reset_timeout);
+        while (true) {
+            const reset_pending = if (host_test) test_host.bus_reset_pending() else USB_SERIAL_JTAG.INT_RAW.read().USB_BUS_RESET_INT_RAW != 0;
+            if (reset_pending) break;
+            if (deadline.is_reached_by(tx_clock.get_time_since_boot())) {
                 record(self.options.attachment, false);
                 return false;
             }
@@ -306,6 +326,9 @@ pub fn reconnect(options: ReattachOptions) ?bool {
     const disconnected = Disconnect.begin(options);
     return disconnected.finish();
 }
+
+// EP1/EP1_CONF FIFO registers: C3 TRM v1.4 §30.6 registers 30.1/30.6,
+// C6 TRM v1.2 §32.7 registers 32.1/32.2.
 
 /// Returns `false` if data can be sent.
 pub fn tx_fifo_full() bool {
@@ -405,7 +428,8 @@ fn release_stuck_tx_at_boot() void {
 }
 
 /// Success means the host consumed every flushed packet, including the final one.
-/// Timeout indicates a host that is absent, closed, or not reading (C3 TRM v1.4 §30.4; C6 TRM v1.2 §32.3.2).
+/// A host can consume packets before an application opens the port.
+/// Timeout means the host did not consume a packet before the deadline.
 /// A timeout can follow partial delivery; retrying the whole slice may duplicate data.
 /// A timed-out wait re-commits the IN buffer for the host (release_stuck_tx).
 /// Serialize TX callers. Masking interrupts does not exclude a preempted logger:
@@ -417,21 +441,27 @@ pub fn write_blocking(data: []const u8, deadline: Deadline) error{Timeout}!usize
     var offset: usize = 0;
     while (offset < data.len) {
         const packet = data[offset..][0..@min(64, data.len - offset)];
-        for (packet) |byte| tx_fifo_write(byte);
-        // The 64th byte flushes automatically (C3 TRM v1.4 §30.3.2; C6 TRM v1.2 §32.3.2).
-        if (packet.len < 64) tx_fifo_flush();
+        commit_packet(packet);
         try wait_for_tx(deadline);
         offset += packet.len;
     }
     return data.len;
 }
 
+fn commit_packet(packet: []const u8) void {
+    for (packet) |byte| tx_fifo_write(byte);
+    // The 64th byte flushes automatically (C3 TRM v1.4 §30.3.2; C6 TRM v1.2 §32.3.2).
+    if (packet.len < 64) tx_fifo_flush();
+}
+
 /// Buffered writer with bounded host-consumption waits. Inspect err after WriteFailed.
 /// Each drain sends at most one 64-byte packet and gets one timeout, or the
 /// shared `deadline` when set. A reservation that needs room sends packets the
 /// same way until the moved bytes fit in the sent prefix. No failed bytes are
-/// retained for a later message.
+/// retained for a later message. Only the logger holds lines for a port open.
 pub const Writer = struct {
+    const tx_vtable: std.Io.Writer.VTable = .{ .drain = drain, .rebase = rebase };
+
     interface: std.Io.Writer,
     storage: []u8,
     timeout: microzig.drivers.time.Duration = .from_ms(100),
@@ -441,15 +471,14 @@ pub const Writer = struct {
 
     pub fn init(buffer: []u8) Writer {
         return .{
-            .interface = .{ .buffer = buffer, .vtable = &.{ .drain = drain, .rebase = rebase } },
+            .interface = .{ .buffer = buffer, .vtable = &tx_vtable },
             .storage = buffer,
         };
     }
 
     /// Discards buffered bytes and restores the full buffer that drains shorten.
     pub fn discard(self: *Writer) void {
-        self.interface.buffer = self.storage;
-        self.interface.end = 0;
+        self.interface = .{ .buffer = self.storage, .vtable = &tx_vtable };
     }
 
     fn send_packet(self: *Writer, bytes: []const u8) std.Io.Writer.Error!usize {
@@ -495,121 +524,400 @@ pub const Writer = struct {
     }
 };
 
-/// USB Serial JTAG logger. Use `.logFn = logger.log` in std_options.
-/// Waits for the host run with the caller's interrupt state: the logger masks
-/// interrupts only to claim the writer and to update its counters, never
-/// while waiting. Each drain waits at most 2 ms. A caller that already has
-/// interrupts masked, or is in a nested interrupt handler, gets one
-/// 2 ms deadline for the whole line instead, so it masks at most 2 ms per
-/// line plus formatting and FIFO writes.
-/// A line that starts while another is being written (from an interrupt
-/// handler or a preempting task) is dropped, not interleaved. A stalled host
-/// drops subsequent lines without waiting. Every dropped or possibly
-/// truncated line is counted conservatively. The next written line reports
-/// at most N lost lines since the last confirmed report: committed packets
-/// can arrive after a timeout, including the report itself.
-/// Fatal panic/trap handling takes over the writer with interrupts masked.
-/// This is best-effort logging (including error/panic text), not confirmed TX;
-/// use write_blocking with caller serialization for delivery confirmation.
-pub const logger = struct {
-    var buffer: [64]u8 = undefined;
-    var writer = Writer.init(&buffer);
-    // All state accesses are guarded by critical sections, or owned by the
-    // context that claimed the writer (host_stalled).
-    var state: log_state.State = .{};
+/// USB Serial/JTAG logger. Use `.logFn = logger.log` in std_options.
+/// At boot the first unmasked log call commits the IN buffer immediately,
+/// whether empty or holding an earlier packet. If the host is already
+/// reading, that call waits for settle and sends queued lines and its own.
+/// After HAL reattach, the probe waits for an unmasked call at least 100 ms
+/// into the hold. Lines logged in that window stay queued until such a call.
+/// Disconnect.finish starts that hold after any bus-reset wait.
+/// While a probe is pending, an unmasked call re-commits a still-full buffer
+/// at least 500 ms after the last commit. Each unmasked probe poll
+/// gives it up to 2 ms to drain. The 100 ms settle starts when a log call
+/// records the drain under the critical section.
+/// Unmasked callers can finish the wait and replay queued lines before
+/// sending their own. Both waits leave the writer free so masked calls
+/// can queue without touching the FIFO.
+/// In the Windows diagnostic on C3 and C6, delayed empty commits stayed
+/// pending with the port closed and drained after open.
+/// Linux cdc-acm.c submits bulk IN read URBs in acm_port_activate at tty open.
+/// The HAL option usb_serial_jtag_log_hold_size sets the queue budget
+/// (2048 bytes by default, zero for immediate writes).
+///
+/// Waits for the host run with the caller's interrupt state. The logger uses
+/// short critical sections for hold decisions, writer ownership and counters.
+/// Each drain waits at most 2 ms. A caller that already has
+/// interrupts masked, or is in a nested interrupt handler, shares one
+/// 2 ms deadline across a direct write, plus formatting and FIFO writes.
+/// A line from an interrupt handler or preempting task is dropped and
+/// counted while another caller holds the writer, including during queue
+/// formatting. Overflow keeps earlier queued lines and counts the dropped
+/// line. A TX timeout during normal logging starts a new hold, including
+/// when the host stops reading after boot. The logger stages a line that
+/// fits before its first send and retains those bytes if no packet commits.
+/// A line that exceeds the queue streams directly and counts as lost on
+/// timeout. Unmasked calls
+/// sample for drain without polling and re-commit a still-full buffer at the
+/// same 500 ms interval. At zero hold size or in panic, the stalled path
+/// drops subsequent lines without waiting until the FIFO is writable.
+/// Observing the drain starts the same settle delay before replay.
+/// A host that never reads keeps the queue on hold. A failed line that
+/// committed a packet is retired and counted. Its bytes may still arrive.
+/// The loss report counts drops and
+/// possible truncations since the last confirmed report. The host may consume
+/// packets before the application reopens, outside the scope of this count.
+/// With holding enabled, fatal panic/trap handling discards the queue and
+/// suppresses loss reports so fatal text gets the first send attempt.
+/// A pending probe occupies the FIFO like any other committed packet. The
+/// fatal write can time out before committing text if the host leaves it pending.
+pub const logger = if (host_test)
+    Logger(0)
+else
+    Logger(microzig.options.hal.usb_serial_jtag_log_hold_size);
 
-    /// Called only on a fatal path that never returns to the interrupted owner.
-    pub fn prepare_panic() void {
-        microzig.cpu.interrupt.disable_interrupts();
-        state.takeover(&writer.interface.end);
-        writer.discard();
-    }
+// The Windows diagnostic first committed 100 ms after reconnect returned.
+// Disconnect.finish starts the hold after the reset wait. An early commit
+// may overlap enumeration: the working hypothesis is that DATA_FREE stays
+// stuck low on C6, while endpoint setup on C3 frees it without a host read.
+const probe_delay: microzig.drivers.time.Duration = .from_ms(100);
+// Retry cadence from the same diagnostic, using the WR_DONE recovery in
+// release_stuck_tx for a buffer that still reads full.
+const probe_retry_interval: microzig.drivers.time.Duration = .from_ms(500);
 
-    fn count_dropped() void {
-        const cs = log_interrupt.enter_critical_section();
-        defer cs.leave();
-        state.count_dropped();
-    }
+/// Time from observing an IN packet drain until the hold can release.
+/// On Windows, pyserial 3.5's `Serial.open` calls SetCommState and then
+/// PurgeComm(PURGE_RXCLEAR)
+/// (serialwin32.py). On the C6 bench, immediate replay could lose lines to
+/// that purge.
+const open_settle: microzig.drivers.time.Duration = .from_ms(100);
+const packet_timeout: microzig.drivers.time.Duration = .from_ms(2);
 
-    /// Owner only: discards the line and counts it.
-    fn drop_line() void {
-        writer.discard();
-        state.host_stalled = true;
-        count_dropped();
-    }
-
-    pub fn log(
-        comptime level: std.log.Level,
-        comptime scope: @TypeOf(.EnumLiteral),
-        comptime format: []const u8,
-        args: anytype,
-    ) void {
-        const level_prefix = comptime "[{}.{:0>6}] " ++ level.asText();
-        const prefix = comptime level_prefix ++ switch (scope) {
-            .default => ": ",
-            else => " (" ++ @tagName(scope) ++ "): ",
+fn Logger(comptime hold_size: usize) type {
+    return struct {
+        const hold_enabled = hold_size != 0;
+        const length_size = @sizeOf(usize);
+        const staging_vtable: std.Io.Writer.VTable = .{
+            .drain = spill_drain,
+            .rebase = spill_rebase,
+            .flush = std.Io.Writer.noopFlush,
         };
-
-        const masked_by_caller = if (host_test) test_host.masked else !microzig.interrupt.globally_enabled() or microzig.cpu.interrupt.get_priority_threshold() != .zero;
-        const unreported = claim: {
-            const cs = log_interrupt.enter_critical_section();
-            defer cs.leave();
-            break :claim state.claim() orelse return;
+        const HoldPhase = union(enum) {
+            probe: ?microzig.drivers.time.Absolute,
+            probe_pending: microzig.drivers.time.Absolute,
+            tx_pending: microzig.drivers.time.Absolute,
+            settling: microzig.drivers.time.Absolute,
+            inactive,
         };
-        defer {
-            const cs = log_interrupt.enter_critical_section();
-            defer cs.leave();
-            state.release();
+        const HoldWait = union(enum) {
+            probe,
+            settle: microzig.drivers.time.Absolute,
+        };
+        var hold_bytes: [hold_size]u8 = undefined;
+        var hold: struct {
+            phase: HoldPhase = .{ .probe = null },
+            len: usize = 0,
+            lines: usize = 0,
+            panic_mode: bool = false,
+        } = .{};
+
+        var buffer: [64]u8 = undefined;
+        var writer = Writer.init(&buffer);
+        // All state accesses are guarded by critical sections, or owned by the
+        // context that claimed the writer (host_stalled).
+        var state: log_state.State = .{};
+
+        // Reattach callers hold a critical section and have quiesced logging.
+        // Preserve any lines still queued from an earlier hold.
+        fn start_hold() void {
+            if (hold_enabled) {
+                hold.phase = .{ .probe = microzig.drivers.time.make_timeout(tx_clock.get_time_since_boot(), probe_delay) };
+                state.host_stalled = false;
+            }
         }
 
-        release_stuck_tx_at_boot();
-        // A reading host frees a packet slot within one 1 ms USB frame
-        // (measured on C3 and C6 under Windows: at most 154 us per packet,
-        // 326 us per line); 50 us dropped most lines while the host read.
-        writer.timeout = .from_ms(2);
-        writer.deadline = if (masked_by_caller)
-            Deadline.init_relative(tx_clock.get_time_since_boot(), writer.timeout)
-        else
-            null;
-
-        if (state.host_stalled and tx_fifo_full()) {
-            // No wait runs here: release a stuck buffer on every dropped
-            // line, not only on the timeout that began the stall.
-            release_stuck_tx();
-            drop_line();
-            return;
+        /// Called only on a fatal path that never returns to the interrupted owner.
+        pub fn prepare_panic() void {
+            if (host_test) {
+                test_host.masked = true;
+            } else {
+                microzig.cpu.interrupt.disable_interrupts();
+            }
+            state.takeover(&writer.interface.end);
+            writer.discard();
+            if (hold_enabled) {
+                hold.phase = .inactive;
+                hold.panic_mode = true;
+                state.dropped_lines +|= hold.lines;
+                hold.len = 0;
+                hold.lines = 0;
+            }
         }
-        if (unreported != 0) {
+
+        fn count_dropped() void {
+            const cs = log_interrupt.enter_critical_section();
+            defer cs.leave();
+            state.count_dropped();
+        }
+
+        /// Owner only: drops the current call's line. Replay accounts for its own line.
+        fn drop_line() void {
+            writer.discard();
+            state.host_stalled = true;
+            count_dropped();
+        }
+
+        fn print_line(w: *std.Io.Writer, comptime format: []const u8, args: anytype) std.Io.Writer.Error!void {
+            const current_time = tx_clock.get_time_since_boot().to_us();
+            try w.print(format ++ "\r\n", .{ current_time / std.time.us_per_s, current_time % std.time.us_per_s } ++ args);
+        }
+
+        fn send_line(comptime format: []const u8, args: anytype) std.Io.Writer.Error!void {
+            try print_line(&writer.interface, format, args);
+            try writer.interface.flush();
+        }
+
+        fn spill_drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            try spill_rebase(w, 0, 0);
+            return w.writeSplat(data, splat);
+        }
+
+        // Switch the same formatter to direct TX, keeping any requested suffix
+        // buffered for a writableSlicePreserve reservation.
+        fn spill_rebase(w: *std.Io.Writer, preserve: usize, capacity: usize) std.Io.Writer.Error!void {
+            if (preserve +| capacity > writer.storage.len) return error.WriteFailed;
+            const staged = w.buffered();
+            const split = staged.len -| preserve;
+            writer.discard();
+            try w.writeAll(staged[0..split]);
+            const suffix = staged[split..];
+            try w.ensureUnusedCapacity(suffix.len + capacity);
+            try w.writeAll(suffix);
+        }
+
+        // The previous queue has drained. Stage this line in the same RAM
+        // budget and stream excess bytes without restarting the formatter.
+        fn stage_or_send_line(comptime format: []const u8, args: anytype) std.Io.Writer.Error!void {
+            writer.err = null;
+            if (hold_size > length_size) {
+                writer.interface = .{ .buffer = hold_bytes[length_size..], .vtable = &staging_vtable };
+            }
+            defer writer.discard();
+            try print_line(&writer.interface, format, args);
+            if (writer.interface.vtable == &staging_vtable) {
+                append_line(&hold_bytes, writer.interface.end);
+            } else {
+                try writer.interface.flush();
+            }
+        }
+
+        fn save_line(comptime format: []const u8, args: anytype) std.Io.Writer.Error!void {
+            const space = hold_bytes[hold.len..];
+            if (space.len < length_size) return error.WriteFailed;
+            var fixed: std.Io.Writer = .fixed(space[length_size..]);
+            try print_line(&fixed, format, args);
+            append_line(space, fixed.end);
+        }
+
+        fn append_line(space: []u8, len: usize) void {
+            std.mem.writeInt(usize, space[0..length_size], len, .little);
+            hold.len += length_size + len;
+            hold.lines += 1;
+        }
+
+        fn replay() error{Timeout}!void {
+            var offset: usize = 0;
+            defer {
+                const pending = hold_bytes[offset..hold.len];
+                @memmove(hold_bytes[0..pending.len], pending);
+                hold.len = pending.len;
+            }
+            while (offset < hold.len) {
+                const len = std.mem.readInt(usize, hold_bytes[offset..][0..length_size], .little);
+                const line = hold_bytes[offset + length_size ..][0..len];
+                var sent: usize = 0;
+                // Once a packet is committed, retire the line even if only a
+                // prefix can arrive. A timeout before that leaves it queued.
+                defer if (sent != 0) {
+                    offset += length_size + len;
+                    hold.lines -= 1;
+                };
+                errdefer if (sent != 0) count_dropped();
+                while (sent < line.len) {
+                    const packet = line[sent..][0..@min(64, line.len - sent)];
+                    const deadline = writer.deadline orelse Deadline.init_relative(tx_clock.get_time_since_boot(), writer.timeout);
+                    try wait_for_tx(deadline);
+                    commit_packet(packet);
+                    sent += packet.len;
+                    try wait_for_tx(deadline);
+                }
+            }
+        }
+
+        fn rehold() void {
+            // The timed-out TX wait just re-committed the buffer.
+            hold.phase = .{ .tx_pending = tx_clock.get_time_since_boot() };
+        }
+
+        // Called under the critical section with the writer free. Return a
+        // wait to perform outside it, or leave the phase ready for claiming.
+        fn hold_wait(probe_waited: bool) ?HoldWait {
+            switch (hold.phase) {
+                .probe => |eligible_at| {
+                    if (eligible_at) |eligible| {
+                        if (!eligible.is_reached_by(tx_clock.get_time_since_boot())) return null;
+                    }
+                    // EP1_CONF.WR_DONE also releases DATA_FREE stuck at boot.
+                    // If a previous packet is still pending, the same write
+                    // re-commits it and its drain supplies the evidence.
+                    tx_fifo_flush();
+                    hold.phase = .{ .probe_pending = tx_clock.get_time_since_boot() };
+                    return .probe;
+                },
+                .probe_pending => |last_commit| {
+                    if (!probe_waited) {
+                        const retry_at = microzig.drivers.time.make_timeout(last_commit, probe_retry_interval);
+                        if (retry_at.is_reached_by(tx_clock.get_time_since_boot()) and tx_fifo_full()) {
+                            release_stuck_tx();
+                            hold.phase = .{ .probe_pending = tx_clock.get_time_since_boot() };
+                        }
+                        return .probe;
+                    }
+                    if (tx_fifo_full()) return null;
+                },
+                .tx_pending => |last_commit| {
+                    const retry_at = microzig.drivers.time.make_timeout(last_commit, probe_retry_interval);
+                    const retry_due = retry_at.is_reached_by(tx_clock.get_time_since_boot());
+                    if (tx_fifo_full()) {
+                        if (!retry_due) return null;
+                        release_stuck_tx();
+                        hold.phase = .{ .tx_pending = tx_clock.get_time_since_boot() };
+                        if (tx_fifo_full()) return null;
+                    }
+                },
+                .settling => |until| {
+                    if (!until.is_reached_by(tx_clock.get_time_since_boot()))
+                        return .{ .settle = until };
+                    return null;
+                },
+                .inactive => return null,
+            }
+            const until = microzig.drivers.time.make_timeout(tx_clock.get_time_since_boot(), open_settle);
+            hold.phase = .{ .settling = until };
+            return .{ .settle = until };
+        }
+
+        fn send_loss_report(unreported: usize) std.Io.Writer.Error!void {
             // A timed-out line may have left a delivered fragment. Terminate
             // it before reporting loss and attempting the next complete line.
-            writer.interface.print("\r\n[usb logger: lost at most {d} lines since last confirmed report]\r\n", .{unreported}) catch {
-                drop_line();
-                return;
-            };
-            writer.interface.flush() catch {
-                drop_line();
-                return;
-            };
-            // Lines dropped by other contexts meanwhile stay counted.
-            const cs = log_interrupt.enter_critical_section();
-            defer cs.leave();
-            state.confirm_report(unreported);
+            try writer.interface.print("\r\n[usb logger: lost at most {d} lines since last confirmed report]\r\n", .{unreported});
+            try writer.interface.flush();
         }
-        state.host_stalled = false;
 
-        const current_time = tx_clock.get_time_since_boot();
-        const seconds = current_time.to_us() / std.time.us_per_s;
-        const microseconds = current_time.to_us() % std.time.us_per_s;
+        pub fn log(
+            comptime level: std.log.Level,
+            comptime scope: @TypeOf(.EnumLiteral),
+            comptime format: []const u8,
+            args: anytype,
+        ) void {
+            const level_prefix = comptime "[{}.{:0>6}] " ++ level.asText();
+            const prefix = comptime level_prefix ++ switch (scope) {
+                .default => ": ",
+                else => " (" ++ @tagName(scope) ++ "): ",
+            };
 
-        writer.interface.print(prefix ++ format ++ "\r\n", .{ seconds, microseconds } ++ args) catch {
-            drop_line();
-            return;
-        };
-        writer.interface.flush() catch {
-            drop_line();
-        };
-    }
-};
+            const masked_by_caller = if (host_test) test_host.masked else !microzig.interrupt.globally_enabled() or microzig.cpu.interrupt.get_priority_threshold() != .zero;
+            var probe_waited = false;
+            const claimed = while (true) {
+                const wait = decide: {
+                    const cs = log_interrupt.enter_critical_section();
+                    defer cs.leave();
+                    const from_hold = hold_enabled and !state.busy and hold.phase != .inactive;
+                    if (from_hold and !masked_by_caller) {
+                        if (hold_wait(probe_waited)) |wait| break :decide wait;
+                    }
+                    const unreported = state.claim() orelse return;
+                    // Only the caller that claims after settling releases the
+                    // hold. Masked callers can still append right up to replay.
+                    const queue = from_hold and (masked_by_caller or hold.phase != .settling);
+                    if (from_hold and !queue) hold.phase = .inactive;
+                    break .{ .unreported = unreported, .queue = queue };
+                };
+                switch (wait) {
+                    .probe => {
+                        const until = Deadline.init_relative(tx_clock.get_time_since_boot(), packet_timeout);
+                        while (tx_fifo_full() and !until.is_reached_by(tx_clock.get_time_since_boot())) {}
+                        // Recheck the current hold and FIFO under the critical
+                        // section. Another caller may have already replayed.
+                        probe_waited = true;
+                    },
+                    .settle => |until| while (!until.is_reached_by(tx_clock.get_time_since_boot())) {},
+                }
+            };
+            defer {
+                const cs = log_interrupt.enter_critical_section();
+                defer cs.leave();
+                state.release();
+            }
+
+            if (claimed.queue) {
+                save_line(prefix ++ format, args) catch count_dropped();
+                return;
+            }
+
+            release_stuck_tx_at_boot();
+            // Allow for USB frame scheduling. Shorter waits dropped lines
+            // even with a reading host on the C3 and C6 under Windows.
+            writer.timeout = packet_timeout;
+            writer.deadline = if (masked_by_caller)
+                Deadline.init_relative(tx_clock.get_time_since_boot(), writer.timeout)
+            else
+                null;
+
+            if (state.host_stalled and tx_fifo_full()) {
+                // No wait runs here: release a stuck buffer on every dropped
+                // line, not only on the timeout that began the stall.
+                release_stuck_tx();
+                drop_line();
+                return;
+            }
+            const can_rehold = hold_enabled and !hold.panic_mode;
+            if (claimed.unreported != 0 and !(hold_enabled and hold.panic_mode)) {
+                send_loss_report(claimed.unreported) catch {
+                    if (can_rehold) {
+                        rehold();
+                        save_line(prefix ++ format, args) catch count_dropped();
+                    } else {
+                        drop_line();
+                    }
+                    return;
+                };
+                // Lines dropped by other contexts meanwhile stay counted.
+                const cs = log_interrupt.enter_critical_section();
+                defer cs.leave();
+                state.confirm_report(claimed.unreported);
+            }
+            state.host_stalled = false;
+
+            if (can_rehold) {
+                if (hold.len != 0) replay() catch {
+                    rehold();
+                    save_line(prefix ++ format, args) catch count_dropped();
+                    return;
+                };
+                stage_or_send_line(prefix ++ format, args) catch {
+                    if (writer.err != null) rehold();
+                    count_dropped();
+                    return;
+                };
+                if (hold.len != 0) replay() catch rehold();
+                return;
+            }
+            send_line(prefix ++ format, args) catch {
+                drop_line();
+            };
+        }
+    };
+}
 
 test "logger strings crossing the line buffer keep their fields" {
     if (!host_test) return error.SkipZigTest;
@@ -629,6 +937,759 @@ fn reset_test_logger() void {
     test_host.reset();
     logger.state = .{};
     logger.writer.discard();
+}
+
+const HeldTestLogger = Logger(256);
+
+fn reset_held_test_logger() void {
+    test_host.reset();
+    HeldTestLogger.state = .{};
+    HeldTestLogger.hold = .{};
+    HeldTestLogger.writer.discard();
+    boot_tx_checked = false;
+}
+
+fn expect_log_order(lines: []const []const u8) !void {
+    var output = test_host.output();
+    for (lines) |line| {
+        const index = std.mem.indexOf(u8, output, line) orelse return error.MissingLogLine;
+        output = output[index + line.len ..];
+    }
+}
+
+test "logger queues before the reattach probe delay even with a free FIFO" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.set_reading(false);
+    try std.testing.expect(!test_host.full());
+    const accesses = test_host.fifo_accesses;
+    HeldTestLogger.start_hold();
+    const attached_at = test_host.clock_us();
+    test_host.advance(probe_delay.to_us() - 30);
+    HeldTestLogger.log(.info, .default, "BEFORE PROBE", .{});
+    try std.testing.expect(test_host.clock_us() - attached_at < probe_delay.to_us());
+    try std.testing.expectEqual(accesses, test_host.fifo_accesses);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    HeldTestLogger.log(.info, .default, "PORT CLOSED", .{});
+    try std.testing.expectEqual(attached_at + probe_delay.to_us(), test_host.last_commit_us);
+    try std.testing.expectEqual(1, test_host.packet_count);
+    try std.testing.expectEqual(0, test_host.output().len);
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "PORT OPEN", .{});
+    try expect_log_order(&.{ "BEFORE PROBE\r\n", "PORT CLOSED\r\n", "PORT OPEN\r\n" });
+}
+
+test "logger re-commits a stuck probe at 500 ms intervals and settles after drain" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.enumerating = true;
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "FIRST PROBE", .{});
+    const first = test_host.last_commit_us;
+    const interval = probe_retry_interval.to_us();
+    test_host.advance(first + interval - 100 - test_host.clock_us());
+    HeldTestLogger.log(.info, .default, "EARLY", .{});
+    try std.testing.expectEqual(0, test_host.recommits);
+
+    HeldTestLogger.log(.info, .default, "STILL ENUMERATING", .{});
+    try std.testing.expectEqual(1, test_host.recommits);
+    try std.testing.expect(test_host.last_commit_us - first >= interval);
+    const retry = test_host.last_commit_us;
+    test_host.enumerating = false;
+    test_host.set_reading(true);
+    try std.testing.expectEqual(0, test_host.packets_read);
+    HeldTestLogger.log(.info, .default, "STILL STUCK", .{});
+    try std.testing.expectEqual(1, test_host.recommits);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    test_host.advance(retry + interval - test_host.clock_us());
+    const reopened = test_host.clock_us();
+    HeldTestLogger.log(.info, .default, "RECOVERED", .{});
+    try std.testing.expectEqual(2, test_host.recommits);
+    try std.testing.expect(test_host.last_commit_us - reopened >= open_settle.to_us());
+    try expect_log_order(&.{ "FIRST PROBE\r\n", "EARLY\r\n", "STILL ENUMERATING\r\n", "STILL STUCK\r\n", "RECOVERED\r\n" });
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "logger bounds each probe wait while the port is closed and replays after open" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    const field: [72]u8 = @splat('x');
+    const start = test_host.clock_us();
+    HeldTestLogger.log(.info, .default, "FIRST {s}", .{&field});
+    try std.testing.expectEqual(1, test_host.packet_count);
+    try std.testing.expectEqual(1, test_host.fifo_accesses - test_host.status_reads);
+    try std.testing.expect(test_host.clock_us() - start <= 2_040);
+
+    test_host.advance(3_000_000);
+    const retry = test_host.clock_us();
+    HeldTestLogger.log(.info, .default, "SECOND", .{});
+    try std.testing.expect(test_host.clock_us() - retry <= 2_040);
+    try std.testing.expectEqual(2, test_host.fifo_accesses - test_host.status_reads);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "REPLAY", .{});
+    try expect_log_order(&.{ "FIRST " ++ field ++ "\r\n", "SECOND\r\n", "REPLAY\r\n" });
+    try std.testing.expectEqual(0, std.mem.count(u8, test_host.output(), "lost at most"));
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "a single unmasked boot log reaches an already reading host before returning" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.latency_us = 1100;
+    HeldTestLogger.log(.info, .default, "ONLY LINE", .{});
+    try expect_log_order(&.{"ONLY LINE\r\n"});
+    try std.testing.expectEqual(2, test_host.packet_count);
+    try std.testing.expect(test_host.last_commit_us >= 1100 + open_settle.to_us());
+    try std.testing.expect(test_host.clock_us() < 103_000);
+}
+
+test "logger flushes an early boot burst on its first unmasked call" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.masked = true;
+    HeldTestLogger.log(.info, .default, "FIRST", .{});
+    HeldTestLogger.log(.info, .default, "SECOND", .{});
+    try std.testing.expectEqual(0, test_host.fifo_accesses);
+
+    test_host.masked = false;
+    try std.testing.expect(test_host.clock_us() < probe_delay.to_us());
+    HeldTestLogger.log(.info, .default, "LAST", .{});
+    try expect_log_order(&.{ "FIRST\r\n", "SECOND\r\n", "LAST\r\n" });
+    try std.testing.expectEqual(4, test_host.packet_count);
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+    try std.testing.expect(test_host.clock_us() < 102_000);
+}
+
+test "logger sends a finite FIELD HEX DONE burst with one settle delay" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    const field: [200]u8 = @splat('h');
+    HeldTestLogger.log(.info, .default, "FIELD {s}", .{&field});
+    HeldTestLogger.log(.info, .default, "HEX 00010203", .{});
+    HeldTestLogger.log(.info, .default, "DONE", .{});
+    try expect_log_order(&.{ "FIELD " ++ field ++ "\r\n", "HEX 00010203\r\n", "DONE\r\n" });
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+    try std.testing.expect(test_host.clock_us() < probe_delay.to_us() + 102_000);
+}
+
+test "logger probes a stuck boot FIFO even when the port is already open" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.stuck_at_boot = true;
+    HeldTestLogger.log(.info, .default, "OPEN AT BOOT", .{});
+    try std.testing.expectEqual(2, test_host.packet_count);
+    try expect_log_order(&.{"OPEN AT BOOT\r\n"});
+}
+
+test "the first eligible unmasked log after reattach starts a fresh probe" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    HeldTestLogger.log(.info, .default, "BEFORE DETACH", .{});
+    HeldTestLogger.log(.info, .default, "BOOT REPLAY", .{});
+    const packets = test_host.packet_count;
+    const fifo_accesses = test_host.fifo_accesses;
+    HeldTestLogger.start_hold();
+    HeldTestLogger.log(.info, .default, "BEFORE PROBE", .{});
+    try std.testing.expectEqual(packets, test_host.packet_count);
+    test_host.advance(3_000_000);
+    try std.testing.expectEqual(fifo_accesses, test_host.fifo_accesses);
+
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "AFTER ATTACH", .{});
+    try std.testing.expectEqual(packets + 1, test_host.packet_count);
+    try std.testing.expect(test_host.fifo_accesses > fifo_accesses);
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "AFTER SETTLE", .{});
+    try expect_log_order(&.{ "BEFORE DETACH\r\n", "BOOT REPLAY\r\n", "BEFORE PROBE\r\n", "AFTER ATTACH\r\n", "AFTER SETTLE\r\n" });
+}
+
+test "Disconnect finish starts the probe delay after a slow bus reset" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    HeldTestLogger.log(.info, .default, "BOOT", .{});
+    const packets = test_host.packet_count;
+    const accesses = test_host.fifo_accesses;
+
+    var attachment: Attachment = .{};
+    const disconnected: Disconnect = .{
+        .conf0 = .{ .USB_PAD_ENABLE = 1 },
+        .int_ena = {},
+        .host_attached = true,
+        .options = .{ .attachment = &attachment },
+    };
+    test_host.set_reading(false);
+    const reset_at = test_host.clock_us() + 150_000;
+    test_host.bus_reset_at_us = reset_at;
+    try std.testing.expectEqual(@as(?bool, true), disconnected.finish());
+    try std.testing.expect(attachment.reset_seen);
+    const returned_at = test_host.clock_us();
+    try std.testing.expect(returned_at >= reset_at);
+
+    HeldTestLogger.log(.info, .default, "AFTER RESET", .{});
+    try std.testing.expectEqual(accesses, test_host.fifo_accesses);
+    test_host.advance(returned_at + probe_delay.to_us() - test_host.clock_us());
+    HeldTestLogger.log(.info, .default, "PORT CLOSED", .{});
+    try std.testing.expectEqual(packets + 1, test_host.packet_count);
+    try std.testing.expect(test_host.last_commit_us - returned_at >= probe_delay.to_us());
+
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "PORT OPEN", .{});
+    try expect_log_order(&.{ "BOOT\r\n", "AFTER RESET\r\n", "PORT CLOSED\r\n", "PORT OPEN\r\n" });
+}
+
+test "logger waits for a previously stalled FIFO on reattach" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    HeldTestLogger.log(.info, .default, "BOOT", .{});
+    HeldTestLogger.log(.info, .default, "BOOT REPLAY", .{});
+
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "BEFORE DETACH", .{});
+    try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+    try std.testing.expectEqual(.tx_pending, std.meta.activeTag(HeldTestLogger.hold.phase));
+    HeldTestLogger.start_hold();
+    test_host.advance(probe_delay.to_us());
+
+    HeldTestLogger.log(.info, .default, "HELD AFTER ATTACH", .{});
+    const retry = test_host.clock_us();
+    HeldTestLogger.log(.info, .default, "STILL PENDING", .{});
+    try std.testing.expect(test_host.clock_us() - retry <= 2_030);
+    try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "REOPENED", .{});
+    try expect_log_order(&.{ "BEFORE DETACH\r\n", "lost at most 1 lines", "HELD AFTER ATTACH\r\n", "STILL PENDING\r\n", "REOPENED\r\n" });
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "logger counts hold overflow and keeps complete earlier lines" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "KEPT", .{});
+    const oversized: [256]u8 = @splat('x');
+    HeldTestLogger.log(.info, .default, "OVERFLOW {s}", .{&oversized});
+    HeldTestLogger.log(.info, .default, "ALSO KEPT", .{});
+    try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+    try std.testing.expectEqual(1, test_host.packet_count);
+
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "CURRENT", .{});
+    try expect_log_order(&.{ "lost at most 1 lines", ": KEPT\r\n", "ALSO KEPT\r\n", "CURRENT\r\n" });
+    try std.testing.expect(std.mem.indexOf(u8, test_host.output(), "OVERFLOW") == null);
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "masked logger leaves probing and replay for unmasked calls" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.latency_us = 1100;
+    test_host.set_reading(false);
+    test_host.masked = true;
+    HeldTestLogger.log(.info, .default, "MASKED AT BOOT", .{});
+    try std.testing.expectEqual(0, test_host.fifo_accesses);
+
+    test_host.masked = false;
+    HeldTestLogger.log(.info, .default, "PROBE", .{});
+    test_host.set_reading(true);
+    test_host.advance(1100);
+
+    const fifo_accesses = test_host.fifo_accesses;
+    test_host.masked = true;
+    HeldTestLogger.log(.info, .default, "MASKED RELEASE", .{});
+    HeldTestLogger.log(.info, .default, "STILL MASKED", .{});
+    try std.testing.expectEqual(fifo_accesses, test_host.fifo_accesses);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    test_host.masked = false;
+    HeldTestLogger.log(.info, .default, "UNMASKED", .{});
+    try expect_log_order(&.{ "MASKED AT BOOT\r\n", "PROBE\r\n", "MASKED RELEASE\r\n", "STILL MASKED\r\n", "UNMASKED\r\n" });
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "masked calls queue without FIFO access during the probe and settle waits" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.latency_us = 1100;
+    const Preempt = struct {
+        var fifo_accesses: usize = 0;
+
+        fn masked_log(comptime message: []const u8) void {
+            const before = test_host.fifo_accesses;
+            test_host.masked = true;
+            defer test_host.masked = false;
+            HeldTestLogger.log(.info, .default, message, .{});
+            fifo_accesses += test_host.fifo_accesses - before;
+        }
+
+        fn during_probe() void {
+            masked_log("MASKED DURING PROBE");
+            test_host.preemption = .{ .at_us = probe_delay.to_us() + 5_000, .run = during_settle };
+        }
+
+        fn during_settle() void {
+            masked_log("MASKED DURING SETTLE");
+        }
+    };
+    Preempt.fifo_accesses = 0;
+    test_host.preemption = .{ .at_us = probe_delay.to_us() + 100, .run = Preempt.during_probe };
+    HeldTestLogger.log(.info, .default, "OUTER", .{});
+    try expect_log_order(&.{ "MASKED DURING PROBE\r\n", "MASKED DURING SETTLE\r\n", "OUTER\r\n" });
+    try std.testing.expectEqual(0, Preempt.fifo_accesses);
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "preemption at settle entry or during settle does not extend the deadline" {
+    if (!host_test) return error.SkipZigTest;
+    const Preempt = struct {
+        fn during_settle() void {
+            HeldTestLogger.log(.info, .default, "PREEMPTING", .{});
+        }
+    };
+    // The first case preempts at the first clock sample of the settle wait.
+    for ([_]u64{ 50, 5_000 }) |preempt_after_us| {
+        reset_held_test_logger();
+        test_host.advance(probe_delay.to_us());
+        test_host.masked = true;
+        HeldTestLogger.log(.info, .default, "QUEUED", .{});
+        test_host.masked = false;
+        test_host.preemption = .{
+            .at_us = test_host.clock_us() + preempt_after_us,
+            .run = Preempt.during_settle,
+        };
+        HeldTestLogger.log(.info, .default, "OUTER", .{});
+        try expect_log_order(&.{ "QUEUED\r\n", "PREEMPTING\r\n", "OUTER\r\n" });
+        try std.testing.expectEqual(1, std.mem.count(u8, test_host.output(), "QUEUED\r\n"));
+        try std.testing.expectEqual(4, test_host.packet_count);
+        try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+        try std.testing.expect(test_host.clock_us() < probe_delay.to_us() + 102_000);
+    }
+}
+
+test "logger keeps untouched queued lines when replay stalls and settles again" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "FIRST", .{});
+    HeldTestLogger.log(.info, .default, "STALLED", .{});
+    HeldTestLogger.log(.info, .default, "UNSENT", .{});
+    test_host.stall_packet = 3; // Empty probe, FIRST, STALLED.
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "QUEUED CURRENT", .{});
+    try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+
+    const reads = test_host.status_reads;
+    HeldTestLogger.log(.info, .default, "STILL FULL", .{});
+    try std.testing.expectEqual(reads + 1, test_host.status_reads);
+    test_host.advance(10_000);
+    const observed = test_host.clock_us();
+    HeldTestLogger.log(.info, .default, "RECOVERED", .{});
+    try std.testing.expect(test_host.last_commit_us - observed >= open_settle.to_us());
+    try expect_log_order(&.{ "FIRST\r\n", "STALLED\r\n", "lost at most 1 lines", "UNSENT\r\n", "QUEUED CURRENT\r\n", "STILL FULL\r\n", "RECOVERED\r\n" });
+    try std.testing.expectEqual(1, std.mem.count(u8, test_host.output(), "STALLED\r\n"));
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "logger re-commits a stuck replay after the retry interval and settles after drain" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.masked = true;
+    HeldTestLogger.log(.info, .default, "STALLED", .{});
+    HeldTestLogger.log(.info, .default, "UNSENT", .{});
+    test_host.masked = false;
+    const HostReset = struct {
+        fn during_settle() void {
+            test_host.enumerating = true;
+        }
+    };
+    test_host.preemption = .{ .at_us = test_host.clock_us() + 5_000, .run = HostReset.during_settle };
+    HeldTestLogger.log(.info, .default, "QUEUED CURRENT", .{});
+    try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+    // The timeout already re-committed once, while the host was enumerating.
+    try std.testing.expectEqual(1, test_host.recommits);
+    const retry_at = test_host.last_commit_us + probe_retry_interval.to_us();
+    test_host.enumerating = false;
+    test_host.advance(retry_at - 100 - test_host.clock_us());
+    HeldTestLogger.log(.info, .default, "TOO EARLY", .{});
+    try std.testing.expectEqual(1, test_host.recommits);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    test_host.advance(retry_at - test_host.clock_us());
+    test_host.masked = true;
+    const accesses = test_host.fifo_accesses;
+    HeldTestLogger.log(.info, .default, "MASKED", .{});
+    test_host.masked = false;
+    try std.testing.expectEqual(accesses, test_host.fifo_accesses);
+
+    const observed = test_host.clock_us();
+    HeldTestLogger.log(.info, .default, "RECOVERED", .{});
+    try std.testing.expectEqual(2, test_host.recommits);
+    try std.testing.expect(test_host.last_commit_us - observed >= open_settle.to_us());
+    try expect_log_order(&.{ "STALLED\r\n", "lost at most 1 lines", "UNSENT\r\n", "QUEUED CURRENT\r\n", "TOO EARLY\r\n", "MASKED\r\n", "RECOVERED\r\n" });
+    try std.testing.expectEqual(1, std.mem.count(u8, test_host.output(), "STALLED\r\n"));
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "logger keeps the queue when the loss report stalls before replay" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "QUEUED", .{});
+    const oversized: [256]u8 = @splat('x');
+    HeldTestLogger.log(.info, .default, "{s}", .{&oversized});
+
+    test_host.stall_packet = 2;
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "QUEUED CURRENT", .{});
+    try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+
+    const reads = test_host.status_reads;
+    HeldTestLogger.log(.info, .default, "WHILE REPORT PENDING", .{});
+    try std.testing.expectEqual(reads + 1, test_host.status_reads);
+    test_host.advance(10_000);
+    HeldTestLogger.log(.info, .default, "RECOVERED", .{});
+    try expect_log_order(&.{
+        "lost at most 1 lines since last confirmed report]\r\n",
+        "QUEUED\r\n",
+        "QUEUED CURRENT\r\n",
+        "WHILE REPORT PENDING\r\n",
+        "RECOVERED\r\n",
+    });
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "logger reholds when the loss report stalls after releasing an empty queue" {
+    if (!host_test) return error.SkipZigTest;
+    const oversized: [256]u8 = @splat('x');
+    for ([_]bool{ false, true }) |after_replay| {
+        reset_held_test_logger();
+        test_host.advance(probe_delay.to_us());
+        test_host.set_reading(false);
+        if (after_replay) {
+            HeldTestLogger.log(.info, .default, "LAST QUEUED", .{});
+            HeldTestLogger.log(.info, .default, "{s}", .{&oversized});
+            test_host.set_reading(true);
+            // The report succeeds, then replay retires the last line on timeout.
+            test_host.stall_packet = 4;
+            HeldTestLogger.log(.info, .default, "{s}", .{&oversized});
+            HeldTestLogger.log(.info, .default, "{s}", .{&oversized});
+            test_host.advance(10_000);
+            test_host.stall_packet = 5;
+        } else {
+            // All calls during the initial hold overflow.
+            HeldTestLogger.log(.info, .default, "{s}", .{&oversized});
+            HeldTestLogger.log(.info, .default, "{s}", .{&oversized});
+            test_host.stall_packet = 2;
+            test_host.set_reading(true);
+        }
+        const dropped = HeldTestLogger.state.dropped_lines;
+        try std.testing.expectEqual(if (after_replay) @as(usize, 3) else 2, dropped);
+        try std.testing.expectEqual(0, HeldTestLogger.hold.lines);
+
+        HeldTestLogger.log(.info, .default, "QUEUED CURRENT", .{});
+        const reads = test_host.status_reads;
+        HeldTestLogger.log(.info, .default, "WHILE REPORT PENDING", .{});
+        try std.testing.expectEqual(reads + 1, test_host.status_reads);
+        try std.testing.expectEqual(dropped, HeldTestLogger.state.dropped_lines);
+        test_host.advance(10_000);
+        HeldTestLogger.log(.info, .default, "RECOVERED", .{});
+        try expect_log_order(&.{
+            if (after_replay) "lost at most 3 lines since last confirmed report]\r\n" else "lost at most 2 lines since last confirmed report]\r\n",
+            "QUEUED CURRENT\r\n",
+            "WHILE REPORT PENDING\r\n",
+            "RECOVERED\r\n",
+        });
+        try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+    }
+}
+
+test "logger re-holds when the host stops reading after boot" {
+    if (!host_test) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |masked| {
+        reset_held_test_logger();
+        HeldTestLogger.log(.info, .default, "BOOT", .{});
+        try expect_log_order(&.{"BOOT\r\n"});
+        const packets = test_host.packet_count;
+
+        test_host.set_reading(false);
+        test_host.masked = masked;
+        const start = test_host.clock_us();
+        const field: [100]u8 = @splat('x');
+        HeldTestLogger.log(.info, .default, "TIMED OUT {s} END", .{&field});
+        try std.testing.expect(test_host.clock_us() - start <= 2_040);
+        try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+        try std.testing.expectEqual(packets + 1, test_host.packet_count);
+        try std.testing.expectEqual(1, test_host.recommits);
+        const retry_at = test_host.last_commit_us + probe_retry_interval.to_us();
+
+        const accesses = test_host.fifo_accesses;
+        test_host.masked = true;
+        HeldTestLogger.log(.info, .default, "MASKED", .{});
+        try std.testing.expectEqual(accesses, test_host.fifo_accesses);
+        test_host.masked = false;
+        test_host.advance(retry_at - 100 - test_host.clock_us());
+        HeldTestLogger.log(.info, .default, "BEFORE RETRY", .{});
+        try std.testing.expect(test_host.clock_us() < retry_at);
+        try std.testing.expectEqual(1, test_host.recommits);
+        test_host.advance(retry_at - test_host.clock_us());
+        HeldTestLogger.log(.info, .default, "AFTER RETRY", .{});
+        try std.testing.expect(test_host.clock_us() - retry_at < 100);
+        try std.testing.expectEqual(2, test_host.recommits);
+        try std.testing.expectEqual(packets + 1, test_host.packet_count);
+        try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+
+        test_host.set_reading(true);
+        const observed = test_host.clock_us();
+        HeldTestLogger.log(.info, .default, "REPLUGGED", .{});
+        try std.testing.expect(test_host.last_commit_us - observed >= open_settle.to_us());
+        try expect_log_order(&.{ "BOOT\r\n", "TIMED OUT ", "lost at most 1 lines", "MASKED\r\n", "BEFORE RETRY\r\n", "AFTER RETRY\r\n", "REPLUGGED\r\n" });
+        try std.testing.expectEqual(1, std.mem.count(u8, test_host.output(), "TIMED OUT "));
+        try std.testing.expectEqual(0, std.mem.count(u8, test_host.output(), " END\r\n"));
+        try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+    }
+}
+
+test "logger preserves the original formatted line when a pending packet prevents its first commit" {
+    if (!host_test) return error.SkipZigTest;
+    const Record = struct {
+        calls: usize = 0,
+        sampled_us: u64 = 0,
+        text: []const u8 = "ORIGINAL",
+
+        pub fn format(self: *@This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            self.calls += 1;
+            self.sampled_us = test_host.clock_us();
+            defer self.text = "CHANGED";
+            try w.writeAll(self.text);
+        }
+    };
+    for ([_]bool{ false, true }) |masked| {
+        reset_held_test_logger();
+        HeldTestLogger.log(.info, .default, "BOOT", .{});
+        test_host.set_reading(false);
+        try std.testing.expectError(error.Timeout, write_blocking("RAW\r\n", .init_relative(tx_clock.get_time_since_boot(), packet_timeout)));
+        test_host.masked = masked;
+        var message: Record = .{};
+        const started = test_host.clock_us();
+        HeldTestLogger.log(.info, .default, "NOT COMMITTED {f}", .{&message});
+        try std.testing.expectEqual(1, message.calls);
+        try std.testing.expect(message.sampled_us - started < 100);
+        try std.testing.expect(test_host.clock_us() - started <= 2_040);
+        try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+        var line: [80]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&line, "[{}.{:0>6}] info: NOT COMMITTED ORIGINAL\r\n", .{
+            message.sampled_us / std.time.us_per_s,
+            message.sampled_us % std.time.us_per_s,
+        });
+
+        test_host.masked = false;
+        test_host.set_reading(true);
+        HeldTestLogger.log(.info, .default, "RECOVERED", .{});
+        try expect_log_order(&.{ "BOOT\r\n", "RAW\r\n", expected, "RECOVERED\r\n" });
+        try std.testing.expectEqual(1, std.mem.count(u8, test_host.output(), expected));
+        try std.testing.expectEqual(1, message.calls);
+    }
+}
+
+test "logger streams an oversized line without restarting its formatter" {
+    if (!host_test) return error.SkipZigTest;
+    const field: [200]u8 = @splat('x');
+    const tail: [48]u8 = @splat('y');
+    const Oversized = struct {
+        calls: *usize,
+        reserve: bool,
+
+        pub fn format(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            self.calls.* += 1;
+            try w.writeAll(&field);
+            try w.writeAll("KEEP");
+            if (self.reserve) {
+                const dest = try w.writableSlicePreserve("KEEP".len, tail.len);
+                @memcpy(dest, &tail);
+            } else {
+                try w.writeAll(&tail);
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |reserve| {
+        reset_held_test_logger();
+        HeldTestLogger.log(.info, .default, "BOOT", .{});
+        var calls: usize = 0;
+        const message: Oversized = .{ .calls = &calls, .reserve = reserve };
+        HeldTestLogger.log(.info, .default, "OVERSIZED {f}", .{message});
+        try expect_log_order(&.{ "BOOT\r\n", field ++ "KEEP" ++ tail ++ "\r\n" });
+        try std.testing.expectEqual(1, calls);
+
+        test_host.set_reading(false);
+        try std.testing.expectError(error.Timeout, write_blocking("RAW\r\n", .init_relative(tx_clock.get_time_since_boot(), packet_timeout)));
+        HeldTestLogger.log(.info, .default, "TIMED OUT {f}", .{message});
+        try std.testing.expectEqual(2, calls);
+        try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+        HeldTestLogger.log(.info, .default, "QUEUED", .{});
+        test_host.set_reading(true);
+        HeldTestLogger.log(.info, .default, "RECOVERED", .{});
+        try expect_log_order(&.{ "RAW\r\n", "lost at most 1 lines", "QUEUED\r\n", "RECOVERED\r\n" });
+        try std.testing.expectEqual(0, std.mem.count(u8, test_host.output(), "TIMED OUT"));
+        try std.testing.expectEqual(2, calls);
+    }
+}
+
+test "zero hold size drops lines while a direct write or loss report is stalled" {
+    if (!host_test) return error.SkipZigTest;
+    reset_test_logger();
+    test_host.stall_packet = 1;
+    logger.log(.info, .default, "DIRECT WRITE", .{});
+    const stalled_at = test_host.clock_us();
+    logger.log(.info, .default, "DROPPED AFTER WRITE", .{});
+    try std.testing.expectEqual(stalled_at, test_host.clock_us());
+    try std.testing.expectEqual(2, logger.state.dropped_lines);
+
+    test_host.advance(10_000);
+    test_host.stall_packet = test_host.packet_count + 1;
+    logger.log(.info, .default, "DROPPED DURING REPORT", .{});
+    logger.log(.info, .default, "DROPPED WHILE STALLED", .{});
+    try std.testing.expectEqual(4, logger.state.dropped_lines);
+
+    test_host.advance(10_000);
+    const resumed_at = test_host.clock_us();
+    logger.log(.info, .default, "RECOVERED", .{});
+    try std.testing.expect(test_host.clock_us() - resumed_at < 100);
+    try expect_log_order(&.{ "lost at most 4 lines since last confirmed report]\r\n", "RECOVERED\r\n" });
+    try std.testing.expectEqual(0, std.mem.count(u8, test_host.output(), "DROPPED"));
+}
+
+test "logger holds through Linux enumeration until tty open submits IN reads" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    const field: [72]u8 = @splat('x');
+    HeldTestLogger.log(.info, .default, "BOOT {s} COMPLETE", .{&field});
+
+    // acm_probe sends line coding, but acm_port_activate has not submitted reads.
+    HeldTestLogger.log(.info, .default, "ENUMERATED", .{});
+    test_host.advance(3_000_000);
+    HeldTestLogger.log(.info, .default, "LATE OPEN", .{});
+    try std.testing.expectEqual(1, test_host.packet_count);
+    try std.testing.expectEqual(0, test_host.output().len);
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "OPEN", .{});
+    try expect_log_order(&.{ "BOOT " ++ field ++ " COMPLETE\r\n", "ENUMERATED\r\n", "LATE OPEN\r\n", "OPEN\r\n" });
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "logger counts overflow during a long hold while the host stays closed" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "FIRST", .{});
+    HeldTestLogger.log(.info, .default, "KEPT", .{});
+    test_host.advance(3_000_000);
+
+    const field: [80]u8 = @splat('x');
+    HeldTestLogger.log(.info, .default, "FILL {s}", .{&field});
+    HeldTestLogger.log(.info, .default, "OVERFLOW {s}", .{&field});
+    HeldTestLogger.log(.info, .default, "STILL FITS", .{});
+    try std.testing.expectEqual(1, test_host.packet_count);
+    try std.testing.expectEqual(1, HeldTestLogger.state.dropped_lines);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "READING", .{});
+    try expect_log_order(&.{ "lost at most 1 lines", "FIRST\r\n", "KEPT\r\n", "FILL " ++ field ++ "\r\n", "STILL FITS\r\n", "READING\r\n" });
+    try std.testing.expectEqual(0, std.mem.count(u8, test_host.output(), "OVERFLOW"));
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+}
+
+test "logger keeps the first queued line when an earlier packet blocks the FIFO" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    try std.testing.expectError(error.Timeout, write_blocking("PENDING\r\n", .init_relative(tx_clock.get_time_since_boot(), .from_ms(2))));
+    HeldTestLogger.log(.info, .default, "FIRST QUEUED", .{});
+    HeldTestLogger.log(.info, .default, "RELEASE", .{});
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "RECOVERED", .{});
+    try expect_log_order(&.{ "PENDING\r\n", "FIRST QUEUED\r\n", "RELEASE\r\n", "RECOVERED\r\n" });
+}
+
+test "logger panic commits fatal text first when the first data packet stalls" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "HELD LINE", .{});
+    try std.testing.expectEqual(1, test_host.packet_count);
+    test_host.set_reading(true);
+    test_host.stall_packet = 2;
+    HeldTestLogger.prepare_panic();
+    HeldTestLogger.log(.err, .default, "PANIC TEXT", .{});
+    try std.testing.expectEqual(error.Timeout, HeldTestLogger.writer.err.?);
+    test_host.advance(10_000);
+    try std.testing.expect(!test_host.full());
+    HeldTestLogger.log(.err, .default, "PANIC DETAIL", .{});
+    try expect_log_order(&.{ "PANIC TEXT\r\n", "PANIC DETAIL\r\n" });
+    try std.testing.expect(std.mem.indexOf(u8, test_host.output(), "HELD LINE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, test_host.output(), "lost at most") == null);
+}
+
+test "a panic write times out within its packet budget when the probe is pending" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "HELD LINE", .{});
+    try std.testing.expectEqual(1, test_host.packet_count);
+
+    HeldTestLogger.prepare_panic();
+    const start = test_host.clock_us();
+    HeldTestLogger.log(.err, .default, "PANIC TEXT", .{});
+    try std.testing.expectEqual(error.Timeout, HeldTestLogger.writer.err.?);
+    try std.testing.expect(test_host.clock_us() - start <= 2_030);
+    try std.testing.expectEqual(0, HeldTestLogger.hold.lines);
+    try std.testing.expectEqual(1, test_host.packet_count);
+
+    test_host.set_reading(true);
+    try std.testing.expectEqual(1, test_host.packets_read);
+    try std.testing.expectEqual(0, test_host.output().len);
+    HeldTestLogger.log(.err, .default, "PANIC DETAIL", .{});
+    try expect_log_order(&.{"PANIC DETAIL\r\n"});
+    try std.testing.expectEqual(0, std.mem.count(u8, test_host.output(), "lost at most"));
+}
+
+test "zero hold size writes immediately at boot and after reattach" {
+    if (!host_test) return error.SkipZigTest;
+    reset_test_logger();
+    boot_tx_checked = false;
+    logger.log(.info, .default, "IMMEDIATE AT BOOT", .{});
+    try expect_log_order(&.{"IMMEDIATE AT BOOT\r\n"});
+    try std.testing.expectEqual(1, test_host.packet_count);
+    logger.start_hold();
+    logger.log(.info, .default, "IMMEDIATE AFTER ATTACH", .{});
+    try expect_log_order(&.{"IMMEDIATE AFTER ATTACH\r\n"});
+    try std.testing.expectEqual(2, test_host.packet_count);
 }
 
 test "logger named and temporary bytesToHex slices and raw hex" {
@@ -841,4 +1902,84 @@ test "dropping a logger line restores its full buffer" {
     try std.testing.expectEqual(logger.writer.storage.ptr, logger.writer.interface.buffer.ptr);
     try std.testing.expectEqual(logger.writer.storage.len, logger.writer.interface.buffer.len);
     reset_test_logger();
+}
+
+test "logger measures settle from observation even if the packet drained long ago" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    test_host.latency_us = 10_000;
+    HeldTestLogger.log(.info, .default, "HELD", .{});
+    const reads = test_host.status_reads;
+    try std.testing.expectEqual(0, test_host.packets_read);
+
+    test_host.set_reading(true);
+    try std.testing.expectEqual(0, test_host.packets_read);
+    test_host.advance(10_000);
+    try std.testing.expectEqual(1, test_host.packets_read);
+    test_host.advance(3_000_000);
+    try std.testing.expectEqual(reads, test_host.status_reads);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    test_host.latency_us = 0;
+    const observed = test_host.clock_us();
+    HeldTestLogger.log(.info, .default, "OPEN", .{});
+    try std.testing.expect(test_host.last_commit_us - observed >= open_settle.to_us());
+    try std.testing.expectEqual(0, test_host.recommits);
+    try expect_log_order(&.{ "HELD\r\n", "OPEN\r\n" });
+}
+
+test "reattach commits a fresh probe after a previous commit drained while idle" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    test_host.latency_us = 10_000;
+    HeldTestLogger.log(.info, .default, "BEFORE ATTACH", .{});
+    const reads = test_host.status_reads;
+    test_host.set_reading(true);
+    test_host.advance(150_000);
+    try std.testing.expectEqual(1, test_host.packets_read);
+    try std.testing.expectEqual(reads, test_host.status_reads);
+
+    HeldTestLogger.start_hold();
+    test_host.set_reading(false);
+    test_host.latency_us = 0;
+    test_host.advance(probe_delay.to_us());
+    HeldTestLogger.log(.info, .default, "AFTER ATTACH", .{});
+    try std.testing.expectEqual(2, test_host.packet_count);
+    try std.testing.expectEqual(1, test_host.packets_read);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "REPLAY", .{});
+    try expect_log_order(&.{ "BEFORE ATTACH\r\n", "AFTER ATTACH\r\n", "REPLAY\r\n" });
+}
+
+test "destructive reattach probes again after the controller discards a pending probe" {
+    if (!host_test) return error.SkipZigTest;
+    reset_held_test_logger();
+    test_host.advance(probe_delay.to_us());
+    test_host.set_reading(false);
+    HeldTestLogger.log(.info, .default, "BEFORE RESET", .{});
+    try std.testing.expect(test_host.full());
+
+    const detached = Reenumeration.detach_and_reset();
+    try std.testing.expect(!test_host.full());
+    try std.testing.expectEqual(0, test_host.packets_read);
+    detached.attach();
+    test_host.advance(probe_delay.to_us());
+
+    HeldTestLogger.log(.info, .default, "AFTER RESET", .{});
+    try std.testing.expectEqual(2, test_host.packet_count);
+    try std.testing.expect(test_host.full());
+    try std.testing.expectEqual(2, HeldTestLogger.hold.lines);
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
+    try std.testing.expectEqual(0, test_host.output().len);
+
+    test_host.set_reading(true);
+    HeldTestLogger.log(.info, .default, "REOPENED", .{});
+    try expect_log_order(&.{ "BEFORE RESET\r\n", "AFTER RESET\r\n", "REOPENED\r\n" });
+    try std.testing.expectEqual(0, HeldTestLogger.state.dropped_lines);
 }

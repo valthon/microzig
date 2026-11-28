@@ -63,6 +63,7 @@ Sections, in order (leave out a section that does not apply; never leave a headi
 | --- | --- |
 | [Interrupt handling and ISR routing](interrupts.md) | core interrupt API, vector tables, singleton routing |
 | [ESP Wi-Fi handle](esp-wifi-handle.md) | Wi-Fi ownership, lifecycle and vendor event routing |
+| [ESP USB Serial/JTAG logger](usb_serial_jtag_logger.md) | logger queue, reattach hold, and replay |
 
 Planned backfills, in the order upcoming work needs them: ESP radio stack and coexistence; USB
 device stack; network, lwIP and the `drivers/src/base` interfaces; the nRF52840 IEEE 802.15.4
