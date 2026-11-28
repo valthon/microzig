@@ -69,6 +69,17 @@ pub const HAL_Options = struct {
     /// On C6, recover USB Serial/JTAG at startup after RWDT core reset (0x09).
     /// Disable when the application manages USB recovery itself.
     recover_usb_at_startup: bool = true,
+    /// RAM reserved for complete USB Serial/JTAG log lines on C3 and C6.
+    /// The first unmasked call probes immediately at boot. After HAL reattach
+    /// it probes once 100 ms have elapsed. An unmasked probe poll waits up to
+    /// 2 ms for drain. A TX timeout also holds later lines, with no polling
+    /// for drain on later calls. In either hold, unmasked calls re-commit a
+    /// pending packet at 500 ms intervals and replay after observing drain
+    /// and waiting 100 ms to settle.
+    /// The logger also uses this space to preserve a formatted line if its
+    /// send times out before the first commit. Oversized lines stream directly.
+    /// Set to zero for immediate writes.
+    usb_serial_jtag_log_hold_size: usize = 2048,
     /// On C6, disable retained EXT1 selection and release its pad holds at startup.
     /// Disable when the application manages retained wake pads itself.
     release_ext1_holds_at_startup: bool = true,

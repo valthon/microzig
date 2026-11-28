@@ -155,20 +155,83 @@ I2S diagnostic `rx_eof_num` is a byte count, matching ESP-IDF v5.5.1
 Its bounds require that many RX bytes and duplex TX bytes.
 The external `eof_num` case checks 64 received bytes, echoed data and guards.
 
-The USB Serial/JTAG logger waits for the host with the caller's interrupt
-state: it masks interrupts only to claim the writer and update its counters,
-never while waiting. Each writer drain (at most 64 bytes) waits at most 2 ms for
+The USB Serial/JTAG logger holds complete lines in RAM on both ESP32-C3 and
+ESP32-C6 from boot, after each HAL reattach, and after a TX timeout.
+At boot the first unmasked call probes immediately and can deliver a one-shot
+log to an already reading host in the same call. A HAL reattach starts a
+100 ms probe delay. `Disconnect.finish`, including `reconnect()` and sleep's
+`.disconnect_and_reenumerate`, starts that delay after any bus-reset wait.
+Lines logged only in that first 100 ms wait for a later unmasked call.
+The probe commits the IN buffer, whether empty or holding an earlier
+packet. Masked calls queue throughout a hold. While the probe is pending,
+an unmasked call re-commits a still-full buffer once 500 ms have elapsed since
+the last commit. Each unmasked probe poll gives it up to 2 ms to drain. Recording the drain
+confirms the host is reading and starts a one-time 100 ms settle delay.
+An unmasked call can finish the wait, replay the queued lines in order,
+then send its own.
+Both waits leave the writer free so masked calls can append without waiting
+or touching the FIFO. An idle logger retains any pending lines until logging
+resumes. Set `microzig_options.hal.usb_serial_jtag_log_hold_size` to
+configure the RAM budget (2048 bytes by default, including line lengths).
+Zero restores immediate writes.
+See the [USB Serial/JTAG logger design](../../../docs/design/usb_serial_jtag_logger.md) for the hold and replay state machine.
+
+In the earlier Windows diagnostic on ESP32-C3 and C6, delayed empty commits
+stayed pending while the port was closed and drained promptly after it reopened.
+With an immediate probe after reconnect, both C6 boards stopped delivering logs,
+and the C3 released its hold while the port was still closed in the late-open run.
+The logger commits with
+EP1_CONF.WR_DONE and observes drain through SERIAL_IN_EP_DATA_FREE
+(C3 TRM v1.4 §30.6 registers 30.1/30.6 and C6 TRM v1.2 §32.7 registers
+32.1/32.2). The commit also clears the C6's stuck-at-boot condition described
+below.
+
+On Linux, `acm_port_activate` submits bulk IN read URBs when the tty opens.
+Enumeration can configure line coding before any reader is active. See
+[Linux cdc-acm.c](https://github.com/torvalds/linux/blob/master/drivers/usb/class/cdc-acm.c).
+The settle delay gives pyserial 3.5 on Windows time to finish opening.
+Its `Serial.open` calls SetCommState and then clears the receive buffer
+with PurgeComm. On the C6 bench, immediate replay could lose lines to that
+purge. See [pyserial 3.5 serialwin32.py](https://github.com/pyserial/pyserial/blob/v3.5/serial/serialwin32.py).
+A hold covers lines logged after a reattach, not before the detach. On the
+bench (Windows), lines logged shortly before `reconnect()` were sometimes
+missing although the host had taken them; give the host time to read before
+calling `reconnect()`.
+
+The logger uses short critical sections for hold decisions, writer ownership
+and counters. Waits for the host run with the caller's interrupt state.
+Each writer drain (at most 64 bytes) waits at most 2 ms for
 the host. Callers with interrupts masked and ordinary interrupt
 handlers (identified by a nonzero priority threshold) share one 2 ms deadline
-per line, plus formatting and FIFO writes. A line that starts while another
-is being written (from an interrupt handler or a preempting task) is dropped
-rather than interleaved. Once stalled, the logger drops lines immediately
-until the FIFO is writable. The next written line reports **at most N** lost
-or truncated lines **since the last confirmed report**. This saturating count
-is an upper bound: committed packets, including reports, can arrive after a
-timeout. Fatal panic/trap handling masks interrupts and takes over an abandoned
-writer before logging; the old owner never resumes. Delivery remains best
-effort. `write_blocking` confirms host consumption, but its caller must quiesce
+per direct write, plus formatting and FIFO writes. A line from an interrupt
+handler or a preempting task is dropped and counted while another caller
+holds the writer, including during queue formatting. With holding enabled,
+a direct write, replay, or loss report that times out starts a new hold.
+This can happen on a self-powered board during a physical replug, when the
+host closes the port, or on a host-side reset. A bus-powered board restarts
+at boot on replug. For sends with holding enabled, the logger formats the
+current line once and stages it in the queue. If the first commit times out
+while waiting for an older packet, it keeps the original bytes and timestamp.
+Lines that outgrow the queue stream directly and count as lost on timeout.
+Unmasked calls check for drain
+without polling while full and re-commit at the same 500 ms interval.
+The call that observes drain waits for settle before replay. When the queue
+is full, excess lines are dropped and counted without waiting. At zero hold
+size or in panic, subsequent stalled writes drop immediately until the FIFO
+is writable.
+
+The logger retires and counts a failed line if it committed any packet for that
+line. Committed bytes, including those of a report, can still arrive after a
+timeout. The next successful send reports **at most N** lost or truncated
+lines **since the last confirmed report**. Across re-enumeration the host can
+consume packets before an application is reading. The count only covers
+losses the logger detects, and the host can consume the report itself.
+Fatal panic/trap handling masks interrupts and takes over the writer. With
+holding enabled, it discards held lines and suppresses loss reports to
+prioritize fatal text. A pending probe occupies the FIFO like any committed
+packet. The first fatal write can reach its 2 ms deadline before committing
+text if the host leaves that packet pending. Delivery remains best effort.
+`write_blocking` confirms host packet consumption, and its caller must quiesce
 logging first; masking interrupts cannot exclude a preempted logger owner.
 The same limitation applies throughout `Disconnect.begin`/`finish`.
 This logger is host-tested; on hardware it ran on a XIAO ESP32-C6 (rev v0.1),
@@ -176,7 +239,9 @@ This logger is host-tested; on hardware it ran on a XIAO ESP32-C6 (rev v0.1),
 10 of 10 watchdog boots with the port opened 40 s late gave USB output, each
 starting with an `at most 25 lines` report. Before the packet-bounded drain change, `selftest_usj`
 (RAM image, host echo script) passed 9/9 echo cases on the C3, Super Mini ESP32-C6 and
-XIAO ESP32-C6, 3 runs each, at 24ebc5d1 (2026-11-19). Radio evidence is documented in "BLE bench examples" and "IEEE 802.15.4 raw MAC (C6)".
+XIAO ESP32-C6, 3 runs each, at 24ebc5d1 (2026-11-19). The hold queue ran on the C3,
+Super Mini ESP32-C6 and XIAO ESP32-C6 with `selftest_usj_reenumerate` under Windows
+(2026-11-27, see below). Radio evidence is documented in "BLE bench examples" and "IEEE 802.15.4 raw MAC (C6)".
 
 An argument longer than the buffer is written in packet-sized drains, each
 with its own 2 ms timeout unless the caller needs the shared line deadline.
@@ -185,20 +250,36 @@ truncate a long string whenever the host takes more than 2 ms to read two
 packets. The host tests drive the real Writer, logger formatting and packet
 loop through a deterministic FIFO/clock seam (hosted tests only), covering
 boundary lengths, vectors/splats, `bytesToHex` slices, raw `{x}`, timeout
-accounting/recovery, the shared deadline, and a large writer that drains in
-place and gets its full buffer back after a failed drain. When a reservation
+accounting/recovery, replay after a late tty open, the shared deadline, and
+a large writer that drains in place and gets its full buffer back after a failed drain. When a reservation
 needs room, the writer sends packets until the unsent bytes are no more than
 the sent prefix before moving them down: in the host test, 64 successive
 64-byte reservations on a full 4 KiB writer move 4,096 bytes, where moving
 after every packet moved 258,048.
+
+`selftest_usj_reenumerate` (C3 and C6, `-Dexample=selftest_usj_reenumerate`)
+discards bytes already in its receive FIFO at boot (the port can survive
+the reset that started it), waits for a newline from the host, prints
+`SELFTEST usj_reenumerate START`,
+then logs numbered `SEQ` lines at 20 ms intervals and reconnects between
+cycles. Start capture before sending the newline, and keep reading while
+sending it: once the test has started it no longer reads, so a later
+newline can block, and a host that stops reading can lose output. After
+each detach, reopen USB Serial/JTAG promptly and continue the same capture.
+The test uses a 4 KiB queue to fit the lines logged during a reopen about 2.2 s
+late and the subsequent settle delay. It passes when every SEQ number from 1 through the final
+`seq` in the repeated `SELFTEST usj_reenumerate DONE` line arrives in order,
+with no loss report after START.
 
 `selftest_usj_log` (C3 and C6; `-Dexample=selftest_usj_log`) logs seven
 `FIELD` lines of 31, 32, 63, 64, 65, 100 and 200 ASCII `h` characters and one
 `HEX` line with the lowercase hex of bytes 0 through 31. Each payload is
 followed by `len=<decimal> crc32=<eight hex digits>` of the logged text (for
 `HEX`, the 64 hex characters: `len=64`)
-(CRC-32/ISO-HDLC, `std.hash.Crc32`), then `SELFTEST usj_log DONE`. Open USB
-within the three-second startup delay or reset with the port open. On the
+(CRC-32/ISO-HDLC, `std.hash.Crc32`), then `SELFTEST usj_log DONE`. Start
+reading within the three-second startup delay or reset with the port open.
+After the startup delay, the first log call waits for the probe and the one-time 100 ms settle before
+sending, so the burst completes within its own log calls. On the
 ESP32-C3, Super Mini ESP32-C6 (rev v0.2) and XIAO ESP32-C6 (rev v0.1), all
 eight payloads matched their length and CRC, with no loss report
 (2026-11-23).
