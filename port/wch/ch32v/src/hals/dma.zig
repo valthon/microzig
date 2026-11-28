@@ -501,3 +501,56 @@ test "Peripheral - get_valid_channels returns correct slices" {
     try std.testing.expectEqual(@as(usize, 1), i2c2_rx_channels.len);
     try std.testing.expectEqual(Channel.Ch5, i2c2_rx_channels[0]);
 }
+
+test "DMA poll returns on a shared expired deadline or idle channel" {
+    const Fake = struct {
+        const Deadline = struct {
+            expires_at: u8,
+
+            pub fn check(deadline: @This(), current: u8) error{Timeout}!void {
+                if (current >= deadline.expires_at) return error.Timeout;
+            }
+        };
+
+        var tick: u8 = 0;
+        var busy_until: u8 = 0;
+
+        fn now() u8 {
+            tick += 1;
+            return tick;
+        }
+
+        fn ready(_: void) error{}!bool {
+            return tick >= busy_until;
+        }
+    };
+
+    const wait_until_ready = @import("time.zig").wait_until_ready;
+    const deadline: Fake.Deadline = .{ .expires_at = 5 };
+    Fake.tick = 0;
+    Fake.busy_until = 3;
+    try wait_until_ready({}, Fake.ready, deadline, Fake.now, null);
+    try std.testing.expect(Fake.tick < deadline.expires_at);
+
+    // A second channel uses whatever remains of the same deadline.
+    Fake.busy_until = 6;
+    try std.testing.expectError(error.Timeout, wait_until_ready({}, Fake.ready, deadline, Fake.now, null));
+    try std.testing.expectEqual(5, Fake.tick);
+
+    // Foreground resumes after the deadline and sees completion on its first poll.
+    Fake.tick = 7;
+    try std.testing.expectError(error.Timeout, wait_until_ready({}, Fake.ready, deadline, Fake.now, null));
+
+    // An interrupt between sampling ready and reading time can cross the deadline.
+    Fake.tick = 4;
+    Fake.busy_until = 4;
+    try std.testing.expectError(error.Timeout, wait_until_ready({}, Fake.ready, deadline, Fake.now, null));
+}
+
+test {
+    // The port's host test target is rooted here.
+    _ = @import("drivers.zig");
+    _ = @import("gpio.zig");
+    _ = @import("spi.zig");
+    _ = @import("i2c.zig");
+}

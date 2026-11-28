@@ -61,7 +61,7 @@ Each dispatched interface has a local `TestDevice`. Port names refer to the `dri
 | Interface | Adapter | Operations provided |
 | --- | --- | --- |
 | BlockMemory | Local test double only | It exercises sector writes and byte-offset reads. |
-| ClockDevice | ESP, RP2xxx, CH32V and nRF5x | They report boot time. Let `port/wch/ch32v/src/hals/time.zig:tim2_handler` run during CH32V adapter sleeps and deadline polling. Keep `port/nordic/nrf5x/src/hal/time.zig:rtc_interrupt` servicing RTC0 compare and overflow events to extend the nRF5x counter. |
+| ClockDevice | ESP, RP2xxx, CH32V and nRF5x | They report boot time. CH32V time stays monotonic across reinitialization. TIM2 ticks between a system clock switch and `time.init()` are scaled at the old rate, which can skew elapsed time and deadlines spanning the switch. Let `port/wch/ch32v/src/hals/time.zig:tim2_handler` run during CH32V adapter sleeps and deadline polling. Keep `port/nordic/nrf5x/src/hal/time.zig:rtc_interrupt` servicing RTC0 compare and overflow events to extend the nRF5x counter. |
 | ClockDevice | ATmega328P | Install `port/microchip/atmega/src/hals/atmega328p/time.zig:timer0_overflow` on `TIMER0_OVF`, call `hal.time.init()`, and leave interrupts enabled during sleeps. |
 | ClockDevice | `port/stmicro/stm32/src/hals/common/systick_timer.zig:clock_device` | It rejects creation before SysTick initialization. Let `port/stmicro/stm32/src/hals/common/systick.zig:SysTick_handler` run during sleeps so the wrap count advances. |
 | DatagramDevice | `I2C_DatagramDevice` on ESP, RP2xxx, nRF5x and STM32F103 | They bind an address, with combined transfer slots on RP2xxx and nRF5x. |

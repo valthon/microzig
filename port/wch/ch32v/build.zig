@@ -255,23 +255,37 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
 pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run platform agnostic unit tests");
 
-    // Test DMA HAL
+    const core = b.createModule(.{
+        .root_source_file = b.path("../../../core/src/microzig.zig"),
+        .target = b.graph.host,
+    });
+    const driver_options = b.addOptions();
+    driver_options.addOption(bool, "asserts", true);
+    const drivers = b.createModule(.{
+        .root_source_file = b.path("../../../drivers/src/root.zig"),
+        .imports = &.{.{ .name = "config", .module = driver_options.createModule() }},
+    });
+    const test_microzig = b.createModule(.{
+        .root_source_file = b.path("src/hals/test_microzig.zig"),
+        .imports = &.{
+            .{ .name = "core", .module = core },
+            .{ .name = "drivers", .module = drivers },
+        },
+    });
+
     const dma_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/hals/dma.zig"),
             .target = b.graph.host,
+            .imports = &.{.{ .name = "microzig", .module = test_microzig }},
         }),
     });
     const run_dma_tests = b.addRunArtifact(dma_tests);
     test_step.dependOn(&run_dma_tests.step);
 
-    const usb_core = b.createModule(.{
-        .root_source_file = b.path("../../../core/src/microzig.zig"),
-        .target = b.graph.host,
-    });
     const usb_test_microzig = b.createModule(.{
         .root_source_file = b.path("src/usb_test_microzig.zig"),
-        .imports = &.{.{ .name = "usb", .module = usb_core }},
+        .imports = &.{.{ .name = "usb", .module = core }},
     });
     const usb_tests = b.addTest(.{
         .name = "usb-hal-tests",
