@@ -133,8 +133,15 @@ A reset latched during the callback takes priority in the next snapshot.
 | `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll` | Follow the foreground polling interval above. | Withdraw both EP0 buffers at SETUP and service reset after packet events. A longer poll gap can let an earlier reset erase a later SETUP's state. |
 | `port/wch/ch32v/src/hals/usbd.zig:Polled.handle_out` | Foreground via `poll(false, controller)`. | Stage EP0 OUT from PMA and set RX to NAK before handing the data to core. |
 | `port/wch/ch32v/src/hals/usbfs.zig:Polled.ep_writev` | Keep the CPU IRQ disabled and call `poll(false, controller)`. | Arm status OUT at the current toggle when writing control IN. |
-| `port/wch/ch32v/src/hals/usbhs.zig:Polled.poll` | Keep the CPU IRQ disabled and call `poll(false, controller)`. | Drop a co-latched transfer event when processing SETUP and leave status OUT armed by the IN write. |
+| `port/wch/ch32v/src/hals/usbhs.zig:Polled.poll` | Keep the CPU IRQ disabled and call `poll(false, controller)`. | Copy the SETUP packet out of DMA before calling core. Acknowledge SETUP_ACT before the callback and keep any co-latched TRANSFER busy through reply publication. |
 | `port/stmicro/stm32/src/hals/STM32F103/usb_internals/usb_ll.zig:usb_handler` | Install this handler on `USB_LP_CAN1_RX0` before USB init and serialize foreground calls with its callbacks. | With `port/stmicro/stm32/src/hals/STM32F103/usb.zig:usb_ll`, the app owns EP0 sequencing and address timing and must discard the old transfer's state at each SETUP. On reset, clear application configuration and pending control state and release transfer waiters. A custom `Config.reset_callback` must also restore address zero and reset endpoints or call `port/stmicro/stm32/src/hals/STM32F103/usb_internals/usb_ll.zig:default_reset_handler`. |
+
+When polling SETUP_ACT, USBHS retires a co-latched EP0 transaction and leaves data endpoint
+completions pending
+for normal TRANSFER handling while their endpoint ownership persists. If the SETUP callback closes
+or reopens the completed endpoint direction, USBHS retires that completion after the callback so
+it cannot reach the new owner. USBFS dispatches SETUP from TRANSFER and holds that interlock through
+reply publication.
 
 Nordic's `port/nordic/nrf5x/src/hal/usbd/ep0.zig:Control` starts read status after the last IN completion.
 Hardware handles SET_ADDRESS and its status (nRF52840 PS v1.1 §6.35.9, as cited there). RP2xxx and WCH filter status OUT via `core/src/core/usb/ControlRequest.zig:out_packet`.

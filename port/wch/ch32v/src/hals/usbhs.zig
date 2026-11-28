@@ -33,6 +33,52 @@ pub const Config = struct {
 
 const Regs = peripherals.USBHS;
 
+// The host model implements write-one-to-clear poll flags and backs endpoint configuration.
+const PollRegs = if (@import("builtin").is_test) &test_poll_regs else Regs;
+const TestFlags = packed struct(u8) {
+    RB_UIF_BUS_RST__RB_UIF_DETECT: u1 = 0,
+    RB_UIF_TRANSFER: u1 = 0,
+    RB_UIF_SUSPEND: u1 = 0,
+    RB_UIF_HST_SOF: u1 = 0,
+    RB_UIF_FIFO_OV: u1 = 0,
+    // Match the generated register default so omitted writes are visible.
+    RB_UIF_SETUP_ACT: u1 = 1,
+    reserved: u2 = 0,
+};
+const TestStatus = packed struct(u8) {
+    MASK_UIS_H_RES__MASK_UIS_ENDP: u4 = 0,
+    MASK_UIS_TOKEN: u2 = 0,
+    reserved: u2 = 0,
+};
+var test_poll_regs: struct {
+    USB_INT_FG: struct {
+        pending: TestFlags = .{ .RB_UIF_SETUP_ACT = 0 },
+        reads_until_setup: u2 = 0,
+
+        fn read(self: *@This()) TestFlags {
+            if (self.reads_until_setup != 0) {
+                self.reads_until_setup -= 1;
+                if (self.reads_until_setup == 0) self.pending.RB_UIF_SETUP_ACT = 1;
+            }
+            return self.pending;
+        }
+
+        fn write(self: *@This(), clear: TestFlags) void {
+            self.pending = @bitCast(@as(u8, @bitCast(self.pending)) & ~@as(u8, @bitCast(clear)));
+        }
+    } = .{},
+    USB_INT_ST: microzig.mmio.Mmio(TestStatus) = .{ .raw = 0 },
+    USB_DEV_AD: microzig.mmio.Mmio(packed struct(u8) {
+        MASK_USB_ADDR: u7 = 0,
+        reserved: u1 = 0,
+    }) = .{ .raw = 0 },
+    UEP_CONFIG__UHOST_CTRL: Reg_U32 = .{ .raw = 0 },
+    UEP_TYPE: Reg_U32 = .{ .raw = 0 },
+    rx_dma: [15]Reg_U32 = @splat(.{ .raw = 0 }),
+    tx_dma: [15]Reg_U32 = @splat(.{ .raw = 0 }),
+    max_len: [15]Reg_U16 = @splat(.{ .raw = 0 }),
+} = .{};
+
 const EP_State = struct {
     buf: []align(4) u8 = &[_]u8{},
     // OUT:
@@ -87,9 +133,9 @@ pub const RegCtrl = microzig.mmio.Mmio(packed struct(u8) {
 // RX DMA: 0x20 + (ep-1)*4  (EP1..EP15)
 // EP0 has its own dedicated DMA reg.
 const EP0_DMA: *Reg_U32 = @ptrFromInt(0x4002341c);
-const UEP_RX_DMA: *volatile [15]Reg_U32 = @ptrFromInt(0x40023420);
-const UEP_TX_DMA: *volatile [15]Reg_U32 = @ptrFromInt(0x4002345c);
-const UEP_MAX_LEN: *volatile [15]Reg_U16 = @ptrFromInt(0x40023498);
+const UEP_RX_DMA: *volatile [15]Reg_U32 = if (@import("builtin").is_test) &test_poll_regs.rx_dma else @ptrFromInt(0x40023420);
+const UEP_TX_DMA: *volatile [15]Reg_U32 = if (@import("builtin").is_test) &test_poll_regs.tx_dma else @ptrFromInt(0x4002345c);
+const UEP_MAX_LEN: *volatile [15]Reg_U16 = if (@import("builtin").is_test) &test_poll_regs.max_len else @ptrFromInt(0x40023498);
 const EP_Regs: *volatile [16]extern struct {
     UEP_T_LEN: Reg_U16,
     UEP_TX_CTRL: RegCtrl,
@@ -162,6 +208,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
         endpoints: PerEndpointArray(cfg.max_endpoints_count),
         control: usb.ControlRequest = .{},
+        setup_data_transfer: enum { inactive, watching, retire } = .inactive,
         // USB DMA addresses must be 4-byte aligned.
         pool: [cfg.buffer_bytes]u8 align(4) = undefined,
 
@@ -173,6 +220,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             log.info("USBHS init starting", .{});
             self.interface = .{ .vtable = &vtable };
             self.endpoints = @splat(@splat(.{}));
+            self.setup_data_transfer = .inactive;
             @memset(self.pool[0..64], 0x7e);
             @memset(self.pool[64..], 0);
 
@@ -249,7 +297,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
         fn read_setup_from_ep0(self: *Self) types.SetupPacket {
             const ep0 = self.st(.ep0, .out);
             assert(ep0.buf.len >= 8);
-            const words_ptr: *align(4) const [2]u32 = @ptrCast(ep0.buf.ptr);
+            const words_ptr: *align(4) const volatile [2]u32 = @ptrCast(ep0.buf.ptr);
             return @bitCast(words_ptr.*);
         }
 
@@ -279,7 +327,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             _ = in_isr;
 
             while (true) {
-                const flags = Regs.USB_INT_FG.read();
+                const flags = PollRegs.USB_INT_FG.read();
                 if (flags.RB_UIF_HST_SOF == 0 and flags.RB_UIF_SUSPEND == 0 and
                     flags.RB_UIF_FIFO_OV == 0 and flags.RB_UIF_BUS_RST__RB_UIF_DETECT == 0 and
                     flags.RB_UIF_SETUP_ACT == 0 and flags.RB_UIF_TRANSFER == 0)
@@ -287,14 +335,14 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
                 if (flags.RB_UIF_HST_SOF != 0) {
                     // acknowledge SOF but ignore
-                    Regs.USB_INT_FG.write(.{
+                    PollRegs.USB_INT_FG.write(.{
                         .RB_UIF_HST_SOF = 1,
                         .RB_UIF_SETUP_ACT = 0,
                     });
                 }
                 if (flags.RB_UIF_SUSPEND != 0) {
                     // acknowledge SUSPEND but ignore
-                    Regs.USB_INT_FG.write(.{
+                    PollRegs.USB_INT_FG.write(.{
                         .RB_UIF_SUSPEND = 1,
                         .RB_UIF_SETUP_ACT = 0,
                     });
@@ -302,7 +350,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
                 if (flags.RB_UIF_FIFO_OV != 0) {
                     log.warn("FIFO overflow!", .{});
-                    Regs.USB_INT_FG.write(.{
+                    PollRegs.USB_INT_FG.write(.{
                         .RB_UIF_FIFO_OV = 1,
                         .RB_UIF_SETUP_ACT = 0,
                     });
@@ -311,7 +359,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                 if (flags.RB_UIF_BUS_RST__RB_UIF_DETECT != 0) {
                     log.info("bus reset\n\n\n", .{});
                     // clear
-                    Regs.USB_INT_FG.write(.{
+                    PollRegs.USB_INT_FG.write(.{
                         .RB_UIF_BUS_RST__RB_UIF_DETECT = 1,
                         .RB_UIF_SETUP_ACT = 0,
                     });
@@ -324,38 +372,40 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                 }
 
                 if (flags.RB_UIF_SETUP_ACT != 0) {
-                    log.info("SETUP received", .{});
-                    const setup: types.SetupPacket = self.read_setup_from_ep0();
+                    // SETUP supersedes EP0 transactions. A data endpoint's
+                    // completion stays pending for the normal transfer path.
+                    // CH32FV2x_V3x RM v2.5, §22.2.1.8–9 (USB_INT_FG/USB_INT_ST).
+                    const retire_ep0_transfer = flags.RB_UIF_TRANSFER != 0 and blk: {
+                        const status = PollRegs.USB_INT_ST.read();
+                        break :blk status.MASK_UIS_H_RES__MASK_UIS_ENDP == 0 and status.MASK_UIS_TOKEN != TOKEN_SOF;
+                    };
+                    const setup = self.read_setup_from_ep0();
+                    // SETUP_ACT can latch without TRANSFER holding the SIE
+                    // busy. Acknowledge the copied SETUP before dispatch.
+                    PollRegs.USB_INT_FG.write(.{ .RB_UIF_SETUP_ACT = 1 });
+                    self.setup_data_transfer = .watching;
+                    self.handle_setup(&setup, controller);
 
-                    // After SETUP, EP0 IN data stage starts with DATA1.
-                    set_tx_ctrl(0, RES_NAK, TOG_DATA1, false);
-                    set_rx_ctrl(0, RES_NAK, TOG_DATA1, false);
-                    self.st(.ep0, .in).tx_busy = false;
-
-                    self.control.setup(&setup);
-
-                    controller.on_setup_req(&self.interface, &setup);
-
-                    if (self.control.needs_stall()) self.stall_control();
-
-                    // A new SETUP aborts the previous control transfer. The
-                    // TRANSFER bit may still describe that previous packet;
-                    // handling it after queueing this response would consume
-                    // the new response as if it had already completed.
-                    Regs.USB_INT_FG.write(.{
-                        .RB_UIF_SETUP_ACT = 1,
-                        .RB_UIF_TRANSFER = flags.RB_UIF_TRANSFER,
-                    });
+                    // Hold TRANSFER through reply publication, including when
+                    // the callback retires the endpoint that owns it.
+                    const retire_transfer = retire_ep0_transfer or self.setup_data_transfer == .retire;
+                    self.setup_data_transfer = .inactive;
+                    if (retire_transfer) {
+                        PollRegs.USB_INT_FG.write(.{
+                            .RB_UIF_SETUP_ACT = 0,
+                            .RB_UIF_TRANSFER = 1,
+                        });
+                    }
                     continue;
                 }
 
                 if (flags.RB_UIF_TRANSFER != 0) {
-                    // clear transfer
-                    const stv = Regs.USB_INT_ST.read();
+                    const stv = PollRegs.USB_INT_ST.read();
                     const ep: u4 = @as(u4, stv.MASK_UIS_H_RES__MASK_UIS_ENDP);
                     const token: u2 = @as(u2, stv.MASK_UIS_TOKEN);
-                    self.handle_transfer(ep, token, flags.RB_UIF_SETUP_ACT != 0, controller);
-                    Regs.USB_INT_FG.write(.{
+                    // INT_BUSY holds the transaction and DMA buffer until W1C.
+                    self.handle_transfer(ep, token, controller);
+                    PollRegs.USB_INT_FG.write(.{
                         .RB_UIF_TRANSFER = 1,
                         .RB_UIF_SETUP_ACT = 0,
                     });
@@ -363,24 +413,26 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             }
         }
 
-        fn handle_transfer(self: *Self, ep: u4, token: u2, setup_already_handled: bool, controller: anytype) void {
+        fn handle_setup(self: *Self, setup: *const types.SetupPacket, controller: anytype) void {
+            set_tx_ctrl(0, RES_NAK, TOG_DATA1, false);
+            set_rx_ctrl(0, RES_NAK, TOG_DATA1, false);
+            self.st(.ep0, .in).tx_busy = false;
+            self.control.setup(setup);
+            controller.on_setup_req(&self.interface, setup);
+            if (self.control.needs_stall()) self.stall_control();
+        }
+
+        fn handle_transfer(self: *Self, ep: u4, token: u2, controller: anytype) void {
             if (ep >= cfg.max_endpoints_count) return;
-            if (token == TOKEN_SOF) return;
             switch (token) {
                 TOKEN_OUT => self.handle_out(ep, controller),
                 TOKEN_SOF => {},
                 TOKEN_IN => self.handle_in(ep, controller),
                 TOKEN_SETUP => {
-                    // If UIF_SETUP_ACT isn't present, handle SETUP via TRANSFER.
-                    if (ep == 0 and !setup_already_handled) {
-                        const setup: types.SetupPacket = self.read_setup_from_ep0();
-                        log.debug("Setup: {any}", .{setup});
-                        set_tx_ctrl(0, RES_NAK, TOG_DATA1, false);
-                        set_rx_ctrl(0, RES_NAK, TOG_DATA1, false);
-                        self.st(.ep0, .in).tx_busy = false;
-                        self.control.setup(&setup);
-                        controller.on_setup_req(&self.interface, &setup);
-                        if (self.control.needs_stall()) self.stall_control();
+                    // SETUP can also be reported through TRANSFER alone.
+                    if (ep == 0) {
+                        const setup = self.read_setup_from_ep0();
+                        self.handle_setup(&setup, controller);
                     }
                 },
             }
@@ -499,7 +551,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
         fn set_address(_: *usb.DeviceInterface, addr: u7) void {
             log.info("set_address {}", .{addr});
-            Regs.USB_DEV_AD.modify(.{ .MASK_USB_ADDR = addr });
+            PollRegs.USB_DEV_AD.modify(.{ .MASK_USB_ADDR = addr });
         }
 
         fn stall_control(self: *Self) void {
@@ -508,6 +560,22 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             self.control = .{};
             set_tx_ctrl(0, RES_STALL, current_tx_tog(0), false);
             set_rx_ctrl(0, RES_STALL, current_rx_tog(0), false);
+        }
+
+        fn retire_setup_data_transfer(self: *Self, endpoint: ?types.Endpoint) void {
+            if (self.setup_data_transfer != .watching or PollRegs.USB_INT_FG.read().RB_UIF_TRANSFER == 0) return;
+            const status = PollRegs.USB_INT_ST.read();
+            const ep = status.MASK_UIS_H_RES__MASK_UIS_ENDP;
+            if (ep == 0) return;
+            const dir: types.Dir = switch (status.MASK_UIS_TOKEN) {
+                TOKEN_OUT => .out,
+                TOKEN_IN => .in,
+                else => return,
+            };
+            if (endpoint) |e| {
+                if (ep != epn(e.num) or dir != e.dir) return;
+            }
+            self.setup_data_transfer = .retire;
         }
 
         fn ep_close_all(itf: *usb.DeviceInterface) void {
@@ -522,8 +590,9 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             }
             // CH32FV2x_V3x RM v2.2, 22.2.2.1, UEP_CONFIG: EP0 remains
             // available for the next SETUP; all data endpoint directions are disabled.
-            Regs.UEP_CONFIG__UHOST_CTRL.write_raw(0);
-            Regs.UEP_TYPE.write_raw(0);
+            PollRegs.UEP_CONFIG__UHOST_CTRL.write_raw(0);
+            PollRegs.UEP_TYPE.write_raw(0);
+            self.retire_setup_data_transfer(null);
         }
 
         fn ep_open(itf: *usb.DeviceInterface, desc_ptr: *const descriptor.Endpoint) void {
@@ -571,24 +640,26 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                     st_ep.buf = self.endpoint_alloc(@as(usize, 512));
                 }
 
-                const ptr_val: u32 = @as(u32, @intCast(@intFromPtr(st_ep.buf.ptr)));
+                const ptr_val: u32 = @truncate(@intFromPtr(st_ep.buf.ptr));
 
                 // The host can configure again without a bus reset (SET_CONFIGURATION), so an
                 // endpoint may be opened while a packet from its previous configuration is still
-                // armed. The NAK below withdraws that packet; the software state has to follow,
-                // or the next ep_listen panics and the next ep_writev refuses the data.
+                // armed. Withdraw the packet and retire any latched completion before reuse.
+                switch (e.dir) {
+                    .out => set_rx_ctrl(ep_i, RES_NAK, TOG_DATA0, false),
+                    .in => set_tx_ctrl(ep_i, RES_NAK, TOG_DATA0, false),
+                }
+                self.retire_setup_data_transfer(e);
                 if (e.dir == .out) {
                     const rx_dma: *volatile Reg_U32 = &UEP_RX_DMA[ep_i - 1];
                     rx_dma.raw = ptr_val;
                     const max_len: *volatile Reg_U16 = &UEP_MAX_LEN[ep_i];
                     max_len.raw = mps;
-                    set_rx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
                     st_ep.rx_armed = false;
                     st_ep.rx_last_len = 0;
                 } else {
                     const tx_dma: *volatile Reg_U32 = &UEP_TX_DMA[ep_i - 1];
                     tx_dma.raw = ptr_val;
-                    set_tx_ctrl(ep_i, RES_NAK, TOG_DATA0, false);
                     st_ep.tx_busy = false;
                 }
             }
@@ -599,17 +670,17 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
             // Enable endpoint direction in UEP_CONFIG bitmaps.
             // TODO: make this a function, too ugly here
-            var cfg_raw: u32 = Regs.UEP_CONFIG__UHOST_CTRL.raw;
+            var cfg_raw: u32 = PollRegs.UEP_CONFIG__UHOST_CTRL.raw;
             if (e.num != .ep0) {
                 if (e.dir == .in) cfg_raw |= (@as(u32, 1) << ep_i) else cfg_raw |= (@as(u32, 1) << (16 + @as(u5, ep_i)));
             }
-            Regs.UEP_CONFIG__UHOST_CTRL.raw = cfg_raw;
+            PollRegs.UEP_CONFIG__UHOST_CTRL.raw = cfg_raw;
 
             // Endpoint type ISO marking (only for ISO endpoints).
             if (e.num != .ep0 and desc.attributes.transfer_type == .Isochronous) {
-                var type_raw: u32 = Regs.UEP_TYPE.raw;
+                var type_raw: u32 = PollRegs.UEP_TYPE.raw;
                 if (e.dir == .in) type_raw |= (@as(u32, 1) << ep_i) else type_raw |= (@as(u32, 1) << (16 + @as(u5, ep_i)));
-                Regs.UEP_TYPE.raw = type_raw;
+                PollRegs.UEP_TYPE.raw = type_raw;
             }
 
             // EP0 OUT always ACK
@@ -775,4 +846,120 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 pub fn usbhs_interrupt_handler() callconv(microzig.cpu.riscv_calling_convention) void {
     Regs.USB_INT_FG.write(Regs.USB_INT_FG.read());
     @panic("Don't Enable USBHS Interrupt, Not yet supported!");
+}
+
+fn expect_transfer_co_latched_with_setup(discard: bool) !void {
+    const Device = Polled(.{}, .{});
+    const Controller = struct {
+        setups: usize = 0,
+        completions: usize = 0,
+
+        pub fn on_bus_reset(_: *@This(), _: *usb.DeviceInterface) void {
+            unreachable;
+        }
+
+        pub fn on_setup_req(self: *@This(), _: *usb.DeviceInterface, _: *const types.SetupPacket) void {
+            self.setups += 1;
+        }
+
+        pub fn on_buffer(self: *@This(), _: *usb.DeviceInterface, comptime ep: types.Endpoint) void {
+            assert(ep.num == .ep1 and ep.dir == .in);
+            self.completions += 1;
+        }
+    };
+    var setup: [8]u8 align(4) = .{ 0x80, 6, 0, 1, 0, 0, 18, 0 }; // GET_DESCRIPTOR
+    for ([_]TestStatus{
+        .{ .MASK_UIS_TOKEN = TOKEN_IN, .MASK_UIS_H_RES__MASK_UIS_ENDP = 1 },
+        .{ .MASK_UIS_TOKEN = TOKEN_SETUP },
+    }) |status| {
+        var dev: Device = undefined;
+        dev.endpoints = @splat(@splat(.{}));
+        dev.control = .{};
+        dev.st(.ep0, .out).buf = &setup;
+        const data_in = status.MASK_UIS_TOKEN == TOKEN_IN;
+        dev.st(.ep1, .in).tx_busy = data_in;
+        var ctl: Controller = .{};
+
+        test_poll_regs.USB_INT_ST.write(status);
+        test_poll_regs.USB_INT_FG.pending = .{ .RB_UIF_SETUP_ACT = 1, .RB_UIF_TRANSFER = 1 };
+        dev.poll(false, &ctl);
+
+        try std.testing.expectEqual(@as(usize, @intFromBool(!discard)), ctl.setups);
+        try std.testing.expectEqual(@as(usize, @intFromBool(data_in)), ctl.completions);
+        try std.testing.expect(!dev.st(.ep1, .in).tx_busy);
+        try std.testing.expectEqual(TestFlags{ .RB_UIF_SETUP_ACT = 0 }, test_poll_regs.USB_INT_FG.pending);
+    }
+}
+
+test "USBHS preserves a data IN completion alongside SETUP" {
+    try expect_transfer_co_latched_with_setup(false);
+}
+
+fn expect_reopened_endpoint_drops_old_completion(comptime dir: types.Dir) !void {
+    const Device = Polled(.{}, .{});
+    const Controller = struct {
+        close_first: bool,
+        completions: usize = 0,
+
+        pub fn on_bus_reset(_: *@This(), _: *usb.DeviceInterface) void {
+            unreachable;
+        }
+
+        pub fn on_setup_req(self: *@This(), itf: *usb.DeviceInterface, _: *const types.SetupPacket) void {
+            if (self.close_first) itf.vtable.ep_close_all.?(itf);
+            itf.ep_open(&.{
+                .endpoint = .{ .num = .ep1, .dir = dir },
+                .attributes = .{ .transfer_type = .Bulk, .usage = .data },
+                .max_packet_size = .from(64),
+                .interval = 0,
+            });
+            switch (dir) {
+                .out => itf.ep_listen(.ep1, 64),
+                .in => assert(itf.ep_writev(.ep1, &.{"new"}) == 3),
+            }
+        }
+
+        pub fn on_buffer(self: *@This(), _: *usb.DeviceInterface, comptime ep: types.Endpoint) void {
+            assert(ep.num == .ep1 and ep.dir == dir);
+            self.completions += 1;
+        }
+    };
+    var setup: [8]u8 align(4) = .{ 0, 9, 1, 0, 0, 0, 0, 0 }; // SET_CONFIGURATION(1)
+    var data: [64]u8 align(4) = @splat(0xA1);
+    for ([_]bool{ false, true }) |close_first| {
+        var dev: Device = undefined;
+        dev.interface = .{ .vtable = &Device.vtable };
+        dev.endpoints = @splat(@splat(.{}));
+        dev.st(.ep0, .out).buf = &setup;
+        const ep = dev.st(.ep1, dir);
+        ep.buf = &data;
+        ep.rx_armed = dir == .out;
+        ep.tx_busy = dir == .in;
+        var ctl: Controller = .{ .close_first = close_first };
+
+        const token = if (dir == .out) TOKEN_OUT else TOKEN_IN;
+        test_poll_regs.USB_INT_ST.write(.{ .MASK_UIS_TOKEN = token, .MASK_UIS_H_RES__MASK_UIS_ENDP = 1 });
+        Regs.USB_RX_LEN.raw = 4;
+        Regs.USB_INT_ST.raw = 1; // TOG_OK
+        test_poll_regs.USB_INT_FG.pending = .{ .RB_UIF_SETUP_ACT = 1, .RB_UIF_TRANSFER = 1 };
+        dev.poll(false, &ctl);
+
+        try std.testing.expectEqual(0, ctl.completions);
+        try std.testing.expectEqual(0, ep.rx_last_len);
+        try std.testing.expect(if (dir == .out) ep.rx_armed else ep.tx_busy);
+        try std.testing.expectEqual(TOG_DATA0, if (dir == .out) current_rx_tog(1) else current_tx_tog(1));
+        try std.testing.expectEqual(TestFlags{ .RB_UIF_SETUP_ACT = 0 }, test_poll_regs.USB_INT_FG.pending);
+
+        test_poll_regs.USB_INT_FG.pending.RB_UIF_TRANSFER = 1;
+        dev.poll(false, &ctl);
+        try std.testing.expectEqual(1, ctl.completions);
+    }
+}
+
+test "USBHS drops the old OUT completion when SETUP reopens and rearms the endpoint" {
+    try expect_reopened_endpoint_drops_old_completion(.out);
+}
+
+test "USBHS drops the old IN completion when SETUP reopens and rearms the endpoint" {
+    try expect_reopened_endpoint_drops_old_completion(.in);
 }
