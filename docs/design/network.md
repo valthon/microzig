@@ -131,6 +131,15 @@ within the remaining buffer.
   bus status word. Preserve the four-byte alignment and accessible tail padding
   for the TX adapter's word-rounded transfer. The driver reports association as
   link state and checks firmware credit before writing TX.
+- `drivers/src/wireless/cyw43439/wifi.zig:start_ap` makes the same link an access point:
+  it marks the station join events done, so link state follows the chip's link event. In the
+  access point role, ioctls wait longer while the AP starts, and link state follows only the
+  link event: `deauth_ind` (one per departing station) and the station `auth`, `psk_sup` and
+  `set_ssid` events are ignored, and a link drop sets no `err`. Station mode keeps the short
+  wait and still fails authentication on `deauth_ind`. With no join or access point in progress
+  (role `.none`, as after `stop_ap`), join events are ignored. A join in progress stays
+  `.joining` until an essential event (`auth`, `link`, `psk_sup`, `set_ssid`, or a station's
+  `deauth_ind`) decides it, and scan results never change join state.
 - In `examples/raspberrypi/rp2xxx/src/net/irq.zig:main`, GPIO masks the source and posts a wake.
   The HAL also masks the pin around SPI transfers and restores its previous state. Foreground drains RX, and
   `drivers/src/wireless/cyw43439/wifi.zig:read` asks the HAL to re-arm when the interrupt
@@ -151,7 +160,12 @@ within the remaining buffer.
 ## Evidence
 
 - `drivers/src/wireless/cyw43439/wifi.zig` defines "events to join_state" for association
-  state and "receive capacity rejects oversized packets and polls full Ethernet frames"
+  state, "deauth_ind ends a station association but not an access point", "an access point
+  link drop sets no error and recovers" and "an access point follows only its link, not station
+  join events" for the role split, "join events after stop_ap or a failed start are ignored",
+  "a driver with no join or access point ignores join events but takes scan results",
+  "a station join survives scan and association events before any essential event",
+  and "receive capacity rejects oversized packets and polls full Ethernet frames"
   for checking RX capacity before the bus read. No build test step includes these tests.
 - `zig build test` in `examples/espressif/esp/` runs "DHCP allocation, renewal, collision, release, exhaustion and expiry"
   in `examples/espressif/esp/src/softap_dhcp.zig`, covering the AP's lease logic.
