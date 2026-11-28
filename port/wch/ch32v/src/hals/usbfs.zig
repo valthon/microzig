@@ -31,6 +31,40 @@ pub const Config = struct {
 
 const Regs = peripherals.USB_OTG_FS;
 
+// The host model implements write-one-to-clear semantics for the poll flags.
+const PollRegs = if (@import("builtin").is_test) &test_poll_regs else Regs;
+const TestFlags = packed struct(u8) {
+    RB_UIF_BUS_RST__RB_UIF_DETECT: u1 = 0,
+    RB_UIF_TRANSFER: u1 = 0,
+    RB_UIF_SUSPEND: u1 = 0,
+    RB_UIF_HST_SOF: u1 = 0,
+    RB_UIF_FIFO_OV: u1 = 0,
+    reserved: u3 = 0,
+};
+const TestStatus = packed struct(u8) {
+    MASK_UIS_H_RES__MASK_UIS_ENDP: u4 = 0,
+    MASK_UIS_TOKEN: u2 = 0,
+    reserved: u2 = 0,
+};
+var test_poll_regs: struct {
+    R8_USB_INT_FG: struct {
+        pending: TestFlags = .{},
+
+        fn read(self: *const @This()) TestFlags {
+            return self.pending;
+        }
+
+        fn write(self: *@This(), clear: TestFlags) void {
+            self.pending = @bitCast(@as(u8, @bitCast(self.pending)) & ~@as(u8, @bitCast(clear)));
+        }
+    } = .{},
+    R8_USB_INT_ST: microzig.mmio.Mmio(TestStatus) = .{ .raw = 0 },
+    R8_USB_DEV_AD: microzig.mmio.Mmio(packed struct(u8) {
+        MASK_USB_ADDR: u7 = 0,
+        reserved: u1 = 0,
+    }) = .{ .raw = 0 },
+} = .{};
+
 const EP_State = struct {
     buf: []align(4) u8 = &[_]u8{},
     // OUT:
@@ -254,7 +288,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                 set_tx_ctrl(e, RES_NAK, TOG_DATA0, false);
             }
 
-            // EP0 special.
+            set_tx_ctrl(0, RES_NAK, TOG_DATA0, false);
             self.arm_ep0_out_always();
         }
 
@@ -289,34 +323,43 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
         pub fn poll(self: *Self, in_isr: bool, controller: anytype) void {
             _ = in_isr;
-            const flags = Regs.R8_USB_INT_FG.read();
+            const flags = PollRegs.R8_USB_INT_FG.read();
             if (flags.RB_UIF_SUSPEND == 0 and flags.RB_UIF_FIFO_OV == 0 and
                 flags.RB_UIF_BUS_RST__RB_UIF_DETECT == 0 and flags.RB_UIF_TRANSFER == 0)
                 return;
 
             if (flags.RB_UIF_SUSPEND != 0) {
-                Regs.R8_USB_INT_FG.write(.{ .RB_UIF_SUSPEND = 1 });
+                PollRegs.R8_USB_INT_FG.write(.{ .RB_UIF_SUSPEND = 1 });
             }
 
             if (flags.RB_UIF_FIFO_OV != 0) {
                 log.warn("FIFO overflow!", .{});
-                Regs.R8_USB_INT_FG.write(.{ .RB_UIF_FIFO_OV = 1 });
+                PollRegs.R8_USB_INT_FG.write(.{ .RB_UIF_FIFO_OV = 1 });
             }
 
             if (flags.RB_UIF_BUS_RST__RB_UIF_DETECT != 0) {
-                log.debug("bus reset", .{});
-                Regs.R8_USB_INT_FG.write(.{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1 });
-                set_address(&self.interface, 0);
+                // A reset can latch again during the controller callback.
+                // CH32FV2x_V3x RM v2.5, §23.2.1.5–6.
+                PollRegs.R8_USB_INT_FG.write(.{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1 });
                 self.on_bus_reset_local();
+                set_address(&self.interface, 0);
+                // Keep INT_BUSY asserted until the stale endpoints are retired
+                // (§23.2.1.1), then release only the sampled transfer.
+                if (flags.RB_UIF_TRANSFER != 0)
+                    PollRegs.R8_USB_INT_FG.write(.{ .RB_UIF_TRANSFER = 1 });
+                log.debug("bus reset", .{});
                 controller.on_bus_reset(&self.interface);
+                // The next poll checks reset first in a fresh snapshot.
+                return;
             }
 
             if (flags.RB_UIF_TRANSFER != 0) {
-                const stv = Regs.R8_USB_INT_ST.read();
+                const stv = PollRegs.R8_USB_INT_ST.read();
                 const ep: u4 = @as(u4, stv.MASK_UIS_H_RES__MASK_UIS_ENDP);
                 const token: u2 = @as(u2, stv.MASK_UIS_TOKEN);
+                // INT_BUSY holds the transaction and DMA buffer until W1C.
                 self.handle_transfer(ep, token, controller);
-                Regs.R8_USB_INT_FG.write(.{ .RB_UIF_TRANSFER = 1 });
+                PollRegs.R8_USB_INT_FG.write(.{ .RB_UIF_TRANSFER = 1 });
             }
         }
 
@@ -398,16 +441,22 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             // must not consume data or advance the expected toggle, including EP0.
             if (stv.RB_UIS_TOG_OK == 0) return;
 
-            // EP0 data OUT waits for the controller to accept or rearm it.
             if (ep == 0) {
-                const st_out = self.st(.ep0, .out);
-                st_out.rx_last_len = len;
-                const next = toggle_next(current_rx_tog(0));
-                set_rx_ctrl(0, RES_NAK, next, false);
-                if (self.control.out_packet()) {
-                    self.call_on_buffer(.out, 0, controller);
-                    if (self.control.needs_stall()) self.stall_control();
+                const next = toggle_next(rx_ctrl.TOG);
+                if (!self.control.out_packet()) {
+                    // ACK a control-read status retry, and let TOG_OK filter
+                    // the duplicate (USB 2.0 §8.6.4, CH32FV2x_V3x RM
+                    // v2.5 §23.2.2.9, UEP_R_RES and UEP_R_TOG).
+                    const status_out = self.control.direction == .in and self.control.answered;
+                    set_rx_ctrl(0, if (status_out) RES_ACK else RES_NAK, next, false);
+                    return;
                 }
+
+                // Data OUT waits for the controller to accept or rearm it.
+                self.st(.ep0, .out).rx_last_len = len;
+                set_rx_ctrl(0, RES_NAK, next, false);
+                self.call_on_buffer(.out, 0, controller);
+                if (self.control.needs_stall()) self.stall_control();
                 return;
             }
 
@@ -445,10 +494,10 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             // Notify controller/drivers of IN completion.
             self.call_on_buffer(.in, ep, controller);
 
-            // After EP0 IN completes, re-arm EP0 OUT for the next SETUP.
-            // SETUP packets always use DATA0 toggle; the WCH USBFS hardware
-            // checks the toggle even for SETUP, so we must reset to DATA0.
-            if (ep == 0) {
+            // A control read still expects a DATA1 status OUT (USB 2.0
+            // §8.5.3). Leave RX armed as set by ep_writev; the expected
+            // PID is independent of TX (CH32FV2x_V3x RM v2.5, §23.2.2.8–9).
+            if (ep == 0 and self.control.direction == .out) {
                 self.arm_ep0_out_always();
             }
         }
@@ -457,7 +506,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
         fn set_address(_: *usb.DeviceInterface, addr: u7) void {
             log.debug("set_address to {}", .{addr});
-            Regs.R8_USB_DEV_AD.modify(.{ .MASK_USB_ADDR = addr });
+            PollRegs.R8_USB_DEV_AD.modify(.{ .MASK_USB_ADDR = addr });
         }
 
         fn stall_control(self: *Self) void {
@@ -720,4 +769,117 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 pub fn usbfs_interrupt_handler() callconv(microzig.cpu.riscv_calling_convention) void {
     Regs.R8_USB_INT_FG.write(Regs.R8_USB_INT_FG.read());
     @panic("USBFS interrupt-driven operation is not supported");
+}
+
+test "USBFS bus reset discards pending SETUP" {
+    const Device = Polled(.{}, .{});
+    const Controller = struct {
+        resets: usize = 0,
+        setups: usize = 0,
+        setup_during_reset: bool = false,
+        second_reset: bool = false,
+
+        pub fn on_bus_reset(self: *@This(), _: *usb.DeviceInterface) void {
+            self.resets += 1;
+            if (self.setup_during_reset) {
+                self.setup_during_reset = false;
+                test_poll_regs.R8_USB_INT_FG.pending.RB_UIF_TRANSFER = 1;
+            }
+            if (self.second_reset) {
+                self.second_reset = false;
+                test_poll_regs.R8_USB_INT_FG.pending.RB_UIF_BUS_RST__RB_UIF_DETECT = 1;
+            }
+        }
+
+        pub fn on_setup_req(self: *@This(), _: *usb.DeviceInterface, _: *const types.SetupPacket) void {
+            self.setups += 1;
+        }
+
+        pub fn on_buffer(_: *@This(), _: *usb.DeviceInterface, comptime _: types.Endpoint) void {
+            unreachable;
+        }
+    };
+    var dev: Device = undefined;
+    dev.endpoints = @splat(@splat(.{}));
+    var setup: [8]u8 align(4) = .{ 0, 9, 1, 0, 0, 0, 0, 0 }; // SET_CONFIGURATION(1)
+    dev.st(.ep0, .out).buf = &setup;
+    var ctl: Controller = .{};
+    test_poll_regs.R8_USB_INT_ST.write(.{ .MASK_UIS_TOKEN = TOKEN_SETUP });
+
+    set_tx_ctrl(0, RES_ACK, TOG_DATA1, false);
+    test_poll_regs.R8_USB_INT_FG.pending = .{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1, .RB_UIF_TRANSFER = 1 };
+    dev.poll(false, &ctl);
+    try std.testing.expectEqual(1, ctl.resets);
+    try std.testing.expectEqual(RES_NAK, EP_Regs[0].UEP_TX_CTRL.read().RES);
+    try std.testing.expectEqual(0, ctl.setups);
+    try std.testing.expectEqual(TestFlags{}, test_poll_regs.R8_USB_INT_FG.pending);
+
+    test_poll_regs.R8_USB_INT_FG.pending = .{ .RB_UIF_TRANSFER = 1 };
+    dev.poll(false, &ctl);
+    try std.testing.expectEqual(1, ctl.setups);
+    // A flag outside the reset snapshot remains pending.
+    ctl.setup_during_reset = true;
+    test_poll_regs.R8_USB_INT_FG.pending = .{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1 };
+    dev.poll(false, &ctl);
+    try std.testing.expectEqual(1, ctl.setups);
+    try std.testing.expectEqual(1, test_poll_regs.R8_USB_INT_FG.pending.RB_UIF_TRANSFER);
+    dev.poll(false, &ctl);
+    try std.testing.expectEqual(2, ctl.setups);
+
+    // A SETUP that arrived before a second reset must be discarded.
+    const resets = ctl.resets;
+    const setups = ctl.setups;
+    ctl.setup_during_reset = true;
+    ctl.second_reset = true;
+    test_poll_regs.R8_USB_INT_FG.pending = .{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1 };
+    dev.poll(false, &ctl);
+    dev.poll(false, &ctl);
+    try std.testing.expectEqual(resets + 2, ctl.resets);
+    try std.testing.expectEqual(setups, ctl.setups);
+}
+
+test "USBFS control read keeps DATA1 status OUT armed through IN completion" {
+    const Device = Polled(.{}, .{});
+    const Controller = struct {
+        completions: usize = 0,
+
+        pub fn on_setup_req(_: *@This(), itf: *usb.DeviceInterface, _: *const types.SetupPacket) void {
+            _ = Device.ep_writev(itf, .ep0, &.{&@as([64]u8, @splat(0xA1))});
+        }
+
+        pub fn on_buffer(self: *@This(), itf: *usb.DeviceInterface, comptime ep: types.Endpoint) void {
+            std.debug.assert(ep.dir == .in and ep.num == .ep0);
+            self.completions += 1;
+            if (self.completions == 1) _ = Device.ep_writev(itf, .ep0, &.{"B"});
+        }
+    };
+    var dev: Device = undefined;
+    dev.endpoints = @splat(@splat(.{}));
+    var setup: [8]u8 align(4) = .{ 0x80, 6, 0, 1, 0, 0, 65, 0 }; // GET_DESCRIPTOR, wLength=65
+    var tx: [64]u8 align(4) = undefined;
+    dev.st(.ep0, .out).buf = &setup;
+    dev.st(.ep0, .in).buf = &tx;
+    var ctl: Controller = .{};
+
+    dev.handle_transfer(0, TOKEN_SETUP, &ctl);
+    try std.testing.expectEqual(TOG_DATA1, current_rx_tog(0));
+    for (1..3) |completions| {
+        dev.handle_in(0, &ctl);
+        try std.testing.expectEqual(completions, ctl.completions);
+        const rx = EP_Regs[0].UEP_RX_CTRL.read();
+        try std.testing.expectEqual(RES_ACK, rx.RES);
+        try std.testing.expectEqual(TOG_DATA1, rx.TOG);
+    }
+
+    Regs.R16_USB_RX_LEN = 0;
+    Regs.R8_USB_INT_ST.raw = 1; // The DATA1 OUT matched.
+    dev.handle_out(0, &ctl);
+    const rx = EP_Regs[0].UEP_RX_CTRL.read();
+    try std.testing.expectEqual(RES_ACK, rx.RES);
+    try std.testing.expectEqual(TOG_DATA0, rx.TOG);
+
+    Regs.R8_USB_INT_ST.raw = 0; // The host repeats DATA1 after losing the ACK.
+    dev.handle_out(0, &ctl);
+    try std.testing.expectEqual(rx, EP_Regs[0].UEP_RX_CTRL.read());
+    try std.testing.expectEqual(2, ctl.completions);
 }
