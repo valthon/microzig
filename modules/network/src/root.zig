@@ -475,9 +475,10 @@ pub const tcp = struct {
 
             errdefer _ = lwip.tcp_close(pcb);
             try c_err(lwip.tcp_bind(pcb, lwip.IP_ADDR_ANY, port));
-            self.pcb = lwip.tcp_listen(pcb);
-            lwip.tcp_arg(self.pcb, self);
-            lwip.tcp_accept(self.pcb, c_on_accept);
+            const listener = lwip.tcp_listen(pcb) orelse return Error.OutOfMemory;
+            lwip.tcp_arg(listener, self);
+            lwip.tcp_accept(listener, c_on_accept);
+            self.pcb = listener;
         }
 
         fn c_on_accept(

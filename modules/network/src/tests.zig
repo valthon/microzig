@@ -53,6 +53,41 @@ fn init_stack() !void {
     }
 }
 
+fn reject_tcp() ?*net.tcp.Connection {
+    return null;
+}
+
+test "TCP bind releases its PCB when the listener pool is exhausted" {
+    try init_stack();
+    var nic: net.Interface = .{ .link = undefined };
+    var listeners: [lwip.MEMP_NUM_TCP_PCB_LISTEN]net.tcp.Server = undefined;
+    var count: usize = 0;
+    defer for (listeners[0..count]) |listener| {
+        _ = lwip.tcp_close(listener.pcb);
+    };
+    for (&listeners, 8100..) |*listener, port| {
+        listener.* = .{ .nic = &nic, .on_accept = reject_tcp };
+        try listener.bind(@intCast(port));
+        count += 1;
+    }
+
+    var retry: net.tcp.Server = .{ .nic = &nic, .on_accept = reject_tcp };
+    defer if (retry.pcb) |pcb| {
+        _ = lwip.tcp_close(pcb);
+    };
+    const port = 8100 + listeners.len;
+    const pcb_pool = lwip.lwip_stats.memp[lwip.MEMP_TCP_PCB];
+    const used = pcb_pool.*.used;
+    try testing.expectError(error.OutOfMemory, retry.bind(port));
+    try testing.expectEqual(null, retry.pcb);
+    try testing.expectEqual(used, pcb_pool.*.used);
+
+    count -= 1;
+    _ = lwip.tcp_close(listeners[count].pcb);
+    try retry.bind(port);
+    try testing.expect(retry.pcb != null);
+}
+
 const Link = @FieldType(net.Interface, "link");
 
 /// Records each frame passed to `send`. With `loopback` set, `recv` returns

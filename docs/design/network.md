@@ -173,7 +173,6 @@ within the remaining buffer.
 - `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Connection.close` sets `.closed` while the old PCB can still call the wrapper on data ACKs or reset during FIN processing, so `.closed` is unsafe as a reuse signal. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` recycles session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:tcp.Server.bind` passes the result of `tcp_listen` onward without checking for null. ([#63](https://github.com/valthon/microzig/issues/63))
 - `modules/network/src/root.zig:Endpoint.parse` and `Interface.Options.Fixed.init` pass slice pointers to C parsers that expect NUL termination. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Endpoint.format` always formats the address as IPv4. ([#64](https://github.com/valthon/microzig/issues/64))
 - `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
