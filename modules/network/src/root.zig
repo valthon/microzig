@@ -124,25 +124,38 @@ pub const Interface = struct {
 
     /// Called by lwip when there is a packet to send.
     /// pbuf chain total_len is <= netif.mtu + ethernet header
+    ///
+    /// lwIP sends the pbuf as-is, so the caller gets it back unchanged. A
+    /// single pbuf with headroom exposes it only while `send` runs. A chain,
+    /// or a pbuf without headroom, is copied after the headroom of a pool
+    /// pbuf, whose payload starts aligned.
     fn c_netif_linkoutput(netif_c: [*c]lwip.netif, pbuf_c: [*c]lwip.pbuf) callconv(.c) lwip.err_t {
         const netif: *lwip.netif = netif_c;
-        var pbuf: *lwip.pbuf = pbuf_c;
+        const frame: *lwip.pbuf = pbuf_c;
         const self: *Self = @fieldParentPtr("netif", netif);
+        const headroom = config.pbuf_header_length;
 
-        if (config.pbuf_header_length > 0 and lwip.pbuf_header(pbuf, config.pbuf_header_length) != 0) {
-            log.err("can't get pbuf headroom len: {}, tot_len: {} ", .{ pbuf.len, pbuf.tot_len });
+        if (frame.next == null and lwip.pbuf_add_header(frame, headroom) == 0) {
+            defer _ = lwip.pbuf_remove_header(frame, headroom);
+            return self.send_frame(frame);
+        }
+
+        const copy: *lwip.pbuf = lwip.pbuf_alloc(
+            lwip.PBUF_RAW,
+            frame.tot_len + headroom,
+            lwip.PBUF_POOL,
+        ) orelse return lwip.ERR_MEM;
+        defer _ = lwip.pbuf_free(copy);
+        if (copy.next != null) {
+            log.err("frame does not fit a pool pbuf tot_len: {}", .{frame.tot_len});
             return lwip.ERR_ARG;
         }
+        const bytes = payload_bytes(copy);
+        _ = lwip.pbuf_copy_partial(frame, bytes[headroom..].ptr, frame.tot_len, 0);
+        return self.send_frame(copy);
+    }
 
-        if (pbuf.next != null) {
-            // clone chain into single packet buffer
-            pbuf = lwip.pbuf_clone(lwip.PBUF_RAW, lwip.PBUF_POOL, pbuf) orelse return lwip.ERR_MEM;
-        }
-        defer {
-            // free local pbuf clone (if clone was made)
-            if (pbuf_c.*.next != null) _ = lwip.pbuf_free(pbuf);
-        }
-
+    fn send_frame(self: *Self, pbuf: *lwip.pbuf) lwip.err_t {
         self.link.vtable.send(self.link.ptr, payload_bytes(pbuf)) catch |err| {
             return switch (err) {
                 error.OutOfMemory => lwip.ERR_MEM,

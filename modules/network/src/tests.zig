@@ -241,3 +241,84 @@ test "RX rejects ranges that extend past the pbuf" {
     try testing.expectError(error.InvalidPbufHead, nic.poll());
     try testing.expectEqual(used, pool.*.used);
 }
+
+fn fill_pattern(pbuf: *lwip.pbuf, start: u8) void {
+    const bytes = @as([*]u8, @ptrCast(pbuf.payload.?))[0..pbuf.len];
+    for (bytes, 0..) |*b, i| b.* = start +% @as(u8, @truncate(i));
+}
+
+fn expect_sent_frame(test_link: *const TestLink, frame: *lwip.pbuf, copied: bool) !void {
+    var expected: [lwip.PBUF_POOL_BUFSIZE]u8 = undefined;
+    const len = lwip.pbuf_copy_partial(frame, &expected, frame.tot_len, 0);
+    try testing.expectEqual(@as(usize, headroom) + len, test_link.last_len);
+    try testing.expectEqualSlices(u8, expected[0..len], test_link.last[headroom..test_link.last_len]);
+    // The link driver's transfer needs a word-aligned copy.
+    if (copied) try testing.expect(test_link.last_aligned);
+}
+
+const PbufView = struct { payload: ?*anyopaque, len: u16, tot_len: u16 };
+
+fn view(pbuf: *const lwip.pbuf) PbufView {
+    return .{ .payload = pbuf.payload, .len = pbuf.len, .tot_len = pbuf.tot_len };
+}
+
+test "TX returns the caller's pbuf unchanged" {
+    try init_stack();
+    var test_link: TestLink = .{};
+    var nic: net.Interface = .{ .link = test_link.link() };
+    try nic.init(test_mac, no_ipv4);
+    defer lwip.netif_remove(&nic.netif);
+    const linkoutput = nic.netif.linkoutput.?;
+    const pool = lwip.lwip_stats.memp[lwip.MEMP_PBUF_POOL];
+    const used = pool.*.used;
+
+    // A single pbuf with headroom is sent in place.
+    const roomy: *lwip.pbuf = lwip.pbuf_alloc(lwip.PBUF_RAW_TX, 60, lwip.PBUF_RAM) orelse return error.OutOfMemory;
+    defer _ = lwip.pbuf_free(roomy);
+    fill_pattern(roomy, 1);
+    const roomy_before = view(roomy);
+    try testing.expectEqual(lwip.ERR_OK, linkoutput(&nic.netif, roomy));
+    try testing.expectEqual(roomy_before, view(roomy));
+    try expect_sent_frame(&test_link, roomy, false);
+
+    // A pbuf without headroom is copied.
+    const tight: *lwip.pbuf = lwip.pbuf_alloc(lwip.PBUF_RAW, 60, lwip.PBUF_RAM) orelse return error.OutOfMemory;
+    defer _ = lwip.pbuf_free(tight);
+    fill_pattern(tight, 2);
+    const tight_before = view(tight);
+    try testing.expectEqual(lwip.ERR_OK, linkoutput(&nic.netif, tight));
+    try testing.expectEqual(tight_before, view(tight));
+    try expect_sent_frame(&test_link, tight, true);
+    try testing.expectEqual(used, pool.*.used);
+
+    // A chain is copied, and neither segment changes.
+    const head: *lwip.pbuf = lwip.pbuf_alloc(lwip.PBUF_RAW_TX, 20, lwip.PBUF_RAM) orelse return error.OutOfMemory;
+    const tail: *lwip.pbuf = lwip.pbuf_alloc(lwip.PBUF_RAW, 40, lwip.PBUF_RAM) orelse {
+        _ = lwip.pbuf_free(head);
+        return error.OutOfMemory;
+    };
+    lwip.pbuf_cat(head, tail);
+    defer _ = lwip.pbuf_free(head);
+    fill_pattern(head, 3);
+    fill_pattern(tail, 4);
+    const head_before = view(head);
+    const tail_before = view(tail);
+    try testing.expectEqual(lwip.ERR_OK, linkoutput(&nic.netif, head));
+    try testing.expectEqual(head_before, view(head));
+    try testing.expectEqual(tail_before, view(tail));
+    try expect_sent_frame(&test_link, head, true);
+    try testing.expectEqual(used, pool.*.used);
+
+    // Copy allocation failure also leaves the chain unchanged.
+    var held: [lwip.PBUF_POOL_SIZE]*lwip.pbuf = undefined;
+    var count: usize = 0;
+    defer for (held[0..count]) |pbuf| {
+        _ = lwip.pbuf_free(pbuf);
+    };
+    while (count < held.len) : (count += 1) {
+        held[count] = lwip.pbuf_alloc(lwip.PBUF_RAW, 1, lwip.PBUF_POOL) orelse break;
+    }
+    try testing.expectEqual(lwip.ERR_MEM, linkoutput(&nic.netif, head));
+    try testing.expectEqual(head_before, view(head));
+    try testing.expectEqual(tail_before, view(tail));
+}
