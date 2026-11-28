@@ -5,6 +5,7 @@
 //! * https://github.com/nrf-rs/nrf-usbd
 
 const std = @import("std");
+const builtin = @import("builtin");
 const log = std.log.scoped(.usb_dev);
 const microzig = @import("microzig");
 const cpu = microzig.cpu;
@@ -150,7 +151,7 @@ pub const USBD = struct {
         // buffer pointer written anywhere else leaves the endpoint's real PTR as it was
         // found, and a transfer then copies to or from wherever that points. Host tests
         // run on a mock register block with its own layout.
-        comptime if (!@import("builtin").is_test) {
+        comptime if (!builtin.is_test) {
             const Regs = @TypeOf(peripherals.USBD.*);
             std.debug.assert(@offsetOf(Regs, "EPIN") == 0x600);
             std.debug.assert(@offsetOf(Regs, "ISOIN") == 0x6A0);
@@ -317,6 +318,9 @@ pub const USBD = struct {
                         .index = .from(@as(u16, @intCast(peripherals.USBD.WINDEXH.raw)) << 8 | @as(u16, @intCast(peripherals.USBD.WINDEXL.raw))),
                         .length = .from(@as(u16, @intCast(peripherals.USBD.WLENGTHH.raw)) << 8 | @as(u16, @intCast(peripherals.USBD.WLENGTHL.raw))),
                     };
+                    if (builtin.is_test) testing.after_register_access(.setup_snapshot);
+                    // A newer SETUP can replace those registers while we read them.
+                    if (ep0_superseded()) return;
                     self.control.setup(.{
                         .request_type = @bitCast(setup.request_type),
                         .request = setup.request,
@@ -361,18 +365,9 @@ pub const USBD = struct {
 
                 // EP0 data-phase completions
                 //
-                // Not while a SETUP packet waits that arrived after the check above. The
-                // completion is then that of the transfer the packet ended, and acting on it
-                // would have the controller load that transfer's next packet: once in the
-                // endpoint, a packet "will trigger a valid, acknowledged (ACK) IN
-                // transaction" (nRF52840 PS v1.1, 6.35.9.1), and the host would take it for
-                // the answer to its new request. The event is left for the next `poll`,
-                // which drops it when it takes up the SETUP packet.
-                // For one that arrives after this check, `ep_writev` looks again before it loads
-                // the packet.
-                if (peripherals.USBD.EVENTS_EP0DATADONE.raw != 0 and
-                    peripherals.USBD.EVENTS_EP0SETUP.raw == 0)
-                {
+                // Leave a superseded completion for the next poll to discard with
+                // SETUP or reset. Check again before issuing a task or notifying core.
+                if (peripherals.USBD.EVENTS_EP0DATADONE.raw != 0 and !ep0_superseded()) {
                     peripherals.USBD.EVENTS_EP0DATADONE.write_raw(0);
                     switch (self.control.direction) {
                         .in => {
@@ -380,6 +375,7 @@ pub const USBD = struct {
                             // one the status stage is started here, by the task and not by
                             // the shortcut EP0DATADONE -> EP0STATUS (see `ep0.Control.in_done`).
                             self.ep0_trigger(self.control.in_done());
+                            if (ep0_superseded()) return;
                             controller.on_buffer(&self.interface, .in(.ep0));
                             if (self.dma.faulted) return;
                         },
@@ -396,6 +392,9 @@ pub const USBD = struct {
                         // the data stage and goes to the driver.
                         .out => if (self.control.out_data_stage()) {
                             if (self.easydma_out(0)) |size| {
+                                // SETUP or reset can latch while the DMA caller
+                                // restores the USBD IRQ after checking END.
+                                if (ep0_superseded()) return;
                                 if (self.control.deliver) {
                                     // The controller listened for it. It reads the packet
                                     // (`ep_readv`) and asks for the next one or for the
@@ -411,9 +410,11 @@ pub const USBD = struct {
                                     self.ep0_trigger(self.control.out_packet(@intCast(size), self.eps_out[0].max_packet_size));
                                 }
                             } else {
-                                log.err("EP0: EasyDMA timeout, system reset required", .{});
-                                self.ep0_trigger(self.control.out_failed());
-                                if (self.dma.faulted) return;
+                                if (self.dma.faulted) {
+                                    log.err("EP0: EasyDMA timeout, system reset required", .{});
+                                    self.ep0_trigger(self.control.out_failed());
+                                }
+                                return;
                             }
                         },
                     }
@@ -655,8 +656,8 @@ pub const USBD = struct {
     }
 
     /// Runs the EasyDMA transfer that PTR and MAXCNT of an endpoint describe: starts it and
-    /// waits for it to end. Returns false if it did not end (see `wait_easydma`). Every
-    /// transfer of this HAL is started here.
+    /// waits for it to end. Returns false on timeout or if a new SETUP or reset
+    /// supersedes the EP0 transfer. Every transfer of this HAL is started here.
     ///
     /// nRF52840 Revision 3 Errata, anomaly 199, Workaround: clear only after DMA
     /// completion. nRF52840 PS v1.1, USBD, "EasyDMA" allows one transfer at a time.
@@ -664,27 +665,45 @@ pub const USBD = struct {
     /// reset. Returning an error must not make a possibly active DMA's buffer reusable.
     fn run_easydma(self: *Self, dir: usb.types.Dir, i: u4) bool {
         var io: DMA_IO = .{ .dir = dir, .i = i };
-        return self.dma.run(&io);
+        if (!self.dma.run(&io) or io.skipped) return false;
+        // A task that was issued owns EasyDMA through END, even if the transfer
+        // is now stale. Leave the event for poll and drop the obsolete result.
+        return i != 0 or !ep0_superseded();
     }
 
     const DMA_IO = struct {
         dir: usb.types.Dir,
         i: u4,
+        skipped: bool = false,
 
         pub fn begin(_: *@This()) void {
             errata.dma_begin();
+            if (builtin.is_test) testing.after_register_access(.dma_begin);
         }
         pub fn start(io: *@This()) void {
+            // Check after the anomaly 199 pre-DMA write as well as PTR, MAXCNT
+            // and the END clear. STARTEPIN0 captures that buffer for USB traffic
+            // (nRF52840 PS v1.8, §6.35.9.1 and §6.35.13.1).
+            if (io.i == 0) {
+                io.skipped = !switch (io.dir) {
+                    .in => ep0_task(&peripherals.USBD.TASKS_STARTEPIN[0]),
+                    .out => ep0_task(&peripherals.USBD.TASKS_STARTEPOUT[0]),
+                };
+                return;
+            }
             switch (io.dir) {
                 .in => peripherals.USBD.TASKS_STARTEPIN[io.i].write_raw(1),
                 .out => peripherals.USBD.TASKS_STARTEPOUT[io.i].write_raw(1),
             }
         }
         pub fn wait(io: *@This()) bool {
-            return wait_easydma(io.dir, io.i);
+            // With no task issued there is no END to wait for. The workaround
+            // can be cleared immediately because no DMA owns the channel.
+            return io.skipped or wait_easydma(io.dir, io.i);
         }
         pub fn end(_: *@This()) void {
             errata.dma_end();
+            if (builtin.is_test) testing.after_register_access(.dma_end);
         }
     };
 
@@ -697,34 +716,60 @@ pub const USBD = struct {
         cpu.isb();
     }
 
-    /// Triggers the task for the next stage of the control transfer `self.control` follows.
-    ///
-    /// Not if a SETUP packet has arrived since `poll` last looked: the task would be applied
-    /// to the transfer that packet started, which `self.control` knows nothing of yet. The
-    /// next `poll` takes that transfer up from its EP0SETUP. The USBD IRQ is masked by
-    /// foreground callers, but this cannot stop bus traffic. nRF52840 PS v1.1, 6.35.9
-    /// provides no atomic SETUP-generation check plus task. A SETUP arriving between
-    /// the check and the task still needs board investigation.
+    inline fn ep0_superseded() bool {
+        // Catch SETUP that arrives during the first reset read, and reset
+        // that arrives during the SETUP read. Either latch vetoes the action.
+        return ep0_reset_pending() or ep0_setup_pending() or ep0_reset_pending();
+    }
+
+    inline fn ep0_setup_pending() bool {
+        const pending = peripherals.USBD.EVENTS_EP0SETUP.raw != 0;
+        if (builtin.is_test) testing.after_register_access(.setup_read);
+        return pending;
+    }
+
+    inline fn ep0_reset_pending() bool {
+        const pending = peripherals.USBD.EVENTS_USBRESET.raw != 0;
+        if (builtin.is_test) testing.after_register_access(.reset_read);
+        return pending;
+    }
+
+    /// Like TinyUSB's nrf5x DCD (ep0_superseded and dma_dispatch_isr), give a
+    /// latched SETUP priority over an old EP0 action. Only foreground clears the
+    /// event here, so there is no deferred action for a prior software generation.
+    /// Select the task before the checks and read USBRESET last. nRF52840 PS
+    /// v1.8 (§6.35.9 and §6.35.13.1, .3, .5–.7, .10, .19) specifies separate
+    /// event and task registers and describes no atomic check-and-trigger.
+    /// Either event can still latch between its final read and the task write.
+    inline fn ep0_task(task: anytype) bool {
+        if (ep0_superseded()) return false;
+        task.write_raw(1);
+        if (builtin.is_test) testing.after_register_access(.ep0_task_write);
+        return true;
+    }
+
     fn ep0_trigger(self: *Self, action: ep0.Action) void {
         if (self.dma.faulted) return;
-        if (action == .none or peripherals.USBD.EVENTS_EP0SETUP.raw != 0 or
-            peripherals.USBD.EVENTS_USBRESET.raw != 0) return;
         switch (action) {
-            .none => unreachable,
-            .rcvout => peripherals.USBD.TASKS_EP0RCVOUT.write_raw(1),
-            .status => peripherals.USBD.TASKS_EP0STATUS.write_raw(1),
-            .stall => peripherals.USBD.TASKS_EP0STALL.write_raw(1),
+            .none => {},
+            .rcvout => _ = ep0_task(&peripherals.USBD.TASKS_EP0RCVOUT),
+            .status => _ = ep0_task(&peripherals.USBD.TASKS_EP0STATUS),
+            .stall => _ = ep0_task(&peripherals.USBD.TASKS_EP0STALL),
         }
     }
 
     /// Copies the packet that OUT endpoint `i` holds into `bufs_out[i]` and returns its
-    /// length, or null if EasyDMA did not finish.
+    /// length, or null if the copy could not run, EasyDMA timed out, or the EP0 transfer
+    /// was superseded.
     ///
     /// A driver may come for a packet after the bus was suspended. The peripheral is then
     /// woken for the copy, without a word to the host, and put back afterwards.
     fn easydma_out(self: *Self, i: u4) ?u32 {
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
-        defer if (was_enabled and !self.dma.faulted) cpu.interrupt.enable(.USBD);
+        defer if (was_enabled and !self.dma.faulted) {
+            cpu.interrupt.enable(.USBD);
+            if (builtin.is_test) testing.after_register_access(.out_irq_restored);
+        };
         usbd_interrupt_off();
 
         // Neither SIZE.EPOUT[n] nor the task can be reached in low power mode (6.35.12).
@@ -874,20 +919,8 @@ pub const USBD = struct {
         // is in the endpoint. Publish ownership before starting the task; foreground
         // `poll` will clear it when it observes the host's completion.
         if (i != 0) self.in_busy[i] = true;
-        // An EP0 packet is not loaded if a SETUP packet has arrived since `poll` last looked,
-        // while the controller was at work on the request before it or on that request's
-        // EP0DATADONE. The packet belongs to the transfer the SETUP packet ended, and once
-        // in the endpoint it would be the answer to the host's next IN token, which may be
-        // one of the new transfer (see the EP0DATADONE branch of `poll`). The caller is told
-        // that nothing was taken, the request stays as `self.control` has it, and the next
-        // `poll` takes up the new transfer from its EP0SETUP. Like `ep0_trigger`: a SETUP
-        // packet that arrives between this check and the write is not caught.
-        if (i == 0 and peripherals.USBD.EVENTS_EP0SETUP.raw != 0) {
-            log.debug("ep_writev ep0: held back, a SETUP packet is waiting", .{});
-            return false;
-        }
         if (!self.run_easydma(.in, i)) {
-            log.err("USBD EasyDMA timeout: system reset required", .{});
+            if (self.dma.faulted) log.err("USBD EasyDMA timeout: system reset required", .{});
             return false;
         }
 
@@ -1042,7 +1075,43 @@ pub const USBD = struct {
     fn set_address(_: *usb.DeviceInterface, _: u7) void {}
 };
 
-pub const testing = if (@import("builtin").is_test) struct {
+pub const testing = if (builtin.is_test) struct {
+    const RegisterAccess = enum {
+        reset_read,
+        setup_read,
+        dma_begin,
+        dma_end,
+        setup_snapshot,
+        ep0_task_write,
+        out_irq_restored,
+    };
+    var on_register_access: ?*const fn (RegisterAccess) void = null;
+
+    fn after_register_access(access: RegisterAccess) void {
+        if (on_register_access) |notify| notify(access);
+    }
+
+    const Ep0Recorder = struct {
+        resets: usize = 0,
+        last_request: ?u8 = null,
+        in_packets: usize = 0,
+        out_packets: usize = 0,
+
+        pub fn on_bus_reset(self: *@This(), _: *usb.DeviceInterface) void {
+            self.resets += 1;
+        }
+        pub fn on_setup_req(self: *@This(), _: *usb.DeviceInterface, setup: *const usb.types.SetupPacket) void {
+            self.last_request = setup.request;
+        }
+        pub fn on_buffer(self: *@This(), _: *usb.DeviceInterface, comptime endpoint: usb.types.Endpoint) void {
+            if (endpoint.num != .ep0) return;
+            switch (endpoint.dir) {
+                .in => self.in_packets += 1,
+                .out => self.out_packets += 1,
+            }
+        }
+    };
+
     const cdc_desc = blk: {
         var alloc: usb.DescriptorAllocator = .init(false, &.{});
         break :blk (usb.drivers.CDC{}).driver_info(.{ .max_packet_size0 = 64, .max_packet_size = 64 }, &alloc).descriptor;
@@ -1293,3 +1362,298 @@ pub const testing = if (@import("builtin").is_test) struct {
         try std.testing.expect(!dev.dma.faulted);
     }
 } else struct {};
+
+test "EP0 EasyDMA reports cancellation in both directions on SETUP or reset" {
+    const regs = peripherals.USBD;
+    const io = microzig.testing_io;
+    const Inject = struct {
+        fn setup(access: testing.RegisterAccess) void {
+            if (access == .dma_begin) regs.EVENTS_EP0SETUP.raw = 1;
+        }
+
+        fn setup_then_clear(access: testing.RegisterAccess) void {
+            setup(access);
+            // Clear only in the mock to isolate the skipped result from the final
+            // event read. Production leaves this latch for poll to consume.
+            if (access == .dma_end) regs.EVENTS_EP0SETUP.raw = 0;
+        }
+
+        fn reset(access: testing.RegisterAccess) void {
+            if (access == .dma_begin) regs.EVENTS_USBRESET.raw = 1;
+        }
+        fn reset_after_setup_read(access: testing.RegisterAccess) void {
+            if (access == .setup_read) regs.EVENTS_USBRESET.raw = 1;
+        }
+    };
+    const scenarios = [_]struct {
+        inject: *const fn (testing.RegisterAccess) void,
+        setup_pending: u32 = 0,
+        reset_pending: u32 = 0,
+    }{
+        .{ .inject = Inject.setup, .setup_pending = 1 },
+        .{ .inject = Inject.setup_then_clear },
+        .{ .inject = Inject.reset, .reset_pending = 1 },
+        .{ .inject = Inject.reset_after_setup_read, .reset_pending = 1 },
+    };
+
+    for ([_]usb.types.Dir{ .in, .out }) |dir| {
+        io.reset();
+        io.dma_ready = true;
+        io.out_packet = "out";
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable } };
+        var received: [3]u8 = @splat(0);
+        const reply = "in";
+        regs.EPIN[0].PTR.write_raw(@intFromPtr(reply));
+        regs.EPIN[0].MAXCNT.write_raw(reply.len);
+        regs.EPOUT[0].PTR.write_raw(@intFromPtr(&received));
+        regs.EPOUT[0].MAXCNT.write_raw(received.len);
+
+        for (scenarios) |scenario| {
+            testing.on_register_access = scenario.inject;
+            defer testing.on_register_access = null;
+            try std.testing.expect(!dev.run_easydma(dir, 0));
+            try std.testing.expectEqual(scenario.setup_pending, regs.EVENTS_EP0SETUP.raw);
+            try std.testing.expectEqual(scenario.reset_pending, regs.EVENTS_USBRESET.raw);
+            try std.testing.expectEqual(0, regs.TASKS_STARTEPIN[0].raw);
+            try std.testing.expectEqual(0, regs.TASKS_STARTEPOUT[0].raw);
+            try std.testing.expect(!dev.dma.faulted);
+            regs.EVENTS_EP0SETUP.raw = 0;
+            regs.EVENTS_USBRESET.raw = 0;
+        }
+
+        try std.testing.expect(dev.run_easydma(dir, 0));
+        switch (dir) {
+            .in => try std.testing.expectEqualSlices(u8, reply, io.in_packet[0..io.in_len]),
+            .out => try std.testing.expectEqualSlices(u8, io.out_packet, &received),
+        }
+    }
+}
+
+test "EP0 stage tasks veto SETUP and reset arriving during the guard" {
+    const regs = peripherals.USBD;
+    const Register = @FieldType(@TypeOf(regs.*), "EVENTS_EP0SETUP");
+    const Inject = struct {
+        fn setup_after_reset_read(access: testing.RegisterAccess) void {
+            if (access == .reset_read) regs.EVENTS_EP0SETUP.raw = 1;
+        }
+        fn reset_after_setup_read(access: testing.RegisterAccess) void {
+            if (access == .setup_read) regs.EVENTS_USBRESET.raw = 1;
+        }
+    };
+    const cases = .{
+        .{ ep0.Action.rcvout, &regs.TASKS_EP0RCVOUT },
+        .{ ep0.Action.status, &regs.TASKS_EP0STATUS },
+        .{ ep0.Action.stall, &regs.TASKS_EP0STALL },
+    };
+    microzig.testing_io.reset();
+    var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
+    inline for (cases) |case| {
+        for ([_]*Register{ &regs.EVENTS_EP0SETUP, &regs.EVENTS_USBRESET }) |event| {
+            event.raw = 1;
+            dev.ep0_trigger(case[0]);
+            try std.testing.expectEqual(0, case[1].raw);
+            try std.testing.expectEqual(1, event.raw);
+            event.raw = 0;
+        }
+
+        const events = [_]*Register{ &regs.EVENTS_EP0SETUP, &regs.EVENTS_USBRESET };
+        const callbacks = [_]*const fn (testing.RegisterAccess) void{
+            Inject.setup_after_reset_read,
+            Inject.reset_after_setup_read,
+        };
+        for (events, callbacks) |event, inject| {
+            testing.on_register_access = inject;
+            defer testing.on_register_access = null;
+            dev.ep0_trigger(case[0]);
+            try std.testing.expectEqual(1, event.raw);
+            try std.testing.expectEqual(0, case[1].raw);
+            event.raw = 0;
+        }
+
+        dev.ep0_trigger(case[0]);
+        try std.testing.expectEqual(1, case[1].raw);
+    }
+}
+
+test "EP0 DMA reaches END but rejects both directions after SETUP or reset" {
+    const regs = peripherals.USBD;
+    const io = microzig.testing_io;
+    const Inject = struct {
+        fn after_start(access: testing.RegisterAccess) bool {
+            if (access != .ep0_task_write) return false;
+            // The mock sets END synchronously with the task. Latch the event
+            // after that write and before the driver reads and clears END.
+            std.debug.assert(regs.EVENTS_ENDEPIN[0].raw != 0 or regs.EVENTS_ENDEPOUT[0].raw != 0);
+            return true;
+        }
+        fn setup(access: testing.RegisterAccess) void {
+            if (after_start(access)) regs.EVENTS_EP0SETUP.raw = 1;
+        }
+        fn reset(access: testing.RegisterAccess) void {
+            if (after_start(access)) regs.EVENTS_USBRESET.raw = 1;
+        }
+    };
+    const Register = @FieldType(@TypeOf(regs.*), "EVENTS_EP0SETUP");
+    const cases = [_]struct { event: *Register, inject: *const fn (testing.RegisterAccess) void }{
+        .{ .event = &regs.EVENTS_EP0SETUP, .inject = Inject.setup },
+        .{ .event = &regs.EVENTS_USBRESET, .inject = Inject.reset },
+    };
+    for (cases) |case| {
+        for ([_]usb.types.Dir{ .in, .out }) |dir| {
+            io.reset();
+            io.dma_ready = true;
+            var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
+            const packet = "old";
+            testing.on_register_access = case.inject;
+            defer testing.on_register_access = null;
+
+            switch (dir) {
+                .in => {
+                    dev.control.setup(.{ .request_type = 0x80, .request = 0x42, .length = packet.len });
+                    try std.testing.expectEqual(0, dev.interface.vtable.ep_writev(&dev.interface, .ep0, &.{packet}));
+                    try std.testing.expectEqual(1, regs.TASKS_STARTEPIN[0].raw);
+                    try std.testing.expectEqual(0, regs.EVENTS_ENDEPIN[0].raw);
+                    try std.testing.expectEqualSlices(u8, packet, io.in_packet[0..io.in_len]);
+                    try std.testing.expectEqual(packet.len, dev.control.remaining);
+                },
+                .out => {
+                    io.out_packet = packet;
+                    regs.SIZE.EPOUT[0].raw = packet.len;
+                    const received = dev.easydma_out(0);
+                    try std.testing.expectEqual(1, regs.TASKS_STARTEPOUT[0].raw);
+                    try std.testing.expectEqual(0, regs.EVENTS_ENDEPOUT[0].raw);
+                    try std.testing.expectEqualSlices(u8, packet, dev.bufs_out[0][0..packet.len]);
+                    try std.testing.expectEqual(null, received);
+                },
+            }
+            try std.testing.expectEqual(1, case.event.raw);
+            try std.testing.expect(!dev.dma.faulted);
+        }
+    }
+}
+
+test "poll discards a superseded SETUP snapshot and dispatches the newer request" {
+    const regs = peripherals.USBD;
+    const Inject = struct {
+        fn setup(access: testing.RegisterAccess) void {
+            if (access != .setup_snapshot) return;
+            regs.BREQUEST.raw = 0x43;
+            regs.EVENTS_EP0SETUP.raw = 1;
+        }
+    };
+    microzig.testing_io.reset();
+    var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
+    var ctl: testing.Ep0Recorder = .{};
+    regs.BREQUEST.raw = 0x42;
+    regs.EVENTS_EP0SETUP.raw = 1;
+    {
+        testing.on_register_access = Inject.setup;
+        defer testing.on_register_access = null;
+        dev.poll(&ctl);
+    }
+    try std.testing.expectEqual(null, ctl.last_request);
+    try std.testing.expectEqual(1, regs.EVENTS_EP0SETUP.raw);
+    dev.poll(&ctl);
+    try std.testing.expectEqual(@as(?u8, 0x43), ctl.last_request);
+}
+
+test "poll leaves EP0DATADONE pending when reset arrives before it is examined" {
+    const regs = peripherals.USBD;
+    const Inject = struct {
+        fn reset(access: testing.RegisterAccess) void {
+            if (access == .dma_end) regs.EVENTS_USBRESET.raw = 1;
+        }
+        fn reset_during_guard(access: testing.RegisterAccess) void {
+            if (access == .setup_read) regs.EVENTS_USBRESET.raw = 1;
+        }
+    };
+    for ([_]*const fn (testing.RegisterAccess) void{ Inject.reset, Inject.reset_during_guard }) |inject| {
+        microzig.testing_io.reset();
+        microzig.testing_io.dma_ready = true;
+        var dev: USBD = .{
+            .interface = .{ .vtable = &USBD.vtable },
+            .power = .connected,
+            .control = .{ .direction = .in, .in_last = true },
+        };
+        var ctl: testing.Ep0Recorder = .{};
+        dev.in_pending[1] = 1;
+        regs.EVENTS_EP0DATADONE.raw = 1;
+        {
+            testing.on_register_access = inject;
+            defer testing.on_register_access = null;
+            dev.poll(&ctl);
+        }
+        try std.testing.expectEqual(1, regs.TASKS_STARTEPIN[1].raw);
+        try std.testing.expectEqual(1, regs.EVENTS_USBRESET.raw);
+        try std.testing.expectEqual(1, regs.EVENTS_EP0DATADONE.raw);
+        try std.testing.expectEqual(0, ctl.in_packets);
+        dev.poll(&ctl);
+        try std.testing.expectEqual(1, ctl.resets);
+        try std.testing.expectEqual(0, regs.EVENTS_EP0DATADONE.raw);
+        try std.testing.expectEqual(0, ctl.in_packets);
+    }
+}
+
+test "poll withholds EP0 OUT data superseded while restoring the USBD IRQ" {
+    const regs = peripherals.USBD;
+    const io = microzig.testing_io;
+    const Inject = struct {
+        fn setup(access: testing.RegisterAccess) void {
+            if (access == .out_irq_restored) regs.EVENTS_EP0SETUP.raw = 1;
+        }
+        fn reset(access: testing.RegisterAccess) void {
+            if (access == .out_irq_restored) regs.EVENTS_USBRESET.raw = 1;
+        }
+    };
+    const events = .{ &regs.EVENTS_EP0SETUP, &regs.EVENTS_USBRESET };
+    inline for (events, .{ Inject.setup, Inject.reset }) |event, inject| {
+        io.reset();
+        io.dma_ready = true;
+        io.irq_enabled = true;
+        io.out_packet = "\x00\xc2\x01\x00\x00\x00\x08"; // 115200 baud, 8N1
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
+        var ctl: testing.Ep0Recorder = .{};
+        dev.control.setup(.{ .request_type = 0x21, .request = 0x20, .length = 7 });
+        _ = dev.control.listen();
+        regs.SIZE.EPOUT[0].raw = @intCast(io.out_packet.len);
+        regs.EVENTS_EP0DATADONE.raw = 1;
+        testing.on_register_access = inject;
+        defer testing.on_register_access = null;
+        dev.poll(&ctl);
+        try std.testing.expectEqual(1, event.raw);
+        try std.testing.expect(io.irq_enabled);
+        try std.testing.expectEqual(0, regs.EVENTS_ENDEPOUT[0].raw);
+        try std.testing.expectEqualSlices(u8, io.out_packet, dev.bufs_out[0][0..io.out_packet.len]);
+        try std.testing.expectEqual(0, ctl.out_packets);
+        try std.testing.expect(!dev.control.out_waiting);
+    }
+}
+
+test "poll withholds the EP0 IN callback if SETUP arrives after the status task" {
+    const regs = peripherals.USBD;
+    const Inject = struct {
+        fn setup(access: testing.RegisterAccess) void {
+            if (access == .ep0_task_write) regs.EVENTS_EP0SETUP.raw = 1;
+        }
+    };
+    microzig.testing_io.reset();
+    var dev: USBD = .{
+        .interface = .{ .vtable = &USBD.vtable },
+        .power = .connected,
+        .control = .{ .direction = .in, .in_last = true },
+    };
+    var ctl: testing.Ep0Recorder = .{};
+    regs.BREQUEST.raw = 0x43;
+    regs.EVENTS_EP0DATADONE.raw = 1;
+    {
+        testing.on_register_access = Inject.setup;
+        defer testing.on_register_access = null;
+        dev.poll(&ctl);
+    }
+    try std.testing.expectEqual(1, regs.TASKS_EP0STATUS.raw);
+    try std.testing.expectEqual(1, regs.EVENTS_EP0SETUP.raw);
+    try std.testing.expectEqual(0, ctl.in_packets);
+    dev.poll(&ctl);
+    try std.testing.expectEqual(@as(?u8, 0x43), ctl.last_request);
+    try std.testing.expectEqual(0, ctl.in_packets);
+}

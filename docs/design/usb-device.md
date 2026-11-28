@@ -111,6 +111,7 @@ cited at `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll`).
 | WCH startup | Configure and enable the chosen USB peripheral clock before `Polled.init` using `enable_usbd_clock`, `enable_usbfs_clock` or `enable_usbhs_clock` in `port/wch/ch32v/src/hals/clocks.zig`. For USBD, start SysTick with `port/wch/ch32v/src/hals/time.zig:init` before `Polled.init` because its delays wait on that counter. |
 | STM32F103 startup | Configure and enable the USB clock and start HAL time before `usb_init` or `usb_runtime_init`, as both examples do with `time.init_timer(.TIM2)`. A positive startup delay cannot expire while `port/stmicro/stm32/src/hals/STM32F103/time.zig:get_time_since_boot` returns zero for an uninitialized source. Provide the external D+ pull-up required by both STM32F103 examples. |
 | Nordic DMA and wake | `port/nordic/nrf5x/src/hal/usbd.zig:USBD` bounds wake and EasyDMA waits in iterations. An EasyDMA timeout quarantines the instance until system reset. |
+| Nordic EP0 tasks and callbacks | Poll owns the control transfer. Read reset, SETUP, then reset again before issuing a task or publishing the result. Check the OUT result again after EasyDMA returns and restores the IRQ, before marking the packet available to core. A superseded action leaves the event for poll. A task already issued retains DMA ownership through END. |
 
 ### Spec rules
 
@@ -121,6 +122,7 @@ cited at `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll`).
 | USB 2.0 §9.2.7 and §8.5.3.4 in the header of `core/src/core/usb/ControlRequest.zig` | Stall an unsupported control request. |
 | USB 2.0 §9.4.2, §9.4.7 and §9.1.1.5 in `core/src/core/usb.zig:DeviceController` | GET_CONFIGURATION returns the selected descriptor's value or zero. The port reopens data endpoints at DATA0 on each selection. |
 | USB 2.0 §5.8.3 in `core/src/core/usb/drivers/CDC.zig:Runtime` | CDC uses a ZLP when a full bulk packet completes and no further data has been queued. |
+| nRF52840 PS v1.8 §§6.35.6, 6.35.9, 6.35.13.1, 6.35.13.5–7 and 6.35.13.19 | SETUP replaces the control request. The software arms the appropriate stage after reading SETUP. STARTEPIN captures the previously prepared IN buffer address and length. |
 
 ### Consumer trace
 
@@ -147,6 +149,15 @@ Hardware handles SET_ADDRESS and its status (nRF52840 PS v1.1 §6.35.9, as cited
 
 - Nordic's `port/nordic/nrf5x/src/hal/usbd.zig:USBD` follows the RP2xxx interface and cites nrf-rs/nrf-usbd.
   `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll` follows TinyUSB and pico-examples in servicing reset last.
+- Nordic EP0 follows the pending-SETUP check in TinyUSB's nrf5x DCD
+  (`ep0_superseded`, `dma_dispatch_isr`, and `dcd_edpt_stall`). Foreground owns both the
+  event and the actions, so the port needs no ISR-to-foreground SETUP tag. The nRF52840 PS v1.8
+  (§§6.35.9, 6.35.13.1, 6.35.13.3, 6.35.13.5–7, 6.35.13.10 and 6.35.13.19) describes
+  separate event and task registers and provides no atomic check-and-trigger. Either event
+  can still latch between its final read and the task write.
+  [TinyUSB nrf5x DCD](https://github.com/hathach/tinyusb/blob/master/src/portable/nordic/nrf5x/dcd_nrf5x.c)
+  · [nRF52840 Product Specification v1.8](https://docs-be.nordicsemi.com/bundle/nRF52840_PS_v1.8/raw/resource/enus/nRF52840_PS_v1.8.pdf)
+  · [nRF52840 Revision 3 Errata, anomaly 199](https://docs.nordicsemi.com/r/bundle/errata_nrf52840_rev3/page/err/nrf52840/rev3/latest/anomaly_840_199.html)
 
 ## Shared patterns
 
@@ -200,8 +211,6 @@ Run `zig build test` in each package. `core/build.zig:build` reaches USB via `co
 - `examples/raspberrypi/rp2xxx/src/usb_cdc.zig:usb_cdc_write` and `examples/wch/ch32v/src/usb_cdc.zig:usb_cdc_write` retain a class pointer across polls that can retire it or replace its runtime mid-write. ([#74](https://github.com/valthon/microzig/issues/74))
 - `examples/raspberrypi/rp2xxx/src/pio_selftest/selftest.zig:emit` retains its CDC borrow across polls in both its write and flush loops, so reset or reselection can invalidate it. ([#74](https://github.com/valthon/microzig/issues/74))
 - `examples/nordic/nrf5x/src/usb_hid.zig:main` checks only `drivers()`, so it can use the retained HID runtime during detach or after reattachment before a new configuration. ([#74](https://github.com/valthon/microzig/issues/74))
-- `port/nordic/nrf5x/src/hal/usbd.zig:USBD.ep0_trigger` can issue an old transfer's task if a new SETUP arrives after the guard. ([#71](https://github.com/valthon/microzig/issues/71))
-- `port/nordic/nrf5x/src/hal/usbd.zig:USBD.load_in` can arm old EP0 IN data if SETUP arrives between its check and `TASKS_STARTEPIN`. ([#71](https://github.com/valthon/microzig/issues/71))
 - `examples/stmicro/stm32/src/stm32f1xx/usb_cdc.zig:USB_conf` relies on the default reset handler, which leaves `config`, `device_addr`, `remain_pkg`, `CDC_coding` and a pending `CDC_send` unchanged, so the app can use stale control state or wait for a discarded TX completion. ([#73](https://github.com/valthon/microzig/issues/73))
 - `examples/stmicro/stm32/src/stm32f1xx/usb_hid.zig:USB_conf` relies on the default reset handler, which leaves `config`, `device_addr` and `to_report` unchanged, so the app can send before reconfiguration, wait for a discarded report completion or apply a stale address. ([#73](https://github.com/valthon/microzig/issues/73))
 - `examples/stmicro/stm32/src/stm32f1xx/usb_cdc.zig:ep0_setup` leaves `device_addr`, `remain_pkg` and `CDC_coding` pending, so later callbacks can apply an abandoned address or use stale control data. ([#73](https://github.com/valthon/microzig/issues/73))
