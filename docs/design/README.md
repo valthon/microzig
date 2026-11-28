@@ -67,6 +67,7 @@ Sections, in order (leave out a section that does not apply; never leave a headi
 | [ESP radio stack and coexistence](esp-radio.md) | common radio lifetime, coexistence adapter, blob OS interface |
 | [USB device stack](usb-device.md) | portable USB device core, controller ports, and class drivers |
 | [Network and lwIP](network.md) | lwIP build, Ethernet netifs, buffer ownership and execution context |
+| [DHCPv4 server](dhcp-server.md) | the shared access point DHCP server module and its two callers |
 | [Base driver interfaces](base-interfaces.md) | portable driver contracts, HAL adapters and consumers |
 | [nRF52840 IEEE 802.15.4 radio](ieee802154.md) | portable 802.15.4 interface and nRF52840 driver |
 

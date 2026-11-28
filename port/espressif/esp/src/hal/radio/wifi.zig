@@ -672,6 +672,24 @@ pub const Wifi = struct {
         return rssi;
     }
 
+    /// The number of stations associated with the soft-AP now (IDF v5.5.1 esp_wifi.h:1044
+    /// esp_wifi_ap_get_sta_list): table slots with a node and a non-zero AID (C6
+    /// `wifi_get_sta_list_process` +0x6a..0x7a; the C3 copy does the same). The blob answers it
+    /// in the Wi-Fi task: `esp_wifi_ap_get_sta_list` hands `wifi_get_sta_list_process` to
+    /// `ieee80211_ioctl` (+0x36..0x4e), which runs it inline when the caller is the Wi-Fi task
+    /// and otherwise posts it to the Wi-Fi task and waits (`current_task_is_wifi_task` +0x32,
+    /// inline +0x1ce, post +0x152, wait +0x1a8..0x1b6; C3 and C6 libnet80211.a). So call it from
+    /// an application task, holding no lock that the Wi-Fi task or `on_packet_received` can
+    /// take. Returns `error.InvalidStationCount` if the count the blob reports is outside its
+    /// list.
+    pub fn get_ap_station_count(self: *const Wifi) (InternalError || error{InvalidStationCount})!usize {
+        try self.require_operational();
+        if (callbacks.host_test) unreachable; // This blob operation is not modelled.
+        var list: ApStationList = undefined;
+        try c_err(c.esp_wifi_ap_get_sta_list(@ptrCast(&list)));
+        return ap_station_count(list.num);
+    }
+
     pub fn send_packet(self: *const Wifi, iface: Interface, data: []const u8) (error{TooManyPacketsInFlight} || InternalError)!void {
         try self.require_operational();
         if (callbacks.host_test) unreachable; // This blob operation is not modelled.
@@ -1066,7 +1084,8 @@ pub const Config = union(enum) {
         /// Authentication config to be used by the access point.
         auth_method: AuthMethod = .none,
 
-        /// The maximum number of connections allowed on the access point.
+        /// The maximum number of connections allowed on the access point, at most
+        /// `max_ap_stations`.
         max_connections: u8,
     };
 
@@ -1144,6 +1163,9 @@ fn check_access_point_config(config: Config.AccessPoint) error{InvalidConfig}!vo
     if (config.auth_method == .wpa3_personal or config.auth_method == .wpa2_wpa3_personal) {
         return error.InvalidConfig;
     }
+    if (config.max_connections > max_ap_stations) {
+        return error.InvalidConfig;
+    }
 }
 
 fn apply_access_point_config(config: Config.AccessPoint) ConfigError!void {
@@ -1172,6 +1194,42 @@ fn apply_access_point_config(config: Config.AccessPoint) ConfigError!void {
 
     var tmp: c_patched.wifi_config_t = .{ .ap = ap_cfg };
     try c_err(set_config(c.WIFI_IF_AP, &tmp));
+}
+
+/// Most stations a C3 or C6 soft-AP holds: `ESP_WIFI_MAX_CONN_NUM` of IDF v5.5.1
+/// local/esp_wifi_types_native.h:21-22. The translated headers cannot supply it: esp_wifi_types.h
+/// includes that header only if found (`__has_include`, lines 9-10), and `local/` is not on
+/// the port's include path, so `wifi_sta_list_t` stays the forward declaration of
+/// esp_wifi.h:1025 and the macro is absent. The asserts below tie the value to the list the
+/// blob writes instead.
+pub const max_ap_stations = 10;
+
+/// `wifi_sta_list_t`: `max_ap_stations` entries of `wifi_sta_info_t`, then `num`
+/// (local/esp_wifi_types_native.h:28-31; esp_wifi_types_generic.h:614-626, the MAC, the RSSI
+/// and a 32-bit word of bit fields, kept as raw bytes here).
+const ApStationList = extern struct {
+    sta: [max_ap_stations][sta_info_len]u8,
+    num: c_int,
+
+    const sta_info_len = 12;
+};
+
+comptime {
+    // `wifi_get_sta_list_process` clears 0x7c bytes, writes 12-byte entries and counts in the
+    // word at 0x78 (C6 libnet80211.a +0x24, +0x56, +0x7c; the C3 copy does the same at nearby
+    // offsets).
+    const blob_list_len = 0x7c;
+    const blob_num_offset = 0x78;
+    const blob_entry_len = 12;
+    assert(ApStationList.sta_info_len == blob_entry_len);
+    assert(@sizeOf(ApStationList) == blob_list_len and @offsetOf(ApStationList, "num") == blob_num_offset);
+    assert(blob_num_offset == max_ap_stations * blob_entry_len);
+}
+
+/// The station count in a `wifi_sta_list_t` the blob filled, checked against its list.
+fn ap_station_count(num: c_int) error{InvalidStationCount}!usize {
+    if (num < 0 or num > max_ap_stations) return error.InvalidStationCount;
+    return @intCast(num);
 }
 
 fn set_config(interface: c.wifi_interface_t, config: *c_patched.wifi_config_t) c.esp_err_t {
@@ -3221,6 +3279,11 @@ test "apply holds the lifecycle claim from the mode change through every interfa
     // A rejected configuration still releases the claim.
     try std.testing.expectError(error.InvalidConfig, wifi.apply(.{ .sta = .{ .ssid = &@as([33]u8, @splat('x')) } }));
     try std.testing.expect(!wifi.lifecycle_active.load(.acquire));
+    // More stations than the blob's station list holds.
+    try std.testing.expectError(error.InvalidConfig, wifi.apply(.{ .ap = .{ .ssid = "ap", .channel = 1, .max_connections = max_ap_stations + 1 } }));
+    try std.testing.expectEqual(@as(usize, 2), HostWifi.configured_len);
+    try wifi.apply(.{ .ap = .{ .ssid = "ap", .channel = 1, .max_connections = max_ap_stations } });
+    try std.testing.expectEqual(@as(usize, 3), HostWifi.configured_len);
     try wifi.deinit();
     _ = EventLog.take();
 }
@@ -3268,6 +3331,13 @@ test "the driver init configuration does not advertise WPA3 SAE" {
     var osi_funcs: c.wifi_osi_funcs_t = undefined;
     const init_config = make_init_config(.{}, &osi_funcs, undefined);
     try std.testing.expectEqual(@as(u64, 0), init_config.feature_caps & wifi_enable_wpa3_sae);
+}
+
+test "the soft-AP station count must lie within the blob's station list" {
+    try std.testing.expectError(error.InvalidStationCount, ap_station_count(-1));
+    try std.testing.expectEqual(@as(usize, 0), try ap_station_count(0));
+    try std.testing.expectEqual(@as(usize, max_ap_stations), try ap_station_count(max_ap_stations));
+    try std.testing.expectError(error.InvalidStationCount, ap_station_count(max_ap_stations + 1));
 }
 
 test "public Wi-Fi calls wait for a pending teardown or another lifecycle owner" {

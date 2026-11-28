@@ -48,8 +48,9 @@ pub fn build(b: *std.Build) void {
     for (softap_password) |ch| {
         if (ch < 32 or ch > 126) std.process.fatal("SoftAP passphrase must be printable ASCII", .{});
     }
+    const dhcp_dep = b.dependency("dhcp_server", .{});
     const dhcp_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/softap_dhcp.zig"),
+        .root_source_file = dhcp_dep.path("src/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     }) });
@@ -341,6 +342,7 @@ pub fn build(b: *std.Build) void {
                 options.addOption([]const u8, "ssid", softap_ssid);
                 options.addOption([]const u8, "password", softap_password);
                 fw.exe.root_module.addOptions("softap_options", options);
+                fw.exe.root_module.addImport("dhcp_server", dhcp_dep.module("dhcp_server"));
             }
 
             if (example.features.lwip) {

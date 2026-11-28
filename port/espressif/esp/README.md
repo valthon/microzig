@@ -1335,26 +1335,38 @@ in firmware and is not logged. Outputs are `esp32_c3_softap` and `esp32_c6_softa
 image-boot setup as `tcp_server`.
 
 The AP is `192.168.4.1/24`. The vendored lwIP build has a DHCP **client**, not a
-server, so `src/softap_dhcp.zig` supplies an example-local minimal DHCPv4 server
-using lwIP raw UDP on the AP netif. Its four MAC-keyed leases cover
-`192.168.4.2`–`192.168.4.5`, last one hour, and advertise the AP as gateway.
-Offers reserve a slot for 30 seconds; renew/rebind, INIT-REBOOT, release and decline
-are supported (declined addresses are quarantined for one hour). Disconnecting does
-not revoke a lease; four different clients can exhaust the pool until release or
-expiry. Leases are volatile across reboot. Ethernet clients only: no relays, option
-overload, DHCPINFORM, DNS service, routing/NAT or Internet access.
+server, so the example runs the shared `modules/dhcp-server` module
+([design](../../../docs/design/dhcp-server.md)) on lwIP raw UDP on the AP netif. The
+AP admits four stations and has eight MAC-keyed leases, `192.168.4.2`–`192.168.4.9`,
+which last one hour and advertise the AP as gateway. Offers reserve a slot for 30
+seconds; renew/rebind, INIT-REBOOT, release and decline are supported (declined
+addresses are quarantined for one hour). A lease ends only by its holder's own message
+or by expiry: a station that leaves without releasing keeps its address for the rest of
+the hour, and gets it back if it returns. If each station uses one MAC, the spare leases
+let new stations join while departed clients' leases, offers they left before taking up
+(30 seconds each) and declined addresses together hold up to four entries; past that, a new
+station gets no offer until the earliest of them expires. A station that changes its MAC
+on each join takes a new lease each time. The station count comes from the blob. Leases
+are volatile across reboot, and the server does not probe an address before offering it,
+so after an AP reboot an address a station still uses can be offered to another until
+that station renews. Ethernet clients only: no relays, option overload, DHCPINFORM, DNS
+service, routing/NAT or Internet access.
 
 A station should join, acquire a lease, ping `192.168.4.1`, and connect to
 `192.168.4.1:7` for TCP echo. Echo serves one connection at a time; an idle client
 holds that slot until disconnect. `SOFTAP up ssid=... ip=192.168.4.1` announces
-readiness, join/leave lines include MAC and AID, DHCP ACK lines include MAC and leased
-IP, and each closed TCP connection reports bytes echoed. A reporter first runs after
-1.5 seconds and repeats status every three seconds so late USB reattachment can see it.
+readiness (`stations=unknown`, after a `SOFTAP warning:` line, if the blob does not
+answer), join/leave lines include MAC and AID (a leave also its reason), DHCP ACK lines
+include MAC and leased IP, and each closed TCP connection reports bytes echoed. A reporter
+first runs after 1.5 seconds and repeats status every three seconds so late USB
+reattachment can see it.
 Join/leave, lease and connection events themselves are not replayed.
 
-Evidence: DHCP packet logic is host unit-tested. On hardware, image boot, 24ebc5d1
-(2026-11-19/20), with an ESP32-S3 station using ESP-IDF v6.0.2 `esp_wifi` and the lwIP
-DHCP client: with the C3, the Super Mini ESP32-C6 and the XIAO ESP32-C6 (generic image) as AP, the S3
+Evidence: DHCP packet logic and the station count check are host unit-tested. A hardware
+run of the shared DHCP module and the blob station count is pending; the run below
+predates them and used the earlier example-local DHCP server. On hardware, image boot,
+24ebc5d1 (2026-11-19/20), with an ESP32-S3 station using ESP-IDF v6.0.2 `esp_wifi` and
+the lwIP DHCP client: with the C3, the Super Mini ESP32-C6 and the XIAO ESP32-C6 (generic image) as AP, the S3
 associated (WPA2-PSK, channel 6), leased 192.168.4.2 and got 5/5 gateway pings and 10/10
 pings in 3 of 3 boots each. TCP echo on port 7 ran through `selftest_wifi_softap_echo` above,
 including the XIAO ESP32-C6 board build as AP.

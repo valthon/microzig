@@ -1,6 +1,6 @@
 # Network and lwIP
 
-Covers: modules/network/, modules/lwip/, modules/foundation-libc/, drivers/build.zig, drivers/src/root.zig, drivers/src/wireless/cyw43439.zig, drivers/src/wireless/cyw43439/, port/raspberrypi/rp2xxx/build.zig, port/raspberrypi/rp2xxx/src/hal/drivers.zig, examples/raspberrypi/rp2xxx/build.zig, examples/raspberrypi/rp2xxx/src/net/, examples/espressif/esp/build.zig, examples/espressif/esp/src/lwip/, examples/espressif/esp/src/tcp_server.zig, examples/espressif/esp/src/softap.zig, examples/espressif/esp/src/softap_dhcp.zig, examples/espressif/esp/src/selftest_wifi_checks.zig, examples/espressif/esp/src/selftest_wifi_softap_echo.zig, examples/espressif/esp/src/selftest_coex_wifi_ble.zig, port/espressif/esp/src/hal/rtos.zig, port/espressif/esp/src/hal/radio.zig, port/espressif/esp/src/hal/radio/, port/espressif/esp/README.md
+Covers: modules/network/, modules/lwip/, modules/foundation-libc/, drivers/build.zig, drivers/src/root.zig, drivers/src/wireless/cyw43439.zig, drivers/src/wireless/cyw43439/, port/raspberrypi/rp2xxx/build.zig, port/raspberrypi/rp2xxx/src/hal/drivers.zig, examples/raspberrypi/rp2xxx/build.zig, examples/raspberrypi/rp2xxx/src/net/, examples/espressif/esp/build.zig, examples/espressif/esp/src/lwip/, examples/espressif/esp/src/tcp_server.zig, examples/espressif/esp/src/softap.zig, examples/espressif/esp/src/selftest_wifi_checks.zig, examples/espressif/esp/src/selftest_wifi_softap_echo.zig, examples/espressif/esp/src/selftest_coex_wifi_ble.zig, port/espressif/esp/src/hal/rtos.zig, port/espressif/esp/src/hal/radio.zig, port/espressif/esp/src/hal/radio/, port/espressif/esp/README.md
 
 ## Purpose
 
@@ -167,8 +167,7 @@ within the remaining buffer.
   "a station join survives scan and association events before any essential event",
   and "receive capacity rejects oversized packets and polls full Ethernet frames"
   for checking RX capacity before the bus read. No build test step includes these tests.
-- `zig build test` in `examples/espressif/esp/` runs "DHCP allocation, renewal, collision, release, exhaustion and expiry"
-  in `examples/espressif/esp/src/softap_dhcp.zig`, covering the AP's lease logic.
+- The AP's DHCP server and its tests are in [DHCPv4 server](dhcp-server.md).
 - The ESP port README records station DHCP and TCP echo between an ESP32-C3 and a XIAO ESP32-C6
   in both roles. Build the images in `examples/espressif/esp/` with `-Dexample=selftest_wifi_softap_echo` and `-Dexample=softap`.
   [ESP Wi-Fi self-tests](../../port/espressif/esp/README.md#wi-fi-station-and-rtos)
