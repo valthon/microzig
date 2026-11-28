@@ -111,5 +111,77 @@ pub fn build(b: *std.Build) !void {
         b.getInstallStep().dependOn(&generate_run.step);
     }
 
-    _ = b.step("test", "Run platform agnostic unit tests");
+    const test_step = b.step("test", "Run platform agnostic unit tests");
+    try add_usb_tests(b, test_step);
+}
+
+fn add_usb_tests(b: *std.Build, test_step: *std.Build.Step) !void {
+    const core_source = "../../../core/src/microzig.zig";
+    const drivers_source = "../../../drivers/src/root.zig";
+    const examples_dir = "../../../examples/stmicro/stm32/src/stm32f1xx/";
+    const cdc_source = examples_dir ++ "usb_cdc.zig";
+    const hid_source = examples_dir ++ "usb_hid.zig";
+
+    // The build.zig.zon paths omit core, drivers, and the examples. Skip the
+    // checkout-only USB suites so the published port's test step can run.
+    for ([_][]const u8{ core_source, drivers_source, cdc_source, hid_source }) |source| {
+        const stat = b.root.statFile(b.graph.io, source) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return,
+            else => return err,
+        };
+        if (stat.kind != .file) return;
+    }
+
+    const stm32_data = b.lazyDependency("stm32-data-generated", .{}) orelse return;
+    const regz = b.dependency("microzig/tools/regz", .{ .optimize = .safe }).artifact("regz");
+    const generate_chip = b.addRunArtifact(regz);
+    generate_chip.addArgs(&.{ "--format", "embassy", "--output_path" });
+    const chips = generate_chip.addOutputDirectoryArg2("chips", .{});
+    generate_chip.addArgs(&.{ "--device", "STM32F103C8" });
+    generate_chip.addDirectoryArg2(stm32_data.path("."), .{});
+
+    const host = b.graph.host;
+    const core = b.createModule(.{
+        .root_source_file = b.path(core_source),
+        .target = host,
+    });
+    const drivers = b.createModule(.{
+        .root_source_file = b.path(drivers_source),
+        .target = host,
+    });
+    const chip = b.createModule(.{
+        .root_source_file = chips.path(b, "STM32F103C8.zig"),
+        .target = host,
+    });
+    const usb_dir = "src/hals/STM32F103/usb_internals/";
+    const ll = b.createModule(.{
+        .root_source_file = b.path(usb_dir ++ "usb_ll.zig"),
+        .target = host,
+    });
+    const test_microzig = b.createModule(.{
+        .root_source_file = b.path(usb_dir ++ "usb_test_microzig.zig"),
+        .target = host,
+        .imports = &.{
+            .{ .name = "chip", .module = chip },
+            .{ .name = "core_support", .module = core },
+            .{ .name = "drivers", .module = drivers },
+            .{ .name = "usb_ll", .module = ll },
+        },
+    });
+    chip.addImport("microzig", test_microzig);
+    ll.addImport("microzig", test_microzig);
+
+    const ll_tests = b.addTest(.{ .name = "stm32f103-usb-ll", .root_module = ll });
+    test_step.dependOn(&b.addRunArtifact(ll_tests).step);
+    inline for (.{ .{ "cdc", cdc_source }, .{ "hid", hid_source } }) |entry| {
+        const example_tests = b.addTest(.{
+            .name = "stm32f103-usb-" ++ entry[0],
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(entry[1]),
+                .target = host,
+                .imports = &.{.{ .name = "microzig", .module = test_microzig }},
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(example_tests).step);
+    }
 }

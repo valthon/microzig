@@ -80,6 +80,7 @@ cited at `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll`).
 | Class data and readiness | Class | Readiness authorizes a packet operation and lasts only within the current configuration. |
 | Armed IN or OUT storage | Port hardware | Establish completion or withdrawal before reusing storage. See [Open questions](#open-questions) for RP2040 B0/B1. |
 | Completed OUT packet | Port | The class copies it with `ep_readv` before rearming. |
+| STM32F103 CDC echo bytes | The ISR queues bytes and the foreground dequeues them with interrupts masked. | The reset callback empties the FIFO and advances the reset generation. Foreground checks the generation under interrupt masking while dequeuing and again when arming IN. |
 
 ### Events × phases
 
@@ -117,6 +118,8 @@ cited at `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll`).
 | Clause and code citation | Rule |
 | --- | --- |
 | USB 2.0 §5.5.5 in `core/src/core/usb.zig:DeviceController.on_setup_req` | A new SETUP ends the old transfer. |
+| RM0008 Rev 21 §§23.4.2 and 23.5.2 in STM32F103 `usb_ll.usb_handler` | Discard a co-latched old EP0 IN completion before dispatching SETUP. |
+| [RM0008 Rev 21 §23.5.3, Table 177](https://www.st.com/resource/en/reference_manual/rm0008-stm32f101xx-stm32f102xx-stm32f103xx-stm32f105xx-and-stm32f107xx-advanced-armbased-32bit-mcus-stmicroelectronics.pdf) | Program the RX count to match the PMA allocation. A 64-byte allocation uses `BL_SIZE=1` and `NUM_BLOCK=1`. |
 | USB 2.0 §5.5.3 and §8.5.3 in `core/src/core/usb.zig:DeviceController` | End data on a short packet or at the requested length. |
 | USB 2.0 §9.2.7 and §8.5.3.4 in the header of `core/src/core/usb/ControlRequest.zig` | Stall an unsupported control request. |
 | USB 2.0 §9.4.2, §9.4.7 and §9.1.1.5 in `core/src/core/usb.zig:DeviceController` | GET_CONFIGURATION returns the selected descriptor's value or zero. The port reopens data endpoints at DATA0 on each selection. |
@@ -173,9 +176,10 @@ Run `zig build test` in each package. `core/build.zig:build` reaches USB via `co
 - **`port/nordic/nrf5x/`** checks EP0 in `port/nordic/nrf5x/src/hal/usbd/ep0.zig` with "a control read gets its status stage when the host has taken the last packet", "a control write whose data the controller refuses is stalled" and "SET_ADDRESS gets neither a status stage nor a stall".
 - **`port/nordic/nrf5x/`** checks EP0 OUT listen and termination in `port/nordic/nrf5x/src/hal/usbd/ep0.zig` with "a control write the controller listens for runs packet by packet" and "a control write's data stage runs until wLength or a short packet".
 - **`port/wch/ch32v/`** checks wrong-toggle OUT in `port/wch/ch32v/src/usb_tests.zig` with "USBFS EP0 discards retransmitted OUT without advancing state" and "USBHS EP0 discards retransmitted OUT without advancing state".
+- **`port/stmicro/stm32/`** checks endpoint lookup and validation, PMA layout and RX count, co-latched SETUP and TX completion, and CDC/HID reset dispatch in the host suites registered when the checkout includes core, drivers and both examples.
 - Dedicated tests are absent for stationary handles, descriptor and handler rules, synchronous callbacks,
   packet and read capacities, clock and IRQ setup, Nordic attach/detach, physical toggles, RP2xxx and
-  WCH USBD register paths, STM32F103 startup and PMA mapping, reset ordering and callbacks, HID I/O,
+  WCH USBD register paths, STM32F103 hardware startup, HID I/O,
   Echo's first IN readiness and ROM reset effects.
 
 ## Open questions
@@ -202,13 +206,5 @@ Run `zig build test` in each package. `core/build.zig:build` reaches USB via `co
 - `examples/nordic/nrf5x/src/usb_hid.zig:main` checks only `drivers()`, so it can use the retained HID runtime during detach or after reattachment before a new configuration. ([#74](https://github.com/valthon/microzig/issues/74))
 - `port/nordic/nrf5x/src/hal/usbd.zig:USBD.ep0_trigger` can issue an old transfer's task if a new SETUP arrives after the guard. ([#71](https://github.com/valthon/microzig/issues/71))
 - `port/nordic/nrf5x/src/hal/usbd.zig:USBD.load_in` can arm old EP0 IN data if SETUP arrives between its check and `TASKS_STARTEPIN`. ([#71](https://github.com/valthon/microzig/issues/71))
-- `examples/stmicro/stm32/src/stm32f1xx/usb_cdc.zig:USB_conf` relies on the default reset handler, which leaves `config`, `device_addr`, `remain_pkg`, `CDC_coding` and a pending `CDC_send` unchanged, so the app can use stale control state or wait for a discarded TX completion. ([#73](https://github.com/valthon/microzig/issues/73))
-- `examples/stmicro/stm32/src/stm32f1xx/usb_hid.zig:USB_conf` relies on the default reset handler, which leaves `config`, `device_addr` and `to_report` unchanged, so the app can send before reconfiguration, wait for a discarded report completion or apply a stale address. ([#73](https://github.com/valthon/microzig/issues/73))
-- `examples/stmicro/stm32/src/stm32f1xx/usb_cdc.zig:ep0_setup` leaves `device_addr`, `remain_pkg` and `CDC_coding` pending, so later callbacks can apply an abandoned address or use stale control data. ([#73](https://github.com/valthon/microzig/issues/73))
-- `examples/stmicro/stm32/src/stm32f1xx/usb_hid.zig:ep0_setup` leaves `device_addr` pending, and `examples/stmicro/stm32/src/stm32f1xx/usb_hid.zig:ep0_tx` can reapply it because it never clears it. ([#73](https://github.com/valthon/microzig/issues/73))
 - `core/src/core/usb.zig:DeviceController.process_device_setup` accepts a nonzero SET_CONFIGURATION value the descriptor does not define, where USB 2.0 §9.4.7 calls for a request error. ([#70](https://github.com/valthon/microzig/issues/70))
-- `port/stmicro/stm32/src/hals/STM32F103/usb_internals/usb_ll.zig:usb_handler` dispatches the previous transfer's TX completion after the new SETUP callback when both are pending in one snapshot, so it can apply a newly pending address before its status packet completes even if the application clears old state at SETUP. ([#73](https://github.com/valthon/microzig/issues/73))
-- `port/stmicro/stm32/src/hals/STM32F103/usb_internals/usb_ll.zig:usb_check` accepts mismatched endpoint and controller slot numbers, so endpoint I/O can use the wrong PMA entry. ([#73](https://github.com/valthon/microzig/issues/73))
 - `port/stmicro/stm32/src/hals/STM32F103/usb_internals/usb_ll.zig:inner_init` waits for RESET without a deadline.
-- `port/stmicro/stm32/src/hals/STM32F103/usb_internals/usb_ll.zig:get_epc_from_ep` reads the nonexistent `Endpoint.EpControl` field. ([#59](https://github.com/valthon/microzig/issues/59))
-- `port/stmicro/stm32/src/hals/STM32F103/usb_internals/usb_ll.zig:usb_runtime_init` instantiates `usb_check` at runtime, where calls to `comptime_or_runtime_err` leave error unions unhandled. ([#73](https://github.com/valthon/microzig/issues/73))

@@ -192,6 +192,7 @@ var CDC_fifo: microzig.utilities.CircularBuffer(u8, 64) = .empty;
 var device_addr: ?u7 = null;
 var remain_pkg: ?[]const u8 = null;
 var config: bool = false;
+var reset_generation: u32 = 0;
 var CDC_coding: bool = false;
 var serial_config: Encoding = undefined;
 var serial_state: SerialState = undefined;
@@ -238,7 +239,14 @@ fn set_addr(receive_addr: u7, epc: EpControl) void {
     epc.ZLP(.force_data1) catch unreachable;
 }
 
+fn clear_control_transfer() void {
+    device_addr = null;
+    remain_pkg = null;
+    CDC_coding = false;
+}
+
 fn ep0_setup(epc: EpControl, _: ?*anyopaque) void {
+    clear_control_transfer();
     const setup = epc.USB_read(.no_change) catch unreachable;
     if (setup.len != 8) {
         return;
@@ -334,7 +342,7 @@ const endpoint0 = usb_ll.Endpoint{
     .ep_kind = false,
     .rx_reset_state = .Valid,
     .tx_reset_state = .Nak,
-    .rx_buffer_size = .{ .block_qtd = 2, .block_size = .@"32bytes" },
+    .rx_buffer_size = .from_bytes(64),
     .tx_buffer_size = 64,
     .rx_callback = ep0_rx,
     .tx_callback = ep0_tx,
@@ -375,43 +383,78 @@ const endpoint3 = usb_ll.Endpoint{
     .ep_kind = false,
     .rx_reset_state = .Valid,
     .tx_reset_state = .Nak,
-    .rx_buffer_size = .{ .block_qtd = 2, .block_size = .@"32bytes" },
+    .rx_buffer_size = .from_bytes(64),
     .tx_buffer_size = 0, //no TX buffer for OUT endpoint
     .rx_callback = ep3_rx,
 };
 
+fn bus_reset(_: ?*anyopaque) void {
+    clear_control_transfer();
+    config = false;
+    reset_generation +%= 1;
+    CDC_send = false;
+    CDC_fifo.reset();
+    usb_ll.default_reset_handler();
+}
+
 const USB_conf = usb_ll.Config{
     .endpoints = &.{ endpoint0, endpoint1, endpoint2, endpoint3 },
     .RX_buffer = &USB_RX_BUFFER,
+    .reset_callback = bus_reset,
 };
 
-fn CDC_write(msg: []const u8) void {
-    const send: *volatile bool = &CDC_send;
-    const EP2 = usb_ll.EpControl.EPC2;
-    send.* = true;
-    EP2.USB_send(msg, .no_change) catch unreachable;
-    while (send.*) {
-        asm volatile ("nop"); //don't call WFE or WFI here, USB events don't count for wakeup
+const CdcRead = struct {
+    bytes: []const u8,
+    generation: u32,
+};
+
+fn start_cdc_write(msg: CdcRead) bool {
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    // A fresh configuration can already be active when the foreground resumes.
+    if (!config or msg.generation != reset_generation) return false;
+    CDC_send = true;
+    EpControl.EPC2.USB_send(msg.bytes, .no_change) catch unreachable;
+    return true;
+}
+
+fn CDC_write(msg: CdcRead) void {
+    if (!start_cdc_write(msg)) return;
+    while (true) {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        if (!CDC_send) return;
     }
 }
 
-fn CDC_read(buf: []u8, timeout: ?Duration) ![]const u8 {
+fn CDC_read(buf: []u8, timeout: ?Duration) !CdcRead {
     const deadline = microzig.drivers.time.Deadline.init_relative(time.get_time_since_boot(), timeout);
-    const fifo = &CDC_fifo;
+    const generation = blk: {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        break :blk reset_generation;
+    };
     var index: usize = 0;
-    reader: for (buf) |*byte| {
-        while (fifo.get_readable_len() == 0) {
-            if (deadline.is_reached_by(time.get_time_since_boot())) break :reader;
+    while (index < buf.len) {
+        const byte = blk: {
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            if (!config) return error.NotConfigured;
+            if (generation != reset_generation) return error.SessionReset;
+            break :blk CDC_fifo.pop();
+        };
+        if (byte) |value| {
+            buf[index] = value;
+            index += 1;
+        } else if (deadline.is_reached_by(time.get_time_since_boot())) {
+            break;
         }
-
-        byte.* = fifo.pop().?;
-        index += 1;
     }
     if (index == 0) {
         return error.Timeout;
     }
 
-    return buf[0..index];
+    return .{ .bytes = buf[0..index], .generation = generation };
 }
 
 pub fn main() !void {
@@ -441,11 +484,102 @@ pub fn main() !void {
     //NOTE: the stm32f103 does not have an internal 1.5k pull-up resistor for USB, you must add one externally
     usb_ll.usb_init(USB_conf, Duration.from_ms(25));
     var recv_byte: [64]u8 = undefined;
-    const conf: *volatile bool = &config;
     while (true) {
         led.toggle();
-        if (!conf.*) continue;
         const recv = CDC_read(&recv_byte, Duration.from_ms(10)) catch continue;
         CDC_write(recv);
     }
+}
+
+test "CDC retires pending state on SETUP and reset" {
+    const host = microzig.testing_usb;
+    const usb_irq = microzig_options.interrupts.USB_LP_CAN1_RX0.c;
+    const Interleave = struct {
+        fn configure() void {
+            host.load_ep0(&.{ 0, 9, 1, 0, 0, 0, 0, 0 });
+            host.raise_ep0_setup();
+            usb_irq();
+        }
+
+        fn reset_and_reconfigure() void {
+            host.raise_reset();
+            usb_irq();
+            configure();
+            CDC_fifo.write_assume_capacity("new");
+        }
+    };
+
+    try host.start(USB_conf);
+    defer host.stop();
+
+    device_addr = 42;
+    remain_pkg = "old descriptor data";
+    CDC_coding = true;
+    host.load_ep0(&.{});
+    ep0_setup(.EPC0, null);
+
+    try std.testing.expectEqual(@as(?u7, null), device_addr);
+    try std.testing.expectEqual(@as(?[]const u8, null), remain_pkg);
+    try std.testing.expect(!CDC_coding);
+
+    // CDC bus reset clears the session and releases the writer.
+    usb_ll.set_addr(12);
+    device_addr = 42;
+    remain_pkg = "old descriptor data";
+    CDC_coding = true;
+    config = true;
+    CDC_send = true;
+    try CDC_fifo.write("old");
+    var recv_buf: [3]u8 = undefined;
+    const old = try CDC_read(&recv_buf, null);
+    try std.testing.expectEqualStrings("old", old.bytes);
+    try CDC_fifo.write("old bytes");
+    host.raise_reset();
+    usb_irq();
+
+    try std.testing.expectEqual(@as(u7, 0), host.address());
+    try std.testing.expectEqual(@as(?u7, null), device_addr);
+    try std.testing.expectEqual(@as(?[]const u8, null), remain_pkg);
+    try std.testing.expect(!CDC_coding);
+    try std.testing.expect(!config);
+    try std.testing.expect(!CDC_send);
+    try std.testing.expect(CDC_fifo.is_empty());
+
+    Interleave.configure();
+    try std.testing.expect(config);
+    const pma_before = host.pma_words;
+    try std.testing.expect(!start_cdc_write(old));
+    try std.testing.expect(!CDC_send);
+    try std.testing.expectEqual(pma_before, host.pma_words);
+
+    try CDC_fifo.write("new");
+    const fresh = try CDC_read(&recv_buf, null);
+    try std.testing.expectEqualStrings("new", fresh.bytes);
+    try std.testing.expect(start_cdc_write(fresh));
+    try std.testing.expect(CDC_send);
+    ep2_tx(.EPC2, null);
+
+    // The first section captures the generation. The second dequeues the old byte.
+    try CDC_fifo.write("x");
+    host.interrupt_after_critical_sections(2, Interleave.reset_and_reconfigure);
+    var partial: [4]u8 = undefined;
+    try std.testing.expectError(error.SessionReset, CDC_read(&partial, .from_us(0)));
+    try std.testing.expectEqual(@as(u8, 'x'), partial[0]);
+    try std.testing.expect(!CDC_send);
+    const after_partial = try CDC_read(&recv_buf, .from_us(0));
+    try std.testing.expectEqualStrings("new", after_partial.bytes);
+
+    // Between the final dequeue and the return, the original generation still owns the byte.
+    try CDC_fifo.write("y");
+    host.interrupt_after_critical_sections(2, Interleave.reset_and_reconfigure);
+    var last_byte: [1]u8 = undefined;
+    const interrupted = try CDC_read(&last_byte, .from_us(0));
+    try std.testing.expectEqualStrings("y", interrupted.bytes);
+    try std.testing.expect(config);
+    const pma_after_reset = host.pma_words;
+    try std.testing.expect(!start_cdc_write(interrupted));
+    try std.testing.expect(!CDC_send);
+    try std.testing.expectEqual(pma_after_reset, host.pma_words);
+    const after_final = try CDC_read(&recv_buf, .from_us(0));
+    try std.testing.expectEqualStrings("new", after_final.bytes);
 }
