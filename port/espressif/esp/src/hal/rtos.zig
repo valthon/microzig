@@ -531,6 +531,11 @@ inline fn context_switch(prev_context: *Context, next_context: *Context) void {
 }
 
 pub fn yield_from_isr() linksection(".ram_text") void {
+    const root = @import("root");
+    if (@import("builtin").is_test and @hasDecl(root, "stop_panic_runner")) {
+        root.isr_yield_requests += 1;
+        return;
+    }
     rtos_options.cpu_interrupt.set_pending(true);
 }
 

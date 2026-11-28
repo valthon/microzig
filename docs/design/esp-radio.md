@@ -131,7 +131,9 @@ Wi-Fi use task slots. See `port/espressif/esp/src/hal/radio/coex.zig:adapter`.
 | Coex task semaphore slots | They panic on ISR entry. Take forwards the timeout and give returns 0 when full. |
 | Coex ISR semaphore slots | Take polls and ignores its wake pointer. Give returns 0 when full and sets the optional wake flag on a higher-priority wake. |
 | Coex scheme timer slots | They panic on ISR entry. Scheme `setfn` requires the pre-init reservation. |
-| Coex ISR yield and BLE status set/clear | These hooks are ISR-capable and silent in coexistence images. |
+| ISR queue send and yield | These hooks are silent in all images. Coex BLE status set/clear hooks are also silent. |
+| Wi-Fi interrupt dispatch | The initial callback slot is empty. Registration and removal publish the callback and argument together with interrupts masked. Dispatch calls an installed handler. |
+| Wi-Fi ISR context query | Reports the RTOS interrupt context, including false from tasks. |
 | Timer deadline | The worker dispatches timers due at its scan time. In coexistence a due one-shot prompts a rescan without sleeping. Finite semaphore waits request at least one RTOS tick in coexistence (`port/espressif/esp/src/hal/radio/coex_timer_wait.zig:Deadlines.wait`). |
 
 ## Prior art
@@ -170,9 +172,6 @@ The ESP port's `test` step (`port/espressif/esp/build.zig:build`) runs these hos
 - `port/espressif/esp/src/hal/radio/osi.zig:WifiShutdown.delete_task` leaves a self-deleting task's stack and control block allocated, and Wi-Fi teardown reclaims only the packet worker.
 - `port/espressif/esp/src/hal/radio/osi.zig:timer_setfn` logs allocation failure and returns without registering a new timer. ([#69](https://github.com/valthon/microzig/issues/69))
 - `port/espressif/esp/src/hal/radio/osi.zig:timer_arm` multiplies milliseconds by 1,000 in a `u32`, so inputs above 4,294,967 ms can trap in safety-enabled builds or produce the wrong deadline in unchecked builds. ([#69](https://github.com/valthon/microzig/issues/69))
-- `port/espressif/esp/src/hal/radio/osi.zig:queue_send_from_isr` logs in interrupt context. ([#69](https://github.com/valthon/microzig/issues/69))
-- `port/espressif/esp/src/hal/radio/osi.zig:is_from_isr` reports true even in task context. ([#69](https://github.com/valthon/microzig/issues/69))
-- `port/espressif/esp/src/hal/radio/osi.zig:wifi_interrupt_handler` starts undefined, so an interrupt reaching the handler before install can read an undefined optional. ([#69](https://github.com/valthon/microzig/issues/69))
 - `port/espressif/esp/src/hal/radio/timer.zig:deinit` can wait indefinitely if the timer worker calls it on final release in a single-radio image. ([#69](https://github.com/valthon/microzig/issues/69))
 - `port/espressif/esp/src/hal/radio/timer.zig:task_fn` rounds positive sub-tick waits down to zero in single-radio images, so the worker can spin until the deadline. ([#69](https://github.com/valthon/microzig/issues/69))
 - `port/espressif/esp/src/hal/radio/timer.zig:task_fn` computes the single-radio semaphore wait from the pre-callback scan time, so it can sleep after a callback has already run past another timer's deadline. ([#69](https://github.com/valthon/microzig/issues/69))

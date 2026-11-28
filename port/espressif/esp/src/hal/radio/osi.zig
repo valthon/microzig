@@ -21,6 +21,7 @@ const log = std.log.scoped(.esp_radio_osi);
 
 const coex_enabled = radio.coex_enabled;
 const coex = @import("coex.zig");
+const callback_context = @import("callback_context.zig");
 const phy_modems = @import("phy_modems.zig");
 const shared_heap = @import("shared_heap.zig");
 
@@ -49,7 +50,7 @@ pub var gpa: if (coex_enabled) void else std.mem.Allocator = if (coex_enabled) {
 pub var wifi_interrupt_handler: ?struct {
     f: *const fn (?*anyopaque) callconv(.c) void,
     arg: ?*anyopaque,
-} = undefined;
+} = null;
 
 extern fn vsnprintf(buffer: [*c]u8, len: usize, fmt: [*c]const u8, va_list: std.lang.VaList) callconv(.c) void;
 
@@ -282,6 +283,8 @@ pub fn set_isr(
 
     switch (n) {
         0, 1 => {
+            const cs = enter_critical_section();
+            defer cs.leave();
             wifi_interrupt_handler = if (f) |handler| .{
                 .f = @ptrCast(@alignCast(handler)),
                 .arg = arg,
@@ -312,7 +315,7 @@ pub fn ints_off(mask: u32) callconv(.c) void {
 }
 
 pub fn is_from_isr() callconv(.c) bool {
-    return true;
+    return callback_context.in_isr();
 }
 
 pub fn spin_lock_create() callconv(.c) ?*anyopaque {
@@ -344,12 +347,7 @@ pub fn wifi_int_restore(mux_ptr: ?*anyopaque, state: u32) callconv(.c) void {
     }
 }
 
-// In a coexistence image this callback and the two coex status-bit callbacks
-// log nothing at any level: this one runs in an interrupt, and
-// coex_callback_test checks all three. Single-radio images keep their logs.
 pub fn task_yield_from_isr() callconv(.c) void {
-    if (!coex_enabled) log.debug("task_yield_from_isr", .{});
-
     rtos.yield_from_isr();
 }
 
@@ -669,8 +667,6 @@ pub fn queue_send(ptr: ?*anyopaque, item_ptr: ?*anyopaque, block_time_tick: u32)
 }
 
 pub fn queue_send_from_isr(ptr: ?*anyopaque, item_ptr: ?*anyopaque, _hptw: ?*anyopaque) callconv(.c) i32 {
-    log.debug("queue_send_from_isr {?} {?} {?}", .{ ptr, item_ptr, _hptw });
-
     const queue: *QueueWrapper = @ptrCast(@alignCast(ptr));
     const item: [*]const u8 = @ptrCast(@alignCast(item_ptr));
 
@@ -1982,6 +1978,59 @@ pub fn coex_schm_flexible_period_get() callconv(.c) u8 {
     log.debug("coex_schm_flexible_period_get", .{});
 
     return if (coex_enabled) 1 else 0;
+}
+
+test "Wi-Fi ISR context queries distinguish tasks from interrupts" {
+    defer microzig.radio_test.in_isr = false;
+    try std.testing.expect(!is_from_isr());
+    microzig.radio_test.in_isr = true;
+    try std.testing.expect(is_from_isr());
+}
+
+test "Wi-Fi interrupt callback starts empty and can be uninstalled" {
+    const Handler = struct {
+        fn run(arg: ?*anyopaque) callconv(.c) void {
+            const called: *bool = @ptrCast(arg);
+            called.* = true;
+        }
+    };
+    try std.testing.expect(wifi_interrupt_handler == null);
+    var called = false;
+    set_isr(0, @ptrCast(@constCast(&Handler.run)), &called);
+    defer set_isr(0, null, null);
+    const handler = wifi_interrupt_handler.?;
+    handler.f(handler.arg);
+    try std.testing.expect(called);
+    set_isr(0, null, null);
+    try std.testing.expect(wifi_interrupt_handler == null);
+}
+
+test "queue send from ISR preserves the wake flag and reports a full queue" {
+    var buffer: [4]u8 = undefined;
+    var queue: QueueWrapper = .{ .item_len = 4, .inner = .init(&buffer) };
+    var item: [4]u8 = .{ 1, 2, 3, 4 };
+    var wake: u32 = 0x40;
+    try std.testing.expectEqual(1, queue_send_from_isr(&queue, &item, &wake));
+    try std.testing.expectEqualSlices(u8, &item, &buffer);
+    try std.testing.expectEqual(0, queue_send_from_isr(&queue, &item, &wake));
+    try std.testing.expectEqual(0x40, wake);
+}
+
+test "ISR queue send and yield are silent with OSI debug logging enabled" {
+    const root = @import("root");
+    if (!@hasDecl(root, "stop_panic_runner")) return error.SkipZigTest;
+
+    log.debug("verify OSI debug logging is enabled", .{});
+    try std.testing.expectEqual(1, root.osi_logs);
+    root.osi_logs = 0;
+    var buffer: [1]u8 = undefined;
+    var queue: QueueWrapper = .{ .item_len = 1, .inner = .init(&buffer) };
+    var item: u8 = 42;
+    var wake: u32 = 0;
+    try std.testing.expectEqual(1, queue_send_from_isr(&queue, &item, &wake));
+    task_yield_from_isr();
+    try std.testing.expectEqual(1, root.isr_yield_requests);
+    try std.testing.expectEqual(0, root.osi_logs);
 }
 
 test "queue creation widens only the legacy supplicant shape" {

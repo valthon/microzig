@@ -383,21 +383,28 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/hal/interrupt_encoding.zig"),
             }));
             test_step.dependOn(&b.addRunArtifact(unit_tests).step);
-            if (radios != .coex) continue;
+            if (radios != .coex and radios != .wifi_only) continue;
 
-            // The public Wi-Fi stop panics, one process each.
-            const stop_panic_tests = b.addTest(.{
-                .name = "wifi-stop-panics",
-                .root_module = unit_tests.root_module,
-                .test_runner = .{ .path = b.path("src/hal/radio/stop_panic_runner.zig"), .mode = .simple },
-            });
-            for ([_][2][]const u8{
+            // Run expected panics and the debug logging probe in isolated processes.
+            const RadioProbe = [2][]const u8;
+            const probes: []const RadioProbe = if (radios == .coex) &.{
                 .{ "rejects the interface stop", "Wi-Fi stop: the PP queue rejected the interface stop (ESP_ERR_WIFI_POST)" },
                 .{ "rejects the hardware stop", "Wi-Fi stop: the PP queue rejected the hardware stop (ESP_ERR_WIFI_POST)" },
                 .{ "rejects both stops", "Wi-Fi stop: the PP queue rejected the interface stop and the hardware stop (ESP_ERR_WIFI_POST)" },
                 .{ "fails after the interfaces stopped", "Wi-Fi stop failed after the interfaces stopped" },
-            }) |case| {
-                const run = b.addRunArtifact(stop_panic_tests);
+            } else &.{
+                .{ "ISR queue send and yield are silent with OSI debug logging enabled", "" },
+            };
+            const probe_filters = b.allocator.alloc([]const u8, probes.len) catch @panic("out of memory");
+            for (probes, probe_filters) |probe, *filter| filter.* = probe[0];
+            const probe_tests = b.addTest(.{
+                .name = b.fmt("radio-probes-{s}", .{@tagName(radios)}),
+                .root_module = unit_tests.root_module,
+                .filters = probe_filters,
+                .test_runner = .{ .path = b.path("src/hal/radio/stop_panic_runner.zig"), .mode = .simple },
+            });
+            for (probes) |case| {
+                const run = b.addRunArtifact(probe_tests);
                 run.addArgs(&case);
                 test_step.dependOn(&run.step);
             }

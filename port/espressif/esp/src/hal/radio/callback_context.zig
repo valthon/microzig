@@ -11,7 +11,7 @@ pub fn current_task() *rtos.Task {
     return if (host_test) host_current orelse &host_task else rtos.get_current_task();
 }
 
-fn in_isr() bool {
+pub fn in_isr() bool {
     return if (host_test) microzig.radio_test.in_isr else rtos.in_isr();
 }
 
