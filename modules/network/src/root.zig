@@ -437,15 +437,18 @@ pub const tcp = struct {
                 return lwip.ERR_OK;
             }
 
+            // Credit the window before on_recv runs: tcp_close resets the
+            // connection and drops queued output if received data is still
+            // uncredited, and on_recv may close.
+            if (self.pcb) |pcb| {
+                lwip.tcp_recved(pcb, c_pbuf.*.tot_len);
+            }
             var pbuf: *lwip.pbuf = c_pbuf;
             while (true) {
                 if (self.on_recv) |cb| cb(self, payload_bytes(pbuf));
                 // Stop at the end of the chain or once on_recv has closed.
                 if (pbuf.next == null or self.pcb == null) break;
                 pbuf = pbuf.next;
-            }
-            if (self.pcb) |pcb| {
-                lwip.tcp_recved(pcb, c_pbuf.*.tot_len);
             }
             return lwip.ERR_OK;
         }

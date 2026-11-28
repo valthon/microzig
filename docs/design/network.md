@@ -51,9 +51,9 @@ Raw UDP and TCP receive callbacks borrow one pbuf segment at a time. UDP marks t
 last with `last_fragment`. Copy data you need after return. UDP and TCP copy outgoing
 data, and TCP `on_sent` reports acknowledged bytes. Retry `tcp.Connection.send` only
 if the bytes were never queued, since `tcp_output` can fail after `tcp_write` succeeds.
-Defer a graceful close requested by `on_recv` until the stack call returns so the
-wrapper can credit the received bytes. Keep callback contexts stationary and TCP
-connection wrapper from `connect`
+The wrapper credits received bytes to the window before calling `on_recv`, so
+`on_recv` may queue a reply and close without the close resetting the connection.
+Keep callback contexts stationary. lwIP holds a TCP connection wrapper from `connect`
 or accept until `close`, a reset or an abort. `close` detaches the wrapper from the PCB, which
 lwIP keeps until the FIN exchange ends, and stops callbacks for that connection, including
 `on_sent` for bytes still in flight. A wrapper that reads `.closed` can be reused or
@@ -170,7 +170,7 @@ For RX, the wrapper checks that `head` and `len` describe a frame within the sup
   pbuf to the pool.
 - The network host tests check that TX returns the caller's pbuf unchanged.
 - The network host tests run TCP through a link that loops frames back to the interface.
-  They check that a
+  They check that a reply sent and closed from `on_recv` reaches the peer, and that a
   closed wrapper gets no callbacks from its closing PCB and can reconnect at once.
 - No host test checks ESP adapter pbuf failure ownership, TX
   scratch lifetime, core-lock use, netif flags and link handoff,
@@ -178,7 +178,6 @@ For RX, the wrapper checks that `head` and `len` describe a frame within the sup
 
 ## Open questions
 
-- `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/espressif/esp/src/tcp_server.zig:run` can return from an ordinary server error even after successful Wi-Fi teardown, while lwIP still references the stack-local netif and allocator. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/tcp_server.zig:run_server` can deinitialize Wi-Fi after a server error with the netif still up and registered, allowing TX to overlap teardown. ([#81](https://github.com/valthon/microzig/issues/81))

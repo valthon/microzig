@@ -434,6 +434,26 @@ const Peer = struct {
     }
 };
 
+test "a reply queued before close in on_recv reaches the peer" {
+    var loop: Loopback = .{};
+    try loop.start(9100);
+    defer loop.stop();
+
+    var server: Peer = .{ .reply = "pong" };
+    var client: Peer = .{};
+    next_accept = &server.conn;
+    try loop.connect(&client, 9100);
+    try loop.pump();
+    try testing.expectEqual(.open, client.conn.state);
+    try testing.expectEqual(.open, server.conn.state);
+
+    try client.conn.send("ping");
+    try loop.pump();
+    try testing.expectEqualStrings("ping", server.data());
+    try testing.expectEqualStrings("pong", client.data());
+    try testing.expectEqualSlices(net.Error, &.{error.EndOfStream}, client.close_errors[0..client.close_count]);
+}
+
 test "close stops callbacks from the closing PCB" {
     var loop: Loopback = .{};
     try loop.start(9200);
