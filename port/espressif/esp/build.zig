@@ -346,16 +346,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run platform agnostic unit tests");
     if (b.lazyDependency("esp-wifi-sys", .{})) |sys| {
         const headers = wifi_headers(b, sys, "esp32c6", target);
-        const HostRadios = enum { coex, wifi_disabled, wifi_only };
-        for ([_]HostRadios{ .coex, .wifi_disabled, .wifi_only }) |radios| {
-            const options = b.addOptions();
-            options.addOption(bool, "wifi", radios != .wifi_disabled);
-            options.addOption(bool, "coex", radios != .wifi_only);
+        const HostRadios = enum { coex, wifi_disabled, wifi_only, ble_only };
+        for ([_]HostRadios{ .coex, .wifi_disabled, .wifi_only, .ble_only }) |radios| {
             const host_microzig = b.createModule(.{
-                .root_source_file = b.path("src/hal/usb_serial_jtag/test_microzig.zig"),
+                .root_source_file = b.path(if (radios == .ble_only)
+                    "src/hal/radio/test_ble_host.zig"
+                else
+                    "src/hal/usb_serial_jtag/test_microzig.zig"),
             });
-            host_microzig.addOptions("test-radio-options", options);
-            host_microzig.addImport("core-allocator", b.createModule(.{ .root_source_file = b.path("../../../core/src/allocator.zig") }));
+            if (radios != .ble_only) {
+                const options = b.addOptions();
+                options.addOption(bool, "wifi", radios != .wifi_disabled);
+                options.addOption(bool, "coex", radios != .wifi_only);
+                host_microzig.addOptions("test-radio-options", options);
+                host_microzig.addImport("core-allocator", b.createModule(.{ .root_source_file = b.path("../../../core/src/allocator.zig") }));
+            }
             host_microzig.addImport("drivers", b.createModule(.{ .root_source_file = b.path("../../../drivers/src/root.zig") }));
             const unit_tests = b.addTest(.{
                 .name = b.fmt("hal-host-{s}", .{@tagName(radios)}),
@@ -368,6 +373,7 @@ pub fn build(b: *std.Build) void {
                     .coex => &.{},
                     .wifi_disabled => &.{"public Wi-Fi init validates options before acquiring a session"},
                     .wifi_only => &.{"hal.radio.wifi.test."},
+                    .ble_only => &.{"BLE-only task ABI removes a timed waiter and reclaims the task"},
                 },
             });
             host_microzig.addImport("hal-under-test", unit_tests.root_module);

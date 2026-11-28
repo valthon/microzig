@@ -12,6 +12,7 @@ const security_hardware = @import("ble/smp_hardware.zig");
 const radio = @import("../radio.zig");
 const rtos = @import("../rtos.zig");
 const osi = @import("osi.zig");
+const host_test = @import("callback_context.zig").host_test;
 const analog = @import("../analog/esp32_c6.zig");
 const p = microzig.chip.peripherals;
 const cs_enter = microzig.interrupt.enter_critical_section;
@@ -229,19 +230,62 @@ fn receive_acl(mbuf: *abi.Mbuf, arg: ?*anyopaque) callconv(.c) c_int {
     return push(self, packet);
 }
 
+// The host scheduler exercises task slots without initializing hardware.
 const ext_funcs: abi.ExtFuncs = .{
-    .intr_alloc = intr_alloc,
-    .intr_free = intr_free,
+    .intr_alloc = if (host_test) undefined else intr_alloc,
+    .intr_free = if (host_test) undefined else intr_free,
     .malloc = osi.malloc,
     .free = osi.free,
     .task_create = osi.task_create_pinned_to_core,
     .task_delete = osi.task_delete,
     .assert = controller_assert,
-    .random = osi.rand,
-    .ecc_key = security_hardware.controller_key,
-    .ecc_dh = security_hardware.controller_dh,
-    .reset_modem = reset_modem,
+    .random = if (host_test) undefined else osi.rand,
+    .ecc_key = if (host_test) undefined else security_hardware.controller_key,
+    .ecc_dh = if (host_test) undefined else security_hardware.controller_dh,
+    .reset_modem = if (host_test) undefined else reset_modem,
 };
+test "BLE-only task ABI removes a timed waiter and reclaims the task" {
+    if (!@hasDecl(microzig, "ble_scheduler_test")) return error.SkipZigTest;
+    comptime std.debug.assert(!radio.coex_enabled and microzig.options.hal.radio.radios.ble);
+
+    const Entry = struct {
+        fn run(_: ?*anyopaque) callconv(.c) noreturn {
+            unreachable; // The host scheduler does not switch stacks.
+        }
+    };
+    var accounting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    osi.gpa = accounting.allocator();
+    defer osi.gpa = undefined;
+    var caller: rtos.Task = .{ .context = undefined, .stack = &.{}, .priority = .lowest };
+    rtos.TestScheduler.init(&caller);
+
+    var handle: usize = 0;
+    const entry: *anyopaque = @ptrCast(@constCast(&Entry.run));
+    try std.testing.expectEqual(0, ext_funcs.task_create(entry, "ble", 0, null, 1, &handle, 0));
+    if (@import("builtin").mode == .debug)
+        try std.testing.expectEqual(0, ext_funcs.task_create(entry, "ble", std.math.maxInt(u32), null, 1, &handle, 0));
+    try std.testing.expectError(error.OutOfMemory, rtos.spawn(accounting.allocator(), Entry.run, .{null}, .{
+        .stack_size = std.math.maxInt(usize),
+    }));
+    try std.testing.expectEqual(0, handle);
+    try std.testing.expectEqual(0, accounting.allocations);
+
+    try std.testing.expectEqual(1, ext_funcs.task_create(entry, "ble", 512, null, 1, &handle, 0));
+    const task: *rtos.Task = @ptrFromInt(handle);
+    var queue: rtos.PriorityWaitQueue = .{};
+    var waiter: rtos.PriorityWaitQueue.Waiter = .{ .task = task, .priority = task.priority };
+    rtos.TestScheduler.park(&queue, &waiter);
+    try std.testing.expect(rtos.TestScheduler.has_sleepers());
+    try std.testing.expect(queue.list.first != null);
+
+    ext_funcs.task_delete(task);
+    try std.testing.expect(!rtos.TestScheduler.has_sleepers());
+    try std.testing.expect(queue.list.first == null and queue.list.last == null);
+    try std.testing.expectEqual(1, accounting.allocations);
+    try std.testing.expectEqual(1, accounting.deallocations);
+    try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+}
+
 pub const coex_funcs: abi.CoexFuncs = .{
     .set = if (radio.coex_enabled) osi.coex_schm_status_bit_set else no_coex,
     .clear = if (radio.coex_enabled) osi.coex_schm_status_bit_clear else no_coex,

@@ -831,10 +831,22 @@ pub fn task_create(
 
 pub fn task_delete(handle: ?*anyopaque) callconv(.c) void {
     log.debug("task_delete {?}", .{handle});
-    if (handle != null) {
-        @panic("task_delete(non-null): not implemented");
-    }
-    rtos.yield(.exit);
+    // C6 libble_app.a r_ble_controller_disable+0xc loads the saved handle,
+    // skips NULL at +0x14, and calls ExtFuncs.task_delete at +0x20.
+    delete_blob_task(handle, rtos.get_current_task(), null, rtos.detach_task, rtos.yield);
+}
+
+fn delete_blob_task(
+    handle: ?*anyopaque,
+    current: *rtos.Task,
+    retained_worker: ?*rtos.Task,
+    comptime detach: anytype,
+    comptime yield: anytype,
+) void {
+    const task: *rtos.Task = @ptrCast(@alignCast(handle orelse return yield(.exit)));
+    if (task == current) return yield(.exit);
+    detach(task);
+    if (task != retained_worker) rtos.free_exited_task(callback_allocator(), task);
 }
 
 // C6 libnet80211.a esp_wifi_stop posts three stop steps to the PP task through
@@ -1096,12 +1108,9 @@ pub const WifiShutdown = struct {
     /// only the WPA2-Enterprise and WPS APIs create (the port has neither).
     /// Starting any of them would leak its stack and TCB for the boot.
     pub fn delete_task(self: *WifiShutdown, handle: ?*anyopaque, current: *rtos.Task, comptime detach: anytype, comptime yield: anytype) void {
-        const task: *rtos.Task = @ptrCast(@alignCast(handle orelse return yield(.exit)));
-        if (task == current) return yield(.exit);
-        detach(task);
-        // During shutdown the caller joins both the manual and the normal
-        // self-delete path, including rollback inside esp_wifi_init_internal.
-        if (task != self.worker) rtos.free_exited_task(callback_allocator(), task);
+        // Shutdown joins the PP task on both manual and self-delete paths,
+        // including rollback inside esp_wifi_init_internal.
+        delete_blob_task(handle, current, self.worker, detach, yield);
     }
 };
 

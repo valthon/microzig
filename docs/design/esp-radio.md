@@ -64,7 +64,11 @@ worker (`port/espressif/esp/src/hal/radio.zig:deinit`), so a callback waiting on
 aligned, writable `usize` handle slot to both task-create hooks
 (`port/espressif/esp/src/hal/radio/osi.zig:task_create_common`). Keep the C task-name storage valid
 for the life of the task because `port/espressif/esp/src/hal/rtos.zig:spawn` stores the slice by reference.
-Creation ignores core affinity and returns 1 on success or 0 on spawn failure. Task queue send and
+Creation ignores core affinity and returns 1 on success or 0 on spawn failure. The delete slot
+exits the calling task for a null or current-task handle. Given another quiesced blob task's
+handle, it removes that task from the scheduler and frees it through the callback allocation route.
+Wi-Fi teardown retains ownership of the packet worker's allocation until it joins the worker.
+Task queue send and
 receive return 1 or −1. A queue requested as three four-byte entries uses eight-byte items for
 the legacy supplicant workaround (esp-wifi 0.14.1, WIFI-6676). Size the send and receive buffers
 for the stored item width. Other requests retain both dimensions. The OSI allocators reject
@@ -163,7 +167,6 @@ The ESP port's `test` step (`port/espressif/esp/build.zig:build`) runs these hos
 
 ## Open questions
 
-- `port/espressif/esp/src/hal/radio/osi.zig:task_delete` panics if the BLE blob passes a non-null task handle. ([#61](https://github.com/valthon/microzig/issues/61))
 - `port/espressif/esp/src/hal/radio/osi.zig:WifiShutdown.delete_task` leaves a self-deleting task's stack and control block allocated, and Wi-Fi teardown reclaims only the packet worker.
 - `port/espressif/esp/src/hal/radio/osi.zig:timer_setfn` logs allocation failure and returns without registering a new timer. ([#69](https://github.com/valthon/microzig/issues/69))
 - `port/espressif/esp/src/hal/radio/osi.zig:timer_arm` multiplies milliseconds by 1,000 in a `u32`, so inputs above 4,294,967 ms can trap in safety-enabled builds or produce the wrong deadline in unchecked builds. ([#69](https://github.com/valthon/microzig/issues/69))
