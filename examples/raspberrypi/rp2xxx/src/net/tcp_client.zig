@@ -128,8 +128,7 @@ const Client = struct {
                     };
                     return;
                 }
-                // TCP_SND_BUF is maximum send buffer size, default is 536 * 2 = 1072 bytes
-                // ref: https://github.com/lwip-tcpip/lwip/blob/6ca936f6b588cee702c638eee75c2436e6cf75de/src/include/lwip/opt.h#L1310
+                // Exercise both sends that fit and sends larger than the configured buffer.
                 var buf: [net.lwip.TCP_SND_BUF + 128]u8 = @splat('-');
                 // add some header to the buf
                 _ = std.mem.print(

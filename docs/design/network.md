@@ -12,9 +12,9 @@ package directly and supply their own netif and RTOS glue.
 ## Code map
 
 - `modules/lwip/build.zig:build` compiles the pinned upstream C sources and translates the
-  umbrella header with the same port include directory. `modules/lwip/src/root.zig:c`
+  umbrella header with the same port include directory and configured macros. `modules/lwip/src/root.zig:c`
   exports the translated bindings.
-- `modules/network/build.zig:build` links foundation libc and sizes the internal lwIP heap
+- `modules/network/build.zig:add_network_module` (called from `build`) links foundation libc and sizes the internal lwIP heap
   and packet buffer (pbuf) pool at build time. MTU counts IP bytes. Size the pool buffer
   for the Ethernet header, driver headroom and any extra receive storage.
 - `modules/network/src/include/lwipopts.h:NO_SYS` selects the bare-metal raw API and
@@ -158,6 +158,7 @@ within the remaining buffer.
 - The ESP port README records station DHCP and TCP echo between an ESP32-C3 and a XIAO ESP32-C6
   in both roles. Build the images in `examples/espressif/esp/` with `-Dexample=selftest_wifi_softap_echo` and `-Dexample=softap`.
   [ESP Wi-Fi self-tests](../../port/espressif/esp/README.md#wi-fi-station-and-rtos)
+- The network host tests check TCP send limits against the compiled lwIP configuration.
 - No host test checks build configuration, pbuf failure ownership, TX headroom and
   scratch lifetime, core-lock use, callback and close ordering, netif flags and link handoff,
   allocator lifetime and concurrency, timers, sys_arch waits or Pico ISR handoff and re-arm.

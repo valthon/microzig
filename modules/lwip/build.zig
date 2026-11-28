@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         "Configurable include directory for lwip",
     );
 
+    const c_macros = b.option(
+        []const []const u8,
+        "c_macros",
+        "Preprocessor definitions shared by the C sources and translated bindings",
+    ) orelse &.{};
+
     const upstream = b.dependency("lwip", .{});
 
     const translate_c = b.addTranslateC(.{
@@ -40,6 +46,11 @@ pub fn build(b: *std.Build) void {
         .flags = &flags,
     });
     lwip.root_module.addIncludePath(upstream.path("src/include"));
+    for (c_macros) |macro| {
+        translate_c.defineCMacroRaw(macro);
+        const eq = std.mem.findScalar(u8, macro, '=') orelse @panic("expected NAME=VALUE for c_macros");
+        lwip.root_module.addCMacro(macro[0..eq], macro[eq + 1 ..]);
+    }
 
     if (maybe_include_dir) |include_dir| {
         translate_c.addIncludePath(include_dir);
