@@ -90,6 +90,9 @@ cited at `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll`).
 | OUT arrival | Core drops data-endpoint callbacks. | Expose one listened-for packet to `ep_readv` during `on_buffer(.out(.ep0))` or consume status OUT locally. | Report one packet per listen. |
 | Bus reset | The port handles the hardware reset and reports it to core. | Core abandons data and pending address. | Core drops the runtime after calling the port's endpoint retirement hook if supplied. |
 
+USBFS acknowledges reset and discards co-latched packet events before the controller callback.
+A reset latched during the callback takes priority in the next snapshot.
+
 ### Entry points × phases
 
 | Call | Before an operation | During or after an operation |
@@ -173,9 +176,10 @@ Run `zig build test` in each package. `core/build.zig:build` reaches USB via `co
 - **`port/nordic/nrf5x/`** checks EP0 in `port/nordic/nrf5x/src/hal/usbd/ep0.zig` with "a control read gets its status stage when the host has taken the last packet", "a control write whose data the controller refuses is stalled" and "SET_ADDRESS gets neither a status stage nor a stall".
 - **`port/nordic/nrf5x/`** checks EP0 OUT listen and termination in `port/nordic/nrf5x/src/hal/usbd/ep0.zig` with "a control write the controller listens for runs packet by packet" and "a control write's data stage runs until wLength or a short packet".
 - **`port/wch/ch32v/`** checks wrong-toggle OUT in `port/wch/ch32v/src/usb_tests.zig` with "USBFS EP0 discards retransmitted OUT without advancing state" and "USBHS EP0 discards retransmitted OUT without advancing state".
+- **`port/wch/ch32v/`** checks USBFS reset priority in `port/wch/ch32v/src/hals/usbfs.zig`.
 - Dedicated tests are absent for stationary handles, descriptor and handler rules, synchronous callbacks,
   packet and read capacities, clock and IRQ setup, Nordic attach/detach, physical toggles, RP2xxx and
-  WCH USBD register paths, STM32F103 startup and PMA mapping, reset ordering and callbacks, HID I/O,
+  WCH USBD register paths, STM32F103 startup and PMA mapping, hardware reset timing, HID I/O,
   Echo's first IN readiness and ROM reset effects.
 
 ## Open questions
@@ -188,7 +192,6 @@ Run `zig build test` in each package. `core/build.zig:build` reaches USB via `co
 - `core/src/core/usb/drivers/HID.zig:Runtime.send_report` reports success on a short write, and `core/src/core/usb/drivers/HID.zig:Runtime.class_request` accepts SetIdle, SetProtocol and SetReport without implementing their effects. ([#70](https://github.com/valthon/microzig/issues/70))
 - `core/src/core/usb/drivers/HID.zig:Runtime.receive_report` logs the byte count but returns a partially undefined report after a short read, with no length or error for the caller. ([#70](https://github.com/valthon/microzig/issues/70))
 - `core/src/core/usb/drivers/EchoExample.zig:Runtime.on_tx_ready` is never called on IN open by Nordic, RP2xxx, WCH USBD, USBFS or USBHS, so Echo starts busy and cannot send its first packet. ([#68](https://github.com/valthon/microzig/issues/68))
-- `port/wch/ch32v/src/hals/usbfs.zig:Polled.poll` uses the saved transfer flag after reset and can dispatch a SETUP from before the reset. ([#72](https://github.com/valthon/microzig/issues/72))
 - `port/wch/ch32v/src/hals/usbhs.zig:Polled.poll` can use saved SETUP_ACT or a SETUP token via TRANSFER after reset, so a stale SET_CONFIGURATION can recreate the runtime. ([#72](https://github.com/valthon/microzig/issues/72))
 - `port/wch/ch32v/src/hals/usbfs.zig:Polled.handle_in` rearms OUT at DATA0 after each EP0 IN completion, overwriting the OUT toggle set for the control read's status stage. ([#72](https://github.com/valthon/microzig/issues/72))
 - `port/raspberrypi/rp2xxx/src/hal/usb.zig:ResetDriver` calls USB boot reset in the flash-reset branch and logs the BOOTSEL LED and interface masks without passing them to the reset helper. ([#66](https://github.com/valthon/microzig/issues/66))
