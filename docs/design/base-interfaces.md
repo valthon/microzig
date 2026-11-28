@@ -152,7 +152,6 @@ count fits `CNTR.NDT` in the port's register definitions.
 - `port/microchip/atmega/src/hals/atmega328p/drivers.zig:SPI_DatagramDevice` waits without a timeout.
 - `drivers/src/base/ClockDevice.zig:Timeout.diff` can underflow if called after the deadline. ([#75](https://github.com/valthon/microzig/issues/75))
 - `port/wch/ch32v/src/hals/time.zig:get_time_since_boot` can read a torn `u64` on RV32 when the TIM2 interrupt increments it across a low-word rollover. ([#78](https://github.com/valthon/microzig/issues/78))
-- `port/stmicro/stm32/src/hals/common/systick.zig:get_time_since_boot` can go backwards when it reads a reloaded counter before the pending SysTick interrupt advances the wrap count. ([#77](https://github.com/valthon/microzig/issues/77))
 - `drivers/src/base/DateTime.zig:from_timestamp` can underflow on the final day of a leap year and overflow its 12-bit year counter on large timestamps. ([#75](https://github.com/valthon/microzig/issues/75))
 - `drivers/src/base/DateTime.zig:offset` casts a negative offset to an unsigned addend even when it passes the underflow check. ([#75](https://github.com/valthon/microzig/issues/75))
 - `drivers/src/base/DatagramDevice.zig:TestDevice.writev_then_readv` discards a short read count and can report success with unfilled RX bytes. ([#75](https://github.com/valthon/microzig/issues/75))
