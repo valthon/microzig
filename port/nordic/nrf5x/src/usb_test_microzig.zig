@@ -54,10 +54,10 @@ pub const testing_io = struct {
         usbd = .{};
     }
 };
-const Register = struct {
+const Register = extern struct {
     raw: u32 = 0,
     full_value: usize = 0,
-    kind: enum { normal, lowpower, cause, out_task, in_task } = .normal,
+    kind: enum(u8) { normal, lowpower, cause, out_task, in_task } = .normal,
     pub fn write_raw(self: *Register, value: anytype) void {
         const v: u32 = @truncate(@as(u64, value));
         if (self.kind == .cause) {
@@ -99,8 +99,13 @@ const Register = struct {
         return .{};
     }
 };
-const Endpoint = struct { PTR: Register = .{}, MAXCNT: Register = .{} };
-const Usbd = struct {
+const Endpoint = extern struct { PTR: Register = .{}, MAXCNT: Register = .{} };
+/// Extern, so that `disarm_area` stays at offset 0.
+const Usbd = extern struct {
+    /// `hal/usbd/errata.zig:disarm_in` writes nrfx's undocumented registers at USBD + 0x800 and
+    /// + 0x804. Without this area those writes landed past the end of the mock, in whatever global
+    /// followed it (the test allocator's state on Windows).
+    disarm_area: [0x808]u8 = @splat(0),
     BMREQUESTTYPE: Register = .{},
     BREQUEST: Register = .{},
     DTOGGLE: Register = .{},
@@ -121,7 +126,7 @@ const Usbd = struct {
     EVENTS_USBRESET: Register = .{},
     LOWPOWER: Register = .{ .kind = .lowpower },
     SHORTS: Register = .{},
-    SIZE: struct { EPOUT: [8]Register = @splat(.{}) } = .{},
+    SIZE: extern struct { EPOUT: [8]Register = @splat(.{}) } = .{},
     TASKS_EP0RCVOUT: Register = .{},
     TASKS_EP0STALL: Register = .{},
     TASKS_EP0STATUS: Register = .{},
@@ -135,6 +140,10 @@ const Usbd = struct {
     WVALUEH: Register = .{},
     WVALUEL: Register = .{},
 };
+comptime {
+    if (@offsetOf(Usbd, "disarm_area") != 0)
+        @compileError("the USBD mock must keep USBD + 0x800 .. + 0x808 inside disarm_area");
+}
 var usbd: Usbd = .{};
 pub const chip = struct {
     pub const peripherals = struct {
