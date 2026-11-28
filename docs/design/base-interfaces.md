@@ -71,7 +71,7 @@ Each dispatched interface has a local `TestDevice`. Port names refer to the `dri
 | I2C_Device | ESP and nRF5x `I2C_Device` | The combined slot uses a repeated START under one deadline. ESP starts with a write address even for an empty write, and nRF5x rejects either empty phase. |
 | I2C_Device | RP2xxx `I2C_Device` | The combined slot shares a deadline and requires `port/raspberrypi/rp2xxx/src/hal/i2c.zig:Config`'s `repeated_start` for a restart, which enables `IC_RESTART_EN` by default. |
 | I2C_Device | CH32V and STM32F103 `I2C_Device` | The combined slot uses separate write and read transactions with a fresh timeout for each. |
-| I2C_Device | `port/stmicro/stm32/src/hals/common/i2c_v2.zig:I2C_Device` | Standalone vectors use one transaction per chunk. Supply matching vector counts for combined calls and keep each chunk length representable in `u8`. |
+| I2C_Device | `port/stmicro/stm32/src/hals/common/i2c_v2.zig:I2C_Device` | Standalone vectors use one transaction per chunk. Combined calls validate matching vector counts and `u8` chunk lengths before starting. Blocking waits have a software deadline. |
 | I2C_Device | `port/nxp/mcx/src/mcxn947/hal/flexcomm/LP_I2C.zig:LP_I2C.i2c_device` | It submits the combined write and read in one transfer. Limit the total across all RX chunks to `get_fifo_sizes().tx * 256` bytes. |
 | I2C_Device | `examples/nordic/nrf5x/src/selftest/sense.zig:ImuBus` | It stages one chunk per direction in DMA storage and has no standalone read slot. |
 | StreamDevice | `port/espressif/esp/src/hal/uart.zig:Stream` | UART uses an optional per-call deadline, and a successful write enqueues bytes whose final stop bit can be awaited with `port/espressif/esp/src/hal/uart.zig:UART.flush_blocking`. |
@@ -81,6 +81,10 @@ slices, which the blocking slots pass directly to EasyDMA. CH32V SPI creates dea
 per phase and DMA chunk. With DMA configured, CH32V I²C uses a transaction and timeout
 per chunk even when polling. Limit CH32V SPI and I²C DMA chunks to 65,535 bytes so the
 count fits `CNTR.NDT` in the port's register definitions.
+
+STM32 I²C v2 clears BERR during controller transfers on the parts covered by ES0246 §2.5.7,
+ES0204 §2.5.7, ES0261 §2.6.6, and ES0250 §2.20.4, then continues polling for progress or a
+terminal flag.
 
 ### Consumer calls
 
@@ -179,7 +183,5 @@ count fits `CNTR.NDT` in the port's register definitions.
 - `port/nxp/mcx/src/mcxn947/hal/flexcomm/LP_I2C.zig:LP_I2C.i2c_device` converts the instance index to a non-null pointer, so instance zero violates the pointer type's invariant. ([#79](https://github.com/valthon/microzig/issues/79))
 - `port/nxp/mcx/src/mcxn947/hal/flexcomm/LP_I2C.zig:readv` builds a write message and returns the requested size. ([#79](https://github.com/valthon/microzig/issues/79))
 - `port/nordic/nrf5x/src/hal/drivers.zig:I2C_Device.write_then_read` calls a missing non-DMA HAL method on the concrete scalar path. ([#76](https://github.com/valthon/microzig/issues/76))
-- `port/stmicro/stm32/src/hals/common/i2c_v2.zig:I2C_Device.writev_then_readv_fn` pairs chunks by index, so a shorter RX vector can be indexed past its end and extra RX chunks are left untouched. ([#77](https://github.com/valthon/microzig/issues/77))
-- `port/stmicro/stm32/src/hals/common/i2c_v2.zig:I2C.read_blocking` and `I2C.write_blocking_intern` poll flags without a software deadline. ([#77](https://github.com/valthon/microzig/issues/77))
 - `port/stmicro/stm32/src/hals/common/i2c_v2.zig:I2C_Device.writev_fn` rejects reserved addresses including TLV493D's general call.
 - `drivers/src/base/StreamDevice.zig:Writer.drain` can write new chunks while earlier buffered bytes remain after a short write. ([#75](https://github.com/valthon/microzig/issues/75))
