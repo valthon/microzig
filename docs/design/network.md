@@ -73,6 +73,8 @@ The TCP/IP task services lwIP timeouts using a wrapping millisecond clock. The
 sys_arch mailbox and semaphore waits take milliseconds. Zero waits indefinitely,
 and expiry returns `SYS_ARCH_TIMEOUT`. The port uses a separate task mutex for
 lightweight protection (`examples/espressif/esp/src/lwip/exports.zig:core_mutex`).
+`sys_mbox_trypost_fromisr` uses the ISR queue API and requests a deferred reschedule
+when a higher-priority waiter wakes.
 
 `tcpip_input`, netifapi and netconn API-message calls such as `netconn_bind`,
 `netconn_listen` and `netconn_write_partly` acquire the non-recursive core mutex
@@ -80,6 +82,9 @@ lightweight protection (`examples/espressif/esp/src/lwip/exports.zig:core_mutex`
 Raw callbacks hold the lock, so defer netifapi and netconn API-message calls to an
 application task that calls them with the lock released. For raw calls from application
 tasks, take `LOCK_TCPIP_CORE` as in `examples/espressif/esp/src/softap.zig:start_dhcp`.
+`lwip_assert_core_locked` rejects ISR calls and checks that the calling task owns the
+TCP/IP core mutex once lwIP has created it. Task calls during early lwIP initialization
+are allowed before the mutex exists.
 
 Vendor RX runs inline on the vendor task. Locked input can call `linkoutput` there
 before RX returns, and TX can also run on the TCP/IP task or a caller holding the lock.
@@ -160,11 +165,13 @@ within the remaining buffer.
   for checking RX capacity before the bus read. No build test step includes these tests.
 - `zig build test` in `examples/espressif/esp/` runs "DHCP allocation, renewal, collision, release, exhaustion and expiry"
   in `examples/espressif/esp/src/softap_dhcp.zig`, covering the AP's lease logic.
+- The ESP example host tests exercise the C exports for ISR mailbox posting and TCP/IP
+  core lock ownership.
 - The ESP port README records station DHCP and TCP echo between an ESP32-C3 and a XIAO ESP32-C6
   in both roles. Build the images in `examples/espressif/esp/` with `-Dexample=selftest_wifi_softap_echo` and `-Dexample=softap`.
   [ESP Wi-Fi self-tests](../../port/espressif/esp/README.md#wi-fi-station-and-rtos)
 - No host test checks build configuration, pbuf failure ownership, TX headroom and
-  scratch lifetime, core-lock use, callback and close ordering, netif flags and link handoff,
+  scratch lifetime, application callback and connection close ordering, netif flags,
   allocator lifetime and concurrency, timers, sys_arch waits or Pico ISR handoff and re-arm.
 
 ## Open questions
@@ -183,6 +190,4 @@ within the remaining buffer.
 - `modules/network/src/root.zig:Endpoint.format` always formats the address as IPv4. ([#64](https://github.com/valthon/microzig/issues/64))
 - `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/espressif/esp/src/tcp_server.zig:run_server` can deinitialize Wi-Fi after a server error with the netif still up and registered, allowing TX to overlap teardown. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/lwip/exports.zig:sys_mbox_trypost` exports a from-ISR alias that uses the task queue API. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/lwip/exports.zig:lwip_assert_core_locked` checks for a lock holder without checking that it is the calling task. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/selftest_coex_wifi_ble.zig:cycle_wifi` clears the TX gate without synchronizing with a `linkoutput` already inside that gate before deinit. ([#81](https://github.com/valthon/microzig/issues/81))

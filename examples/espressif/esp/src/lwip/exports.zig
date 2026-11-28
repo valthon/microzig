@@ -25,10 +25,17 @@ export fn lwip_unlock_core_mutex() void {
 }
 
 export fn lwip_assert_core_locked() void {
-    if (c.lock_tcpip_core == null) return;
+    if (!core_lock_held()) @panic("lwIP core lock is not held by the calling task");
+}
+
+fn core_lock_held() bool {
+    if (rtos.in_isr()) return false;
+    if (c.lock_tcpip_core == null) return true;
 
     const mutex: *rtos.Mutex = @ptrCast(@alignCast(c.lock_tcpip_core));
-    std.debug.assert(mutex.locked != null);
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
+    return mutex.locked == rtos.get_current_task();
 }
 
 export fn lwip_rand() u32 {
@@ -122,8 +129,12 @@ export fn sys_mbox_trypost(ptr: *c.sys_mbox_t, element: MailboxElement) c.err_t 
     return c.ERR_OK;
 }
 
-comptime {
-    @export(&sys_mbox_trypost, .{ .name = "sys_mbox_trypost_fromisr" });
+export fn sys_mbox_trypost_fromisr(ptr: *c.sys_mbox_t, element: MailboxElement) c.err_t {
+    const mailbox: *Mailbox = @ptrCast(@alignCast(ptr.*));
+    var higher_priority_woken = false;
+    if (!mailbox.put_one_from_isr(element, &higher_priority_woken)) return c.ERR_MEM;
+    if (higher_priority_woken) rtos.yield_from_isr();
+    return c.ERR_OK;
 }
 
 export fn sys_arch_mbox_fetch(ptr: *c.sys_mbox_t, element_ptr: *MailboxElement, timeout: u32) u32 {
@@ -197,4 +208,41 @@ export fn sys_thread_new(name: [*:0]u8, thread: c.lwip_thread_fn, arg: ?*anyopaq
         .stack_size = 4096,
         .priority = @fromBackingInt(2),
     }) catch @panic("failed to allocate lwip task");
+}
+
+test "ISR mailbox posts defer a higher-priority wake and preserve full-queue errors" {
+    const abi = struct {
+        extern fn sys_mbox_trypost_fromisr(*c.sys_mbox_t, MailboxElement) c.err_t;
+    };
+    var buffer: [1]MailboxElement = undefined;
+    var mailbox: Mailbox = .init(&buffer);
+    var handle: c.sys_mbox_t = &mailbox;
+    var message: u8 = 0;
+    rtos.higher_priority_waiter = true;
+    defer rtos.higher_priority_waiter = false;
+    rtos.immediate_yields = 0;
+    rtos.deferred_yields = 0;
+
+    try std.testing.expectEqual(c.ERR_OK, abi.sys_mbox_trypost_fromisr(&handle, &message));
+    try std.testing.expectEqual(c.ERR_MEM, abi.sys_mbox_trypost_fromisr(&handle, null));
+    try std.testing.expectEqual(@as(usize, 0), rtos.immediate_yields);
+    try std.testing.expectEqual(@as(usize, 1), rtos.deferred_yields);
+    try std.testing.expectEqual(@as(MailboxElement, &message), try mailbox.get_one(.non_blocking));
+
+    rtos.higher_priority_waiter = false;
+    try std.testing.expectEqual(c.ERR_OK, abi.sys_mbox_trypost_fromisr(&handle, null));
+    try std.testing.expectEqual(@as(MailboxElement, null), try mailbox.get_one(.non_blocking));
+    try std.testing.expectEqual(@as(usize, 1), rtos.deferred_yields);
+}
+
+test "lwIP core lock belongs to the calling task" {
+    const abi = struct {
+        extern fn lwip_assert_core_locked() void;
+    };
+    abi.lwip_assert_core_locked(); // lwip_init runs before the mutex is created.
+    var mutex: rtos.Mutex = .{ .locked = rtos.get_current_task() };
+    c.lock_tcpip_core = &mutex;
+    defer c.lock_tcpip_core = null;
+
+    abi.lwip_assert_core_locked();
 }
