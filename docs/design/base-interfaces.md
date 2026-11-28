@@ -19,9 +19,10 @@ Handles borrow an erased context and point to a constant vtable. `BlockMemory` s
 its table by value. Keep contexts stationary and tables alive while borrowed.
 
 Calls may report acceptance before hardware finishes. End the borrow of caller buffers
-and their vectors on every return, including errors. Use adapter-owned storage for DMA
-that outlives the call. Serialize unguarded shared buses and staging storage, and reserve
-the bus from selection through deselection. Check the adapter's timeout scope and ISR rules.
+and their vectors on every return, including errors, except for the nRF5x SPI recovery
+contract below. Use adapter-owned storage for DMA that outlives the call. Serialize
+unguarded shared buses and staging storage, and reserve the bus from selection through
+deselection. Check the adapter's timeout scope and ISR rules.
 
 - `drivers/src/base/BlockMemory.zig:VTable` has optional write enable and disable hooks
   that default to no-ops. Absent data or sector-size slots return `Unsupported`.
@@ -77,8 +78,22 @@ Each dispatched interface has a local `TestDevice`. Port names refer to the `dri
 | StreamDevice | `port/espressif/esp/src/hal/uart.zig:Stream` | UART uses an optional per-call deadline, and a successful write enqueues bytes whose final stop bit can be awaited with `port/espressif/esp/src/hal/uart.zig:UART.flush_blocking`. |
 
 Only the datagram test double supplies full duplex. Use DMA-accessible RAM for nRF5x SPI
-slices, which the blocking slots pass directly to EasyDMA. CH32V SPI creates deadlines
-per phase and DMA chunk. With DMA configured, CH32V I²C uses a transaction and timeout
+slices, which the blocking slots pass directly to EasyDMA. After `BusStuck` from SPIM or
+TWIM, keep the previous buffers alive and untouched until a later transfer or deinit
+returns without `BusStuck`. The SPI datagram slots report this condition as `IoError`.
+Recovery leaves the controller enabled and waits for STOPPED before a new transfer or
+teardown. SPIM also checks END for DMA release. The HAL records which mode has an
+unfinished STOP when a call returns `BusStuck`. Serialize calls on each shared instance
+across modes. The guard checks the record until the required completion events arrive.
+After recovery, mode changes clear the shared DMA pointers and counts while the
+instance is disabled.
+Their `apply` and `deinit` calls leave the configuration intact on `BusStuck`.
+Both I²C HALs also check before cycling ENABLE to change the target address.
+The legacy TWI adapters map that error to `IoError` for datagrams and to
+`UnknownAbort` for addressed I²C. Legacy TWI `reset` leaves the instance intact
+and logs a warning if recovery is still pending. [nRF52840 Product Specification v1.2, §§6.1.2, 6.25.4–5 and 6.31.1, 6.31.3, 6.31.5](https://docs-be.nordicsemi.com/bundle/nRF52840_PS_v1.2/raw/resource/enus/nRF52840_PS_v1.2.pdf?save_local=true)
+
+CH32V SPI creates deadlines per phase and DMA chunk. With DMA configured, CH32V I²C uses a transaction and timeout
 per chunk even when polling. Limit CH32V SPI and I²C DMA chunks to 65,535 bytes so the
 count fits `CNTR.NDT` in the port's register definitions.
 
@@ -166,8 +181,6 @@ count fits `CNTR.NDT` in the port's register definitions.
 - `port/espressif/esp/src/hal/spi.zig:SPI.wait_for_transfer_blocking` has no software deadline.
 - `port/raspberrypi/rp2xxx/src/hal/spi.zig:SPI.writev_blocking` and `SPI.readv_blocking` wait without software deadlines.
 - `port/nordic/nrf5x/src/hal/spim.zig:SPIM.inner_tx_rx` can slice past an exhausted direction on a later DMA chunk, including when a one-way transfer spans multiple chunks. ([#76](https://github.com/valthon/microzig/issues/76))
-- `port/nordic/nrf5x/src/hal/spim.zig:SPIM.inner_tx_rx_chunk` can return `Timeout` after starting DMA without stopping it or confirming completion, so the buffers can still be in use. ([#76](https://github.com/valthon/microzig/issues/76))
-- `port/nordic/nrf5x/src/hal/i2cdma.zig:I2C.wait` requests STOP on timeout and returns before waiting for STOPPED, so the DMA buffers may still be in use. ([#76](https://github.com/valthon/microzig/issues/76))
 - `port/raspberrypi/rp2xxx/src/hal/drivers.zig:SPI_Device.readv` takes read-only chunks where the HAL needs writable chunks. ([#79](https://github.com/valthon/microzig/issues/79))
 - `port/wch/ch32v/src/hals/spi.zig:SPI.write_dma` waits for DMA without a deadline and uses an incrementing RX slice over a one-byte dummy, which can overwrite adjacent stack bytes. ([#78](https://github.com/valthon/microzig/issues/78))
 - `port/wch/ch32v/src/hals/spi.zig:SPI.read_dma` waits for DMA without a deadline and uses an incrementing TX slice over a one-byte dummy, which can transmit adjacent stack bytes. ([#78](https://github.com/valthon/microzig/issues/78))

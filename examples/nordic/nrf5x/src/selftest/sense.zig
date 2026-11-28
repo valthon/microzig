@@ -208,8 +208,8 @@ fn magnitude(vector: [3]i16) f32 {
 }
 
 // Stage register transactions in DMA-safe RAM. The register read uses
-// a repeated START. A timeout requests STOP and may leave DMA in flight,
-// so the storage stays allocated after the adapter returns.
+// a repeated START. BusStuck leaves DMA in flight, so storage stays allocated
+// and the next call checks for STOPPED before staging another transfer.
 const ImuBus = struct {
     const bus = nrf.i2cdma.num(0);
     const timeout: microzig.drivers.time.Duration = .from_ms(20);
@@ -238,6 +238,7 @@ const ImuBus = struct {
 
     fn stage_write(writes: []const []const u8) I2C_Device.InterfaceError![]const u8 {
         if (writes.len != 1 or writes[0].len > tx.len) return error.Unsupported;
+        bus.wait_for_dma() catch |err| return bus_error(err);
         const buffer = tx[0..writes[0].len];
         @memcpy(buffer, writes[0]);
         asm volatile ("dmb" ::: .{ .memory = true });
@@ -246,7 +247,7 @@ const ImuBus = struct {
 
     fn bus_error(err: nrf.i2cdma.Error) I2C_Device.InterfaceError {
         return switch (err) {
-            error.Overrun, error.Receive, error.TooMuchData, error.Transmit => error.UnknownAbort,
+            error.BusStuck, error.Overrun, error.Receive, error.TooMuchData, error.Transmit => error.UnknownAbort,
             else => |other| other,
         };
     }

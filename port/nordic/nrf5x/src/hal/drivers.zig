@@ -98,6 +98,7 @@ pub const I2C_DatagramDevice = struct {
             => error.Unsupported,
 
             error.BufferOverrun,
+            error.BusStuck,
             error.DeviceNotPresent,
             error.NoAcknowledge,
             error.UnknownAbort,
@@ -117,6 +118,7 @@ pub const I2C_DatagramDevice = struct {
             => error.Unsupported,
 
             error.BufferOverrun,
+            error.BusStuck,
             error.DeviceNotPresent,
             error.NoAcknowledge,
             error.UnknownAbort,
@@ -140,6 +142,7 @@ pub const I2C_DatagramDevice = struct {
             => error.Unsupported,
 
             error.BufferOverrun,
+            error.BusStuck,
             error.DeviceNotPresent,
             error.NoAcknowledge,
             error.UnknownAbort,
@@ -178,21 +181,21 @@ pub const I2C_Device = struct {
 
     pub fn write(dev: I2C_Device, address: I2CAddress, buf: []const u8) I2CError!void {
         return dev.bus.write_blocking(address, buf, dev.timeout) catch |err| switch (err) {
-            error.Overrun => I2CError.UnknownAbort,
+            error.BusStuck, error.Overrun => I2CError.UnknownAbort,
             else => |e| e,
         };
     }
 
     pub fn writev(dev: I2C_Device, address: I2CAddress, chunks: []const []const u8) I2CError!void {
         return dev.bus.writev_blocking(address, chunks, dev.timeout) catch |err| switch (err) {
-            error.Overrun => I2CError.UnknownAbort,
+            error.BusStuck, error.Overrun => I2CError.UnknownAbort,
             else => |e| e,
         };
     }
 
     pub fn read(dev: I2C_Device, address: I2CAddress, buf: []u8) I2CError!usize {
         dev.bus.read_blocking(address, buf, dev.timeout) catch |err| return switch (err) {
-            error.Overrun => I2CError.UnknownAbort,
+            error.BusStuck, error.Overrun => I2CError.UnknownAbort,
             else => |e| e,
         };
         return buf.len;
@@ -200,7 +203,7 @@ pub const I2C_Device = struct {
 
     pub fn readv(dev: I2C_Device, address: I2CAddress, chunks: []const []u8) I2CError!usize {
         dev.bus.readv_blocking(address, chunks, dev.timeout) catch |err| return switch (err) {
-            error.Overrun => I2CError.UnknownAbort,
+            error.BusStuck, error.Overrun => I2CError.UnknownAbort,
             else => |e| e,
         };
         return microzig.utilities.SliceVector([]u8).init(chunks).size();
@@ -217,7 +220,7 @@ pub const I2C_Device = struct {
         read_chunks: []const []u8,
     ) I2CError!void {
         return dev.bus.writev_then_readv_blocking(address, write_chunks, read_chunks, dev.timeout) catch |err| switch (err) {
-            error.Overrun => I2CError.UnknownAbort,
+            error.BusStuck, error.Overrun => I2CError.UnknownAbort,
             else => |e| e,
         };
     }
@@ -273,6 +276,8 @@ pub const ClockDevice = struct {
 
 ///
 /// A datagram device attached to an SPI bus.
+/// After error.BusStuck (error.IoError through datagram_device), keep the
+/// previous buffers alive and untouched until the bus confirms DMA release.
 ///
 pub const SPI_Device = struct {
     pub const ConnectError = DatagramDevice.ConnectError;
@@ -363,6 +368,7 @@ pub const SPI_Device = struct {
     fn writev_fn(dd: *anyopaque, chunks: []const []const u8) WriteError!void {
         const dev: *SPI_Device = @ptrCast(@alignCast(dd));
         return dev.writev(chunks) catch |err| switch (err) {
+            error.BusStuck => WriteError.IoError,
             error.Timeout => WriteError.Timeout,
             else => WriteError.Unsupported,
         };
@@ -371,6 +377,7 @@ pub const SPI_Device = struct {
     fn readv_fn(dd: *anyopaque, chunks: []const []u8) ReadError!usize {
         const dev: *SPI_Device = @ptrCast(@alignCast(dd));
         return dev.readv(chunks) catch |err| switch (err) {
+            error.BusStuck => ReadError.IoError,
             error.Timeout => ReadError.Timeout,
             else => ReadError.Unsupported,
         };

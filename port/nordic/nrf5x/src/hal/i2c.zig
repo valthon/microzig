@@ -37,7 +37,7 @@ const Config = struct {
 
 pub const Address = drivers.I2C_Device.Address;
 pub const AddressError = drivers.I2C_Device.Address.Error;
-pub const Error = drivers.I2C_Device.Error || error{Overrun};
+pub const Error = drivers.I2C_Device.Error || error{ BusStuck, Overrun };
 
 pub fn num(n: u1) I2C {
     return @fromBackingInt(n);
@@ -65,8 +65,11 @@ pub const I2C = enum(u1) {
         });
     }
 
+    /// Returns BusStuck while the shared instance is still recovering EasyDMA.
     pub fn apply(i2c: I2C, config: Config) !void {
+        try hal.wait_for_shared_dma(@backingInt(i2c));
         i2c.disable();
+        hal.clear_shared_dma_registers(@backingInt(i2c));
         defer i2c.enable();
 
         const regs = i2c.get_regs();
@@ -103,9 +106,18 @@ pub const I2C = enum(u1) {
         });
     }
 
-    /// Disables I2C, returns peripheral registers to reset state.
+    /// Resets the peripheral when possible. Use deinit to report a stuck bus.
     pub fn reset(i2c: I2C) void {
+        i2c.deinit() catch {
+            std.log.warn("TWI reset deferred while EasyDMA recovery is pending", .{});
+        };
+    }
+
+    /// Disables I2C and resets its registers once the shared instance is free.
+    pub fn deinit(i2c: I2C) error{BusStuck}!void {
+        try hal.wait_for_shared_dma(@backingInt(i2c));
         i2c.disable();
+        hal.clear_shared_dma_registers(@backingInt(i2c));
         const regs = i2c.get_regs();
         regs.SHORTS.raw = 0x00000000;
         regs.INTENSET.raw = 0x00000000;
@@ -193,7 +205,10 @@ pub const I2C = enum(u1) {
             addr.check_reserved() catch |err| if (err != AddressError.GeneralCall)
                 return Error.IllegalAddress;
 
+        try hal.wait_for_shared_dma(@backingInt(i2c));
+        const was_enabled = i2c.get_regs().ENABLE.read().ENABLE == .Enabled;
         i2c.disable();
+        if (!was_enabled) hal.clear_shared_dma_registers(@backingInt(i2c));
         defer i2c.enable();
         i2c.get_regs().ADDRESS.write(.{
             .ADDRESS = @backingInt(addr),

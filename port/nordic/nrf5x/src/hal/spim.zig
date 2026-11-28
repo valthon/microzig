@@ -54,6 +54,7 @@ const Frequency = switch (version) {
 };
 
 pub const TransactionError = error{
+    BusStuck,
     Timeout,
     NoData,
     Overrun,
@@ -65,6 +66,9 @@ pub fn num(n: u2) SPIM {
     return @fromBackingInt(@as(u1, @intCast(n)));
 }
 
+/// After error.BusStuck, the previous transfer's buffers remain owned by
+/// EasyDMA. Keep them alive and untouched until a subsequent transfer,
+/// apply, or deinit on the same instance returns without error.BusStuck.
 pub const SPIM = enum(u1) {
     _,
 
@@ -76,7 +80,12 @@ pub const SPIM = enum(u1) {
     }
 
     pub fn apply(spi: SPIM, config: Config) !void {
+        try hal.wait_for_shared_dma(@backingInt(spi));
         const regs = spi.get_regs();
+        // nRF52840 PS v1.2 §6.25.3 requires SPIM disabled for PSEL writes.
+        regs.ENABLE.write(.{ .ENABLE = .Disabled });
+        hal.clear_shared_dma_registers(@backingInt(spi));
+
         // TODO: Chip-specific
         if (config.miso_pin) |miso| {
             miso.set_direction(.in);
@@ -178,27 +187,39 @@ pub const SPIM = enum(u1) {
         regs.INTENCLR.write_raw(0xFFFFFFFF);
     }
 
+    /// Disable the peripheral once EasyDMA has released any outstanding buffers.
+    pub fn deinit(spi: SPIM) error{BusStuck}!void {
+        try hal.wait_for_shared_dma(@backingInt(spi));
+        spi.get_regs().ENABLE.write(.{ .ENABLE = .Disabled });
+        hal.clear_shared_dma_registers(@backingInt(spi));
+    }
+
     pub fn write_blocking(spi: SPIM, data: []const u8, timeout: ?Duration) TransactionError!void {
+        try spi.wait_for_dma();
         const deadline: Deadline = .init_relative(time.get_time_since_boot(), timeout);
         try spi.inner_tx_rx(data, &.{}, deadline);
     }
 
     pub fn writev_blocking(spi: SPIM, chunks: []const []const u8, timeout: ?Duration) TransactionError!void {
+        try spi.wait_for_dma();
         const deadline: Deadline = .init_relative(time.get_time_since_boot(), timeout);
         for (chunks) |chunk| try spi.inner_tx_rx(chunk, &.{}, deadline);
     }
 
     pub fn read_blocking(spi: SPIM, dst: []u8, timeout: ?Duration) TransactionError!void {
+        try spi.wait_for_dma();
         const deadline: Deadline = .init_relative(time.get_time_since_boot(), timeout);
         try spi.inner_tx_rx(&.{}, dst, deadline);
     }
 
     pub fn readv_blocking(spi: SPIM, chunks: []const []u8, timeout: ?Duration) TransactionError!void {
+        try spi.wait_for_dma();
         const deadline: Deadline = .init_relative(time.get_time_since_boot(), timeout);
         for (chunks) |chunk| try spi.inner_tx_rx(&.{}, chunk, deadline);
     }
 
     pub fn transceive_blocking(spi: SPIM, tx: []const u8, rx: []u8, timeout: ?Duration) TransactionError!void {
+        try spi.wait_for_dma();
         const deadline: Deadline = .init_relative(time.get_time_since_boot(), timeout);
         try spi.inner_tx_rx(tx, rx, deadline);
     }
@@ -212,9 +233,31 @@ pub const SPIM = enum(u1) {
         regs.TXD.MAXCNT.write(.{ .MAXCNT = @truncate(tx.len) });
 
         regs.EVENTS_END.write(.{ .EVENTS_END = .NotGenerated });
+        regs.EVENTS_STOPPED.write(.{ .EVENTS_STOPPED = .NotGenerated });
         regs.INTENSET.modify(.{ .END = .Enabled });
 
         regs.TASKS_START.write(.{ .TASKS_START = .Trigger });
+    }
+
+    fn release_dma(regs: *volatile SpimRegs) void {
+        regs.RXD.MAXCNT.write(.{ .MAXCNT = 0 });
+        regs.TXD.MAXCNT.write(.{ .MAXCNT = 0 });
+    }
+
+    /// Waits for STOPPED and END before the caller reuses its DMA buffers.
+    pub fn wait_for_dma(spi: SPIM) error{BusStuck}!void {
+        return hal.wait_for_shared_dma(@backingInt(spi));
+    }
+
+    /// Completes an already-requested SPIM STOP for the shared recovery guard.
+    pub fn finish_dma_stop(spi: SPIM) error{BusStuck}!void {
+        const regs = spi.get_regs();
+        // nRF52840 PS v1.2 §§6.25.4–5 require END for DMA release and STOPPED
+        // before disabling after STOP. At 250 kbps or faster the minimum wins.
+        const frequency: u32 = if (regs.FREQUENCY.read().FREQUENCY == .K125) 125_000 else 250_000;
+        const cleanup = Deadline.init_relative(time.get_time_since_boot(), .from_us(hal.stop_budget_us(frequency, 8)));
+        try hal.wait_for_stop(regs, cleanup, time.get_time_since_boot, true);
+        release_dma(regs);
     }
 
     fn inner_tx_rx(spi: SPIM, write_data: []const u8, read_data: []u8, deadline: Deadline) TransactionError!void {
@@ -241,14 +284,20 @@ pub const SPIM = enum(u1) {
         if (deadline.is_reached_by(time.get_time_since_boot())) return TransactionError.Timeout;
 
         const regs = spi.get_regs();
+        if (regs.ENABLE.read().ENABLE != .Enabled) return TransactionError.UnknownAbort;
         try spi.prepare_dma_transfer(write_data, read_data);
 
+        // nRF52840 Product Specification, SPIM, "EasyDMA": END means both
+        // channels have finished accessing RAM.
         while (true) {
-            if (regs.EVENTS_END.read().EVENTS_END == .Generated)
-                break;
-            if (deadline.is_reached_by(time.get_time_since_boot())) {
-                // TODO: Do we have to stop the task on timeout?
-                // regs.TASKS_STOP.write(.{ .TASKS_STOP = .Trigger });
+            const now = time.get_time_since_boot();
+            if (regs.EVENTS_END.read().EVENTS_END == .Generated) {
+                release_dma(regs);
+                return;
+            }
+            if (deadline.is_reached_by(now)) {
+                regs.TASKS_STOP.write(.{ .TASKS_STOP = .Trigger });
+                try hal.finish_dma_stop(@backingInt(spi), .spim);
                 return TransactionError.Timeout;
             }
         }
