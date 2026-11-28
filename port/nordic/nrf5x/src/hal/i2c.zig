@@ -148,8 +148,10 @@ pub const I2C = enum(u1) {
         const regs = i2c.get_regs();
         regs.TXD.write(.{ .TXD = byte });
         while (!i2c.tx_sent()) {
-            if (deadline.is_reached_by(time.get_time_since_boot()))
+            if (deadline.is_reached_by(time.get_time_since_boot())) {
+                i2c.stop_on_timeout();
                 return Error.Timeout;
+            }
             try i2c.check_and_clear_error();
             std.mem.doNotOptimizeAway(0);
         }
@@ -159,8 +161,10 @@ pub const I2C = enum(u1) {
     fn read_byte(i2c: I2C, deadline: mdf.time.Deadline) Error!u8 {
         const regs = i2c.get_regs();
         while (!i2c.rx_ready()) {
-            if (deadline.is_reached_by(time.get_time_since_boot()))
+            if (deadline.is_reached_by(time.get_time_since_boot())) {
+                i2c.stop_on_timeout();
                 return Error.Timeout;
+            }
             try i2c.check_and_clear_error();
             std.mem.doNotOptimizeAway(0);
         }
@@ -174,11 +178,38 @@ pub const I2C = enum(u1) {
         regs.SHORTS.raw = 0x00000000;
     }
 
+    fn stop_on_timeout(i2c: I2C) void {
+        const regs = i2c.get_regs();
+        if (regs.EVENTS_STOPPED.read().EVENTS_STOPPED == .Generated) return;
+        const frequency: u32 = switch (regs.FREQUENCY.read().FREQUENCY) {
+            .K250 => 250_000,
+            .K400 => 400_000,
+            else => 100_000,
+        };
+        const cleanup = mdf.time.Deadline.init_relative(time.get_time_since_boot(), .from_us(hal.stop_budget_us(frequency, 9)));
+
+        // nRF52840 Product Specification, TWI, "Master read sequence" and
+        // "Low power": STOP ends the bus transaction and STOPPED acknowledges it.
+        // Clear the byte-boundary suspend shortcut before resuming to stop.
+        // The disable fallback follows nrfx v3.11.0 drivers/src/nrfx_twi.c,
+        // twi_tx_start_transfer and twi_rx_start_transfer, which cycle ENABLE
+        // if their hardware wait expires. set_address re-enables it on reuse.
+        i2c.clear_shorts();
+        regs.TASKS_RESUME.write(.{ .TASKS_RESUME = .Trigger });
+        regs.TASKS_STOP.write(.{ .TASKS_STOP = .Trigger });
+        hal.wait_for_stop(regs, cleanup, time.get_time_since_boot, false) catch {
+            regs.ENABLE.write(.{ .ENABLE = .Disabled });
+            @import("microzig").cpu.dsb();
+        };
+    }
+
     fn clear_events(i2c: I2C) void {
         const regs = i2c.get_regs();
         regs.EVENTS_SUSPENDED.raw = 0;
         regs.EVENTS_STOPPED.raw = 0;
         regs.EVENTS_ERROR.raw = 0;
+        regs.EVENTS_TXDSENT.raw = 0;
+        regs.EVENTS_RXDREADY.raw = 0;
     }
 
     fn clear_errors(i2c: I2C) void {

@@ -328,6 +328,21 @@ pub const serial_test = struct {
     }
 };
 
+test "TWI disables a stuck controller and the next transfer can re-enable it" {
+    const fake = serial_test;
+    const bus = i2c.num(0);
+    const addr: i2c.Address = @fromBackingInt(0x42);
+    fake.reset(.twi);
+    fake.bus.twi_stops = false;
+    try std.testing.expectError(error.Timeout, bus.write_blocking(addr, "w", .from_us(100)));
+    try std.testing.expect(fake.bus.twi_stop_at != null);
+    try std.testing.expectEqual(.Disabled, fake.twi.ENABLE.read().ENABLE);
+
+    fake.bus.twi_tx_at = fake.bus.now + fake.tick_us;
+    try bus.write_blocking(addr, "x", .from_us(100));
+    try std.testing.expectEqual(.Enabled, fake.twi.ENABLE.read().ENABLE);
+}
+
 test "concrete SPI adapter keeps its timeout across scalar, vectored and erased calls" {
     const fake = serial_test;
     var adapter = drivers.SPI_Device.init(spim.num(0), null);
