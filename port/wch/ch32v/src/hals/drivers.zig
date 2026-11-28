@@ -47,21 +47,21 @@ pub fn I2C_Device(comptime config: i2c.Config) type {
 
         pub fn write(dev: Self, address: I2CAddress, buf: []const u8) I2CError!void {
             return dev.bus.write_auto(config, address, buf, dev.timeout) catch |err| switch (err) {
-                error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                 else => |e| e,
             };
         }
 
         pub fn writev(dev: Self, address: I2CAddress, chunks: []const []const u8) I2CError!void {
             return dev.bus.writev_auto(config, address, chunks, dev.timeout) catch |err| switch (err) {
-                error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                 else => |e| e,
             };
         }
 
         pub fn read(dev: Self, address: I2CAddress, buf: []u8) I2CError!usize {
             dev.bus.read_auto(config, address, buf, dev.timeout) catch |err| return switch (err) {
-                error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                 else => |e| e,
             };
             return buf.len;
@@ -69,7 +69,7 @@ pub fn I2C_Device(comptime config: i2c.Config) type {
 
         pub fn readv(dev: Self, address: I2CAddress, chunks: []const []u8) I2CError!usize {
             dev.bus.readv_auto(config, address, chunks, dev.timeout) catch |err| return switch (err) {
-                error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                 else => |e| e,
             };
             return microzig.utilities.SliceVector([]u8).init(chunks).size();
@@ -80,7 +80,7 @@ pub fn I2C_Device(comptime config: i2c.Config) type {
             const read_chunks: []const []u8 = &.{dst};
             dev.bus.writev_then_readv_auto(config, address, write_chunks, read_chunks, dev.timeout) catch |err|
                 return switch (err) {
-                    error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                    error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                     else => |e| e,
                 };
         }
@@ -93,7 +93,7 @@ pub fn I2C_Device(comptime config: i2c.Config) type {
         ) I2CError!void {
             return dev.bus.writev_then_readv_auto(config, address, write_chunks, read_chunks, dev.timeout) catch |err|
                 switch (err) {
-                    error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                    error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                     else => |e| e,
                 };
         }

@@ -212,9 +212,35 @@ pub const Channel = enum(u3) {
         }
     }
 
+    /// Poll channel completion and distinguish hardware failure from idle.
+    pub fn poll_completion(comptime chan: Channel) error{DmaTransferFailed}!bool {
+        // CH32F/V20x_V30x_V31x RM §11.3.1 and §11.3.3: a transfer error
+        // sets TEIF and clears EN.
+        const idle = !chan.is_busy();
+        const flag_shift: u5 = (@as(u5, @backingInt(chan)) - 1) * 4;
+        const teif_bit: u5 = flag_shift + 3;
+        if (chan.get_regs().INTFR.raw & (@as(u32, 1) << teif_bit) != 0)
+            return error.DmaTransferFailed;
+        return idle;
+    }
+
+    /// Wait against the caller's existing deadline. The caller owns channel teardown.
+    pub fn wait_for_finish_until(
+        comptime chan: Channel,
+        deadline: microzig.drivers.time.Deadline,
+    ) error{ Timeout, DmaTransferFailed }!void {
+        const Poll = struct {
+            fn ready(_: void) error{DmaTransferFailed}!bool {
+                return chan.poll_completion();
+            }
+        };
+        try @import("time.zig").wait_until_ready({}, Poll.ready, deadline, hal.time.get_time_since_boot, null);
+    }
+
     pub fn stop(comptime chan: Channel) void {
         const regs = chan.get_regs();
         regs.CFGR.modify(.{ .EN = 0 });
+        asm volatile ("" ::: .{ .memory = true });
     }
 
     /// Check if transfer is complete (for non-circular mode)
@@ -245,6 +271,17 @@ pub const Channel = enum(u3) {
         return regs.CNTR.read().NDT;
     }
 };
+
+/// A peripheral error can stop requests without completing any channel.
+pub fn poll_peripheral_transfer(device: anytype, comptime check_errors: anytype, comptime channels: anytype) !bool {
+    try check_errors(device);
+    var complete = true;
+    inline for (channels) |channel| {
+        const channel_complete = try channel.poll_completion();
+        complete = complete and channel_complete;
+    }
+    return complete;
+}
 
 const Endpoint = struct {
     fn is_peripheral(Type: type) bool {
@@ -616,4 +653,47 @@ test {
     _ = @import("gpio.zig");
     _ = @import("spi.zig");
     _ = @import("i2c.zig");
+}
+
+test "peripheral status ends a stalled DMA wait without a deadline" {
+    const Fake = struct {
+        const Terminal = error{ ArbitrationLost, BusError, NoAcknowledge, ModeFault, Overrun };
+        const ChannelStub = enum {
+            active,
+
+            fn poll_completion(_: @This()) error{}!bool {
+                return false;
+            }
+        };
+        const Deadline = struct {
+            pub fn check(_: @This(), current: u8) error{Timeout}!void {
+                if (current == 3) return error.Timeout;
+            }
+        };
+
+        var ticks: u8 = 0;
+
+        fn check_errors(terminal: Terminal) Terminal!void {
+            if (ticks != 0) return terminal;
+        }
+
+        fn poll(terminal: Terminal) Terminal!bool {
+            return poll_peripheral_transfer(terminal, check_errors, .{ChannelStub.active});
+        }
+
+        fn now() u8 {
+            ticks += 1;
+            return ticks;
+        }
+    };
+
+    // The clock's guard keeps the test from hanging if the error check is removed.
+    const deadline: Fake.Deadline = .{};
+    for ([_]Fake.Terminal{
+        error.ArbitrationLost, error.BusError, error.NoAcknowledge, error.ModeFault, error.Overrun,
+    }) |terminal| {
+        Fake.ticks = 0;
+        try std.testing.expectError(terminal, @import("time.zig").wait_until_ready(terminal, Fake.poll, deadline, Fake.now, null));
+        try std.testing.expectEqual(1, Fake.ticks);
+    }
 }
