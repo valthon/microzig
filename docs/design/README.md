@@ -66,7 +66,8 @@ Sections, in order (leave out a section that does not apply; never leave a headi
 | [ESP USB Serial/JTAG logger](usb_serial_jtag_logger.md) | logger queue, reattach hold, and replay |
 | [ESP radio stack and coexistence](esp-radio.md) | common radio lifetime, coexistence adapter, blob OS interface |
 | [USB device stack](usb-device.md) | portable USB device core, controller ports, and class drivers |
+| [Network and lwIP](network.md) | lwIP build, Ethernet netifs, buffer ownership and execution context |
+| [Base driver interfaces](base-interfaces.md) | portable driver contracts, HAL adapters and consumers |
 
 Planned backfills, in the order upcoming work needs them: the ESP IEEE 802.15.4 MAC
-(`esp-ieee802154.md`); network, lwIP and the `drivers/src/base` interfaces; the nRF52840 IEEE
-802.15.4 driver.
+(`esp-ieee802154.md`); the nRF52840 IEEE 802.15.4 driver.
