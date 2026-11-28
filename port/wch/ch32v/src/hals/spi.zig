@@ -166,19 +166,6 @@ pub const SPI = enum(u1) {
         spi.get_regs().CTLR1.modify(.{ .SPE = 1 });
     }
 
-    /// Check if SPI is busy
-    inline fn is_busy(spi: SPI) bool {
-        return spi.get_regs().STATR.read().BSY == 1;
-    }
-
-    /// Check for and return any error flags
-    fn check_errors(spi: SPI) Error!void {
-        const statr = spi.get_regs().STATR.read();
-        if (statr.OVR == 1) return Error.Overrun;
-        if (statr.MODF == 1) return Error.ModeFault;
-        if (statr.CRCERR == 1) return Error.CrcError;
-    }
-
     /// Initializes the SPI HW block per the Config provided
     pub fn apply(comptime spi: SPI, comptime config: Config, comptime remap: Remap) void {
         const regs = spi.get_regs();
@@ -308,18 +295,6 @@ pub const SPI = enum(u1) {
             }
         };
         try hal.time.wait_until_ready(spi, Poll.ready, deadline, hal.time.get_time_since_boot, 100_000);
-    }
-
-    /// Wait for SPI to not be busy with timeout
-    fn wait_not_busy(spi: SPI, deadline: mdf.time.Deadline) Error!void {
-        var iterations: u32 = 0;
-        while (spi.is_busy()) {
-            try spi.check_errors();
-            iterations += 1;
-            if (iterations > 100_000) return Error.Timeout;
-            if (deadline.is_reached_by(hal.time.get_time_since_boot()))
-                return Error.Timeout;
-        }
     }
 
     /// Write data blocking (polling mode)
@@ -525,39 +500,13 @@ pub const SPI = enum(u1) {
 
         if (data.len == 0) return Error.NoData;
 
-        const deadline = mdf.time.Deadline.init_relative(
-            hal.time.get_time_since_boot(),
-            timeout orelse mdf.time.Duration.from_ms(1000),
-        );
+        const deadline = try spi.begin_transfer(timeout);
 
-        const regs = spi.get_regs();
+        const count = try dma.checked_transfer_count(data.len);
+        const target: dma.PeripheralTarget = .{ .addr = @intFromPtr(&spi.get_regs().DATAR) };
 
-        // SPI DMA requires both TX and RX to be active
-        // Use dummy TX buffer with 0xFF to clock out data
         var dummy_tx: u8 = 0xFF;
-        const rx_target = dma.PeripheralTarget{ .addr = @intFromPtr(&regs.DATAR) };
-        const tx_target = dma.PeripheralTarget{ .addr = @intFromPtr(&regs.DATAR) };
-
-        // Setup RX DMA (real data)
-        dma_cfg.rx_channel.setup_transfer(
-            data,
-            rx_target,
-            .{ .priority = dma_cfg.priority },
-        );
-
-        // Setup TX DMA (dummy 0xFF bytes)
-        dma_cfg.tx_channel.setup_transfer(
-            tx_target,
-            @as([*]const u8, @ptrCast(&dummy_tx))[0..data.len],
-            .{ .priority = dma_cfg.priority },
-        );
-
-        // Wait for both channels to complete
-        dma_cfg.tx_channel.wait_for_finish_blocking();
-        dma_cfg.rx_channel.wait_for_finish_blocking();
-
-        // Wait for SPI to finish transmission
-        try spi.wait_not_busy(deadline);
+        try transfer_dma(spi, dma_cfg, target, .{ .rx = data, .tx = @as(*const u8, &dummy_tx) }, count, deadline, hal.time.get_time_since_boot);
     }
 
     fn poll_errors(spi: SPI) StatusError!void {
