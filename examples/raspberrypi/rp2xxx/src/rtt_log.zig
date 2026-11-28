@@ -5,6 +5,10 @@ const time = hal.time;
 
 const rtt = microzig.cpu.rtt.RTT(.{});
 
+// On boards with a CYW43 (Pico W, Pico 2 W) GPIO25 is the radio's SPI chip select and the
+// LED hangs off the CYW43, so this example blinks nothing there.
+const has_gpio_led = !@hasDecl(microzig.board, "has_cyw43");
+
 pub const panic = microzig.panic;
 pub const std_options = microzig.std_options(.{
     .log_level = .debug,
@@ -37,22 +41,29 @@ fn log(
 
 pub fn main() void {
     const led = hal.gpio.num(25);
-    led.set_direction(.out);
-    led.set_function(.sio);
     var led_on: u1 = 1;
-    led.put(led_on);
+    if (has_gpio_led) {
+        led.set_direction(.out);
+        led.set_function(.sio);
+        led.put(led_on);
+    }
 
     rtt.init();
     _ = rtt.write(0, "Hello RTT!\n");
     std.log.info("Hello from std.log!", .{});
 
     var blink_deadline = time.deadline_in_ms(500);
+    var ticks: u32 = 0;
     var input: [16]u8 = undefined;
     while (true) {
         if (blink_deadline.is_reached_by(time.get_time_since_boot())) {
             led_on ^= 1;
-            led.put(led_on);
+            if (has_gpio_led) led.put(led_on);
             blink_deadline = time.deadline_in_ms(500);
+            if (led_on == 1) {
+                std.log.info("RTT tick {d}", .{ticks});
+                ticks +%= 1;
+            }
         }
         // Poll without waiting for a newline so the LED keeps blinking.
         const n = rtt.read(0, &input);
