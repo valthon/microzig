@@ -146,6 +146,8 @@ terminal flag.
 - The direct HAL checks "timing_115200" and "timing_1000000" in `examples/espressif/esp/src/selftest_uart.zig`
   ran on ESP32-C3, Super Mini ESP32-C6 and XIAO ESP32-C6. Build with `-Dexample=selftest_uart`.
   [Driver evidence](../../port/espressif/esp/README.md#drivers)
+- The STM32 HAL host tests check pending SysTick rollover, F103 I²C receive register ordering and scalar
+  adapter routing, I²C v2 vector validation and polling errors, and SPI GPIO writes in both NSS modes.
 - No host test verifies hardware framing or timing, adapter and DMA lifetimes, erase
   side effects, the clock polling fallback, port GPIO bias or std.Io edge cases.
 
