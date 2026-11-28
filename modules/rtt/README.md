@@ -4,8 +4,9 @@ An implementation of [Segger's RTT protocol](https://wiki.segger.com/RTT) in pur
 
 ## Installation
 
-This package is included as a part of MicroZig. Currently only Cortex-M CPU targets have RTT
-support. To access the rtt module, import it like so:
+MicroZig includes RTT on Cortex-M and on RISC-V targets with a CPU export for RTT.
+The RISC-V exports cover RP2350 Hazard3 and ESP32-C3/C6 (the C6 HP core).
+Applications import it from the CPU namespace.
 
 ```zig
 const microzig = @import("microzig");
@@ -14,19 +15,22 @@ const rtt = microzig.cpu.rtt;
 
 ## Configuration
 
+Create one RTT instance per image, and do not link another RTT implementation (such as SEGGER's
+`SEGGER_RTT.c`) into the same image: both define the `_SEGGER_RTT` symbol.
+
 RTT is configured by creating the RTT "type" at `comptime` like so:
 ```zig
 // rtt.RTT takes an rtt.Config
 const rtt_instance = rtt.RTT(.{
     // A slice of rtt.channel.Config for target -> probe communication
     .up_channels = &.{
-        .{ .name = "Terminal", .mode = .NoBlockSkip, .buffer_size = 128 },
-        .{ .name = "Up2", .mode = .NoBlockSkip, .buffer_size = 256 },
+        .{ .name = "Terminal", .mode = .no_block_skip, .buffer_size = 128 },
+        .{ .name = "Up2", .mode = .no_block_skip, .buffer_size = 256 },
     },
     // A slice of rtt.channel.Config for probe -> target communication
     .down_channels = &.{
-        .{ .name = "Terminal", .mode = .BlockIfFull, .buffer_size = 512 },
-        .{ .name = "Down2", .mode = .BlockIfFull, .buffer_size = 1024 },
+        .{ .name = "Terminal", .mode = .block_if_full, .buffer_size = 512 },
+        .{ .name = "Down2", .mode = .block_if_full, .buffer_size = 1024 },
     },
     // Optional override of lock/unlock functionality for thread safe RTT
     .exclusive_access = your_lock_struct,
@@ -39,12 +43,24 @@ This mirrors the functionality presented in the original `SEGGER_RTT_Conf.h` fil
 can specify a compile time configuration for _every_ up and down channel as opposed to just
 up/down channel 0!
 
-Every field in `rtt.Config` is optional, and an empty `Config` gives the default behavior of the
-original RTT default config which is:
-- Single up channel with a buffer size of 1024 bytes
-- Single down channel with a buffer size of 16 bytes
-- Architecture specific thread safety via disabling/re-enabling interrupts during RTT write/read operations
-- No specific linker section placement
+An empty `Config` uses one 1024-byte up channel in `.no_block_skip` mode and one
+16-byte down channel. Every up and down channel needs a `buffer_size` of at least
+two bytes. One byte is reserved to distinguish full from empty, leaving at least
+one usable byte even if the probe switches the channel into blocking mode.
+
+### Locking
+
+The default lock saves the interrupt mask at the outermost entry and restores
+it on the final exit. It protects calls on a single core. Supply
+`Config.exclusive_access` if more than one core calls RTT.
+
+On Cortex-M targets that use BASEPRI (Armv7-M, Armv7E-M and Armv8-M Mainline),
+RTT callers in interrupt handlers must have priority values numerically at or
+above `0x20`. Higher-urgency handlers must leave RTT to a lower-urgency context.
+
+Use `.block_if_full` up channels only from foreground code with interrupts
+enabled. A blocking write releases the RTT lock between attempts, but a caller
+that already masked interrupts will keep them masked until the probe frees space.
 
 ### Custom Thread Safety
 
@@ -56,28 +72,74 @@ own custom lock/unlock behavior for RTT to use if the default behavior isn't des
 
 ## Usage
 
-Once an rtt instance is configured, the API is quite simple:
-- `init()` properly initializes the control block memory, and _must_ be called before any other RTT
-  operations take place
-- `fn write(comptime channel_number: usize, bytes: []const u8) usize` writes bytes to a specific up
-  channel (device -> probe), where `channel_number` is validated at compile time to exist, and
-  returns number of bytes written (writing less than requested bytes is not an error)
-- `fn writer(comptime channel_number: usize, buf: []u8) Writer` returns a struct that implements the
-  `std.Io.Writer` interface for a specific up channel. Allows integration with the standard library
-  functions that use this type. A special note is that the `Writer` discards write data when the RTT
-  up channel write buffer is full. While this can lead to data loss if the up buffer isn't big
-  enough and getting written too fast/frequently, it prevents the undesirable behavior of constantly
-  returning a `WriteError` if a debug probe isn't connected. See the implementation code for more
-  details.
-- `fn read(comptime channel_number: usize, bytes: []u8) usize` reads bytes from a specific down
-  channel (probe -> device), where `channel_number` is validated at compile time to exist, and
-  returns number of bytes read (reading less than requested bytes is not an error)
-- `fn reader(comptime channel_number: usize, buf: []u8) Reader` returns a struct that implements the
-  `std.Io.Reader` interface for a specific down channel. See implementation and doc comments for
-  more information on choosing a buffer.
+Call channel operations on the `RTT(config)` namespace with a comptime channel
+number. `Writer` and `Reader` are `std.Io` adapters. Use their `interface` field
+for I/O. Their remaining fields are implementation details. When migrating from
+an adapter channel field, use the corresponding function below.
 
-See the [example](../../examples/raspberrypi/rp2xxx/src/rtt_log.zig) for more information on using
-this package.
+- `init()` publishes the control block. Calling it again discards unread data in
+  the rings. A later flush writes any bytes still buffered by a Writer to the
+  new block, and bytes prefetched by a Reader stay readable.
+  A Writer flush before the first `init` drops its bytes.
+- `write(channel_number, bytes)` returns the number of bytes written. Skip mode drops
+  a write that cannot fit in full, trim mode writes as much as fits, and block mode
+  waits for room.
+- `writer(channel_number, buf)` provides a `std.Io.Writer`. In skip and trim modes
+  it consumes input even when the RTT ring drops bytes. In block mode it waits.
+  Flush a buffered writer to publish pending output.
+- `read(channel_number, bytes)` polls for down-channel input and returns the number
+  of bytes read, which may be zero. Use it in a main loop that also has work to
+  do while the probe is idle. This replaces the channel's `read_available`.
+- `reader(channel_number, buf)` provides a `std.Io.Reader`. Its `stream` operation
+  returns zero when the channel is empty. Calls that fill the reader's buffer, such
+  as `take` and `peek`, wait for data, also before `init`: never call them from the
+  context that is responsible for calling `init`.
+- `bytes_available(channel_number)` reports how many bytes are in the down ring
+  without consuming them. It returns zero before `init` and excludes bytes
+  already prefetched by a Reader. The count can change before the next read.
+- `mode(direction, channel_number)` reports the current mode, or `null` before
+  `init`. Pass `.up` or `.down` as the direction.
+- `set_mode(direction, channel_number, mode)` updates only the mode bits under
+  the lock. Calls before `init` have no effect.
+
+See the [RP2xxx `rtt-log` example](../../examples/raspberrypi/rp2xxx/src/rtt_log.zig)
+and the [ESP32-C3/C6 `rtt_log` example](../../examples/espressif/esp/src/rtt_log.zig).
+Both examples emit an `RTT tick <n>` line once a second. Each echo chunk has its own
+`RTT echo` line, with input line breaks escaped.
+
+## Attach a host
+
+With the firmware running and a supported probe connected, pass the ELF to
+probe-rs so it can locate the control block.
+
+```sh
+probe-rs attach --chip <chip> <elf>
+```
+
+For OpenOCD, get the address and size of the control block from the first two
+columns of the ELF symbol listing. Prefix the hexadecimal values with `0x`.
+
+```sh
+nm -S <elf> | grep ' _SEGGER_RTT$'
+```
+
+The same object is also exported as `RttControlBlock`.
+
+With OpenOCD configured for the board and the target running, select System Bus
+Access on RISC-V before starting RTT. These commands expose channel 0 over TCP.
+
+```text
+riscv mem_access sysbus
+rtt setup <_SEGGER_RTT address> <size> "SEGGER RTT"
+rtt start
+rtt server start <port> 0
+```
+
+Connect a TCP client to that port, for example `nc localhost <port>`.
+
+Espressif's OpenOCD build (seen with v0.12.0-esp32-20260831) has no `rtt setup`/`rtt start` for
+the ESP32-C3/C6, so use probe-rs there. probe-rs finds the block by the `_SEGGER_RTT` symbol; on
+these chips (probe-rs 0.32) it does not scan RAM for it.
 
 ## TODO:
 - Support for CPUs with caches (cache alignment + cache access considerations) to mirror the
