@@ -53,7 +53,11 @@ data, and TCP `on_sent` reports acknowledged bytes. Retry `tcp.Connection.send` 
 if the bytes were never queued, since `tcp_output` can fail after `tcp_write` succeeds.
 Defer a graceful close requested by `on_recv` until the stack call returns so the
 wrapper can credit the received bytes. Keep callback contexts stationary and TCP
-connection wrappers reserved until lwIP can no longer call them, even after `close`.
+connection wrapper from `connect`
+or accept until `close`, a reset or an abort. `close` detaches the wrapper from the PCB, which
+lwIP keeps until the FIN exchange ends, and stops callbacks for that connection, including
+`on_sent` for bytes still in flight. A wrapper that reads `.closed` can be reused or
+reconnected at once.
 The UDP and TCP listener wrappers have no close API. IPv6 endpoints format as
 `[address]:port` and IPv4 endpoints as `address:port`.
 
@@ -165,15 +169,16 @@ For RX, the wrapper checks that `head` and `len` describe a frame within the sup
 - The network host tests check that RX driver errors and invalid frame ranges return the
   pbuf to the pool.
 - The network host tests check that TX returns the caller's pbuf unchanged.
+- The network host tests run TCP through a link that loops frames back to the interface.
+  They check that a
+  closed wrapper gets no callbacks from its closing PCB and can reconnect at once.
 - No host test checks ESP adapter pbuf failure ownership, TX
-  scratch lifetime, core-lock use, callback and close ordering, netif flags and link handoff,
+  scratch lifetime, core-lock use, netif flags and link handoff,
   allocator lifetime and concurrency, timers, sys_arch waits or Pico ISR handoff and re-arm.
 
 ## Open questions
 
 - `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:tcp.Connection.close` sets `.closed` while the old PCB can still call the wrapper on data ACKs or reset during FIN processing, so `.closed` is unsafe as a reuse signal. ([#80](https://github.com/valthon/microzig/issues/80))
-- `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` recycles session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/espressif/esp/src/tcp_server.zig:run` can return from an ordinary server error even after successful Wi-Fi teardown, while lwIP still references the stack-local netif and allocator. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/tcp_server.zig:run_server` can deinitialize Wi-Fi after a server error with the netif still up and registered, allowing TX to overlap teardown. ([#81](https://github.com/valthon/microzig/issues/81))

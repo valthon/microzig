@@ -440,7 +440,8 @@ pub const tcp = struct {
             var pbuf: *lwip.pbuf = c_pbuf;
             while (true) {
                 if (self.on_recv) |cb| cb(self, payload_bytes(pbuf));
-                if (pbuf.next == null) break;
+                // Stop at the end of the chain or once on_recv has closed.
+                if (pbuf.next == null or self.pcb == null) break;
                 pbuf = pbuf.next;
             }
             if (self.pcb) |pcb| {
@@ -461,8 +462,16 @@ pub const tcp = struct {
             try c_err(lwip.tcp_output(pcb));
         }
 
+        /// The wrapper gets no further callbacks for this connection and can
+        /// be reused once `close` returns, although lwIP keeps the PCB until
+        /// the FIN exchange ends.
         pub fn close(self: *Self) !void {
             const pcb = self.pcb orelse return Error.NotConnected;
+            // A closing PCB can still report acknowledged data or a reset.
+            lwip.tcp_arg(pcb, null);
+            lwip.tcp_recv(pcb, null);
+            lwip.tcp_sent(pcb, null);
+            lwip.tcp_err(pcb, null);
             self.pcb = null;
             self.state = .closed;
             c_err(lwip.tcp_close(pcb)) catch |err| {

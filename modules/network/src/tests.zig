@@ -345,3 +345,140 @@ test "ready reports a routable IPv6 address without IPv4" {
     nic.netif.flags = lwip.NETIF_FLAG_UP;
     try testing.expect(!nic.ready());
 }
+
+/// One interface whose link delivers every sent frame back to it, so TCP
+/// connections to its own address run through the whole stack.
+const Loopback = struct {
+    test_link: TestLink = .{ .loopback = true },
+    nic: net.Interface = undefined,
+    server: net.tcp.Server = undefined,
+
+    /// `self` must stay at this address until `stop`.
+    fn start(self: *Loopback, port: u16) !void {
+        try init_stack();
+        self.nic = .{ .link = self.test_link.link() };
+        try self.nic.init(test_mac, .{ .fixed = try .init("192.0.2.1", "255.255.255.0", "192.0.2.254") });
+        errdefer lwip.netif_remove(&self.nic.netif);
+        self.server = .{ .nic = &self.nic, .on_accept = accept_next };
+        try self.server.bind(port);
+        // The first receive reports the link up.
+        try self.pump();
+    }
+
+    fn stop(self: *Loopback) void {
+        _ = lwip.tcp_close(self.server.pcb);
+        lwip.netif_remove(&self.nic.netif);
+        next_accept = null;
+    }
+
+    /// Deliver frames until the link is idle.
+    fn pump(self: *Loopback) !void {
+        for (0..64) |_| {
+            try self.nic.poll();
+            if (self.test_link.count == 0) return;
+        }
+        return error.LinkNeverIdle;
+    }
+
+    fn connect(self: *Loopback, peer: *Peer, port: u16) !void {
+        var target = try net.Endpoint.parse("192.0.2.1", port);
+        try net.tcp.connect(&self.nic, &peer.conn, &target);
+    }
+};
+
+var next_accept: ?*net.tcp.Connection = null;
+
+fn accept_next() ?*net.tcp.Connection {
+    defer next_accept = null;
+    return next_accept;
+}
+
+/// A connection that records what its callbacks see.
+const Peer = struct {
+    conn: net.tcp.Connection = .{
+        .on_recv = on_recv,
+        .on_close = on_close,
+        .on_sent = on_sent,
+    },
+    received: [256]u8 = undefined,
+    received_len: usize = 0,
+    close_errors: [4]net.Error = undefined,
+    close_count: usize = 0,
+    sent: usize = 0,
+    /// Sent and followed by `close` from inside `on_recv`.
+    reply: ?[]const u8 = null,
+
+    fn data(self: *const Peer) []const u8 {
+        return self.received[0..self.received_len];
+    }
+
+    fn on_recv(conn: *net.tcp.Connection, bytes: []u8) void {
+        const self: *Peer = @fieldParentPtr("conn", conn);
+        @memcpy(self.received[self.received_len..][0..bytes.len], bytes);
+        self.received_len += bytes.len;
+        if (self.reply) |reply| {
+            conn.send(reply) catch @panic("reply send failed");
+            conn.close() catch @panic("close failed");
+        }
+    }
+
+    fn on_close(conn: *net.tcp.Connection, err: net.Error) void {
+        const self: *Peer = @fieldParentPtr("conn", conn);
+        self.close_errors[self.close_count] = err;
+        self.close_count += 1;
+    }
+
+    fn on_sent(conn: *net.tcp.Connection, n: u16) void {
+        const self: *Peer = @fieldParentPtr("conn", conn);
+        self.sent += n;
+    }
+};
+
+test "close stops callbacks from the closing PCB" {
+    var loop: Loopback = .{};
+    try loop.start(9200);
+    defer loop.stop();
+
+    var server: Peer = .{};
+    var client: Peer = .{};
+    next_accept = &server.conn;
+    try loop.connect(&client, 9200);
+    try loop.pump();
+    try testing.expectEqual(.open, client.conn.state);
+
+    // The peer acknowledges these bytes after close returns.
+    try client.conn.send("bye");
+    try client.conn.close();
+    try loop.pump();
+    try testing.expectEqualStrings("bye", server.data());
+    try testing.expectEqual(0, client.sent);
+    try testing.expectEqual(0, client.close_count);
+}
+
+test "a closed connection can reconnect while its old PCB is closing" {
+    var loop: Loopback = .{};
+    try loop.start(9300);
+    defer loop.stop();
+
+    var server: Peer = .{};
+    var client: Peer = .{};
+    next_accept = &server.conn;
+    try loop.connect(&client, 9300);
+    try loop.pump();
+    try testing.expectEqual(.open, client.conn.state);
+
+    try client.conn.close();
+    var second: Peer = .{};
+    next_accept = &second.conn;
+    try loop.connect(&client, 9300);
+    // The reset reaches the old client PCB, which is still in FIN_WAIT_1.
+    lwip.tcp_abort(server.conn.pcb.?);
+    try loop.pump();
+    try testing.expectEqual(.open, client.conn.state);
+    try testing.expect(client.conn.pcb != null);
+    try testing.expectEqual(0, client.close_count);
+    try testing.expectEqual(.open, second.conn.state);
+    try client.conn.close();
+    try second.conn.close();
+    try loop.pump();
+}
