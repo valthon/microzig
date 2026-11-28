@@ -49,8 +49,9 @@ do nothing, so keep bus transfers, allocation and lwIP calls in the foreground.
 
 Raw UDP and TCP receive callbacks borrow one pbuf segment at a time. UDP marks the
 last with `last_fragment`. Copy data you need after return. UDP and TCP copy outgoing
-data, and TCP `on_sent` reports acknowledged bytes. Retry `tcp.Connection.send` only
-if the bytes were never queued, since `tcp_output` can fail after `tcp_write` succeeds.
+data, and TCP `on_sent` reports acknowledged bytes. `tcp.Connection.send` fails only
+if the bytes were not queued, so the same bytes can be retried. If the immediate output
+fails after queuing, lwIP sends the bytes later from its timers or on incoming segments.
 The wrapper credits received bytes to the window before calling `on_recv`, so
 `on_recv` may queue a reply and close without the close resetting the connection.
 Keep callback contexts stationary. lwIP holds a TCP connection wrapper from `connect`
@@ -171,7 +172,8 @@ For RX, the wrapper checks that `head` and `len` describe a frame within the sup
 - The network host tests check that TX returns the caller's pbuf unchanged.
 - The network host tests run TCP through a link that loops frames back to the interface.
   They check that a reply sent and closed from `on_recv` reaches the peer, and that a
-  closed wrapper gets no callbacks from its closing PCB and can reconnect at once.
+  closed wrapper gets no callbacks from its closing PCB and can reconnect at once. A send
+  whose immediate output fails reaches the peer once, after lwIP's slow timer runs.
 - No host test checks ESP adapter pbuf failure ownership, TX
   scratch lifetime, core-lock use, netif flags and link handoff,
   allocator lifetime and concurrency, timers, sys_arch waits or Pico ISR handoff and re-arm.

@@ -459,10 +459,16 @@ pub const tcp = struct {
             return lwip.ERR_OK;
         }
 
+        /// Copies `bytes` into the send queue. An error means nothing was
+        /// queued, so the same bytes can be sent again.
         pub fn send(self: *Self, bytes: []const u8) !void {
             const pcb = self.pcb orelse return Error.NotConnected;
-            try c_err(lwip.tcp_write(pcb, bytes.ptr, @intCast(bytes.len), lwip.TCP_WRITE_FLAG_COPY));
-            try c_err(lwip.tcp_output(pcb));
+            // tcp_write takes a u16 length.
+            const len = std.math.cast(u16, bytes.len) orelse return Error.BufferError;
+            try c_err(lwip.tcp_write(pcb, bytes.ptr, len, lwip.TCP_WRITE_FLAG_COPY));
+            // The bytes stay queued if output fails; lwIP's slow timer and
+            // incoming segments call tcp_output again.
+            if (to_error(lwip.tcp_output(pcb))) |err| log.debug("tcp output deferred {}", .{err});
         }
 
         /// The wrapper gets no further callbacks for this connection and can

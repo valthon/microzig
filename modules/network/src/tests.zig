@@ -502,3 +502,53 @@ test "a closed connection can reconnect while its old PCB is closing" {
     try second.conn.close();
     try loop.pump();
 }
+
+test "a send longer than tcp_write accepts fails without queuing" {
+    var loop: Loopback = .{};
+    try loop.start(9401);
+    defer loop.stop();
+
+    var server: Peer = .{};
+    var client: Peer = .{};
+    next_accept = &server.conn;
+    try loop.connect(&client, 9401);
+    try loop.pump();
+    try testing.expectEqual(.open, client.conn.state);
+
+    const big: [std.math.maxInt(u16) + 1]u8 = @splat(0);
+    try testing.expectError(error.BufferError, client.conn.send(&big));
+    try client.conn.send("after");
+    try loop.pump();
+    try testing.expectEqualStrings("after", server.data());
+    try client.conn.close();
+    try server.conn.close();
+    try loop.pump();
+}
+
+test "a send whose output fails is queued once and sent later" {
+    var loop: Loopback = .{};
+    try loop.start(9400);
+    defer loop.stop();
+
+    var server: Peer = .{};
+    var client: Peer = .{};
+    next_accept = &server.conn;
+    try loop.connect(&client, 9400);
+    try loop.pump();
+    try testing.expectEqual(.open, client.conn.state);
+
+    // tcp_output fails after tcp_write has queued the bytes.
+    loop.test_link.send_error = error.OutOfMemory;
+    try client.conn.send("once");
+    loop.test_link.send_error = null;
+    try loop.pump();
+    try testing.expectEqualStrings("", server.data());
+
+    // The lwIP slow timer outputs the queued bytes.
+    now_ms +%= 1000;
+    try loop.pump();
+    try testing.expectEqualStrings("once", server.data());
+    try client.conn.close();
+    try server.conn.close();
+    try loop.pump();
+}
