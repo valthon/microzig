@@ -575,3 +575,7 @@ pub fn RTT(comptime config: Config) type {
         }
     };
 }
+
+test {
+    _ = lock;
+}

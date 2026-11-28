@@ -9,6 +9,10 @@ inline fn arm_memory_barrier() void {
     asm volatile ("DMB" ::: .{ .memory = true });
 }
 
+inline fn riscv_memory_barrier() void {
+    asm volatile ("fence" ::: .{ .memory = true });
+}
+
 inline fn error_memory_barrier() void {
     @compileError(std.fmt.comptimePrint("Unsupported architecture for built in memory barrier: {any}, please provide custom memory barrier support via Config.memory_barrier_fn field", .{builtin.target.cpu.arch}));
 }
@@ -17,7 +21,7 @@ pub fn resolve_memory_barrier() struct { memory_barrier_fn: MemoryBarrierFn } {
     const current_arch = builtin.target.cpu.arch;
     switch (current_arch) {
         .arm, .armeb, .thumb, .thumbeb => {},
-        // Nothing other than ARM has explicit memory barrier support yet
+        .riscv32, .riscv64 => return .{ .memory_barrier_fn = riscv_memory_barrier },
         else => return .{ .memory_barrier_fn = error_memory_barrier },
     }
 

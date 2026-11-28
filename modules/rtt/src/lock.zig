@@ -46,128 +46,176 @@ pub const AnyLock = struct {
     unlock_fn: fn (context: *anyopaque) void,
 };
 
-/// Provides the same locking mechanism as included by the original RTT code.
-///
-/// The default lock behavior when none is provided explicitly. Will error
-/// if platform doesn't have a default locking implementation and no user
-/// provided implementation (including none) is specified.
+const EnterStep = enum { masked, depth_loaded, depth_claimed, mask_saved };
+
+/// The mask operation must exclude all interrupt handlers that use this lock.
+fn NestedLock(comptime Mask: type) type {
+    const Context = struct {
+        depth: usize = 0,
+        saved: usize = 0,
+    };
+
+    return struct {
+        var context: Context = .{};
+        var generic_lock: GenericLock(*Context, enter, leave) = .{ .context = &context };
+
+        inline fn after_enter_step(step: EnterStep) void {
+            if (@hasDecl(Mask, "after_enter_step")) Mask.after_enter_step(step);
+        }
+
+        fn enter(ctx: *Context) void {
+            const saved = Mask.disable();
+            after_enter_step(.masked);
+            const state: *volatile Context = ctx;
+            const depth = state.depth;
+            after_enter_step(.depth_loaded);
+            // A returning exception before the claim can restore only the
+            // already-masked state. After the claim it sees a nested entry
+            // and leaves the outer saved mask alone, even before it is stored.
+            state.depth = depth + 1;
+            after_enter_step(.depth_claimed);
+            if (depth == 0) state.saved = saved;
+            after_enter_step(.mask_saved);
+        }
+
+        fn leave(ctx: *Context) void {
+            const state: *volatile Context = ctx;
+            // Cache the mask before releasing the claim. A returning exception
+            // after the release can use the shared save slot for its own entry.
+            const saved = state.saved;
+            const depth = state.depth - 1;
+            state.depth = depth;
+            if (depth == 0) Mask.restore(saved);
+        }
+
+        fn get() AnyLock {
+            return generic_lock.any();
+        }
+    };
+}
+
+test "nested lock during outer entry" {
+    const Mask = struct {
+        var enabled: bool = true;
+        var inject_at: ?EnterStep = null;
+
+        fn disable() usize {
+            const saved = enabled;
+            enabled = false;
+            return @intFromBool(saved);
+        }
+
+        fn restore(saved: usize) void {
+            enabled = saved != 0;
+        }
+
+        pub fn after_enter_step(step: EnterStep) void {
+            if (inject_at != step) return;
+            inject_at = null;
+            const access = NestedLock(@This()).get();
+            access.lock_fn(access.context);
+            access.unlock_fn(access.context);
+            std.debug.assert(!enabled);
+        }
+    };
+    const access = NestedLock(Mask).get();
+
+    for ([_]bool{ true, false }) |initial_state| {
+        for (std.enums.values(EnterStep)) |step| {
+            Mask.enabled = initial_state;
+            Mask.inject_at = step;
+            access.lock_fn(access.context);
+            try std.testing.expect(!Mask.enabled);
+            try std.testing.expectEqual(null, Mask.inject_at);
+            access.unlock_fn(access.context);
+            try std.testing.expectEqual(initial_state, Mask.enabled);
+        }
+    }
+}
+
+/// Single-core default locking. The BASEPRI path requires RTT callers to run
+/// at priorities numerically at or above MAX_ISR_PRIORITY.
 pub const default = struct {
-    const Context = struct { isr_reg_value: usize };
-    var ctx: Context = undefined;
-    var generic_lock: resolve_lock_type() = .{ .context = &ctx };
-    const ArmV6mV8m = struct {
-        fn lock(context: *Context) void {
-            var val: usize = undefined;
-            asm volatile (
-                \\mrs   %[val], primask
-                \\movs  r1, #1
-                \\msr   primask, r1
-                : [val] "=r" (val),
+    const Primask = struct {
+        fn disable() usize {
+            return asm volatile (
+                \\mrs %[saved], primask
+                \\cpsid i
+                : [saved] "=r" (-> usize),
                 :
-                : .{ .r1 = true, .cpsr = true });
-            context.isr_reg_value = val;
+                : .{ .memory = true });
         }
 
-        fn unlock(context: *Context) void {
-            const val = context.isr_reg_value;
-            asm volatile ("msr   primask, %[val]"
+        fn restore(saved: usize) void {
+            asm volatile ("msr primask, %[saved]"
                 :
-                : [val] "r" (val),
-            );
+                : [saved] "r" (saved),
+                : .{ .memory = true });
         }
     };
 
-    const ArmV7mV7emV8mMain = struct {
-        const MAX_ISR_PRIORITY = 0x20;
+    const Basepri = struct {
+        const MAX_ISR_PRIORITY: usize = 0x20;
 
-        fn lock(context: *Context) void {
-            var val: usize = undefined;
-            asm volatile (
-                \\mrs   %[val], basepri
-                \\movs  r1, %[MAX_ISR_PRIORITY]
-                \\msr   basepri, r1
-                : [val] "=r" (val),
-                : [MAX_ISR_PRIORITY] "i" (MAX_ISR_PRIORITY),
-                : .{ .r1 = true, .cpsr = true });
-            context.isr_reg_value = val;
+        fn disable() usize {
+            return asm volatile (
+                \\mrs %[saved], basepri
+                \\msr basepri_max, %[threshold]
+                : [saved] "=&r" (-> usize),
+                : [threshold] "r" (MAX_ISR_PRIORITY),
+                : .{ .memory = true });
         }
 
-        fn unlock(context: *Context) void {
-            const val = context.isr_reg_value;
-            asm volatile ("msr   basepri, %[val]"
+        fn restore(saved: usize) void {
+            asm volatile ("msr basepri, %[saved]"
                 :
-                : [val] "r" (val),
-            );
+                : [saved] "r" (saved),
+                : .{ .memory = true });
         }
     };
 
-    const ArmV7aV7r = struct {
-        fn lock(context: *Context) void {
-            var val: usize = undefined;
-            asm volatile (
-                \\mrs   r1, CPSR
-                \\mrs   %[val], r1
-                \\orr r1, r1, #0xC0
-                \\msr CPSR_C, r1
-                : [val] "=r" (val),
+    const RiscV = struct {
+        // RISC-V Privileged Architecture v20211203, section 3.1.6.1.
+        const MSTATUS_MIE: usize = 1 << 3;
+
+        fn disable() usize {
+            return asm volatile ("csrrci %[saved], mstatus, 8"
+                : [saved] "=r" (-> usize),
                 :
-                : .{ .r1 = true, .cpsr = true });
-            context.isr_reg_value = val;
+                : .{ .memory = true });
         }
 
-        fn unlock(context: *Context) void {
-            const val = context.isr_reg_value;
-            asm volatile (
-                \\mov r0, %[val]
-                \\mrs r1, CPSR
-                \\bic r1, r1, #0xC0
-                \\and r0, r0, #0xC0
-                \\orr r1, r1, r0
-                \\msr CPSR_C, r1
+        fn restore(saved: usize) void {
+            asm volatile ("csrs mstatus, %[mask]"
                 :
-                : [val] "r" (val),
-                : .{ .r0 = true, .r1 = true, .cpsr = true });
+                : [mask] "r" (saved & MSTATUS_MIE),
+                : .{ .memory = true });
         }
     };
 
-    /// Allows an intelligent compile error when someone attempts to use RTT on a platform where "default" locking isn't supported yet
-    const ErrorLock = struct {
-        fn error_lock_unlock(_: *Context) void {
+    const Unsupported = struct {
+        fn fail(_: *anyopaque) void {
             @compileError(std.fmt.comptimePrint("Unsupported architecture for built in lock support: {any}, please provide custom locking support via Config.exclusive_access field", .{builtin.target.cpu.arch}));
         }
     };
 
-    fn resolve_lock_type() type {
-        const current_arch = builtin.target.cpu.arch;
-        switch (current_arch) {
-            .arm, .armeb, .thumb, .thumbeb => {},
-            else => return GenericLock(*Context, ErrorLock.error_lock_unlock, ErrorLock.error_lock_unlock),
+    pub fn get() AnyLock {
+        const cpu = builtin.target.cpu;
+        switch (cpu.arch) {
+            .arm, .armeb, .thumb, .thumbeb => {
+                if (std.Target.arm.featureSetHasAny(cpu.features, .{ .v7m, .v7em, .v8m_main }))
+                    return NestedLock(Basepri).get();
+                if (std.Target.arm.featureSetHasAny(cpu.features, .{ .v6m, .v8m }))
+                    return NestedLock(Primask).get();
+            },
+            .riscv32, .riscv64 => {
+                if (std.Target.riscv.featureSetHas(cpu.features, .zicsr))
+                    return NestedLock(RiscV).get();
+            },
+            else => {},
         }
 
-        if (builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v6m)) or builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v8m))) {
-            return GenericLock(
-                *Context,
-                ArmV6mV8m.lock,
-                ArmV6mV8m.unlock,
-            );
-        } else if (builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7m)) or builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7em)) or builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v8m_main))) {
-            return GenericLock(
-                *Context,
-                ArmV7mV7emV8mMain.lock,
-                ArmV7mV7emV8mMain.unlock,
-            );
-        } else if (builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7a)) or builtin.target.cpu.features.isEnabled(@backingInt(std.Target.arm.Feature.v7r))) {
-            return GenericLock(
-                *Context,
-                ArmV7aV7r.lock,
-                ArmV7aV7r.unlock,
-            );
-        } else {
-            return GenericLock(*Context, ErrorLock.error_lock_unlock, ErrorLock.error_lock_unlock);
-        }
-    }
-    pub fn get() AnyLock {
-        return generic_lock.any();
+        return .{ .context = undefined, .lock_fn = Unsupported.fail, .unlock_fn = Unsupported.fail };
     }
 };
 
