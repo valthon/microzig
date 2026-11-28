@@ -354,6 +354,32 @@ test "concrete SPI adapter keeps its timeout across scalar, vectored and erased 
     }
 }
 
+test "SPIM chunks asymmetric DMA buffers and accepts END at the deadline" {
+    const fake = serial_test;
+    const spi = spim.num(0);
+    var rx: [65_536]u8 = undefined;
+    fake.reset(.spim);
+    try spi.transceive_blocking("w", &rx, null);
+    try std.testing.expectEqual(@as(usize, 2), fake.bus.spim_starts);
+    try std.testing.expectEqual(@as(u16, 1), fake.bus.spim_chunks[0].tx);
+    try std.testing.expectEqual(@as(u16, 65_535), fake.bus.spim_chunks[0].rx);
+    try std.testing.expectEqual(@as(u16, 0), fake.bus.spim_chunks[1].tx);
+    try std.testing.expectEqual(@as(u16, 1), fake.bus.spim_chunks[1].rx);
+
+    fake.reset(.spim);
+    try spi.write_blocking(&rx, null);
+    try std.testing.expectEqual(@as(usize, 2), fake.bus.spim_starts);
+    try std.testing.expectEqual(@as(u16, 65_535), fake.bus.spim_chunks[0].tx);
+    try std.testing.expectEqual(@as(u16, 0), fake.bus.spim_chunks[0].rx);
+    try std.testing.expectEqual(@as(u16, 1), fake.bus.spim_chunks[1].tx);
+    try std.testing.expectEqual(@as(u16, 0), fake.bus.spim_chunks[1].rx);
+
+    fake.reset(.spim);
+    fake.bus.spim_complete_at = 100;
+    try spi.write_blocking("w", .from_us(100));
+    try std.testing.expectEqual(null, fake.bus.spim_stop_at);
+}
+
 test "SPIM keeps the instance and DMA buffers outstanding until STOPPED and END" {
     const fake = serial_test;
     const spi = spim.num(0);

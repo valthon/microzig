@@ -180,7 +180,6 @@ count fits `CNTR.NDT` in the port's register definitions.
 - `port/nordic/nrf5x/src/hal/drivers.zig:I2C_DatagramDevice.writev_then_readv` discards the configured timeout. ([#76](https://github.com/valthon/microzig/issues/76))
 - `port/espressif/esp/src/hal/spi.zig:SPI.wait_for_transfer_blocking` has no software deadline.
 - `port/raspberrypi/rp2xxx/src/hal/spi.zig:SPI.writev_blocking` and `SPI.readv_blocking` wait without software deadlines.
-- `port/nordic/nrf5x/src/hal/spim.zig:SPIM.inner_tx_rx` can slice past an exhausted direction on a later DMA chunk, including when a one-way transfer spans multiple chunks. ([#76](https://github.com/valthon/microzig/issues/76))
 - `port/raspberrypi/rp2xxx/src/hal/drivers.zig:SPI_Device.readv` takes read-only chunks where the HAL needs writable chunks. ([#79](https://github.com/valthon/microzig/issues/79))
 - `port/wch/ch32v/src/hals/spi.zig:SPI.write_dma` waits for DMA without a deadline and uses an incrementing RX slice over a one-byte dummy, which can overwrite adjacent stack bytes. ([#78](https://github.com/valthon/microzig/issues/78))
 - `port/wch/ch32v/src/hals/spi.zig:SPI.read_dma` waits for DMA without a deadline and uses an incrementing TX slice over a one-byte dummy, which can transmit adjacent stack bytes. ([#78](https://github.com/valthon/microzig/issues/78))

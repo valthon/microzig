@@ -269,13 +269,8 @@ pub const SPIM = enum(u1) {
         const xfer_len = @max(write_data.len, read_data.len);
         var offset: usize = 0;
         while (offset < xfer_len) : (offset += EASY_DMA_SIZE) {
-            const rx_chunk_start = offset;
-            const rx_chunk_end = @min(offset + EASY_DMA_SIZE, read_data.len);
-            const rx_chunk = read_data[rx_chunk_start..rx_chunk_end];
-
-            const tx_chunk_start = offset;
-            const tx_chunk_end = @min(offset + EASY_DMA_SIZE, write_data.len);
-            const tx_chunk = write_data[tx_chunk_start..tx_chunk_end];
+            const rx_chunk = dma_chunk(read_data, offset, EASY_DMA_SIZE);
+            const tx_chunk = dma_chunk(write_data, offset, EASY_DMA_SIZE);
             try spi.inner_tx_rx_chunk(tx_chunk, rx_chunk, deadline);
         }
     }
@@ -303,3 +298,8 @@ pub const SPIM = enum(u1) {
         }
     }
 };
+
+fn dma_chunk(data: anytype, offset: usize, limit: usize) @TypeOf(data) {
+    const start = @min(offset, data.len);
+    return data[start..][0..@min(limit, data.len - start)];
+}
