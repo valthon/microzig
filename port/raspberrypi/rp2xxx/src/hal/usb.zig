@@ -107,6 +107,7 @@ pub fn Polled(config: Config) type {
             .ep_listen = ep_listen,
             .ep_open = ep_open,
             .ep_close_all = ep_close_all,
+            .ep_set_stall = ep_set_stall,
             .control_out_data = true,
             .set_address = set_address,
         };
@@ -183,7 +184,17 @@ pub fn Polled(config: Config) type {
                         // buffer, when the handler of a setup request seen by this same poll
                         // has just armed the endpoint again (EP0 IN, typically), and that
                         // buffer stays AVAILABLE until the host takes it, if it ever does.
-                        if (buffer_control[ep_num].get(ep.dir).read().AVAILABLE_0 == 0) {
+                        const ctrl = buffer_control[ep_num].get(ep.dir);
+                        var state = ctrl.read();
+                        if (state.AVAILABLE_0 == 0) {
+                            // STATUS clears STALL (RP2040 datasheet 4.1.2.8.2–3,
+                            // RP2350 datasheet 12.7.3.8.2–3). For the H8 suspend fallback
+                            // in docs/design/usb-device.md, restore STALL before the callback
+                            // can arm another packet on a halted endpoint.
+                            if (self.interface.halted.contains(ep)) {
+                                state.STALL = 1;
+                                ctrl.write(state);
+                            }
                             // Acknowledge this one completion (write-one-to-clear) before
                             // its handler runs. The handler may arm the endpoint again, and
                             // the bit set when that buffer completes must survive this poll.
@@ -483,6 +494,40 @@ pub fn Polled(config: Config) type {
             buffer_control[0].out.modify(.{ .STALL = 1 });
         }
 
+        fn ep_set_stall(_: *usb.DeviceInterface, ep: usb.types.Endpoint, stalled: bool) usb.DeviceInterface.StallError!void {
+            // RP2040-E2 rules out EP_ABORT on B0/B1. A STATUS rewrite can race the
+            // buffer-control read-modify-write without the abort handshake.
+            if (!ep_abort_usable()) return error.NotSupported;
+
+            const ctrl = buffer_control[@backingInt(ep.num)].get(ep.dir);
+            var state = ctrl.read();
+            var io: BufferWithdrawal = .{ .ep = ep };
+            var aborting = false;
+            if (stalled or state.STALL == 0) {
+                // RP2040 datasheet 4.1.2.8.2–3 / RP2350 datasheet 12.7.3.8.2–3:
+                // STATUS may rewrite an armed buffer. Read again after taking ownership.
+                aborting = io.begin_abort();
+                if (aborting and !io.wait_abort())
+                    @panic("USB endpoint abort timed out: reset required");
+                state = ctrl.read();
+            }
+            defer if (aborting) io.end_abort();
+
+            if (stalled) {
+                state.STALL = 1;
+            } else {
+                // An idle buffer's PID flips when software next arms it.
+                state.PID_0 = @intFromBool(state.AVAILABLE_0 == 0);
+                ctrl.write(state);
+                // RP2040 datasheet 4.1.2.7.4 / RP2350 datasheet 12.7.3.7.4:
+                // let the other buffer-control fields settle before changing STALL.
+                inline for (0..config.sync_noops) |_|
+                    asm volatile ("nop");
+                state.STALL = 0;
+            }
+            ctrl.write(state);
+        }
+
         fn ep_close_all(itf: *usb.DeviceInterface) void {
             _ = itf;
             for (1..config.max_endpoints_count) |i| {
@@ -543,8 +588,8 @@ pub fn Polled(config: Config) type {
         /// buffer control register holds `pid` and nothing else, as `ep_listen` and
         /// `ep_writev` require, and `poll` reports no completion from before.
         fn withdraw_buffer(ep: usb.types.Endpoint, pid: u1) void {
-            var io: BufferWithdrawal = .{ .ep = ep, .pid = pid };
-            usb.endpoint_buffer.withdraw(&io) catch {
+            var io: BufferWithdrawal = .{ .ep = ep };
+            usb.endpoint_buffer.withdraw(&io, pid) catch {
                 // Retain EP_ABORT and DPRAM ownership until a reset. RP2040 datasheet
                 // 4.1.4 and RP2350 datasheet 12.7.5, EP_ABORT_DONE: only DONE establishes
                 // that software can modify the buffer control register.
@@ -554,7 +599,6 @@ pub fn Polled(config: Config) type {
 
         const BufferWithdrawal = struct {
             ep: usb.types.Endpoint,
-            pid: u1,
 
             fn bit(self: *const @This()) u32 {
                 return @as(u32, 1) << (2 * @as(u5, @backingInt(self.ep.num)) +
@@ -578,8 +622,8 @@ pub fn Polled(config: Config) type {
                 return true;
             }
 
-            pub fn withdraw(self: *@This()) void {
-                buffer_control[@backingInt(self.ep.num)].get(self.ep.dir).write(.{ .PID_0 = self.pid });
+            pub fn withdraw(self: *@This(), pid: u1) void {
+                buffer_control[@backingInt(self.ep.num)].get(self.ep.dir).write(.{ .PID_0 = pid });
             }
 
             pub fn clear_completion(self: *@This()) void {
