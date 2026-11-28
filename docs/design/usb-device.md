@@ -26,9 +26,13 @@ The logger built on it is described in [usb_serial_jtag_logger.md](usb_serial_jt
   core opens OUT, initializes the runtime, then opens IN. Data endpoints open at DATA0.
 - **Class lifetime.** Keep the port and controller at fixed addresses while classes borrow their storage.
   After poll, reacquire runtimes through `drivers()` and discard old state even if addresses match.
-- **Nordic lifetime.** Invalidate the runtime on detach and wait for a fresh configuration before
-  resuming I/O. `examples/nordic/nrf5x/src/cdc_console.zig:poll` clears the controller when
-  `is_connected()` is false. Detect replacement across polls with `get_configuration_generation()`.
+- **Nordic lifetime.** A poll that sees absent VBUS or a latched `POWER.EVENTS_USBREMOVED` retires
+  the endpoint state and calls core's bus-reset callback. A latched removal wins even when VBUS is
+  already present again (nRF52840 PS v1.8 §§5.3.2, 6.35.4). Poll checks the latch at entry and
+  again before enabling USBD or connecting the pull-up. Leave the latch for poll to consume.
+  The next pull-up can report a connection before the host selects a new configuration. Wait
+  for `drivers()` to return a runtime before resuming I/O.
+  Detect replacement across polls with `get_configuration_generation()`.
 - **Packet lifetime.** An open, healthy, idle IN endpoint must copy and accept the whole submission
   before returning when it fits within the endpoint's maximum packet size; it never takes only a
   prefix. Class drivers rely on this (`core/src/core/usb.zig:DeviceInterface`). Publish busy before submission. Use nonempty vectors with payload in the first write
@@ -89,6 +93,7 @@ cited at `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll`).
 | IN completion | EP0 completions still run. | Advance IN data or commit the pending address. | Report completion against the current endpoint and direction. |
 | OUT arrival | Core drops data-endpoint callbacks. | Expose one listened-for packet to `ep_readv` during `on_buffer(.out(.ep0))` or consume status OUT locally. | Report one packet per listen. |
 | Bus reset | The port handles the hardware reset and reports it to core. | Core abandons data and pending address. | Core drops the runtime after calling the port's endpoint retirement hook if supplied. |
+| Nordic VBUS loss | Poll consumes the removal event and returns to detached. The next attachment waits for complete disable, USBD READY and regulator readiness (nRF52840 PS v1.8 §§6.35.4, 6.35.13.41). | Poll forgets the transfer and calls core's bus-reset callback. | Poll retires endpoints and advances the generation before notifying core. |
 
 ### Entry points × phases
 
@@ -98,6 +103,7 @@ cited at `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll`).
 | `ep_writev` | On an open, idle data IN endpoint, keep the total vector length within its advertised maximum packet size. | Wait for completion before submitting another packet. |
 | `ep_listen` / `ep_readv` | Listen on an open OUT endpoint with no outstanding listen. | Read once with capacity for the whole packet, before relistening or requesting EP0 status. |
 | `ep_close_all` / `ep_open` | Retire the old endpoints before opening replacements. | Drop old completions before an endpoint number and direction can be reused. |
+| Nordic `DeviceInterface` while detached | Calls return without register access, including from the detach notification (nRF52840 PS v1.8 §6.35.12). | Reads and writes return zero. |
 | STM32F103 `EpControl` | Match each `Config.endpoints` entry's `endpoint` and `ep_control` numbers so I/O uses the PMA entry assigned during init. | Wait for TX completion before reusing armed PMA because `write_buffer`, `USB_send` and `ZLP` lack busy checks. |
 | STM32F103 `USB_read` | Keep the caller-provided `Config.RX_buffer` alive while USB uses it. | The call rearms RX, so consume or copy the borrowed bytes before the next read replaces them. |
 
@@ -207,10 +213,8 @@ Run `zig build test` in each package. `core/build.zig:build` reaches USB via `co
 - `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.ep_writev`, `port/wch/ch32v/src/hals/usbfs.zig:Polled.ep_writev` and `port/wch/ch32v/src/hals/usbhs.zig:Polled.ep_writev` cap writes by buffer capacity, which can exceed the advertised packet size. ([#65](https://github.com/valthon/microzig/issues/65))
 - `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.ep_writev` copies before checking AVAILABLE, so writing while busy can overwrite an armed packet. ([#65](https://github.com/valthon/microzig/issues/65))
 - `port/raspberrypi/rp2xxx/src/hal/usb.zig:Polled.poll` orders co-latched events using a reset interval cited to TinyUSB without a datasheet section. Its reset branch leaves EP0 buffer retirement to the next SETUP.
-- `port/nordic/nrf5x/src/hal/usbd.zig:USBD.poll` leaves the core runtime intact on VBUS loss and marks the next connection live at pull-up enable, before the next bus reset. ([#71](https://github.com/valthon/microzig/issues/71))
 - `examples/raspberrypi/rp2xxx/src/usb_cdc.zig:usb_cdc_write` and `examples/wch/ch32v/src/usb_cdc.zig:usb_cdc_write` retain a class pointer across polls that can retire it or replace its runtime mid-write. ([#74](https://github.com/valthon/microzig/issues/74))
 - `examples/raspberrypi/rp2xxx/src/pio_selftest/selftest.zig:emit` retains its CDC borrow across polls in both its write and flush loops, so reset or reselection can invalidate it. ([#74](https://github.com/valthon/microzig/issues/74))
-- `examples/nordic/nrf5x/src/usb_hid.zig:main` checks only `drivers()`, so it can use the retained HID runtime during detach or after reattachment before a new configuration. ([#74](https://github.com/valthon/microzig/issues/74))
 - `examples/stmicro/stm32/src/stm32f1xx/usb_cdc.zig:USB_conf` relies on the default reset handler, which leaves `config`, `device_addr`, `remain_pkg`, `CDC_coding` and a pending `CDC_send` unchanged, so the app can use stale control state or wait for a discarded TX completion. ([#73](https://github.com/valthon/microzig/issues/73))
 - `examples/stmicro/stm32/src/stm32f1xx/usb_hid.zig:USB_conf` relies on the default reset handler, which leaves `config`, `device_addr` and `to_report` unchanged, so the app can send before reconfiguration, wait for a discarded report completion or apply a stale address. ([#73](https://github.com/valthon/microzig/issues/73))
 - `examples/stmicro/stm32/src/stm32f1xx/usb_cdc.zig:ep0_setup` leaves `device_addr`, `remain_pkg` and `CDC_coding` pending, so later callbacks can apply an abandoned address or use stale control data. ([#73](https://github.com/valthon/microzig/issues/73))

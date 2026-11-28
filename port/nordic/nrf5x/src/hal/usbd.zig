@@ -10,6 +10,7 @@ const log = std.log.scoped(.usb_dev);
 const microzig = @import("microzig");
 const cpu = microzig.cpu;
 const peripherals = microzig.chip.peripherals;
+const power_regs = if (builtin.is_test) &testing.power_regs else peripherals.POWER;
 const usb = microzig.core.usb;
 
 const errata = @import("./usbd/errata.zig");
@@ -53,6 +54,7 @@ const WAKE_WAIT_TURNS: u32 = 1 << 20;
 const CAUSE_SUSPEND: u32 = 1 << 8;
 const CAUSE_RESUME: u32 = 1 << 9;
 const CAUSE_USBWUALLOWED: u32 = 1 << 10;
+const CAUSE_READY: u32 = 1 << 11;
 
 // CLOCK's HFCLKSTAT (nRF52840 PS v1.1, 5.4.3.17): SRC = Xtal in bit 0, STATE = Running in
 // bit 16.
@@ -202,46 +204,52 @@ pub const USBD = struct {
     /// Calls from an ISR leave all events pending and do no work. If using the USBD IRQ
     /// to notify foreground, its handler must mask the IRQ and signal the main loop;
     /// foreground calls poll before re-enabling the IRQ. Poll regularly for power changes.
+    /// Leave POWER.EVENTS_USBREMOVED pending for this poll to consume.
     pub fn poll(self: *Self, controller: anytype) void {
         comptime usb.validate_controller(@TypeOf(controller));
         if (cpu.executing_isr()) return;
-        if (self.dma.faulted) return;
 
-        if (self.power != .detached and peripherals.POWER.USBREGSTATUS.read().VBUSDETECT == .NoVbus) {
-            self.teardown();
-            self.power = .detached;
-            self.configuration_generation +%= 1;
-            return;
-        }
+        if (self.reconcile_vbus_loss(controller)) return;
+        if (self.dma.faulted) return;
 
         switch (self.power) {
             .detached => {
-                if (peripherals.POWER.USBREGSTATUS.read().VBUSDETECT == .VbusPresent) {
-                    errata.pre_enable();
-                    peripherals.USBD.ENABLE.write_raw(1);
-                    self.power = .enabling;
+                // ENABLE reads back as enabled until teardown completes (§6.35.13.41).
+                if (peripherals.USBD.ENABLE.raw != 0) return;
+                peripherals.USBD.EVENTCAUSE.write_raw(CAUSE_READY); // W1C
+                // The host mock has no silicon-specific errata registers.
+                if (!builtin.is_test) errata.pre_enable();
+                if (builtin.is_test) testing.after_register_access(.enable_prepared);
+                if (self.reconcile_vbus_loss(controller)) {
+                    // No enable was issued, so undo the pre-enable writes.
+                    if (!builtin.is_test) errata.post_enable();
+                    return;
                 }
+                peripherals.USBD.ENABLE.write_raw(1);
+                self.power = .enabling;
             },
             .enabling => {
-                if (peripherals.USBD.EVENTCAUSE.read().READY == .Ready) {
-                    peripherals.USBD.EVENTCAUSE.write(.{ .READY = .Ready }); // W1C
+                if (peripherals.USBD.EVENTCAUSE.raw & CAUSE_READY != 0) {
+                    peripherals.USBD.EVENTCAUSE.write_raw(CAUSE_READY); // W1C
                     peripherals.USBD.EVENTS_USBEVENT.write_raw(0);
-                    errata.post_enable();
+                    if (!builtin.is_test) errata.post_enable();
                     // Enabled and ready: from here on the registers of 6.35.12 can be
                     // accessed. The pull-up stays off until the regulator is ready, and
                     // only endpoint 0 is enabled, whatever was left in the registers by
                     // an earlier connection or by the program that ran before this one.
                     peripherals.USBD.USBPULLUP.write_raw(0);
-                    peripherals.USBD.EPINEN.write_raw(0x01); // only EP0 IN
-                    peripherals.USBD.EPOUTEN.write_raw(0x01); // only EP0 OUT
+                    peripherals.USBD.EVENTS_USBRESET.write_raw(0);
+                    self.reset();
                     self.power = .waiting_pwrrdy;
                 }
             },
             .waiting_pwrrdy => {
-                if (peripherals.POWER.USBREGSTATUS.read().OUTPUTRDY == .Ready) {
+                if (power_regs.USBREGSTATUS.read().OUTPUTRDY == .Ready) {
+                    if (builtin.is_test) testing.after_register_access(.regulator_ready_read);
                     // The host is about to talk to a device that cannot answer.
                     if (peripherals.CLOCK.HFCLKSTAT.raw & HFCLK_XTAL_RUNNING != HFCLK_XTAL_RUNNING)
                         log.warn("the crystal oscillator (HFXO) is not running: start it before USB", .{});
+                    if (self.reconcile_vbus_loss(controller)) return;
                     peripherals.USBD.USBPULLUP.write_raw(1);
                     self.power = .connected;
                 }
@@ -493,13 +501,28 @@ pub const USBD = struct {
         }
     }
 
-    fn teardown(self: *Self) void {
-        // Upon VBUS removal detection, it is recommended to
-        // let on-going EasyDMA transfers finish before disabling USBD
-        //
-        // But in this case it won't happen because
-        // we busywait for ENDEP* with interrupts disabled
+    /// USBREMOVED records a voltage drop even when VBUS is already back
+    /// (nRF52840 PS v1.8, §§5.3.2 and 6.35.4). Retire the old attachment
+    /// before advancing power-up on a subsequent poll.
+    fn reconcile_vbus_loss(self: *Self, controller: anytype) bool {
+        const vbus_present = power_regs.USBREGSTATUS.read().VBUSDETECT == .VbusPresent;
+        const removed = power_regs.EVENTS_USBREMOVED.raw != 0;
+        if (removed) power_regs.EVENTS_USBREMOVED.write_raw(0);
+        if (!removed and vbus_present) return false;
+        if (self.power != .detached) {
+            // A timed-out DMA still owns its buffers and the peripheral.
+            if (!self.dma.faulted) self.teardown();
+            self.power = .detached;
+            self.reset_endpoint_state();
+            self.configuration_generation +%= 1;
+            // DeviceInterface calls from this notification are inert while detached
+            // (nRF52840 PS v1.8, §6.35.12).
+            controller.on_bus_reset(&self.interface);
+        }
+        return true;
+    }
 
+    fn teardown(self: *Self) void {
         if (self.low_power) {
             // USBPULLUP cannot be accessed in low power mode either (6.35.12), so it is
             // left alone and disabling the peripheral has to take the pull-up off the bus.
@@ -621,9 +644,15 @@ pub const USBD = struct {
             peripherals.USBD.SIZE.EPOUT[i].write_raw(0);
         }
 
+        self.reset_endpoint_state();
+    }
+
+    fn reset_endpoint_state(self: *Self) void {
         self.eps_in = @splat(.{});
         self.eps_out = @splat(.{});
         self.control = .{};
+        self.control_out_len = 0;
+        self.out_len = @splat(0);
         self.in_busy = @splat(false);
         self.in_pending = @splat(null);
         self.opened_in = 0;
@@ -807,6 +836,7 @@ pub const USBD = struct {
         data: []const []const u8,
     ) usb.types.PacketLength {
         const self: *Self = @fieldParentPtr("interface", itf);
+        if (self.power == .detached) return 0;
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled and !self.dma.faulted) cpu.interrupt.enable(.USBD);
         usbd_interrupt_off();
@@ -932,11 +962,13 @@ pub const USBD = struct {
         ep_num: usb.types.Endpoint.Num,
         data: []const []u8,
     ) usb.types.PacketLength {
+        const self: *Self = @fieldParentPtr("interface", itf);
+        if (self.power == .detached) return 0;
+
         var total_len: usize = data[0].len;
         for (data[1..]) |d| total_len += d.len;
         log.debug("ep_readv {t}: ({} bytes)", .{ ep_num, total_len });
 
-        const self: *Self = @fieldParentPtr("interface", itf);
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled and !self.dma.faulted) cpu.interrupt.enable(.USBD);
         usbd_interrupt_off();
@@ -971,6 +1003,7 @@ pub const USBD = struct {
         len: usb.types.PacketLength,
     ) void {
         const self: *Self = @fieldParentPtr("interface", itf);
+        if (self.power == .detached) return;
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled and !self.dma.faulted) cpu.interrupt.enable(.USBD);
         usbd_interrupt_off();
@@ -995,6 +1028,7 @@ pub const USBD = struct {
 
     fn ep_open(itf: *usb.DeviceInterface, desc: *const usb.descriptor.Endpoint) void {
         const self: *Self = @fieldParentPtr("interface", itf);
+        if (self.power == .detached) return;
         const was_enabled = cpu.interrupt.is_enabled(.USBD);
         defer if (was_enabled and !self.dma.faulted) cpu.interrupt.enable(.USBD);
         usbd_interrupt_off();
@@ -1052,6 +1086,10 @@ pub const USBD = struct {
 
     fn ep_close_all(itf: *usb.DeviceInterface) void {
         const self: *Self = @fieldParentPtr("interface", itf);
+        // VBUS loss already retired the endpoints and recorded the generation.
+        // Core calls back here while dropping the runtime after teardown, when
+        // endpoint registers are inaccessible (nRF52840 PS v1.8, §6.35.12).
+        if (self.power == .detached) return;
         // The controller is discarding its active runtime, even if EP0 did
         // not recognize the request or the hardware can no longer be used.
         self.configuration_generation +%= 1;
@@ -1076,6 +1114,19 @@ pub const USBD = struct {
 };
 
 pub const testing = if (builtin.is_test) struct {
+    const PowerStatus = struct {
+        VBUSDETECT: enum { NoVbus, VbusPresent } = .VbusPresent,
+        OUTPUTRDY: enum { Ready, NotReady } = .Ready,
+
+        fn read(self: PowerStatus) PowerStatus {
+            return self;
+        }
+    };
+    var power_regs: struct {
+        USBREGSTATUS: PowerStatus = .{},
+        EVENTS_USBREMOVED: microzig.mmio.Mmio(packed struct(u32) { event: u32 }) = .{ .raw = 0 },
+    } = .{};
+
     const RegisterAccess = enum {
         reset_read,
         setup_read,
@@ -1084,6 +1135,8 @@ pub const testing = if (builtin.is_test) struct {
         setup_snapshot,
         ep0_task_write,
         out_irq_restored,
+        enable_prepared,
+        regulator_ready_read,
     };
     var on_register_access: ?*const fn (RegisterAccess) void = null;
 
@@ -1197,6 +1250,7 @@ pub const testing = if (builtin.is_test) struct {
         try std.testing.expect(!io.irq_enabled);
         try std.testing.expect(!io.irq_pending);
 
+        dev.power = .connected;
         dev.out.arrived(1);
         USBD.ep_listen(&dev.interface, .ep1, 64);
         try std.testing.expect(!io.irq_pending);
@@ -1206,7 +1260,7 @@ pub const testing = if (builtin.is_test) struct {
     pub fn late_listen() !void {
         const io = microzig.testing_io;
         io.reset();
-        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable } };
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
         dev.out.arrived(1);
         io.irq_enabled = true;
         USBD.ep_listen(&dev.interface, .ep1, 64);
@@ -1223,7 +1277,7 @@ pub const testing = if (builtin.is_test) struct {
     pub fn wake_timeout() !void {
         const io = microzig.testing_io;
         io.reset();
-        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .low_power = true };
+        var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected, .low_power = true };
         // A stale readiness bit must not authorize this wake.
         peripherals.USBD.EVENTCAUSE.raw = CAUSE_USBWUALLOWED;
         try std.testing.expectEqual(null, dev.easydma_out(1));
@@ -1287,18 +1341,20 @@ pub const testing = if (builtin.is_test) struct {
             try std.testing.expectEqual(0, peripherals.USBD.EVENTCAUSE.raw & CAUSE_USBWUALLOWED);
         }
     }
+    const ConfigurationController = usb.DeviceController(.{
+        .device_triple = .unspecified,
+        .bcd_device = .v1_00,
+        .serial = "test",
+        .device_capabilities = USBD.device_capabilities,
+    }, &.{usb.Configuration(
+        .{ .attributes = .{ .self_powered = false }, .max_current_ma = 50 },
+        .{ .serial = usb.drivers.CDC{} },
+    )});
+
     pub fn configuration_reselection() !void {
         microzig.testing_io.reset();
         var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
-        var ctl: usb.DeviceController(.{
-            .device_triple = .unspecified,
-            .bcd_device = .v1_00,
-            .serial = "test",
-            .device_capabilities = USBD.device_capabilities,
-        }, &.{usb.Configuration(
-            .{ .attributes = .{ .self_powered = false }, .max_current_ma = 50 },
-            .{ .serial = usb.drivers.CDC{} },
-        )}) = .init;
+        var ctl: ConfigurationController = .init;
 
         const regs = peripherals.USBD;
         regs.BREQUEST.raw = @backingInt(usb.types.SetupRequest.set_configuration);
@@ -1362,6 +1418,167 @@ pub const testing = if (builtin.is_test) struct {
         try std.testing.expect(!dev.dma.faulted);
     }
 } else struct {};
+
+test "poll retires the attachment after VBUS loss even if VBUS is already back" {
+    const regs = peripherals.USBD;
+    peripherals.CLOCK.HFCLKSTAT.raw = HFCLK_XTAL_RUNNING;
+    defer peripherals.CLOCK.HFCLKSTAT.raw = 0;
+    defer testing.power_regs = .{};
+    for ([_]bool{ true, false }) |vbus_returned| {
+        microzig.testing_io.reset();
+        testing.power_regs = .{};
+        var dev = USBD.init();
+        var ctl: testing.ConfigurationController = .init;
+        dev.poll(&ctl);
+        regs.EVENTCAUSE.raw = CAUSE_READY;
+        dev.poll(&ctl);
+        dev.poll(&ctl);
+        try std.testing.expect(dev.is_connected());
+        regs.BREQUEST.raw = @backingInt(usb.types.SetupRequest.set_configuration);
+        regs.WVALUEL.raw = 1;
+        regs.EVENTS_EP0SETUP.raw = 1;
+        dev.poll(&ctl);
+        try std.testing.expect(ctl.drivers() != null);
+        const generation = dev.get_configuration_generation();
+
+        // Leave stale endpoint ownership and a SET_CONFIGURATION in the old attachment.
+        dev.in_pending[1] = 4;
+        dev.in_busy[1] = true;
+        dev.out.arrived(1);
+        regs.EPINEN.raw = 0x03;
+        regs.EPOUTEN.raw = 0x03;
+        regs.EPIN[1].MAXCNT.raw = 4;
+        regs.EVENTS_EP0SETUP.raw = 1;
+        regs.EVENTS_EP0DATADONE.raw = 1;
+        regs.EVENTS_EPDATA.raw = 1;
+        power_regs.EVENTS_USBREMOVED.raw = @intFromBool(vbus_returned);
+        power_regs.USBREGSTATUS.VBUSDETECT = if (vbus_returned) .VbusPresent else .NoVbus;
+        power_regs.USBREGSTATUS.OUTPUTRDY = .NotReady;
+        dev.poll(&ctl);
+        try std.testing.expectEqual(.detached, dev.power);
+        try std.testing.expect(ctl.drivers() == null);
+        try std.testing.expectEqual(0, power_regs.EVENTS_USBREMOVED.raw);
+        try std.testing.expectEqual(0, regs.USBPULLUP.raw);
+        try std.testing.expectEqual(0, regs.ENABLE.raw);
+        // The core reset callback must not touch endpoint MMIO after disable.
+        try std.testing.expectEqual(0x03, regs.EPINEN.raw);
+        try std.testing.expectEqual(generation +% 1, dev.get_configuration_generation());
+        try std.testing.expectEqual(null, dev.in_pending[1]);
+        try std.testing.expect(!dev.in_busy[1]);
+        try std.testing.expect(!dev.out.waiting[1]);
+
+        power_regs.USBREGSTATUS.VBUSDETECT = .VbusPresent;
+        dev.poll(&ctl);
+        try std.testing.expectEqual(.enabling, dev.power);
+        dev.poll(&ctl);
+        try std.testing.expectEqual(.enabling, dev.power);
+        try std.testing.expectEqual(0, regs.USBPULLUP.raw);
+
+        regs.EVENTCAUSE.raw = CAUSE_READY;
+        dev.poll(&ctl);
+        try std.testing.expectEqual(.waiting_pwrrdy, dev.power);
+        try std.testing.expectEqual(1, regs.EPINEN.raw);
+        try std.testing.expectEqual(1, regs.EPOUTEN.raw);
+        try std.testing.expectEqual(0, regs.EPIN[1].MAXCNT.raw);
+        try std.testing.expectEqual(0, regs.EVENTS_EP0SETUP.raw);
+        try std.testing.expectEqual(0, regs.EVENTS_EP0DATADONE.raw);
+        try std.testing.expectEqual(0, regs.EVENTS_EPDATA.raw);
+        dev.poll(&ctl);
+        try std.testing.expect(!dev.is_connected());
+        try std.testing.expectEqual(0, regs.USBPULLUP.raw);
+
+        power_regs.USBREGSTATUS.OUTPUTRDY = .Ready;
+        dev.poll(&ctl);
+        try std.testing.expect(dev.is_connected());
+        try std.testing.expectEqual(1, regs.USBPULLUP.raw);
+        dev.poll(&ctl);
+        try std.testing.expect(ctl.drivers() == null);
+        try std.testing.expectEqual(generation +% 1, dev.get_configuration_generation());
+        try std.testing.expectEqual(0, regs.TASKS_STARTEPIN[1].raw);
+    }
+}
+
+test "device interface ignores endpoint operations from the detach callback" {
+    const regs = peripherals.USBD;
+    const io = microzig.testing_io;
+    const Controller = struct {
+        resets: usize = 0,
+        written: usb.types.PacketLength = 0,
+
+        pub fn on_bus_reset(self: *@This(), itf: *usb.DeviceInterface) void {
+            self.resets += 1;
+            itf.ep_open(&testing.cdc_desc.ep_out);
+            const out_ep = testing.cdc_desc.ep_out.endpoint.num;
+            itf.ep_ack(.ep0);
+            self.written = itf.ep_writev(.ep0, &.{"packet"});
+            itf.ep_listen(out_ep, 64);
+        }
+
+        pub fn on_setup_req(_: *@This(), _: *usb.DeviceInterface, _: *const usb.types.SetupPacket) void {}
+        pub fn on_buffer(_: *@This(), _: *usb.DeviceInterface, comptime _: usb.types.Endpoint) void {}
+    };
+
+    io.reset();
+    io.dma_ready = true;
+    defer testing.power_regs = .{};
+    testing.power_regs.USBREGSTATUS.VBUSDETECT = .NoVbus;
+    var dev: USBD = .{ .interface = .{ .vtable = &USBD.vtable }, .power = .connected };
+    var ctl: Controller = .{};
+    regs.ENABLE.raw = 1;
+    regs.USBPULLUP.raw = 1;
+    regs.EPOUTEN.raw = 1;
+    dev.poll(&ctl);
+
+    try std.testing.expectEqual(1, ctl.resets);
+    try std.testing.expectEqual(.detached, dev.power);
+    try std.testing.expectEqual(0, regs.ENABLE.raw);
+    try std.testing.expectEqual(1, regs.EPOUTEN.raw);
+    try std.testing.expectEqual(0, regs.TASKS_EP0STATUS.raw);
+    try std.testing.expectEqual(0, regs.TASKS_STARTEPIN[0].raw);
+    try std.testing.expectEqual(0, ctl.written);
+    try std.testing.expectEqual(out_flow.Flow{}, dev.out);
+}
+
+test "poll reconciles removal before enabling USBD or the pull-up" {
+    const regs = peripherals.USBD;
+    peripherals.CLOCK.HFCLKSTAT.raw = HFCLK_XTAL_RUNNING;
+    defer peripherals.CLOCK.HFCLKSTAT.raw = 0;
+    defer testing.power_regs = .{};
+
+    inline for (.{ testing.RegisterAccess.enable_prepared, .regulator_ready_read }) |boundary| {
+        const Inject = struct {
+            fn remove(access: testing.RegisterAccess) void {
+                if (access == boundary) power_regs.EVENTS_USBREMOVED.raw = 1;
+            }
+        };
+        microzig.testing_io.reset();
+        testing.power_regs = .{};
+        var dev = USBD.init();
+        var ctl: testing.ConfigurationController = .init;
+
+        if (boundary == .regulator_ready_read) {
+            dev.poll(&ctl);
+            regs.EVENTCAUSE.raw = CAUSE_READY;
+            dev.poll(&ctl);
+            try std.testing.expectEqual(.waiting_pwrrdy, dev.power);
+        }
+        {
+            testing.on_register_access = Inject.remove;
+            defer testing.on_register_access = null;
+            dev.poll(&ctl);
+        }
+        try std.testing.expectEqual(0, power_regs.EVENTS_USBREMOVED.raw);
+        try std.testing.expectEqual(.detached, dev.power);
+        try std.testing.expect(!dev.is_connected());
+        try std.testing.expectEqual(0, regs.ENABLE.raw);
+        try std.testing.expectEqual(0, regs.USBPULLUP.raw);
+        try std.testing.expectEqual(null, ctl.drivers());
+
+        dev.poll(&ctl);
+        try std.testing.expectEqual(.enabling, dev.power);
+        try std.testing.expectEqual(0, regs.USBPULLUP.raw);
+    }
+}
 
 test "EP0 EasyDMA reports cancellation in both directions on SETUP or reset" {
     const regs = peripherals.USBD;
