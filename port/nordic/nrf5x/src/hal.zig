@@ -37,6 +37,7 @@ comptime {
         _ = &drivers.SPI_Device.writev;
         _ = &drivers.SPI_Device.read;
         _ = &drivers.SPI_Device.readv;
+        _ = &drivers.I2C_Device.write_then_read;
         _ = &drivers.I2C_DatagramDevice.datagram_device;
         _ = &i2cdma.I2C.read_blocking;
         _ = &i2cdma.I2C.writev_blocking;
@@ -368,6 +369,18 @@ test "TWI disables a stuck controller and the next transfer can re-enable it" {
     fake.bus.twi_tx_at = fake.bus.now + fake.tick_us;
     try bus.write_blocking(addr, "x", .from_us(100));
     try std.testing.expectEqual(.Enabled, fake.twi.ENABLE.read().ENABLE);
+}
+
+test "concrete addressed I2C adapter uses the vectored non-DMA transaction" {
+    const fake = serial_test;
+    fake.reset(.twi);
+    fake.bus.twi_tx_at = 50;
+    fake.bus.twi_rx_at = 100;
+    const adapter = drivers.I2C_Device.init(i2c.num(0), .from_us(200));
+    var dst: [1]u8 = .{0};
+    try adapter.write_then_read(@fromBackingInt(0x42), "w", &dst);
+    try std.testing.expectEqual(@as(u7, 0x42), fake.twi.ADDRESS.read().ADDRESS);
+    try std.testing.expectEqual(@as(u8, 0xA5), dst[0]);
 }
 
 test "concrete SPI adapter keeps its timeout across scalar, vectored and erased calls" {

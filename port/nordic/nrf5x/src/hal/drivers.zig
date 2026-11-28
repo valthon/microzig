@@ -210,7 +210,7 @@ pub const I2C_Device = struct {
     }
 
     pub fn write_then_read(dev: I2C_Device, address: I2CAddress, src: []const u8, dst: []u8) I2CError!void {
-        try dev.bus.write_then_read_blocking(address, src, dst, dev.timeout);
+        return dev.writev_then_readv(address, &.{src}, &.{dst});
     }
 
     pub fn writev_then_readv(

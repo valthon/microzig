@@ -391,7 +391,7 @@ pub const I2C = enum(u1) {
     }
 
     /// Attempts to write number of bytes provided to target device and then immediately read bytes
-    /// following a repeated start command (or Start + Stop if repeated start is disabled). Blocks
+    /// following a repeated start command. Blocks
     /// until one of the following occurs:
     /// - Bytes have been transmitted and read successfully
     /// - An error occurs and the transaction is aborted
@@ -444,7 +444,8 @@ pub const I2C = enum(u1) {
             regs.SHORTS.modify(.{ .BB_STOP = .Enabled });
         }
 
-        // We start the RX task without stopping the TX task
+        // nRF52840 Product Specification, TWI, "Master repeated start sequence":
+        // STARTRX after TX begins the read phase without a STOP between phases.
         regs.TASKS_STARTRX.write(.{ .TASKS_STARTRX = .Trigger });
 
         // Read bytes
