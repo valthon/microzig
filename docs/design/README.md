@@ -68,6 +68,7 @@ Sections, in order (leave out a section that does not apply; never leave a headi
 | [USB device stack](usb-device.md) | portable USB device core, controller ports, and class drivers |
 | [Network and lwIP](network.md) | lwIP build, Ethernet netifs, buffer ownership and execution context |
 | [Base driver interfaces](base-interfaces.md) | portable driver contracts, HAL adapters and consumers |
+| [nRF52840 IEEE 802.15.4 radio](ieee802154.md) | portable 802.15.4 interface and nRF52840 driver |
 
 Planned backfills, in the order upcoming work needs them: the ESP IEEE 802.15.4 MAC
-(`esp-ieee802154.md`); the nRF52840 IEEE 802.15.4 driver.
+(`esp-ieee802154.md`).

@@ -5,6 +5,10 @@ pub const compatibility = @import("hal/compatibility.zig");
 pub const gpio = @import("hal/gpio.zig");
 pub const gpiote = @import("hal/gpiote.zig");
 pub const i2c = @import("hal/i2c.zig");
+pub const ieee802154 = if (microzig.options.hal.ieee802154 and compatibility.chip == .nrf52840)
+    @import("hal/radio/ieee802154.zig")
+else
+    struct {};
 pub const i2cdma = @import("hal/i2cdma.zig");
 pub const nvmc = @import("hal/nvmc.zig");
 pub const pdm = @import("hal/pdm.zig");
@@ -25,9 +29,22 @@ pub const wdt = @import("hal/wdt.zig");
 pub const drivers = @import("hal/drivers.zig");
 // TODO: interrupts, wifi, nfc, bt, zigbee
 
-pub const default_interrupts: microzig.cpu.InterruptOptions = .{
-    // Required for timekeeping longer than 512 seconds
-    .RTC0 = .{ .c = time.rtc_interrupt },
+pub const HAL_Options = struct {
+    /// Reserve the nRF52840 RADIO and TIMER3 interrupt vectors for the radio driver.
+    ieee802154: bool = false,
+};
+
+pub const default_interrupts: microzig.cpu.InterruptOptions = interrupts: {
+    var handlers: microzig.cpu.InterruptOptions = .{
+        // Required for timekeeping longer than 512 seconds.
+        .RTC0 = .{ .c = time.rtc_interrupt },
+    };
+    if (microzig.options.hal.ieee802154) {
+        if (compatibility.chip != .nrf52840) compatibility.unsupported_chip("IEEE 802.15.4");
+        handlers.RADIO = .{ .c = ieee802154.radio_interrupt };
+        handlers.TIMER3 = .{ .c = ieee802154.timer_interrupt };
+    }
+    break :interrupts handlers;
 };
 
 pub fn init() void {

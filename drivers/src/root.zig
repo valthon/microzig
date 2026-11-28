@@ -228,6 +228,7 @@ pub const base = struct {
     pub const Digital_IO = @import("base/Digital_IO.zig");
     pub const ClockDevice = @import("base/ClockDevice.zig");
     pub const BlockMemory = @import("base/BlockMemory.zig");
+    pub const IEEE802154_Radio = @import("base/IEEE802154_Radio.zig");
     pub const I2C_Device = @import("base/I2C_Device.zig");
 };
 
@@ -266,6 +267,7 @@ test {
     _ = base.Digital_IO;
     _ = base.BlockMemory;
     _ = base.ClockDevice;
+    _ = base.IEEE802154_Radio;
     _ = base.I2C_Device;
 
     _ = wireless.nrf24l01;
