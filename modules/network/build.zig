@@ -95,6 +95,9 @@ fn add_network_module(
         .c_macros = &[_][]const u8{
             // Align for both DMA words and pointers stored by lwIP.
             b.fmt("MEM_ALIGNMENT={d}", .{@max(4, target.result.ptrBitWidth() / 8)}),
+            // IPv6 reassembly overlays a pointer on the 8-byte fragment header
+            // unless the header is copied aside.
+            b.fmt("IPV6_FRAG_COPYHEADER={d}", .{@intFromBool(target.result.ptrBitWidth() > 32)}),
             b.fmt("MEM_SIZE={d}", .{settings.mem_size}),
             b.fmt("PBUF_POOL_SIZE={d}", .{settings.pbuf_pool_size}),
             b.fmt("PBUF_LINK_HLEN={d}", .{ethernet_header}),
