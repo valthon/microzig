@@ -25,8 +25,12 @@ pub const RX_size = struct {
     block_qtd: usize,
 
     pub fn calc_rx_size(size: *const RX_size) usize {
-        const mul: usize = if (@backingInt(size.block_size) == 0) 2 else 32;
-        return size.block_qtd * mul;
+        // RM0008 Rev 21 §23.5.3 (USB_COUNTn_RX): the 32-byte encoding
+        // stores one less than the number of blocks.
+        return switch (size.block_size) {
+            .@"2bytes" => size.block_qtd * 2,
+            .@"32bytes" => (size.block_qtd + 1) * 32,
+        };
     }
 
     pub fn to_RXcount(size: *const RX_size) u16 {
@@ -37,12 +41,9 @@ pub const RX_size = struct {
 
     pub fn from_bytes(bytes: usize) RX_size {
         if (bytes > 62) {
-            const block_qtd: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(bytes)) / 32));
-            return .{ .block_qtd = block_qtd - 1, .block_size = .@"32bytes" };
-        } else {
-            const block_qtd: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(bytes)) / 2));
-            return .{ .block_qtd = block_qtd, .block_size = .@"2bytes" };
+            return .{ .block_qtd = (bytes - 1) / 32, .block_size = .@"32bytes" };
         }
+        return .{ .block_qtd = std.mem.alignForward(usize, bytes, 2) / 2 };
     }
 };
 //the memory will be rounded to the nearest number of blocks to the value
@@ -83,85 +84,56 @@ pub const BTABLEError = error{
     PMAOverflow,
 };
 
-const BTABLE: *volatile [8]BTABLEDescriptor = @ptrFromInt(PMA_BASE);
+// RM0008 Rev 21 §§23.3.1 and 23.5.3: the USB uses byte offsets into
+// 512 bytes of PMA. The CPU accesses each 16-bit word in a 32-bit slot.
+const capacity = 512;
+const table_bytes = 8 * 8;
+const pma_words: [*]volatile u32 = if (@import("builtin").is_test and @hasDecl(microzig, "testing_usb"))
+    &microzig.testing_usb.pma_words
+else
+    @ptrFromInt(PMA_BASE);
+const BTABLE: *volatile [8]BTABLEDescriptor = @ptrCast(pma_words);
 
-var metadata: [8]?EntryMetadata = undefined;
-pub fn btable_init(config: Config) BTABLEError!void {
-    try load_and_check(config);
+const BufferDescriptor = struct {
+    tx_addr: u16,
+    rx_addr: u16,
+    rx_count: u16,
+};
 
-    var offset: usize = 32;
+pub const Layout = [8]?BufferDescriptor;
 
-    USB.BTABLE.raw = 0;
-
-    //init BTABLE;
-    for (0..8) |i| {
-        if (metadata[i]) |data| {
-            BTABLE[i].TX_addr.value = @intCast(offset);
-            BTABLE[i].TX_count.value = 0;
-            offset += calc_offset(data.tx_max_size);
-            BTABLE[i].RX_addr.value = @intCast(offset);
-            BTABLE[i].RX_count.value = data.rx_max_size.to_RXcount();
-            offset += calc_offset(data.rx_max_size.calc_rx_size());
-        }
-    }
-}
-
-//load config into metadata and check if the SUM of all buffer can fit into the PMA
-fn load_and_check(config: Config) BTABLEError!void {
-    //load metadata
-    metadata[0] = config.EP0;
-    metadata[1] = config.EP1;
-    metadata[2] = config.EP2;
-    metadata[3] = config.EP3;
-    metadata[4] = config.EP4;
-    metadata[5] = config.EP5;
-    metadata[6] = config.EP6;
-    metadata[7] = config.EP7;
-
-    var available_memory: usize = 512 - 64;
-
-    for (metadata) |ep_data| {
-        if (ep_data) |data| {
-            const entry_size = data.tx_max_size + data.rx_max_size.calc_rx_size();
-            if (entry_size < available_memory) {
-                available_memory -= entry_size;
-            } else {
-                return error.PMAOverflow;
-            }
-        }
-    }
-}
-
-pub fn comptime_check(comptime config: Config) void {
-    comptime {
-        const meta: [8]?EntryMetadata = .{
-            config.EP0,
-            config.EP1,
-            config.EP2,
-            config.EP3,
-            config.EP4,
-            config.EP5,
-            config.EP6,
-            config.EP7,
+pub fn plan_layout(config: Config) BTABLEError!Layout {
+    const entries: [8]?EntryMetadata = .{
+        config.EP0, config.EP1, config.EP2, config.EP3,
+        config.EP4, config.EP5, config.EP6, config.EP7,
+    };
+    var layout: Layout = @splat(null);
+    var offset: usize = table_bytes;
+    for (entries, &layout) |entry, *descriptor| {
+        const data = entry orelse continue;
+        if (data.tx_max_size > capacity - offset) return error.PMAOverflow;
+        const tx_size = std.mem.alignForward(usize, data.tx_max_size, 2);
+        const rx_size = data.rx_max_size.calc_rx_size();
+        if (rx_size > capacity - offset - tx_size) return error.PMAOverflow;
+        descriptor.* = .{
+            .tx_addr = @intCast(offset),
+            .rx_addr = @intCast(offset + tx_size),
+            .rx_count = data.rx_max_size.to_RXcount(),
         };
-
-        var available_memory: usize = 512 - 64;
-
-        for (meta) |ep_data| {
-            if (ep_data) |data| {
-                const entry_size = data.tx_max_size + data.rx_max_size.calc_rx_size();
-                if (entry_size < available_memory) {
-                    available_memory -= entry_size;
-                } else {
-                    @compileError(std.fmt.comptimePrint("PMA overflow by {d} bytes", .{entry_size - available_memory}));
-                }
-            }
-        }
+        offset += tx_size + rx_size;
     }
+    return layout;
 }
 
-fn calc_offset(bytes: usize) usize {
-    return @intFromFloat(@ceil(@as(f32, @floatFromInt(bytes)) / 2));
+pub fn btable_init(layout: Layout) void {
+    USB.BTABLE.raw = 0;
+    for (layout, 0..) |descriptor, slot| {
+        const data = descriptor orelse continue;
+        BTABLE[slot].TX_addr.value = data.tx_addr;
+        BTABLE[slot].TX_count.value = 0;
+        BTABLE[slot].RX_addr.value = data.rx_addr;
+        BTABLE[slot].RX_count.value = data.rx_count;
+    }
 }
 
 pub inline fn RX_recv_size(EP: usize) usize {
@@ -170,7 +142,6 @@ pub inline fn RX_recv_size(EP: usize) usize {
 
 pub fn RX_to_buffer(buffer: []u8, EP: usize) []const u8 {
     const PMA_buf = BTABLE[EP];
-    const addr = PMA_BASE + PMA_buf.RX_addr.value * 2; //calc real addr
     const count = RX_recv_size(EP);
     if (count == 0) {
         return buffer[0..0];
@@ -178,7 +149,7 @@ pub fn RX_to_buffer(buffer: []u8, EP: usize) []const u8 {
 
     const len = @min(count, buffer.len);
     const to_read = len / 2;
-    const data = @as([*]const u32, @ptrFromInt(addr))[0..to_read];
+    const data = pma_words[PMA_buf.RX_addr.value / 2 ..][0..to_read];
     const buf_ptr = @as([*]align(1) u16, @ptrCast(buffer.ptr))[0..to_read];
 
     for (data, buf_ptr) |word, *half| {
@@ -194,7 +165,6 @@ pub fn RX_to_buffer(buffer: []u8, EP: usize) []const u8 {
 
 pub fn buffer_to_TX(buffer: []const u8, EP: usize) void {
     const len = buffer.len;
-    const addr = PMA_BASE + BTABLE[EP].TX_addr.value * 2; //calc real ADDRS
 
     //load bytes qtd into PMA
     if (len == 0) {
@@ -205,7 +175,7 @@ pub fn buffer_to_TX(buffer: []const u8, EP: usize) void {
 
     const to_write = len / 2;
     const buf_ptr = @as([*]align(1) const u16, @ptrCast(buffer.ptr))[0..to_write];
-    var data = @as([*]volatile u32, @ptrFromInt(addr))[0..to_write];
+    const data = pma_words[BTABLE[EP].TX_addr.value / 2 ..][0..to_write];
     for (data, buf_ptr) |*word, val| {
         word.* = val;
     }

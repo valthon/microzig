@@ -334,7 +334,7 @@ const endpoint0 = usb_ll.Endpoint{
     .ep_kind = false,
     .rx_reset_state = .Valid,
     .tx_reset_state = .Nak,
-    .rx_buffer_size = .{ .block_qtd = 2, .block_size = .@"32bytes" },
+    .rx_buffer_size = .from_bytes(64),
     .tx_buffer_size = 64,
     .rx_callback = ep0_rx,
     .tx_callback = ep0_tx,
@@ -375,7 +375,7 @@ const endpoint3 = usb_ll.Endpoint{
     .ep_kind = false,
     .rx_reset_state = .Valid,
     .tx_reset_state = .Nak,
-    .rx_buffer_size = .{ .block_qtd = 2, .block_size = .@"32bytes" },
+    .rx_buffer_size = .from_bytes(64),
     .tx_buffer_size = 0, //no TX buffer for OUT endpoint
     .rx_callback = ep3_rx,
 };
