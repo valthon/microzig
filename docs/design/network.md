@@ -51,7 +51,8 @@ if the bytes were never queued, since `tcp_output` can fail after `tcp_write` su
 Defer a graceful close requested by `on_recv` until the stack call returns so the
 wrapper can credit the received bytes. Keep callback contexts stationary and TCP
 connection wrappers reserved until lwIP can no longer call them, even after `close`.
-The UDP and TCP listener wrappers have no close API.
+The UDP and TCP listener wrappers have no close API. IPv6 endpoints format as
+`[address]:port` and IPv4 endpoints as `address:port`.
 
 ### ESP tasks
 
@@ -174,7 +175,6 @@ within the remaining buffer.
 - `modules/network/src/root.zig:tcp.Connection.close` sets `.closed` while the old PCB can still call the wrapper on data ACKs or reset during FIN processing, so `.closed` is unsafe as a reuse signal. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` recycles session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Endpoint.parse` and `Interface.Options.Fixed.init` pass slice pointers to C parsers that expect NUL termination. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Endpoint.format` always formats the address as IPv4. ([#64](https://github.com/valthon/microzig/issues/64))
 - `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
 - `examples/espressif/esp/src/tcp_server.zig:run` can return from an ordinary server error even after successful Wi-Fi teardown, while lwIP still references the stack-local netif and allocator. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/tcp_server.zig:run_server` can deinitialize Wi-Fi after a server error with the netif still up and registered, allowing TX to overlap teardown. ([#81](https://github.com/valthon/microzig/issues/81))

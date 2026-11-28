@@ -507,10 +507,14 @@ pub const Endpoint = struct {
     port: u16 = 0,
 
     pub fn format(self: Endpoint, writer: anytype) !void {
-        const ip4_addr: *const lwip.ip4_addr_t = @ptrCast(&self.addr);
-        try writer.writeAll(std.mem.sliceTo(lwip.ip4addr_ntoa(ip4_addr), 0));
-        var buf: [16]u8 = undefined;
-        try writer.writeAll(std.mem.print(&buf, ":{}", .{self.port}) catch "");
+        var buf: [lwip.IPADDR_STRLEN_MAX]u8 = undefined;
+        const text = lwip.ipaddr_ntoa_r(&self.addr, &buf, buf.len) orelse unreachable;
+        const address = std.mem.sliceTo(text, 0);
+        if (self.addr.type == lwip.IPADDR_TYPE_V6) {
+            try writer.print("[{s}]:{d}", .{ address, self.port });
+        } else {
+            try writer.print("{s}:{d}", .{ address, self.port });
+        }
     }
 
     pub fn parse(ip: []const u8, port: u16) !Endpoint {

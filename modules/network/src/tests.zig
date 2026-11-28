@@ -88,6 +88,14 @@ test "TCP bind releases its PCB when the listener pool is exhausted" {
     try testing.expect(retry.pcb != null);
 }
 
+test "endpoint formatting uses the address family" {
+    var buf: [64]u8 = undefined;
+    const ipv4 = try net.Endpoint.parse("192.0.2.1", 80);
+    const ipv6 = try net.Endpoint.parse("2001:DB8::1", 443);
+    try testing.expectEqualStrings("192.0.2.1:80", try std.fmt.bufPrint(&buf, "{f}", .{ipv4}));
+    try testing.expectEqualStrings("[2001:DB8::1]:443", try std.fmt.bufPrint(&buf, "{f}", .{ipv6}));
+}
+
 const Link = @FieldType(net.Interface, "link");
 
 /// Records each frame passed to `send`. With `loopback` set, `recv` returns
