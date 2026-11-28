@@ -41,7 +41,12 @@ pub const testing_io = struct {
     pub var irq_enabled = false;
     pub var irq_pending = false;
     pub var wake_ready = false;
+    pub var reset_on_wake = false;
     pub var force_normal_writes: usize = 0;
+    pub var stall_writes: usize = 0;
+    pub var toggle_at_stall_write: u32 = 0;
+    pub var out_size_at_stall_write: u32 = 0;
+    pub var force_normal_writes_at_stall: usize = 0;
     pub fn reset() void {
         out_packet = "";
         in_len = 0;
@@ -50,14 +55,19 @@ pub const testing_io = struct {
         irq_enabled = false;
         irq_pending = false;
         wake_ready = false;
+        reset_on_wake = false;
         force_normal_writes = 0;
+        stall_writes = 0;
+        toggle_at_stall_write = 0;
+        out_size_at_stall_write = 0;
+        force_normal_writes_at_stall = 0;
         usbd = .{};
     }
 };
-const Register = struct {
+const Register = extern struct {
     raw: u32 = 0,
     full_value: usize = 0,
-    kind: enum { normal, lowpower, cause, out_task, in_task } = .normal,
+    kind: enum(u8) { normal, lowpower, cause, out_task, in_task, stall } = .normal,
     pub fn write_raw(self: *Register, value: anytype) void {
         const v: u32 = @truncate(@as(u64, value));
         if (self.kind == .cause) {
@@ -82,9 +92,23 @@ const Register = struct {
                 }
             }
         }
+        if (self.kind == .stall) {
+            const ep = v & 0x7;
+            const stalled = (v >> 8) & 1;
+            testing_io.stall_writes += 1;
+            testing_io.toggle_at_stall_write = usbd.DTOGGLE.raw;
+            testing_io.out_size_at_stall_write = usbd.SIZE.EPOUT[ep].raw;
+            testing_io.force_normal_writes_at_stall = testing_io.force_normal_writes;
+            if (v & 0x80 == 0) {
+                usbd.HALTED.EPOUT[ep].raw = stalled;
+            } else {
+                usbd.HALTED.EPIN[ep].raw = stalled;
+            }
+        }
         if (self.kind == .lowpower and v == 0) {
             testing_io.force_normal_writes += 1;
             if (testing_io.wake_ready) usbd.EVENTCAUSE.raw |= 1 << 10;
+            if (testing_io.reset_on_wake) usbd.EVENTS_USBRESET.raw = 1;
         }
     }
     pub fn write(self: *Register, value: anytype) void {
@@ -99,8 +123,13 @@ const Register = struct {
         return .{};
     }
 };
-const Endpoint = struct { PTR: Register = .{}, MAXCNT: Register = .{} };
-const Usbd = struct {
+const Endpoint = extern struct { PTR: Register = .{}, MAXCNT: Register = .{} };
+/// Extern, so that `disarm_area` stays at offset 0.
+const Usbd = extern struct {
+    /// `hal/usbd/errata.zig:disarm_in` writes nrfx's undocumented registers at USBD + 0x800 and
+    /// + 0x804. Without this area those writes landed past the end of the mock, in whatever global
+    /// followed it (the test allocator's state on Windows).
+    disarm_area: [0x808]u8 = @splat(0),
     BMREQUESTTYPE: Register = .{},
     BREQUEST: Register = .{},
     DTOGGLE: Register = .{},
@@ -110,6 +139,7 @@ const Usbd = struct {
     EPINEN: Register = .{},
     EPOUT: [8]Endpoint = @splat(.{}),
     EPOUTEN: Register = .{},
+    EPSTALL: Register = .{ .kind = .stall },
     EPSTATUS: Register = .{},
     EVENTCAUSE: Register = .{ .kind = .cause },
     EVENTS_ENDEPIN: [8]Register = @splat(.{}),
@@ -119,9 +149,13 @@ const Usbd = struct {
     EVENTS_EPDATA: Register = .{},
     EVENTS_USBEVENT: Register = .{},
     EVENTS_USBRESET: Register = .{},
+    HALTED: extern struct {
+        EPIN: [8]Register = @splat(.{}),
+        EPOUT: [8]Register = @splat(.{}),
+    } = .{},
     LOWPOWER: Register = .{ .kind = .lowpower },
     SHORTS: Register = .{},
-    SIZE: struct { EPOUT: [8]Register = @splat(.{}) } = .{},
+    SIZE: extern struct { EPOUT: [8]Register = @splat(.{}) } = .{},
     TASKS_EP0RCVOUT: Register = .{},
     TASKS_EP0STALL: Register = .{},
     TASKS_EP0STATUS: Register = .{},
@@ -135,6 +169,10 @@ const Usbd = struct {
     WVALUEH: Register = .{},
     WVALUEL: Register = .{},
 };
+comptime {
+    if (@offsetOf(Usbd, "disarm_area") != 0)
+        @compileError("the USBD mock must keep USBD + 0x800 .. + 0x808 inside disarm_area");
+}
 var usbd: Usbd = .{};
 pub const chip = struct {
     pub const peripherals = struct {

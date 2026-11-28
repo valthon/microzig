@@ -2,10 +2,10 @@
 //! The IO adapter owns the bounded wait and the register encodings.
 const std = @import("std");
 
-pub fn withdraw(io: anytype) error{Timeout}!void {
+pub fn withdraw(io: anytype, pid: u1) error{Timeout}!void {
     const aborting = io.begin_abort();
     if (aborting and !io.wait_abort()) return error.Timeout;
-    io.withdraw();
+    io.withdraw(pid);
     io.clear_completion();
     if (aborting) io.end_abort();
 }
@@ -23,7 +23,7 @@ const Fake = struct {
     pub fn wait_abort(self: *Fake) bool {
         return self.done;
     }
-    pub fn withdraw(self: *Fake) void {
+    pub fn withdraw(self: *Fake, _: u1) void {
         std.debug.assert(self.aborting);
         self.withdrawn = true;
     }
@@ -39,7 +39,7 @@ const Fake = struct {
 
 test "abort timeout retains buffer ownership and pending completion" {
     var io: Fake = .{ .done = false };
-    try std.testing.expectError(error.Timeout, withdraw(&io));
+    try std.testing.expectError(error.Timeout, withdraw(&io, 1));
     try std.testing.expect(io.aborting);
     try std.testing.expect(!io.withdrawn);
     try std.testing.expect(io.completion);
@@ -47,7 +47,7 @@ test "abort timeout retains buffer ownership and pending completion" {
 
 test "successful abort withdraws the buffer before dropping its completion" {
     var io: Fake = .{ .done = true };
-    try withdraw(&io);
+    try withdraw(&io, 1);
     try std.testing.expect(io.withdrawn);
     try std.testing.expect(!io.completion);
     try std.testing.expect(!io.aborting);

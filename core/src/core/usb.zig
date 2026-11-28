@@ -95,6 +95,24 @@ pub fn DriverInfo(Descriptor: type) type {
 /// USB Device interface
 /// Any device implementation used with DeviceController must implement these functions
 pub const DeviceInterface = struct {
+    pub const EndpointSet = struct {
+        bits: std.StaticBitSet(32) = .empty,
+
+        fn index(ep: types.Endpoint) usize {
+            return @as(usize, @backingInt(ep.dir)) * 16 + @backingInt(ep.num);
+        }
+
+        pub fn contains(self: EndpointSet, ep: types.Endpoint) bool {
+            return self.bits.isSet(index(ep));
+        }
+
+        pub fn set(self: *EndpointSet, ep: types.Endpoint, value: bool) void {
+            self.bits.setValue(index(ep), value);
+        }
+    };
+
+    pub const StallError = error{ NotSupported, Timeout, Unavailable };
+
     pub const VTable = struct {
         ep_writev: *const fn (*DeviceInterface, types.Endpoint.Num, []const []const u8) types.PacketLength,
         ep_readv: *const fn (*DeviceInterface, types.Endpoint.Num, []const []u8) types.PacketLength,
@@ -103,6 +121,9 @@ pub const DeviceInterface = struct {
         /// Disable and disarm all non-control endpoints, discarding old completions.
         /// Called before replacing or deselecting an active configuration.
         ep_close_all: ?*const fn (*DeviceInterface) void = null,
+        /// Preserve armed packets and pending completions. A successful clear resets DATA0.
+        /// On error, leave the endpoint stall state unchanged.
+        ep_set_stall: ?*const fn (*DeviceInterface, types.Endpoint, bool) StallError!void = null,
         set_address: *const fn (*DeviceInterface, u7) void,
         /// The device hands the data stage of a control write to the controller, packet by
         /// packet, and leaves the answer to the request until the controller has seen the
@@ -125,6 +146,9 @@ pub const DeviceInterface = struct {
     };
 
     vtable: *const VTable,
+    halted: EndpointSet = .{},
+    opened: EndpointSet = .{},
+    configuring: bool = false,
 
     /// Called by drivers to send a packet.
     pub fn ep_writev(self: *@This(), ep_num: types.Endpoint.Num, data: []const []const u8) types.PacketLength {
@@ -169,7 +193,27 @@ pub const DeviceInterface = struct {
     /// endpoint was opened again would reach the new configuration's driver as
     /// if its own packet had completed.
     pub fn ep_open(self: *@This(), desc: *const descriptor.Endpoint) void {
-        return self.vtable.ep_open(self, desc);
+        if (desc.endpoint.num != .ep0) {
+            self.halted.set(desc.endpoint, false);
+            self.opened.set(desc.endpoint, true);
+        }
+        self.vtable.ep_open(self, desc);
+    }
+
+    /// Halt an open data endpoint owned by the calling class, after configuration init.
+    /// The host clears the halt. Serialize this call with foreground poll.
+    /// Returns NotOpen during configuration init, for EP0, or for a closed endpoint.
+    pub fn ep_halt(self: *@This(), ep: types.Endpoint) (StallError || error{NotOpen})!void {
+        if (self.configuring or ep.num == .ep0 or !self.opened.contains(ep))
+            return error.NotOpen;
+        return self.set_halt(ep, true);
+    }
+
+    fn set_halt(self: *@This(), ep: types.Endpoint, stalled: bool) StallError!void {
+        const set_stall = self.vtable.ep_set_stall orelse return error.NotSupported;
+        if (stalled and self.halted.contains(ep)) return;
+        try set_stall(self, ep, stalled);
+        self.halted.set(ep, stalled);
     }
 
     /// Immediately sets the device address.
@@ -342,6 +386,7 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
         new_address: u8,
         /// 0 - no config set
         cfg_num: u16,
+        remote_wakeup_enabled: bool = false,
         /// Ep0 data waiting to be sent
         tx_slice: ?[]const u8,
         /// A full final packet short of wLength needs a terminating zero-length packet.
@@ -396,6 +441,7 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
             const ret = switch (setup.request_type.recipient) {
                 .device => self.process_device_setup(device_itf, setup),
                 .interface => self.process_interface_setup(device_itf, setup),
+                .endpoint => self.process_endpoint_setup(device_itf, setup),
                 else => nak,
             };
             if (ret) |data| {
@@ -494,8 +540,9 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
                     switch (request) {
                         .get_status => {
                             const attr = config_descriptor.first.attributes;
-                            const status: types.DeviceStatus = comptime .create(attr.self_powered, false);
-                            return std.mem.asBytes(&status);
+                            const disabled: types.DeviceStatus = comptime .create(attr.self_powered, false);
+                            const enabled: types.DeviceStatus = comptime .create(attr.self_powered, true);
+                            return if (self.remote_wakeup_enabled) std.mem.asBytes(&enabled) else std.mem.asBytes(&disabled);
                         },
                         .set_address => self.new_address = @truncate(setup.value.native()),
                         .set_configuration => self.process_set_config(device_itf, setup.value.native()),
@@ -507,14 +554,12 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
                         else
                             std.mem.asBytes(&config_descriptor.first.configuration_value),
                         .get_descriptor => return get_descriptor(setup.value.native()),
-                        .set_feature => {
-                            const feature: types.FeatureSelector = @fromBackingInt(@intCast(setup.value.native() >> 8));
-                            switch (feature) {
-                                .DeviceRemoteWakeup, .EndpointHalt => {},
-                                // TODO: https://github.com/ZigEmbeddedGroup/microzig/issues/453
-                                .TestMode => return nak,
-                                else => return nak,
-                            }
+                        .set_feature, .clear_feature => {
+                            if (setup.value.native() != @backingInt(types.FeatureSelector.DeviceRemoteWakeup) or
+                                !config_descriptor.first.attributes.can_remote_wakeup or
+                                setup.request_type.direction != .out or setup.index.native() != 0 or
+                                setup.length.native() != 0) return nak;
+                            self.remote_wakeup_enabled = request == .set_feature;
                         },
                         else => {
                             log.warn("Unsupported standard request: {}", .{setup.request});
@@ -527,6 +572,31 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
                     log.warn("Unhandled device setup request: {any}", .{t});
                     return nak;
                 },
+            }
+        }
+
+        fn process_endpoint_setup(self: *@This(), device_itf: *DeviceInterface, setup: *const types.SetupPacket) ?[]const u8 {
+            const index = setup.index.native();
+            if (setup.request_type.type != .standard or index & ~@as(u16, 0x8f) != 0) return nak;
+            const ep: types.Endpoint = @bitCast(@as(u8, @truncate(index)));
+            if (ep.num != .ep0 and (self.cfg_num == 0 or !device_itf.opened.contains(ep))) return nak;
+
+            const request: types.SetupRequest = @fromBackingInt(setup.request);
+            switch (request) {
+                .get_status => {
+                    if (setup.request_type.direction != .in or setup.value.native() != 0 or
+                        setup.length.native() != 2) return nak;
+                    return if (ep.num != .ep0 and device_itf.halted.contains(ep)) &.{ 1, 0 } else &.{ 0, 0 };
+                },
+                .set_feature, .clear_feature => {
+                    if (setup.request_type.direction != .out or setup.length.native() != 0 or
+                        setup.value.native() != @backingInt(types.FeatureSelector.EndpointHalt)) return nak;
+                    const stalled = request == .set_feature;
+                    if (ep.num == .ep0) return if (stalled) nak else ack;
+                    device_itf.set_halt(ep, stalled) catch return nak;
+                    return ack;
+                },
+                else => return nak,
             }
         }
 
@@ -647,12 +717,16 @@ pub fn DeviceController(options: Options, Configurations: []const type) type {
                 configurations[0].deinit(device_itf, data_old);
             }
 
+            device_itf.halted = .{};
+            device_itf.opened = .{};
             self.cfg_num = cfg_num;
             if (cfg_num == 0)
                 self.driver_data = null
             else {
                 // We support just one config for now so ignore config index
                 self.driver_data = @as(configurations[0].RuntimeData, undefined);
+                device_itf.configuring = true;
+                defer device_itf.configuring = false;
                 configurations[0].init(device_itf, &self.driver_data.?, &self.driver_alloc, config_descriptor);
             }
         }
@@ -681,12 +755,17 @@ const TestDevice = struct {
     opened: usize = 0,
     closed: usize = 0,
     data_armed: bool = false,
+    stalled: DeviceInterface.EndpointSet = .{},
+    stall_calls: usize = 0,
+    stall_error: ?DeviceInterface.StallError = null,
+    last_stall_ep: ?types.Endpoint = null,
     record_endpoint_calls: bool = false,
     endpoint_calls: [32]u8 = undefined,
     endpoint_calls_len: usize = 0,
 
     control: ControlRequest = .{},
     listened: usize = 0,
+    read_calls: usize = 0,
     written: usize = 0,
     /// The most an endpoint takes in one write, and what the last write was given credit for.
     packet_size: types.PacketLength = 64,
@@ -724,6 +803,12 @@ const TestDevice = struct {
         .control_out_data = true,
     };
 
+    const vtable_halt: DeviceInterface.VTable = blk: {
+        var table = vtable_control_out;
+        table.ep_set_stall = ep_set_stall;
+        break :blk table;
+    };
+
     fn from(itf: *DeviceInterface) *TestDevice {
         return @fieldParentPtr("interface", itf);
     }
@@ -746,6 +831,7 @@ const TestDevice = struct {
 
     fn ep_readv(itf: *DeviceInterface, _: types.Endpoint.Num, data: []const []u8) types.PacketLength {
         const dev = from(itf);
+        dev.read_calls += 1;
         var rest = dev.rx_packet;
         for (data) |dst| {
             const len = @min(dst.len, rest.len);
@@ -764,15 +850,27 @@ const TestDevice = struct {
         from(itf).listened += 1;
     }
 
-    fn ep_open(itf: *DeviceInterface, _: *const descriptor.Endpoint) void {
-        from(itf).record('o');
-        from(itf).opened += 1;
+    fn ep_open(itf: *DeviceInterface, desc: *const descriptor.Endpoint) void {
+        const dev = from(itf);
+        dev.record('o');
+        dev.opened += 1;
+        dev.stalled.set(desc.endpoint, false);
     }
 
     fn ep_close_all(itf: *DeviceInterface) void {
         from(itf).record('c');
         from(itf).closed += 1;
         from(itf).data_armed = false;
+        from(itf).stalled = .{};
+    }
+
+    fn ep_set_stall(itf: *DeviceInterface, ep: types.Endpoint, stalled: bool) DeviceInterface.StallError!void {
+        const dev = from(itf);
+        dev.record('s');
+        dev.stall_calls += 1;
+        dev.last_stall_ep = ep;
+        if (dev.stall_error) |err| return err;
+        dev.stalled.set(ep, stalled);
     }
 
     fn set_address(itf: *DeviceInterface, address: u7) void {
@@ -1582,6 +1680,242 @@ test "software EP0 stalls unhandled requests and clears the decision at SETUP" {
         try std.testing.expect(!dev.control.needs_stall());
         try std.testing.expect(!dev.control.out_packet()); // status OUT
     }
+}
+
+fn halt_test_controller(comptime remote_wakeup: bool) type {
+    return DeviceController(test_options(), &.{Configuration(.{
+        .attributes = .{ .self_powered = false, .can_remote_wakeup = remote_wakeup },
+        .max_current_ma = 50,
+    }, .{ .serial = drivers.CDC{} })});
+}
+
+const HaltTestController = halt_test_controller(false);
+const halt_test_cdc = HaltTestController.config_descriptor.drv.serial;
+
+fn test_standard_request(recipient: types.RequestType.Recipient, request: types.SetupRequest, index: u16, value: u16) types.SetupPacket {
+    const read = request == .get_status;
+    return .{
+        .request_type = .{ .recipient = recipient, .type = .standard, .direction = if (read) .in else .out },
+        .request = @backingInt(request),
+        .value = .from(value),
+        .index = .from(index),
+        .length = .from(if (read) 2 else 0),
+    };
+}
+
+fn test_endpoint_request(request: types.SetupRequest, ep: types.Endpoint) types.SetupPacket {
+    return test_standard_request(.endpoint, request, @as(u8, @bitCast(ep)), 0);
+}
+
+fn expect_setup_reply(ctl: anytype, dev: *TestDevice, setup: types.SetupPacket, reply: ?[]const u8) !void {
+    const writes = dev.written;
+    dev.control.setup(&setup);
+    ctl.on_setup_req(&dev.interface, &setup);
+    try std.testing.expectEqual(reply == null, dev.control.needs_stall());
+    try std.testing.expectEqual(writes + @intFromBool(reply != null), dev.written);
+    if (reply) |bytes| try std.testing.expectEqualSlices(u8, bytes, dev.last_written_data[0..dev.last_written_len]);
+}
+
+test "endpoint halt requests change only the addressed endpoint and always clear its toggle" {
+    var ctl: HaltTestController = .init;
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_halt } };
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    const in = halt_test_cdc.ep_in.endpoint;
+    const out = halt_test_cdc.ep_out.endpoint;
+
+    for ([_]types.Endpoint{ in, out }) |ep| {
+        const calls = dev.stall_calls;
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(.set_feature, ep), ack);
+        try std.testing.expect(dev.interface.halted.contains(ep));
+        try std.testing.expect(dev.stalled.contains(ep));
+        try std.testing.expectEqual(ep, dev.last_stall_ep.?);
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(.set_feature, ep), ack);
+        try std.testing.expectEqual(calls + 1, dev.stall_calls);
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(.get_status, ep), &.{ 1, 0 });
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(.get_status, if (ep.dir == .in) out else in), &.{ 0, 0 });
+
+        for (0..2) |_| {
+            try expect_setup_reply(&ctl, &dev, test_endpoint_request(.clear_feature, ep), ack);
+            try std.testing.expect(!dev.interface.halted.contains(ep));
+            try std.testing.expect(!dev.stalled.contains(ep));
+            try std.testing.expectEqual(ep, dev.last_stall_ep.?);
+        }
+        // Both clears call the port to reset the data toggle, including the second clear.
+        try std.testing.expectEqual(calls + 3, dev.stall_calls);
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(.get_status, ep), &.{ 0, 0 });
+    }
+}
+
+test "endpoint halt requests report a port failure as a request error" {
+    var ctl: HaltTestController = .init;
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_halt } };
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    const ep = halt_test_cdc.ep_in.endpoint;
+
+    dev.stall_error = error.NotSupported;
+    try expect_setup_reply(&ctl, &dev, test_endpoint_request(.set_feature, ep), nak);
+    try expect_setup_reply(&ctl, &dev, test_endpoint_request(.clear_feature, ep), nak);
+    try std.testing.expectError(error.NotSupported, dev.interface.ep_halt(ep));
+    try std.testing.expectEqual(3, dev.stall_calls);
+    try expect_setup_reply(&ctl, &dev, test_endpoint_request(.get_status, ep), &.{ 0, 0 });
+
+    dev.stall_error = null;
+    try expect_setup_reply(&ctl, &dev, test_endpoint_request(.set_feature, ep), ack);
+    dev.stall_error = error.Unavailable;
+    try expect_setup_reply(&ctl, &dev, test_endpoint_request(.clear_feature, ep), nak);
+    try expect_setup_reply(&ctl, &dev, test_endpoint_request(.get_status, ep), &.{ 1, 0 });
+}
+
+test "endpoint requests reject unopened addresses and validate EP0 and legacy port requests" {
+    var ctl: HaltTestController = .init;
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_halt } };
+    const in = halt_test_cdc.ep_in.endpoint;
+    for ([_]types.SetupRequest{ .get_status, .set_feature, .clear_feature }) |request| {
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(request, in), nak);
+    }
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    for ([_]types.SetupRequest{ .get_status, .set_feature, .clear_feature }) |request| {
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(request, .in(.ep15)), nak);
+    }
+    for ([_]types.Endpoint{ .in(.ep0), .out(.ep0) }) |ep0| {
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(.get_status, ep0), &.{ 0, 0 });
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(.set_feature, ep0), nak);
+        try expect_setup_reply(&ctl, &dev, test_endpoint_request(.clear_feature, ep0), ack);
+    }
+    var invalid = test_endpoint_request(.get_status, in);
+    invalid.index = .from(invalid.index.native() | 0x100);
+    try expect_setup_reply(&ctl, &dev, invalid, nak);
+    invalid = test_endpoint_request(.get_status, in);
+    invalid.length = .from(1);
+    try expect_setup_reply(&ctl, &dev, invalid, nak);
+    invalid = test_endpoint_request(.set_feature, in);
+    invalid.value = .from(0x100);
+    try expect_setup_reply(&ctl, &dev, invalid, nak);
+    invalid = test_endpoint_request(.clear_feature, in);
+    invalid.length = .from(1);
+    try expect_setup_reply(&ctl, &dev, invalid, nak);
+    try std.testing.expectEqual(0, dev.stall_calls);
+
+    var legacy_ctl: HaltTestController = .init;
+    var legacy: TestDevice = .{};
+    legacy_ctl.on_setup_req(&legacy.interface, &test_set_configuration(1));
+    try expect_setup_reply(&legacy_ctl, &legacy, test_endpoint_request(.get_status, in), &.{ 0, 0 });
+    try expect_setup_reply(&legacy_ctl, &legacy, test_endpoint_request(.set_feature, in), nak);
+    try expect_setup_reply(&legacy_ctl, &legacy, test_endpoint_request(.clear_feature, in), nak);
+    try std.testing.expectError(error.NotSupported, legacy.interface.ep_halt(in));
+}
+
+test "class halt rejects unopened endpoints, EP0 and calls during configuration init" {
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_halt } };
+    const ep = halt_test_cdc.ep_in.endpoint;
+    try std.testing.expectError(error.NotOpen, dev.interface.ep_halt(ep));
+
+    // Mark EP0 open to exercise the EP0 guard independently of the opened check.
+    for ([_]types.Endpoint{ .in(.ep0), .out(.ep0) }) |ep0| {
+        dev.interface.opened.set(ep0, true);
+        try std.testing.expectError(error.NotOpen, dev.interface.ep_halt(ep0));
+    }
+
+    dev.interface.opened.set(ep, true);
+    dev.interface.configuring = true;
+    try std.testing.expectError(error.NotOpen, dev.interface.ep_halt(ep));
+
+    try std.testing.expectEqual(0, dev.stall_calls);
+    try std.testing.expectEqual(0, dev.interface.halted.bits.count());
+}
+
+test "configuration selection and bus reset retire endpoint halts" {
+    var ctl: HaltTestController = .init;
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_halt } };
+    const endpoints = [_]types.Endpoint{ halt_test_cdc.ep_in.endpoint, halt_test_cdc.ep_out.endpoint };
+    for (0..3) |step| {
+        ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+        for (endpoints) |ep| try dev.interface.ep_halt(ep);
+        switch (step) {
+            0 => ctl.on_setup_req(&dev.interface, &test_set_configuration(1)),
+            1 => ctl.on_setup_req(&dev.interface, &test_set_configuration(0)),
+            2 => ctl.on_bus_reset(&dev.interface),
+            else => unreachable,
+        }
+        for (endpoints) |ep| {
+            try std.testing.expect(!dev.interface.halted.contains(ep));
+            try std.testing.expect(!dev.stalled.contains(ep));
+            try std.testing.expectEqual(step == 0, dev.interface.opened.contains(ep));
+            try expect_setup_reply(&ctl, &dev, test_endpoint_request(.get_status, ep), if (step == 0) &.{ 0, 0 } else nak);
+        }
+    }
+}
+
+test "reopening a halted endpoint in the active configuration clears its halt" {
+    var ctl: HaltTestController = .init;
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_halt } };
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    const desc = &halt_test_cdc.ep_in;
+    const ep = desc.endpoint;
+    try dev.interface.ep_halt(ep);
+    try dev.interface.ep_halt(halt_test_cdc.ep_out.endpoint);
+    dev.interface.ep_open(desc);
+
+    try std.testing.expect(dev.interface.opened.contains(ep));
+    try std.testing.expect(!dev.stalled.contains(ep));
+    try expect_setup_reply(&ctl, &dev, test_endpoint_request(.get_status, ep), &.{ 0, 0 });
+    try expect_setup_reply(&ctl, &dev, test_endpoint_request(.get_status, halt_test_cdc.ep_out.endpoint), &.{ 1, 0 });
+    try expect_setup_reply(&ctl, &dev, test_endpoint_request(.set_feature, ep), ack);
+    try std.testing.expect(dev.stalled.contains(ep));
+    try std.testing.expectEqual(3, dev.stall_calls);
+}
+
+test "device feature requests use all of wValue and report the remote wakeup enable bit" {
+    const get = test_standard_request(.device, .get_status, 0, 0);
+    var disabled: HaltTestController = .init;
+    var enabled: halt_test_controller(true) = .init;
+    var dev: TestDevice = .{};
+    for ([_]types.SetupRequest{ .set_feature, .clear_feature }) |request| {
+        try expect_setup_reply(&disabled, &dev, test_standard_request(.device, request, 0, 1), nak);
+        for ([_]u16{ 0, 0x0100, 0x0101 }) |invalid|
+            try expect_setup_reply(&enabled, &dev, test_standard_request(.device, request, 0, invalid), nak);
+    }
+    try expect_setup_reply(&disabled, &dev, get, &.{ 0, 0 });
+    try expect_setup_reply(&enabled, &dev, get, &.{ 0, 0 });
+    const set = test_standard_request(.device, .set_feature, 0, 1);
+    try expect_setup_reply(&enabled, &dev, set, ack);
+    for ([_]u16{ 1, 1, 0 }) |value| {
+        try expect_setup_reply(&enabled, &dev, test_set_configuration(value), ack);
+        try expect_setup_reply(&enabled, &dev, get, &.{ 2, 0 });
+    }
+    try expect_setup_reply(&enabled, &dev, test_standard_request(.device, .clear_feature, 0, 1), ack);
+    try expect_setup_reply(&enabled, &dev, get, &.{ 0, 0 });
+    try expect_setup_reply(&enabled, &dev, set, ack);
+    enabled.on_bus_reset(&dev.interface);
+    try expect_setup_reply(&enabled, &dev, get, &.{ 0, 0 });
+}
+
+test "a class halt calls only ep_set_stall and leaves CDC awaiting completion" {
+    const in = halt_test_cdc.ep_in.endpoint;
+    var ctl: HaltTestController = .init;
+    var dev: TestDevice = .{ .interface = .{ .vtable = &TestDevice.vtable_halt } };
+    ctl.on_setup_req(&dev.interface, &test_set_configuration(1));
+    const serial = &ctl.drivers().?.serial;
+    try std.testing.expectEqual(5, serial.write("first"));
+    try std.testing.expect(serial.flush());
+
+    const writes = dev.written;
+    const listens = dev.listened;
+    const reads = dev.read_calls;
+    const address = dev.address;
+    dev.record_endpoint_calls = true;
+    try dev.interface.ep_halt(in);
+    try dev.interface.ep_halt(in);
+    try std.testing.expectEqualStrings("s", dev.endpoint_calls[0..dev.endpoint_calls_len]);
+    try std.testing.expectEqual(writes, dev.written);
+    try std.testing.expectEqual(listens, dev.listened);
+    try std.testing.expectEqual(reads, dev.read_calls);
+    try std.testing.expectEqual(address, dev.address);
+
+    try std.testing.expectEqual(4, serial.write("next"));
+    try std.testing.expect(!serial.flush());
+    ctl.on_buffer(&dev.interface, in);
+    try std.testing.expect(serial.flush());
 }
 
 test "SET_CONFIGURATION with the current value opens the endpoints again" {
