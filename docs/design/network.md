@@ -1,6 +1,6 @@
 # Network and lwIP
 
-Covers: modules/network/, modules/lwip/, modules/foundation-libc/, drivers/build.zig, drivers/src/root.zig, drivers/src/wireless/cyw43439.zig, drivers/src/wireless/cyw43439/, port/raspberrypi/rp2xxx/build.zig, port/raspberrypi/rp2xxx/src/hal/drivers.zig, examples/raspberrypi/rp2xxx/build.zig, examples/raspberrypi/rp2xxx/src/net/, examples/espressif/esp/build.zig, examples/espressif/esp/src/lwip/, examples/espressif/esp/src/tcp_server.zig, examples/espressif/esp/src/softap.zig, examples/espressif/esp/src/softap_dhcp.zig, examples/espressif/esp/src/selftest_wifi_checks.zig, examples/espressif/esp/src/selftest_wifi_softap_echo.zig, examples/espressif/esp/src/selftest_coex_wifi_ble.zig, port/espressif/esp/src/hal/rtos.zig, port/espressif/esp/src/hal/radio.zig, port/espressif/esp/src/hal/radio/, port/espressif/esp/README.md
+Covers: modules/network/, modules/lwip/, modules/foundation-libc/, drivers/build.zig, drivers/src/root.zig, drivers/src/wireless/cyw43439.zig, drivers/src/wireless/cyw43439/, port/raspberrypi/rp2xxx/build.zig, port/raspberrypi/rp2xxx/src/hal/drivers.zig, examples/raspberrypi/rp2xxx/build.zig, examples/raspberrypi/rp2xxx/src/net/, examples/espressif/esp/build.zig, examples/espressif/esp/src/lwip/, examples/espressif/esp/src/tcp_server.zig, examples/espressif/esp/src/softap.zig, examples/espressif/esp/src/selftest_wifi_checks.zig, examples/espressif/esp/src/selftest_wifi_softap_echo.zig, examples/espressif/esp/src/selftest_coex_wifi_ble.zig, port/espressif/esp/src/hal/rtos.zig, port/espressif/esp/src/hal/radio.zig, port/espressif/esp/src/hal/radio/, port/espressif/esp/README.md
 
 ## Purpose
 
@@ -131,6 +131,19 @@ within the remaining buffer.
   bus status word. Preserve the four-byte alignment and accessible tail padding
   for the TX adapter's word-rounded transfer. The driver reports association as
   link state and checks firmware credit before writing TX.
+- `drivers/src/wireless/cyw43439/wifi.zig:start_ap` makes the same link an access point:
+  it marks the station join events done, so link state follows the chip's link event. In the
+  access point role, ioctls wait longer while the AP starts, and link state follows only the
+  link event: `deauth_ind` (one per departing station) and the station `auth`, `psk_sup` and
+  `set_ssid` events are ignored, and a link drop sets no `err`. Station mode keeps the short
+  wait and still fails authentication on `deauth_ind`. With no join or access point in progress
+  (role `.none`, as after `stop_ap`), join events are ignored. A join in progress stays
+  `.joining` until an essential event (`auth`, `link`, `psk_sup`, `set_ssid`, or a station's
+  `deauth_ind`) decides it, and scan results never change join state. `join` and `start_ap`
+  check the SSID and passphrase lengths against what their fixed buffers hold, and return
+  `error.InvalidSsid` or `error.InvalidPassphrase` before they talk to the chip.
+  `examples/raspberrypi/rp2xxx/src/net/access_point.zig:main` serves DHCP from
+  [DHCPv4 server](dhcp-server.md) and a TCP echo.
 - In `examples/raspberrypi/rp2xxx/src/net/irq.zig:main`, GPIO masks the source and posts a wake.
   The HAL also masks the pin around SPI transfers and restores its previous state. Foreground drains RX, and
   `drivers/src/wireless/cyw43439/wifi.zig:read` asks the HAL to re-arm when the interrupt
@@ -151,10 +164,15 @@ within the remaining buffer.
 ## Evidence
 
 - `drivers/src/wireless/cyw43439/wifi.zig` defines "events to join_state" for association
-  state and "receive capacity rejects oversized packets and polls full Ethernet frames"
+  state, "deauth_ind ends a station association but not an access point", "an access point
+  link drop sets no error and recovers" and "an access point follows only its link, not station
+  join events" for the role split, "join events after stop_ap or a failed start are ignored",
+  "a driver with no join or access point ignores join events but takes scan results",
+  "a station join survives scan and association events before any essential event",
+  "join rejects credentials its buffers cannot hold" for the length checks,
+  and "receive capacity rejects oversized packets and polls full Ethernet frames"
   for checking RX capacity before the bus read. No build test step includes these tests.
-- `zig build test` in `examples/espressif/esp/` runs "DHCP allocation, renewal, collision, release, exhaustion and expiry"
-  in `examples/espressif/esp/src/softap_dhcp.zig`, covering the AP's lease logic.
+- The AP's DHCP server and its tests are in [DHCPv4 server](dhcp-server.md).
 - The ESP port README records station DHCP and TCP echo between an ESP32-C3 and a XIAO ESP32-C6
   in both roles. Build the images in `examples/espressif/esp/` with `-Dexample=selftest_wifi_softap_echo` and `-Dexample=softap`.
   [ESP Wi-Fi self-tests](../../port/espressif/esp/README.md#wi-fi-station-and-rtos)
@@ -172,7 +190,7 @@ within the remaining buffer.
 - `modules/network/src/root.zig:Udp.bind` stores its callback before bind succeeds, so retry can panic. ([#62](https://github.com/valthon/microzig/issues/62))
 - `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Connection.close` sets `.closed` while the old PCB can still call the wrapper on data ACKs or reset during FIN processing, so `.closed` is unsafe as a reuse signal. ([#80](https://github.com/valthon/microzig/issues/80))
-- `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` recycles session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))
+- `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` and `examples/raspberrypi/rp2xxx/src/net/access_point.zig:on_accept` recycle session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Server.bind` passes the result of `tcp_listen` onward without checking for null. ([#63](https://github.com/valthon/microzig/issues/63))
 - `modules/network/src/root.zig:Endpoint.parse` and `Interface.Options.Fixed.init` pass slice pointers to C parsers that expect NUL termination. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Endpoint.format` always formats the address as IPv4. ([#64](https://github.com/valthon/microzig/issues/64))

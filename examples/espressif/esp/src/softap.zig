@@ -14,7 +14,19 @@ var wifi: radio.wifi.Wifi = .{};
 const usb_serial_jtag = hal.usb_serial_jtag;
 
 const options = @import("softap_options");
-const dhcp = @import("softap_dhcp.zig");
+const dhcp = @import("dhcp_server");
+// Stations the access point admits (`max_connections`).
+const max_stations = 4;
+// A lease ends only by its holder's own message or by expiry, so a station that leaves without
+// RELEASE keeps its address for up to the lease time, one hour. With twice as many leases as
+// stations, and each station using one MAC, every admitted station finds an address while
+// departed clients' leases, declined addresses and offers no admitted station has taken up
+// together hold at most `max_stations` entries; a returning station gets its own entry back.
+// docs/design/dhcp-server.md (Pool sizing).
+const Dhcp = dhcp.Server(.{ .lease_count = 2 * max_stations, .lease_ms = 3600 * std.time.ms_per_s });
+comptime {
+    if (max_stations > radio.wifi.max_ap_stations) @compileError("the soft-AP holds at most max_ap_stations stations");
+}
 const exports = @import("lwip/exports.zig");
 const lwip = @import("lwip/include.zig");
 
@@ -67,9 +79,8 @@ pub const microzig_options: microzig.Options = .{
 var ap_netif: lwip.c.netif = undefined;
 var ap_started: std.atomic.Value(bool) = .init(false);
 var serving: std.atomic.Value(bool) = .init(false);
-var station_count: std.atomic.Value(u32) = .init(0);
-// Accessed only with the lwIP core mutex held (including UDP callbacks/output).
-var dhcp_server: dhcp.Server = .{};
+// Accessed only by dhcp_receive, with the lwIP core lock held.
+var dhcp_server: Dhcp = .{};
 var packet_buf: [1600]u8 = undefined;
 
 extern fn netconn_new_with_proto_and_callback(t: lwip.c.enum_netconn_type, proto: lwip.c.u8_t, callback: ?*const anyopaque) [*c]lwip.c.struct_netconn;
@@ -83,8 +94,8 @@ pub fn main() !void {
     try wifi.init(gpa, .{});
     exports.gpa = gpa;
     lwip.c.tcpip_init(null, null);
-    const ip = ipv4(dhcp.gateway);
-    const mask = ipv4(.{ 255, 255, 255, 0 });
+    const ip = ipv4(Dhcp.server_ip);
+    const mask = ipv4(Dhcp.netmask);
     try lwip.c_err(lwip.c.netifapi_netif_add(
         &ap_netif,
         &ip.u_addr.ip4,
@@ -100,7 +111,7 @@ pub fn main() !void {
         .password = options.password,
         .auth_method = .wpa2_personal,
         .channel = 6,
-        .max_connections = dhcp.max_stations,
+        .max_connections = max_stations,
     } });
     try wifi.start();
     const deadline = microzig.drivers.time.Deadline.init_relative(hal.time.get_time_since_boot(), .from_ms(10_000));
@@ -161,7 +172,12 @@ fn reporter() void {
 
 fn report() void {
     if (serving.load(.acquire) and ap_started.load(.acquire)) {
-        std.log.info("SOFTAP up ssid={s} ip=192.168.4.1 stations={d} tcp=7", .{ options.ssid, station_count.load(.monotonic) });
+        if (wifi.get_ap_station_count()) |count| {
+            std.log.info("SOFTAP up ssid={s} ip=192.168.4.1 stations={d} tcp=7", .{ options.ssid, count });
+        } else |err| {
+            std.log.warn("SOFTAP warning: station count: {t}", .{err});
+            std.log.info("SOFTAP up ssid={s} ip=192.168.4.1 stations=unknown tcp=7", .{options.ssid});
+        }
     } else std.log.info("SOFTAP waiting ssid={s}", .{options.ssid});
 }
 
@@ -169,25 +185,24 @@ fn on_wifi_event(event: radio.wifi.Event) void {
     switch (event) {
         .ApStart => ap_started.store(true, .release),
         .ApStop => ap_started.store(false, .release),
-        inline .ApStaconnected, .ApStadisconnected => |station, tag| {
-            if (tag == .ApStaconnected) {
-                _ = station_count.fetchAdd(1, .monotonic);
-            } else {
-                _ = station_count.fetchSub(1, .monotonic);
-            }
-            std.log.info("SOFTAP {s} mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} aid={d}", .{
-                if (tag == .ApStaconnected) "join" else "leave",
-                station.mac[0],
-                station.mac[1],
-                station.mac[2],
-                station.mac[3],
-                station.mac[4],
-                station.mac[5],
-                station.aid,
+        .ApStaconnected => |station| {
+            const m = station.mac;
+            std.log.info("SOFTAP join mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} aid={d}", .{
+                m[0], m[1], m[2], m[3], m[4], m[5], station.aid,
+            });
+        },
+        .ApStadisconnected => |station| {
+            const m = station.mac;
+            std.log.info("SOFTAP leave mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} aid={d} reason={d}", .{
+                m[0], m[1], m[2], m[3], m[4], m[5], station.aid, station.reason,
             });
         },
         else => {},
     }
+}
+
+fn now_ms() u32 {
+    return @truncate(hal.time.get_time_since_boot().to_us() / 1000);
 }
 
 fn ipv4(bytes: [4]u8) lwip.c.ip_addr_t {
@@ -202,17 +217,17 @@ fn start_dhcp() !void {
     const pcb = lwip.c.udp_new_ip_type(lwip.c.IPADDR_TYPE_V4) orelse return error.OutOfMemory;
     errdefer lwip.c.udp_remove(pcb);
     const any = ipv4(.{ 0, 0, 0, 0 });
-    try lwip.c_err(lwip.c.udp_bind(pcb, &any, 67));
+    try lwip.c_err(lwip.c.udp_bind(pcb, &any, dhcp.server_port));
     lwip.c.udp_bind_netif(pcb, &ap_netif);
     lwip.c.udp_recv(pcb, dhcp_receive, null);
 }
 
 fn dhcp_receive(_: ?*anyopaque, pcb: [*c]lwip.c.udp_pcb, p: [*c]lwip.c.pbuf, _: [*c]const lwip.c.ip_addr_t, port: u16) callconv(.c) void {
     defer _ = lwip.c.pbuf_free(p);
-    if (port != 68 or p.*.tot_len > 1500) return;
+    if (port != dhcp.client_port or p.*.tot_len > 1500) return;
     var input: [1500]u8 = undefined;
     const len = lwip.c.pbuf_copy_partial(p, &input, p.*.tot_len, 0);
-    const reply = dhcp_server.receive(input[0..len], @truncate(hal.time.get_time_since_boot().to_us() / 1000)) orelse return;
+    const reply = dhcp_server.receive(input[0..len], now_ms()) orelse return;
     const out = lwip.c.pbuf_alloc(lwip.c.PBUF_TRANSPORT, reply.bytes.len, lwip.c.PBUF_RAM) orelse {
         std.log.err("SOFTAP DHCP: out of memory", .{});
         return;
@@ -223,7 +238,7 @@ fn dhcp_receive(_: ?*anyopaque, pcb: [*c]lwip.c.udp_pcb, p: [*c]lwip.c.pbuf, _: 
         return;
     };
     const dest = ipv4(reply.destination);
-    lwip.c_err(lwip.c.udp_sendto_if(pcb, out, &dest, 68, &ap_netif)) catch |err| {
+    lwip.c_err(lwip.c.udp_sendto_if(pcb, out, &dest, dhcp.client_port, &ap_netif)) catch |err| {
         std.log.err("SOFTAP DHCP send: {t}", .{err});
         return;
     };

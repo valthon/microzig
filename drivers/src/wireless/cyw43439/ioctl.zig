@@ -20,6 +20,10 @@ const log = std.log.scoped(.cyw43_ioctl);
 
 // Time to wait for ioctl response (msec)
 pub const response_wait = response_poll_interval * 8;
+// Time to wait for ioctl response while an access point is being started (msec).
+// Upstream's AP author reports slow answers after a WPA3 passphrase in AP mode
+// (ZigEmbeddedGroup/microzig#1147); not measured here.
+pub const ap_start_response_wait = response_poll_interval * 32;
 // Polling interval for ioctl responses
 pub const response_poll_interval = 10;
 
@@ -91,9 +95,11 @@ pub const Cmd = enum(u32) {
     set_infra = 20,
     set_auth = 22,
     set_ssid = 26,
+    set_channel = 30,
     set_antdiv = 64,
     set_pm = 86,
     set_gmode = 110,
+    set_ap = 118,
     set_wsec = 134,
     set_band = 142,
     set_wpa_auth = 165,
@@ -707,13 +713,23 @@ pub const EventStatus = enum(u32) {
     _,
 };
 
+test "sae pwd encode sends the whole zero-padded structure" {
+    var buf: [sae_pwd_encoded_len]u8 = @splat(0xaa);
+    const out = encode_sae_pwd(&buf, "microzig-demo");
+    try testing.expectEqual(@as(usize, 130), out.len);
+    try testing.expectEqualSlices(u8, &.{ 13, 0 }, out[0..2]);
+    try testing.expectEqualSlices(u8, "microzig-demo", out[2..15]);
+    for (out[15..]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
 test "pwd encode" {
     var buf: [36]u8 = @splat(0);
+    var max_buf: [pwd_encoded_max_len]u8 = undefined;
 
     try testing.expectEqualSlices(
         u8,
         &hex_to_bytes("0A0001005065726F5A6465726F31"),
-        encode_pwd(&buf, "PeroZdero1"),
+        encode_pwd(&max_buf, "PeroZdero1"),
     );
 
     try testing.expectEqualSlices(
@@ -721,24 +737,56 @@ test "pwd encode" {
         &hex_to_bytes("080000006E696E617A617261"),
         encode_ssid(&buf, "ninazara"),
     );
+
+    // The longest passphrase fills the buffer sized for it.
+    const longest: [pwd_max_len]u8 = @splat('p');
+    const encoded = encode_pwd(&max_buf, &longest);
+    try testing.expectEqual(max_buf.len, encoded.len);
+    try testing.expectEqualSlices(u8, &.{ pwd_max_len, 0, 1, 0 }, encoded[0..4]);
 }
 
-pub fn encode_pwd(buf: []u8, pwd: []const u8) []u8 {
+/// Longest WPA or WPA2 passphrase (IEEE 802.11, Annex J.4).
+pub const pwd_max_len = 63;
+/// Bytes of an encoded passphrase of `pwd_max_len`: a little-endian u32 of the length and a
+/// flag, then the passphrase.
+pub const pwd_encoded_max_len = 4 + pwd_max_len;
+
+/// `pwd` must be at most `pwd_max_len` bytes.
+pub fn encode_pwd(buf: *[pwd_encoded_max_len]u8, pwd: []const u8) []u8 {
     mem.writeInt(u32, buf[0..4], @intCast(pwd.len | 0x10000), .little);
     @memcpy(buf[4..][0..pwd.len], pwd);
     return buf[0 .. 4 + pwd.len];
 }
 
-pub fn encode_sae_pwd(buf: []u8, pwd: []const u8) []u8 {
-    mem.writeInt(u16, buf[0..2], @intCast(pwd.len), .little);
-    @memcpy(buf[2..][0..pwd.len], pwd);
-    return buf[0 .. 2 + pwd.len];
+/// Longest SAE password the `sae_password` iovar holds.
+pub const sae_pwd_max_len = 128;
+/// Bytes of an encoded `sae_password`: a little-endian u16 length, then the password
+/// zero-padded to `sae_pwd_max_len`. The whole structure is sent, as by georgerobotics/cyw43-driver
+/// (`cyw43_ll.c`, `2 + CYW43_WPA_SAE_MAX_PASSWORD_LEN`), embassy-rs cyw43 (`SaePassphraseInfo`)
+/// and this tree's `drivers/src/wireless/cyw43` (`SAE_PassphraseInfo`).
+pub const sae_pwd_encoded_len = 2 + sae_pwd_max_len;
+
+/// `pwd` must be at most `sae_pwd_max_len` bytes.
+pub fn encode_sae_pwd(buf: *[sae_pwd_encoded_len]u8, pwd: []const u8) []u8 {
+    const out = buf;
+    @memset(out, 0);
+    mem.writeInt(u16, out[0..2], @intCast(pwd.len), .little);
+    @memcpy(out[2..][0..pwd.len], pwd);
+    return out;
 }
 
+/// `buf` must hold `4 + ssid.len` bytes.
 pub fn encode_ssid(buf: []u8, ssid: []const u8) []u8 {
     mem.writeInt(u32, buf[0..4], @intCast(ssid.len), .little);
     @memcpy(buf[4..][0..ssid.len], ssid);
     return buf[0 .. 4 + ssid.len];
+}
+
+/// `buf` must hold `8 + ssid.len` bytes.
+pub fn encode_ap_ssid(buf: []u8, ssid: []const u8) []u8 {
+    mem.writeInt(u32, buf[0..4], 0, .little);
+    const encoded_ssid = encode_ssid(buf[4..], ssid);
+    return buf[0 .. 4 + encoded_ssid.len];
 }
 
 pub fn bytes_to_words(bytes: []const u8) struct { []const u32, ?u32 } {

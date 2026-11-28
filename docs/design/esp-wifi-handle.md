@@ -83,7 +83,15 @@ options and refusing a handle whose earlier calls have not all returned (`WifiSe
 The cache update and the routing decision happen in one critical section. `Options.on_event` runs
 afterwards, in the task that posted the event (observed to be the Wi-Fi task for station events), so it can still
 run after `deinit` released the handle; it is given the event by value. Teardown from `on_event`
-is refused or times out (see `Wifi.stop`): schedule it from an application task.
+is refused or times out (see `Wifi.stop`): schedule it from an application task. The soft-AP
+station count `get_ap_station_count` belongs in an application task too. The blob answers it in
+the Wi-Fi task: a caller in another task waits for the Wi-Fi task to run the request, and a caller
+that is the Wi-Fi task runs it inline (`ieee80211_ioctl` and `current_task_is_wifi_task`, C3 and
+C6 `libnet80211.a`); from `on_event` the answer can come before the blob has finished the
+station change the event reports. From another task, the caller must not hold a lock the Wi-Fi
+task can take. It returns `InvalidStationCount` for a count outside the blob's station list,
+whose length, `max_ap_stations`, also bounds `Config.AccessPoint.max_connections`: `apply`
+rejects a larger value with `InvalidConfig`.
 
 ### Entry points × phases
 
@@ -94,7 +102,7 @@ is refused or times out (see `Wifi.stop`): schedule it from an application task.
 | `stop` | `WifiNotInitialized` | `WouldBlock` | runs | waits for the running stop (2) | `WouldBlock` |
 | `connect` | `WifiNotInitialized` | `WouldBlock` | runs | `WifiStopping` | `WouldBlock` |
 | `disconnect` | `WifiNotInitialized` | `WouldBlock` | runs (3) | runs (3) | `WouldBlock` |
-| `start`, `set_mode`, `apply`, `get_mode`, `scan`, `send_packet`, `get_sta_rssi`, `set_protocol`, `set_inactive_time`, `set_power_save_mode`, `apply_station_config`, `Interface.is_active`, `ScanResultsIterator.next`/`deinit` | `WifiNotInitialized` | `WouldBlock` | runs (4) | runs (4) | `WouldBlock` |
+| `start`, `set_mode`, `apply`, `get_mode`, `scan`, `send_packet`, `get_sta_rssi`, `get_ap_station_count`, `set_protocol`, `set_inactive_time`, `set_power_save_mode`, `apply_station_config`, `Interface.is_active`, `ScanResultsIterator.next`/`deinit` | `WifiNotInitialized` | `WouldBlock` | runs (4) | runs (4) | `WouldBlock` |
 | `get_sta_state`, `get_ap_state` | last cached state | cached | cached | cached | cached |
 
 1. In a coexistence image, `init` on the owning handle returns success without reading its

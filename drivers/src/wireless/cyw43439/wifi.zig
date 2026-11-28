@@ -16,6 +16,8 @@ log_state: LogState = .{},
 
 event_log: EventLog = .{},
 join_state: JoinState = .none,
+role: Role = .none,
+response_wait: u32 = ioctl.response_wait,
 scan_state: ScanState = .none,
 scan_result: ?ScanResult = null,
 err: ?anyerror = null,
@@ -334,7 +336,7 @@ fn request(self: *Self, cmd: ioctl.Cmd, name: []const u8, data: []const u8) !voi
 fn response_poll(self: *Self, cmd: ioctl.Cmd, data: ?[]u8) !usize {
     var bytes: [ioctl_response_bytes_len]u8 align(4) = undefined;
     var delay: usize = 0;
-    while (delay < ioctl.response_wait) {
+    while (delay < self.response_wait) {
         var rsp, _ = try self.read(&bytes) orelse {
             self.sleep_ms(ioctl.response_poll_interval);
             delay += ioctl.response_poll_interval;
@@ -376,8 +378,25 @@ pub const JoinOptions = struct {
     };
 };
 
+/// Checks what `join` encodes into fixed buffers: an SSID of 1 to 32 bytes, and a password of
+/// 8 to 63 characters for WPA and WPA2 (IEEE 802.11, Annex J.4; 64 would be a hex PSK, which
+/// `set_wsec_pmk` is not told about) or of 8 to `ioctl.sae_pwd_max_len` bytes for WPA3 SAE.
+/// Open networks take no password.
+fn check_join_credentials(ssid: []const u8, pwd: []const u8, security: JoinOptions.Security) error{ InvalidSsid, InvalidPassphrase }!void {
+    if (ssid.len == 0 or ssid.len > 32) return error.InvalidSsid;
+    const min_pwd_len = 8;
+    const max_pwd_len: usize = switch (security) {
+        .open => return,
+        .wpa_psk, .wpa2_psk => ioctl.pwd_max_len,
+        .wpa3_sae => ioctl.sae_pwd_max_len,
+    };
+    if (pwd.len < min_pwd_len or pwd.len > max_pwd_len) return error.InvalidPassphrase;
+}
+
 pub fn join(self: *Self, ssid: []const u8, pwd: []const u8, opt: JoinOptions) !JoinPoller {
-    self.err = null;
+    try check_join_credentials(ssid, pwd, opt.security);
+    self.begin(.station);
+    errdefer self.reset_join_state();
 
     var buf: [64]u8 = @splat(0); // space for 10 addresses
     // Enable multicast
@@ -408,10 +427,12 @@ pub fn join(self: *Self, ssid: []const u8, pwd: []const u8, opt: JoinOptions) !J
     switch (opt.security) {
         .open => {},
         .wpa3_sae => {
-            try self.set_var("sae_password", ioctl.encode_sae_pwd(&buf, pwd));
+            var sae_buf: [ioctl.sae_pwd_encoded_len]u8 = undefined;
+            try self.set_var("sae_password", ioctl.encode_sae_pwd(&sae_buf, pwd));
         },
         else => {
-            try self.set_cmd(.set_wsec_pmk, ioctl.encode_pwd(&buf, pwd));
+            var pwd_buf: [ioctl.pwd_encoded_max_len]u8 = undefined;
+            try self.set_cmd(.set_wsec_pmk, ioctl.encode_pwd(&pwd_buf, pwd));
         },
     }
     try self.set_cmd(.set_infra, &.{1});
@@ -439,7 +460,6 @@ pub fn join(self: *Self, ssid: []const u8, pwd: []const u8, opt: JoinOptions) !J
         self.event_log.psk_sup = .success;
     }
 
-    self.join_state = .joining;
     return .{ .parent = self };
 }
 
@@ -514,6 +534,137 @@ pub const JoinPoller = struct {
     }
 };
 
+pub const ApOptions = struct {
+    security: Security = .wpa2_psk,
+    channel: u8 = 5,
+
+    pub const Security = enum {
+        open,
+        wpa_psk,
+        wpa2_psk,
+        wpa3_sae,
+    };
+};
+
+pub fn start_ap(
+    self: *Self,
+    ssid: []const u8,
+    pwd: []const u8,
+    opt: ApOptions,
+) !void {
+    // Fits the encoded SSID, the WPA2 passphrase and the encoded SAE password.
+    var buf: [@max(64 + @sizeOf(u32) * 2, ioctl.sae_pwd_encoded_len)]u8 = undefined;
+    if (ssid.len == 0 or ssid.len > 32) {
+        log.err("SSID length must be between 1 and 32. Length was {}.", .{ssid.len});
+        return error.InvalidSsid;
+    }
+    if (opt.channel < 1 or opt.channel > 14) {
+        log.err("Channel must be between 1 and 14. Channel was {}.", .{opt.channel});
+        return error.InvalidChannel;
+    }
+    // Check passphrase length, as embassy-rs does. 63 is the longest WPA passphrase
+    // (IEEE 802.11, Annex J.4); 64 characters would be a hex PSK, which set_wsec_pmk
+    // is not told about.
+    const min_pwd_len = 8;
+    const max_pwd_len = ioctl.pwd_max_len;
+    if (opt.security != .open and (min_pwd_len > pwd.len or pwd.len > max_pwd_len)) {
+        log.err(
+            "Password length must be between {} and {}. Length was {}.",
+            .{ min_pwd_len, max_pwd_len, pwd.len },
+        );
+        return error.InvalidPassphrase;
+    }
+
+    // Only AP setup waits longer for responses; station error paths keep the short wait.
+    self.response_wait = ioctl.ap_start_response_wait;
+    defer self.response_wait = ioctl.response_wait;
+    self.begin(.access_point);
+    errdefer self.reset_join_state();
+
+    try self.set_var("apsta", &.{0});
+    self.sleep_ms(10);
+
+    try self.set_cmd(.set_auth, &.{0});
+    self.sleep_ms(10);
+
+    try self.set_cmd(.set_ap, &.{1});
+    self.sleep_ms(10);
+
+    try self.set_var("bsscfg:ssid", ioctl.encode_ap_ssid(&buf, ssid));
+    self.sleep_ms(10);
+    self.event_log.set_ssid = .success;
+
+    try self.set_cmd(.set_channel, std.mem.asBytes(&@as(u32, opt.channel)));
+    self.sleep_ms(10);
+
+    const wsec: u32 = switch (opt.security) {
+        .open => 0,
+        else => 4,
+    };
+    try self.set_var("bsscfg:wsec", std.mem.asBytes(&[_]u32{ 0, wsec }));
+    self.sleep_ms(10);
+
+    try self.set_var("mfp", &.{switch (opt.security) {
+        .open, .wpa_psk, .wpa2_psk => 0, // none
+        .wpa3_sae => 2, // required
+    }});
+    self.sleep_ms(10);
+
+    const wpa_auth: [8]u8 = [4]u8{ 0, 0, 0, 0 } ++ switch (opt.security) {
+        .wpa_psk => [4]u8{ 0x04, 0, 0, 0 },
+        .wpa2_psk => [4]u8{ 0x80, 0, 0, 0 },
+        .wpa3_sae => [4]u8{ 0, 0, 0x04, 0 },
+        .open => [4]u8{ 0, 0, 0, 0 },
+    };
+    try self.set_var("bsscfg:wpa_auth", &wpa_auth);
+    self.sleep_ms(10);
+
+    if (opt.security != .open) {
+        self.sleep_ms(100);
+    }
+    switch (opt.security) {
+        .open => {},
+        .wpa_psk, .wpa2_psk => try self.set_cmd(.set_wsec_pmk, ioctl.encode_pwd(buf[0..ioctl.pwd_encoded_max_len], pwd)),
+        .wpa3_sae => try self.set_var("sae_password", ioctl.encode_sae_pwd(buf[0..ioctl.sae_pwd_encoded_len], pwd)),
+    }
+    self.sleep_ms(10);
+    self.event_log.psk_sup = .success;
+    self.event_log.auth = .success;
+
+    try self.set_var("2g_mrate", std.mem.asBytes(&@as(u32, 11_000_000 / 500_000)));
+    self.sleep_ms(10);
+    try self.set_var("bss", std.mem.asBytes(&[_]u32{ 0, 1 }));
+    self.sleep_ms(10);
+}
+
+pub fn stop_ap(self: *Self) !void {
+    // Report the link down at once; with role .none, handle_event ignores the join events
+    // the chip sends during or after teardown.
+    self.reset_join_state();
+    try self.set_var("bss", std.mem.asBytes(&[_]u32{ 0, 0 }));
+    self.sleep_ms(10);
+    try self.set_cmd(.set_ap, &.{0});
+    self.sleep_ms(10);
+    try self.set_var("apsta", &.{1});
+    self.sleep_ms(10);
+}
+
+/// Start counting join events for a new station join or access point. Earlier events must
+/// not count, and join_state is `.joining` from the first ioctl so read() keeps re-arming the
+/// interrupt while the chip answers.
+fn begin(self: *Self, role: Role) void {
+    self.err = null;
+    self.event_log = .{};
+    self.join_state = .joining;
+    self.role = role;
+}
+
+fn reset_join_state(self: *Self) void {
+    self.event_log = .{};
+    self.join_state = .none;
+    self.role = .none;
+}
+
 pub fn poll(self: *Self) !void {
     var bytes: [ioctl_response_bytes_len]u8 align(4) = undefined;
     var rsp, _ = try self.read(&bytes) orelse return;
@@ -534,10 +685,20 @@ fn handle_event(self: *Self, rsp: *ioctl.Response) void {
             .{ evt.event_type, evt.status },
         );
     switch (evt.event_type) {
+        .escan_result => return self.handle_escan_event(rsp, evt.status),
+        .none => return,
+        else => {},
+    }
+    // Join events count only while a join or access point is in progress; late events after
+    // stop_ap or a failed start must not rebuild a state nobody asked for.
+    if (self.role == .none) return;
+    switch (evt.event_type) {
         .link => {
             event_log.link = state(evt.status == .success and evt.flags & 1 > 0);
         },
-        .psk_sup => {
+        // start_ap marks auth, psk_sup and set_ssid done itself, so an access point ignores
+        // these events and follows only the link.
+        .psk_sup => if (self.role == .station) {
             event_log.psk_sup =
                 state(evt.status == .success or evt.status == .unsolicited);
         },
@@ -547,30 +708,20 @@ fn handle_event(self: *Self, rsp: *ioctl.Response) void {
         .disassoc_ind, .disassoc => {
             event_log.assoc = .fail;
         },
-        .auth => {
+        .auth => if (self.role == .station) {
             event_log.auth = state(evt.status == .success);
         },
         .deauth_ind => {
-            event_log.auth = .fail;
+            // An access point gets one for every station that leaves; only a
+            // station's own deauthentication ends its association.
+            if (self.role == .station) event_log.auth = .fail;
         },
-        .set_ssid => {
+        .set_ssid => if (self.role == .station) {
             event_log.set_ssid = state(evt.status == .success);
         },
         .join => {
             event_log.join = state(evt.status == .success);
         },
-        .escan_result => {
-            self.scan_result = null;
-            self.scan_state = switch (evt.status) {
-                .success, .newassoc, .ccxfastrm => .success,
-                .partial, .newscan => .running,
-                else => .fail,
-            };
-            if (evt.status == .partial) {
-                self.handle_scan_event(rsp);
-            }
-        },
-        .none => return,
         else => {
             log.warn(
                 "unhandled event type: {}, status: {} ",
@@ -579,17 +730,36 @@ fn handle_event(self: *Self, rsp: *ioctl.Response) void {
             return;
         },
     }
-    const new_state = event_log.join_state();
+    // A join stays in progress until an essential event decides it; an event such as assoc
+    // arriving before any essential one must not make it look idle.
+    const new_state = switch (event_log.join_state()) {
+        .none => .joining,
+        else => |s| s,
+    };
     if (debug_log and new_state != self.join_state) {
         log.debug("state changed old: {}, new: {}", .{ self.join_state, new_state });
         log.debug("event log: {}", .{self.event_log});
     }
-    if (self.join_state == .joining and new_state == .disjoined) {
+    // A failed station join is reported through err; an access point whose link drops just
+    // reports the link down until the chip raises it again.
+    if (self.role == .station and self.join_state == .joining and new_state == .disjoined) {
         event_log.err() catch |err| {
             self.err = err;
         };
     }
     self.join_state = new_state;
+}
+
+fn handle_escan_event(self: *Self, rsp: *ioctl.Response, status: ioctl.EventStatus) void {
+    self.scan_result = null;
+    self.scan_state = switch (status) {
+        .success, .newassoc, .ccxfastrm => .success,
+        .partial, .newscan => .running,
+        else => .fail,
+    };
+    if (status == .partial) {
+        self.handle_scan_event(rsp);
+    }
 }
 
 fn handle_scan_event(self: *Self, rsp: *ioctl.Response) void {
@@ -924,6 +1094,13 @@ const EventLog = packed struct {
     }
 };
 
+pub const Role = enum {
+    /// No station join or access point is in progress.
+    none,
+    station,
+    access_point,
+};
+
 pub const JoinState = enum {
     none,
     joining,
@@ -1034,6 +1211,185 @@ const SharedMemLog = extern struct {
     idx: u32,
     out_idx: u32,
 };
+
+fn event_response(packet: []u8, event_type: ioctl.EventType, flags: u16) !ioctl.Response {
+    // Same layout as ioctl's "padded WiFi event is decoded" test.
+    const head = 22;
+    @memset(packet, 0);
+    std.mem.writeInt(u16, packet[0..2], @intCast(packet.len), .little);
+    std.mem.writeInt(u16, packet[2..4], ~@as(u16, @intCast(packet.len)), .little);
+    packet[5] = 1; // event channel
+    packet[7] = 14;
+    packet[14] = 0x20;
+    packet[17] = 1; // BDC padding in words
+    std.mem.writeInt(u16, packet[head + 12 ..][0..2], 0x886c, .big);
+    @memcpy(packet[head + 19 ..][0..3], &[_]u8{ 0, 0x10, 0x18 });
+    std.mem.writeInt(u16, packet[head + 26 ..][0..2], flags, .big);
+    std.mem.writeInt(u32, packet[head + 28 ..][0..4], @backingInt(event_type), .big);
+    return ioctl.Response.init(packet);
+}
+
+test "deauth_ind ends a station association but not an access point" {
+    var bus: Bus = undefined;
+    var packet: [22 + 256]u8 = undefined;
+    const joined: EventLog = .{ .auth = .success, .link = .success, .psk_sup = .success, .set_ssid = .success };
+
+    var station: Self = .{ .bus = &bus, .event_log = joined, .join_state = .joined, .role = .station };
+    var rsp = try event_response(&packet, .deauth_ind, 0);
+    station.handle_event(&rsp);
+    try testing.expectEqual(.fail, station.event_log.auth);
+    try testing.expectEqual(.disjoined, station.join_state);
+
+    var ap: Self = .{ .bus = &bus, .event_log = joined, .join_state = .joined, .role = .access_point };
+    rsp = try event_response(&packet, .deauth_ind, 0);
+    ap.handle_event(&rsp);
+    try testing.expectEqual(.success, ap.event_log.auth);
+    try testing.expectEqual(.joined, ap.join_state);
+}
+
+test "an access point link drop sets no error and recovers" {
+    var bus: Bus = undefined;
+    var packet: [22 + 256]u8 = undefined;
+    var ap: Self = .{ .bus = &bus };
+    ap.begin(.access_point);
+    ap.event_log.set_ssid = .success;
+    ap.event_log.psk_sup = .success;
+    ap.event_log.auth = .success;
+    var rsp = try event_response(&packet, .link, 0);
+    ap.handle_event(&rsp);
+    try testing.expectEqual(.disjoined, ap.join_state);
+    try testing.expectEqual(null, ap.err);
+    rsp = try event_response(&packet, .link, 1);
+    ap.handle_event(&rsp);
+    try testing.expectEqual(.joined, ap.join_state);
+    try testing.expectEqual(null, ap.err);
+}
+
+test "an access point follows only its link, not station join events" {
+    var bus: Bus = undefined;
+    var packet: [22 + 256]u8 = undefined;
+    var ap: Self = .{ .bus = &bus };
+    ap.begin(.access_point);
+    ap.event_log.set_ssid = .success;
+    ap.event_log.psk_sup = .success;
+    ap.event_log.auth = .success;
+    var rsp = try event_response(&packet, .link, 1);
+    ap.handle_event(&rsp);
+    try testing.expectEqual(.joined, ap.join_state);
+    for ([_]ioctl.EventType{ .auth, .psk_sup, .set_ssid }) |event_type| {
+        _ = try event_response(&packet, event_type, 0);
+        std.mem.writeInt(u32, packet[22 + 32 ..][0..4], @backingInt(ioctl.EventStatus.fail), .big);
+        rsp = try ioctl.Response.init(&packet);
+        ap.handle_event(&rsp);
+        try testing.expectEqual(.joined, ap.join_state);
+        try testing.expectEqual(null, ap.err);
+    }
+}
+
+test "join events after stop_ap or a failed start are ignored" {
+    var bus: Bus = undefined;
+    var packet: [22 + 256]u8 = undefined;
+    var wifi: Self = .{ .bus = &bus };
+    wifi.begin(.access_point);
+    wifi.reset_join_state(); // what stop_ap and a failed start_ap or join do first
+    var rsp = try event_response(&packet, .link, 1);
+    wifi.handle_event(&rsp);
+    rsp = try event_response(&packet, .deauth_ind, 0);
+    wifi.handle_event(&rsp);
+    try testing.expectEqual(.none, wifi.join_state);
+    try testing.expectEqual(EventLog{}, wifi.event_log);
+    try testing.expectEqual(null, wifi.err);
+}
+
+test "a failed or stopped access point leaves no join state behind" {
+    var bus: Bus = undefined;
+    var wifi: Self = .{
+        .bus = &bus,
+        .event_log = .{ .auth = .success, .link = .success, .psk_sup = .success, .set_ssid = .success },
+        .join_state = .joined,
+        .role = .access_point,
+    };
+    wifi.reset_join_state();
+    try testing.expectEqual(EventLog{}, wifi.event_log);
+    try testing.expectEqual(.none, wifi.join_state);
+    try testing.expectEqual(.none, wifi.role);
+}
+
+test "a new join or access point starts from no events or error, joining" {
+    var bus: Bus = undefined;
+    var wifi: Self = .{
+        .bus = &bus,
+        .event_log = .{ .auth = .fail, .link = .success },
+        .join_state = .disjoined,
+        .err = error.Cyw43Authentication,
+    };
+    wifi.begin(.access_point);
+    try testing.expectEqual(null, wifi.err);
+    try testing.expectEqual(EventLog{}, wifi.event_log);
+    try testing.expectEqual(.joining, wifi.join_state);
+    try testing.expectEqual(.access_point, wifi.role);
+}
+
+test "a driver with no join or access point ignores join events but takes scan results" {
+    var bus: Bus = undefined;
+    var packet: [22 + 256]u8 = undefined;
+    var wifi: Self = .{ .bus = &bus };
+    for ([_]ioctl.EventType{ .link, .auth, .psk_sup, .set_ssid, .assoc, .join, .deauth_ind }) |event_type| {
+        var rsp = try event_response(&packet, event_type, 1);
+        wifi.handle_event(&rsp);
+    }
+    try testing.expectEqual(.none, wifi.join_state);
+    try testing.expectEqual(EventLog{}, wifi.event_log);
+    var rsp = try event_response(&packet, .escan_result, 0);
+    wifi.handle_event(&rsp);
+    try testing.expectEqual(.success, wifi.scan_state);
+}
+
+test "a station join survives scan and association events before any essential event" {
+    var bus: Bus = undefined;
+    var packet: [22 + 256]u8 = undefined;
+    for ([_]ioctl.EventType{ .escan_result, .assoc, .join }) |first| {
+        var wifi: Self = .{ .bus = &bus };
+        wifi.begin(.station);
+        var rsp = try event_response(&packet, first, 0);
+        wifi.handle_event(&rsp);
+        try testing.expectEqual(.joining, wifi.join_state);
+        for ([_]ioctl.EventType{ .auth, .psk_sup, .set_ssid }) |event_type| {
+            rsp = try event_response(&packet, event_type, 0);
+            wifi.handle_event(&rsp);
+        }
+        rsp = try event_response(&packet, .link, 1);
+        wifi.handle_event(&rsp);
+        try testing.expectEqual(.joined, wifi.join_state);
+        try testing.expectEqual(null, wifi.err);
+    }
+}
+
+test "join rejects credentials its buffers cannot hold" {
+    const long: [ioctl.sae_pwd_max_len + 1]u8 = @splat('p');
+    try check_join_credentials(long[0..32], "", .open);
+    try testing.expectError(error.InvalidSsid, check_join_credentials("", "", .open));
+    try testing.expectError(error.InvalidSsid, check_join_credentials(long[0..33], "", .open));
+    try check_join_credentials("net", &long, .open); // an open network ignores the password
+    for ([_]JoinOptions.Security{ .wpa_psk, .wpa2_psk }) |security| {
+        try testing.expectError(error.InvalidPassphrase, check_join_credentials("net", long[0..7], security));
+        try check_join_credentials("net", long[0..8], security);
+        try check_join_credentials("net", long[0..ioctl.pwd_max_len], security);
+        try testing.expectError(error.InvalidPassphrase, check_join_credentials("net", long[0 .. ioctl.pwd_max_len + 1], security));
+    }
+    try testing.expectError(error.InvalidPassphrase, check_join_credentials("net", long[0..7], .wpa3_sae));
+    try check_join_credentials("net", long[0..ioctl.sae_pwd_max_len], .wpa3_sae);
+    try testing.expectError(error.InvalidPassphrase, check_join_credentials("net", &long, .wpa3_sae));
+
+    // join checks before it touches the bus or the join state.
+    var bus: Bus = undefined;
+    var wifi: Self = .{ .bus = &bus };
+    try testing.expectError(error.InvalidPassphrase, wifi.join("net", &long, .{ .security = .wpa3_sae }));
+    try testing.expectError(error.InvalidPassphrase, wifi.join("net", long[0 .. ioctl.pwd_max_len + 1], .{ .security = .wpa2_psk }));
+    try testing.expectError(error.InvalidSsid, wifi.join(long[0..33], "password", .{}));
+    try testing.expectEqual(.none, wifi.join_state);
+    try testing.expectEqual(.none, wifi.role);
+}
 
 test "receive capacity rejects oversized packets and polls full Ethernet frames" {
     const Mock = struct {
