@@ -65,8 +65,11 @@ aligned, writable `usize` handle slot to both task-create hooks
 (`port/espressif/esp/src/hal/radio/osi.zig:task_create_common`). Keep the C task-name storage valid
 for the life of the task because `port/espressif/esp/src/hal/rtos.zig:spawn` stores the slice by reference.
 Creation ignores core affinity and returns 1 on success or 0 on spawn failure. Task queue send and
-receive return 1 or −1. Size all task and ISR send buffers and receive buffers for the stored item
-width because either a requested capacity of three or width of four forces three eight-byte entries.
+receive return 1 or −1. A queue requested as three four-byte entries uses eight-byte items for
+the legacy supplicant workaround (esp-wifi 0.14.1, WIFI-6676). Size the send and receive buffers
+for the stored item width. Other requests retain both dimensions. The OSI allocators reject
+zero-sized or overflowing allocations before reaching the allocator. The static Wi-Fi queue also
+rejects negative dimensions.
 Pass an initialized, aligned, writable `u32` wake flag to
 `port/espressif/esp/src/hal/radio/osi.zig:queue_send_from_isr`, which ORs the result into it.
 Task queue operations and semaphore take use zero ticks to probe and the blocking sentinel to
@@ -160,7 +163,6 @@ The ESP port's `test` step (`port/espressif/esp/build.zig:build`) runs these hos
 
 ## Open questions
 
-- `port/espressif/esp/src/hal/radio/osi.zig:queue_create` overrides the requested dimensions, so task sends to either end and ISR sends can read past a short buffer, receives can write past it, and the queue can fill early. ([#60](https://github.com/valthon/microzig/issues/60))
 - `port/espressif/esp/src/hal/radio/osi.zig:task_delete` panics if the BLE blob passes a non-null task handle. ([#61](https://github.com/valthon/microzig/issues/61))
 - `port/espressif/esp/src/hal/radio/osi.zig:WifiShutdown.delete_task` leaves a self-deleting task's stack and control block allocated, and Wi-Fi teardown reclaims only the packet worker.
 - `port/espressif/esp/src/hal/radio/osi.zig:timer_setfn` logs allocation failure and returns without registering a new timer. ([#69](https://github.com/valthon/microzig/issues/69))

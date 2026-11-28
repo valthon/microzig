@@ -244,7 +244,10 @@ pub fn spawn(
 
     const args_start = args_align.forward(@sizeOf(Task));
     const stack_start = STACK_ALIGN.forward(args_start + @sizeOf(Args));
-    const stack_end = STACK_ALIGN.forward(stack_start + options.stack_size + EXTRA_STACK_SIZE);
+    const stack_payload_end = std.math.add(usize, stack_start, options.stack_size) catch return error.OutOfMemory;
+    const padding = STACK_ALIGN.toByteUnits() - 1;
+    const padded_end = std.math.add(usize, stack_payload_end, EXTRA_STACK_SIZE + padding) catch return error.OutOfMemory;
+    const stack_end = STACK_ALIGN.backward(padded_end);
 
     const alloc_size = stack_end;
     const raw_alloc = try gpa.alignedAlloc(u8, alloc_align, alloc_size);

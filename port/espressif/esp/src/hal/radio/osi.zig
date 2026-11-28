@@ -124,18 +124,20 @@ pub fn __assert_func(
 pub fn malloc(len: usize) callconv(.c) ?*anyopaque {
     log.debug("malloc {}", .{len});
 
-    const buf = callback_allocator().rawAlloc(8 + len, .@"8", @returnAddress()) orelse {
+    if (len == 0) return null;
+    const alloc_len = std.math.add(usize, 8, len) catch return null;
+    const buf = callback_allocator().rawAlloc(alloc_len, .@"8", @returnAddress()) orelse {
         log.warn("failed to allocate memory: {}", .{len});
         return null;
     };
 
-    const alloc_len: *usize = @ptrCast(@alignCast(buf));
-    alloc_len.* = len;
+    const stored_len: *usize = @ptrCast(@alignCast(buf));
+    stored_len.* = len;
     return @ptrFromInt(@intFromPtr(buf) + 8);
 }
 
 pub fn calloc(number: usize, size: usize) callconv(.c) ?*anyopaque {
-    const total_size: usize = number * size;
+    const total_size = std.math.mul(usize, number, size) catch return null;
     if (malloc(total_size)) |ptr| {
         @memset(@as([*]u8, @ptrCast(ptr))[0..total_size], 0);
         return ptr;
@@ -354,6 +356,7 @@ pub fn task_yield_from_isr() callconv(.c) void {
 pub fn semphr_create(max_value: u32, init_value: u32) callconv(.c) ?*anyopaque {
     log.debug("semphr_create {} {}", .{ max_value, init_value });
 
+    if (max_value == 0 or init_value > max_value) return null;
     const sem = callback_allocator().create(rtos.Semaphore) catch {
         log.warn("failed to allocate semaphore", .{});
         return null;
@@ -607,17 +610,20 @@ pub const QueueWrapper = struct {
     inner: rtos.TypeErasedQueue,
 };
 
+fn queue_buffer_len(capacity: u32, item_len: u32) ?usize {
+    if (capacity == 0 or item_len == 0) return null;
+    return std.math.mul(u32, capacity, item_len) catch null;
+}
+
 pub fn queue_create(capacity: u32, item_len: u32) callconv(.c) ?*anyopaque {
     log.debug("queue_create {} {}", .{ capacity, item_len });
 
-    const new_cap, const new_item_len = if (capacity != 3 and item_len != 4)
-        .{ capacity, item_len }
-    else blk: {
-        log.warn("fixing queue item len", .{});
-        break :blk .{ 3, 8 };
-    };
+    // esp-wifi's WIFI-6676 workaround is for the supplicant message queue.
+    // The pinned C3/C6 eap_peer_sm_init already requests (3, 8).
+    const stored_item_len: u32 = if (capacity == 3 and item_len == 4) 8 else item_len;
 
-    const buf: []u8 = callback_allocator().alloc(u8, new_cap * new_item_len) catch {
+    const len = queue_buffer_len(capacity, stored_item_len) orelse return null;
+    const buf: []u8 = callback_allocator().alloc(u8, len) catch {
         log.warn("failed to allocate queue buffer", .{});
         return null;
     };
@@ -629,7 +635,7 @@ pub fn queue_create(capacity: u32, item_len: u32) callconv(.c) ?*anyopaque {
     };
 
     queue.* = .{
-        .item_len = new_item_len,
+        .item_len = stored_item_len,
         .inner = .init(buf),
     };
 
@@ -758,10 +764,10 @@ fn task_create_common(
 ) i32 {
     _ = core_id; // autofix
 
+    if (stack_depth == 0) return 0;
+    const debug_stack_extra = if (builtin.mode == .debug) 6000 else 0;
+    const stack_size = std.math.add(u32, stack_depth, debug_stack_extra) catch return 0;
     const task_entry: *const fn (param: ?*anyopaque) callconv(.c) noreturn = @ptrCast(@alignCast(task_func));
-
-    // increase stack size if we are in debug mode
-    const stack_size: usize = stack_depth + if (builtin.mode == .debug) 6000 else 0;
     const task: *rtos.Task = rtos.spawn(callback_allocator(), task_wrapper, .{ task_entry, param }, .{
         .name = std.mem.span(name),
         .priority = @fromBackingInt(@truncate(prio)),
@@ -1796,16 +1802,19 @@ test "PP rollback clears ROM aliases before freeing the queue and startup semaph
 pub fn wifi_create_queue(capacity: c_int, item_len: c_int) callconv(.c) ?*anyopaque {
     log.debug("wifi_create_queue {} {}", .{ capacity, item_len });
 
+    if (capacity <= 0 or item_len <= 0) return null;
+    const width: u32 = @intCast(item_len);
+    const len = queue_buffer_len(@intCast(capacity), width) orelse return null;
     std.debug.assert(wifi_queue_handle == null);
 
-    const buf: []u8 = callback_allocator().alloc(u8, @intCast(capacity * item_len)) catch {
+    const buf: []u8 = callback_allocator().alloc(u8, len) catch {
         log.warn("failed to allocate queue buffer", .{});
         return null;
     };
 
     wifi_queue = .{
         .inner = .init(buf),
-        .item_len = @intCast(item_len),
+        .item_len = width,
     };
     wifi_queue_handle = &wifi_queue;
 
@@ -1964,6 +1973,65 @@ pub fn coex_schm_flexible_period_get() callconv(.c) u8 {
     log.debug("coex_schm_flexible_period_get", .{});
 
     return if (coex_enabled) 1 else 0;
+}
+
+test "queue creation widens only the legacy supplicant shape" {
+    var route: @import("shared_heap.zig").TestRoute = .{};
+    route.install(std.testing.allocator);
+    defer route.restore();
+
+    for ([_]struct { capacity: u32, requested: u32, stored: u32 }{
+        .{ .capacity = 10, .requested = 4, .stored = 4 },
+        .{ .capacity = 3, .requested = 12, .stored = 12 },
+        .{ .capacity = 3, .requested = 8, .stored = 8 },
+        .{ .capacity = 3, .requested = 4, .stored = 8 },
+    }) |shape| {
+        const handle = queue_create(shape.capacity, shape.requested) orelse return error.OutOfMemory;
+        defer queue_delete(handle);
+        const queue: *QueueWrapper = @ptrCast(@alignCast(handle));
+        try std.testing.expectEqual(shape.stored, queue.item_len);
+        try std.testing.expectEqual(shape.capacity * shape.stored, queue.inner.buffer.len);
+    }
+}
+
+test "OSI size validation rejects invalid requests before the allocator" {
+    var rejecting = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var route: @import("shared_heap.zig").TestRoute = .{};
+    route.install(rejecting.allocator());
+    defer route.restore();
+
+    try std.testing.expect(queue_create(0, 4) == null);
+    try std.testing.expect(queue_create(3, 0) == null);
+    try std.testing.expect(queue_create(1_073_741_825, 4) == null);
+    try std.testing.expect(queue_create(3, std.math.maxInt(u32) / 3 + 1) == null);
+    try std.testing.expect(wifi_create_queue(0, 4) == null);
+    try std.testing.expect(wifi_create_queue(3, 0) == null);
+    try std.testing.expect(wifi_create_queue(-3, -4) == null);
+    try std.testing.expect(wifi_create_queue(std.math.maxInt(c_int), 3) == null);
+
+    try std.testing.expect(malloc(0) == null);
+    try std.testing.expect(malloc(std.math.maxInt(usize) - 7) == null);
+    try std.testing.expect(calloc(0, 1) == null);
+    try std.testing.expect(calloc(std.math.maxInt(usize) / 2 + 1, 2) == null);
+    try std.testing.expect(calloc(1, std.math.maxInt(usize)) == null);
+    try std.testing.expect(wifi_zalloc(0) == null);
+    try std.testing.expect(wifi_realloc(null, std.math.maxInt(usize)) == null);
+    try std.testing.expect(semphr_create(0, 0) == null);
+    try std.testing.expect(semphr_create(1, 2) == null);
+    try std.testing.expect(!rejecting.has_induced_failure);
+}
+
+test "an overflowing OSI reallocation keeps the old allocation" {
+    var route: @import("shared_heap.zig").TestRoute = .{};
+    route.install(std.testing.allocator);
+    defer route.restore();
+
+    const old = wifi_malloc(8) orelse return error.OutOfMemory;
+    defer free(old);
+    const bytes: *[8]u8 = @ptrCast(old);
+    @memcpy(bytes, "retained");
+    try std.testing.expect(wifi_realloc(old, std.math.maxInt(usize)) == null);
+    try std.testing.expectEqualStrings("retained", bytes);
 }
 
 test "a deleted blob task is freed into the callback route, the PP task only by teardown" {
