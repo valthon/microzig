@@ -139,6 +139,11 @@ A reset latched during the callback takes priority in the next snapshot.
 | `port/wch/ch32v/src/hals/usbhs.zig:Polled.poll` | Keep the CPU IRQ disabled and call `poll(false, controller)`. | Copy the SETUP packet out of DMA before calling core. Acknowledge SETUP_ACT before the callback and keep any co-latched TRANSFER busy through reply publication. |
 | `port/stmicro/stm32/src/hals/STM32F103/usb_internals/usb_ll.zig:usb_handler` | Install this handler on `USB_LP_CAN1_RX0` before USB init and serialize foreground calls with its callbacks. | With `port/stmicro/stm32/src/hals/STM32F103/usb.zig:usb_ll`, the app owns EP0 sequencing and address timing and must discard the old transfer's state at each SETUP. On reset, clear application configuration and pending control state and release transfer waiters. A custom `Config.reset_callback` must also restore address zero and reset endpoints or call `port/stmicro/stm32/src/hals/STM32F103/usb_internals/usb_ll.zig:default_reset_handler`. |
 
+USBHS shares one EP0 DMA buffer between RX and TX. SETUP_ACT can latch without the TRANSFER busy
+interlock. If a SETUP is pending after a nonempty reply copy, the HAL discards the suspect request and
+leaves the reply unarmed. The host can retry the control transfer by sending a fresh SETUP. A new
+SETUP can still latch between the final SETUP_ACT check and the separate TX arm write.
+
 When polling SETUP_ACT, USBHS retires a co-latched EP0 transaction and leaves data endpoint
 completions pending
 for normal TRANSFER handling while their endpoint ownership persists. If the SETUP callback closes

@@ -208,6 +208,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
         endpoints: PerEndpointArray(cfg.max_endpoints_count),
         control: usb.ControlRequest = .{},
+        discard_ep0_setup: bool = false,
         setup_data_transfer: enum { inactive, watching, retire } = .inactive,
         // USB DMA addresses must be 4-byte aligned.
         pool: [cfg.buffer_bytes]u8 align(4) = undefined,
@@ -220,6 +221,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             log.info("USBHS init starting", .{});
             self.interface = .{ .vtable = &vtable };
             self.endpoints = @splat(@splat(.{}));
+            self.discard_ep0_setup = false;
             self.setup_data_transfer = .inactive;
             @memset(self.pool[0..64], 0x7e);
             @memset(self.pool[64..], 0);
@@ -276,6 +278,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
         fn on_bus_reset_local(self: *Self) void {
             self.control = .{};
+            self.discard_ep0_setup = false;
             // Clear state
             inline for (0..cfg.max_endpoints_count) |i| {
                 self.endpoints[i][@backingInt(types.Dir.out)].rx_armed = false;
@@ -385,6 +388,15 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                         const status = PollRegs.USB_INT_ST.read();
                         break :blk status.MASK_UIS_H_RES__MASK_UIS_ENDP == 0 and status.MASK_UIS_TOKEN != TOKEN_SOF;
                     };
+                    if (self.discard_ep0_setup) {
+                        self.discard_ep0_setup = false;
+                        self.control = .{};
+                        PollRegs.USB_INT_FG.write(.{
+                            .RB_UIF_SETUP_ACT = 1,
+                            .RB_UIF_TRANSFER = @intFromBool(retire_ep0_transfer),
+                        });
+                        continue;
+                    }
                     const setup = self.read_setup_from_ep0();
                     // SETUP_ACT can latch without TRANSFER holding the SIE
                     // busy. Acknowledge the copied SETUP before dispatch.
@@ -780,8 +792,8 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 
             if (ep_num == .ep0) {
                 self.control.reply();
-                if (self.control.direction == .in)
-                    set_rx_ctrl(0, RES_ACK, current_rx_tog(0), false);
+                // Preserve an intact SETUP and its latch for the next poll.
+                if (PollRegs.USB_INT_FG.read().RB_UIF_SETUP_ACT != 0) return 0;
             }
 
             // Copy vector into DMA buffer (up to MPS/buffer size)
@@ -791,6 +803,24 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                 const n = @min(chunk.len, st_in.buf.len - w);
                 @memcpy(st_in.buf[w .. w + n], chunk[0..n]);
                 w += n;
+            }
+
+            if (ep_num == .ep0) {
+                // USBHS uses one EP0 DMA address for both directions
+                // (CH32FV2x_V3x RM v2.5, §22.2.2). SETUP_ACT can latch
+                // independently of the TRANSFER interlock (§22.2.1.1, §22.2.1.8).
+                // A SETUP accepted during this copy may no longer
+                // contain a valid request. Drop the reply and let the host retry.
+                // A new SETUP can still latch between this final check and
+                // the TX arm because the register operations are separate.
+                if (PollRegs.USB_INT_FG.read().RB_UIF_SETUP_ACT != 0) {
+                    if (w != 0) self.discard_ep0_setup = true;
+                    set_tx_ctrl(0, RES_NAK, TOG_DATA0, false);
+                    self.arm_ep0_out_always();
+                    return 0;
+                }
+                if (self.control.direction == .in)
+                    set_rx_ctrl(0, RES_ACK, current_rx_tog(0), false);
             }
 
             const tx_len: *volatile Reg_U16 = &EP_Regs[ep_i].UEP_T_LEN;
@@ -884,6 +914,7 @@ test "USBHS bus reset discards pending SETUP" {
     };
     var dev: Device = undefined;
     dev.endpoints = @splat(@splat(.{}));
+    dev.discard_ep0_setup = false;
     var setup: [8]u8 align(4) = .{ 0, 9, 1, 0, 0, 0, 0, 0 }; // SET_CONFIGURATION(1)
     dev.st(.ep0, .out).buf = &setup;
     var ctl: Controller = .{};
@@ -926,6 +957,90 @@ test "USBHS bus reset discards pending SETUP" {
     try std.testing.expectEqual(setups, ctl.setups);
 }
 
+fn expect_setup_during_callback(comptime reset: bool, comptime reply: enum { none, pending_setup, racing_setup }) !void {
+    const Device = Polled(.{}, .{});
+    const get_descriptor = [8]u8{ 0x80, 6, 0, 1, 0, 0, 18, 0 };
+    const set_address_request = [8]u8{ 0, 5, 2, 0, 0, 0, 0, 0 };
+    const Controller = struct {
+        requests: [3][8]u8 = undefined,
+        count: usize = 0,
+
+        pub fn on_bus_reset(_: *@This(), itf: *usb.DeviceInterface) void {
+            latch_setup(itf);
+        }
+
+        pub fn on_setup_req(self: *@This(), itf: *usb.DeviceInterface, packet: *const types.SetupPacket) void {
+            const raw: [8]u8 = @bitCast(packet.*);
+            if (std.mem.eql(u8, &raw, &get_descriptor)) {
+                if (reply == .racing_setup) {
+                    // Surface the event on the post-copy read.
+                    test_poll_regs.USB_INT_FG.reads_until_setup = 2;
+                } else {
+                    latch_setup(itf);
+                }
+                if (reply != .none) {
+                    const dev: *Device = @fieldParentPtr("interface", itf);
+                    const written = Device.ep_writev(itf, .ep0, &.{"\x12\x01\x00\x02\x00\x00\x00\x40"});
+                    assert(written == 0);
+                    assert(test_poll_regs.USB_INT_FG.pending.RB_UIF_SETUP_ACT == 1);
+                    assert(!dev.st(.ep0, .in).tx_busy);
+                }
+            }
+            self.requests[self.count] = @bitCast(packet.*);
+            self.count += 1;
+        }
+
+        fn latch_setup(itf: *usb.DeviceInterface) void {
+            const dev: *Device = @fieldParentPtr("interface", itf);
+            dev.st(.ep0, .out).buf[0..8].* = set_address_request;
+            test_poll_regs.USB_INT_FG.pending.RB_UIF_SETUP_ACT = 1;
+        }
+
+        pub fn on_buffer(_: *@This(), _: *usb.DeviceInterface, comptime _: types.Endpoint) void {
+            unreachable;
+        }
+    };
+    var dev: Device = undefined;
+    dev.endpoints = @splat(@splat(.{}));
+    dev.discard_ep0_setup = false;
+    var dma: [64]u8 align(4) = undefined;
+    dma[0..8].* = get_descriptor;
+    dev.st(.ep0, .out).buf = &dma;
+    dev.st(.ep0, .in).buf = &dma;
+
+    var ctl: Controller = .{};
+    test_poll_regs.USB_INT_FG.pending = .{ .RB_UIF_BUS_RST__RB_UIF_DETECT = @intFromBool(reset), .RB_UIF_SETUP_ACT = 1 };
+    dev.poll(false, &ctl);
+    const expected: []const [8]u8 = if (reset) &.{set_address_request} else if (reply == .racing_setup) &.{get_descriptor} else &.{ get_descriptor, set_address_request };
+    try std.testing.expectEqualSlices([8]u8, expected, ctl.requests[0..ctl.count]);
+    if (reply == .racing_setup) {
+        try std.testing.expectEqual(0, test_poll_regs.USB_INT_FG.pending.RB_UIF_SETUP_ACT);
+        try std.testing.expectEqual(RES_NAK, EP_Regs[0].UEP_TX_CTRL.read().RES);
+        try std.testing.expectEqual(RES_ACK, EP_Regs[0].UEP_RX_CTRL.read().RES);
+        try std.testing.expect(!dev.st(.ep0, .in).tx_busy);
+
+        Controller.latch_setup(&dev.interface);
+        dev.poll(false, &ctl);
+        try std.testing.expectEqualSlices([8]u8, &.{ get_descriptor, set_address_request }, ctl.requests[0..ctl.count]);
+    }
+}
+
+test "USBHS preserves a SETUP accepted during a reset callback" {
+    try expect_setup_during_callback(true, .none);
+}
+
+test "USBHS preserves a SETUP accepted during a SETUP callback" {
+    try expect_setup_during_callback(false, .none);
+}
+
+test "USBHS preserves a pending SETUP when the previous reply starts" {
+    try expect_setup_during_callback(false, .pending_setup);
+}
+
+test "USBHS drops SETUP bytes overwritten by a control reply and accepts the retry" {
+    try expect_setup_during_callback(false, .racing_setup);
+}
+
 fn expect_transfer_co_latched_with_setup(discard: bool) !void {
     const Device = Polled(.{}, .{});
     const Controller = struct {
@@ -953,6 +1068,7 @@ fn expect_transfer_co_latched_with_setup(discard: bool) !void {
         var dev: Device = undefined;
         dev.endpoints = @splat(@splat(.{}));
         dev.control = .{};
+        dev.discard_ep0_setup = discard;
         dev.st(.ep0, .out).buf = &setup;
         const data_in = status.MASK_UIS_TOKEN == TOKEN_IN;
         dev.st(.ep1, .in).tx_busy = data_in;
@@ -971,6 +1087,10 @@ fn expect_transfer_co_latched_with_setup(discard: bool) !void {
 
 test "USBHS preserves a data IN completion alongside SETUP" {
     try expect_transfer_co_latched_with_setup(false);
+}
+
+test "USBHS preserves a data IN completion when discarding SETUP" {
+    try expect_transfer_co_latched_with_setup(true);
 }
 
 fn expect_reopened_endpoint_drops_old_completion(comptime dir: types.Dir) !void {
@@ -1008,6 +1128,7 @@ fn expect_reopened_endpoint_drops_old_completion(comptime dir: types.Dir) !void 
         var dev: Device = undefined;
         dev.interface = .{ .vtable = &Device.vtable };
         dev.endpoints = @splat(@splat(.{}));
+        dev.discard_ep0_setup = false;
         dev.st(.ep0, .out).buf = &setup;
         const ep = dev.st(.ep1, dir);
         ep.buf = &data;
