@@ -105,3 +105,11 @@ This example will send various TCP payload sizes. When the payload is too big fo
 
 Similar to simple pong example but in interrupt mode. Link layer (cyw43) interrupts when there is available data packet to read. 
 Now when `nic.poll` is called only when there is data packet available there is need to call `nic.tick` periodically to run lwip internal timers. 
+
+## access_point.zig
+
+Starts an access point (SSID `microzig-softap`, passphrase `microzig-demo`, channel 6) instead of joining one. It does not use `secrets.zig`. The AP is `192.168.4.1/24`; the shared `modules/dhcp-server` module hands out addresses from `192.168.4.2`, and a TCP echo listens on port 7.
+
+Build with `-Dap_security=wpa2_psk` (the default), `wpa3_sae`, `wpa_psk` or `open`. The defaults match the ESP SoftAP example, so an ESP32-C3 or ESP32-C6 running `selftest_wifi_softap_echo` from `examples/espressif/esp/` can join it and checks DHCP and ten echoes. That holds for `wpa2_psk`, `wpa_psk` and `open` only: the ESP port has no SAE (WPA3), so with `wpa3_sae` the access point needs another station, such as a phone or a PC.
+
+With `-Dap_run_s=N` the example reboots into the firmware in flash after N seconds. `pico2_w_ram_net-access_point` is a RAM image of it: copy it to the BOOTSEL drive of a Pico 2 W to run the access point without touching flash.

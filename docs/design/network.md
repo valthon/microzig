@@ -139,7 +139,11 @@ within the remaining buffer.
   wait and still fails authentication on `deauth_ind`. With no join or access point in progress
   (role `.none`, as after `stop_ap`), join events are ignored. A join in progress stays
   `.joining` until an essential event (`auth`, `link`, `psk_sup`, `set_ssid`, or a station's
-  `deauth_ind`) decides it, and scan results never change join state.
+  `deauth_ind`) decides it, and scan results never change join state. `join` and `start_ap`
+  check the SSID and passphrase lengths against what their fixed buffers hold, and return
+  `error.InvalidSsid` or `error.InvalidPassphrase` before they talk to the chip.
+  `examples/raspberrypi/rp2xxx/src/net/access_point.zig:main` serves DHCP from
+  [DHCPv4 server](dhcp-server.md) and a TCP echo.
 - In `examples/raspberrypi/rp2xxx/src/net/irq.zig:main`, GPIO masks the source and posts a wake.
   The HAL also masks the pin around SPI transfers and restores its previous state. Foreground drains RX, and
   `drivers/src/wireless/cyw43439/wifi.zig:read` asks the HAL to re-arm when the interrupt
@@ -165,6 +169,7 @@ within the remaining buffer.
   join events" for the role split, "join events after stop_ap or a failed start are ignored",
   "a driver with no join or access point ignores join events but takes scan results",
   "a station join survives scan and association events before any essential event",
+  "join rejects credentials its buffers cannot hold" for the length checks,
   and "receive capacity rejects oversized packets and polls full Ethernet frames"
   for checking RX capacity before the bus read. No build test step includes these tests.
 - The AP's DHCP server and its tests are in [DHCPv4 server](dhcp-server.md).
@@ -185,7 +190,7 @@ within the remaining buffer.
 - `modules/network/src/root.zig:Udp.bind` stores its callback before bind succeeds, so retry can panic. ([#62](https://github.com/valthon/microzig/issues/62))
 - `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Connection.close` sets `.closed` while the old PCB can still call the wrapper on data ACKs or reset during FIN processing, so `.closed` is unsafe as a reuse signal. ([#80](https://github.com/valthon/microzig/issues/80))
-- `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` recycles session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))
+- `examples/raspberrypi/rp2xxx/src/net/tcp_client.zig:Client.tick` reconnects on `.closed`, and `examples/raspberrypi/rp2xxx/src/net/tcp_server.zig:on_accept` and `examples/raspberrypi/rp2xxx/src/net/access_point.zig:on_accept` recycle session slots on the same state. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Server.bind` passes the result of `tcp_listen` onward without checking for null. ([#63](https://github.com/valthon/microzig/issues/63))
 - `modules/network/src/root.zig:Endpoint.parse` and `Interface.Options.Fixed.init` pass slice pointers to C parsers that expect NUL termination. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Endpoint.format` always formats the address as IPv4. ([#64](https://github.com/valthon/microzig/issues/64))

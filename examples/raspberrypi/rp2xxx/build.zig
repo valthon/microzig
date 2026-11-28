@@ -14,6 +14,12 @@ pub fn build(b: *std.Build) void {
     }) });
     b.step("test", "Test the ESP peer protocol").dependOn(&b.addRunArtifact(protocol_tests).step);
     const maybe_example = b.option([]const u8, "example", "only build matching examples");
+    const ap_security = b.option(
+        enum { open, wpa_psk, wpa2_psk, wpa3_sae },
+        "ap_security",
+        "net-access_point security (default wpa2_psk)",
+    ) orelse .wpa2_psk;
+    const ap_run_s = b.option(u32, "ap_run_s", "net-access_point: reboot into the flash firmware after this many seconds (default 0, never)") orelse 0;
 
     const mz_dep = b.dependency("microzig", .{});
     const mb = MicroBuild.init(b, mz_dep) orelse return;
@@ -57,6 +63,7 @@ pub fn build(b: *std.Build) void {
     const specific_examples: []const Example = &.{
         .{ .target = pico2_w_ram, .name = "pico2_w_ram_esp_peer", .file = "src/esp_peer.zig" },
         .{ .target = pico2_w_ram, .name = "pico2_w_ram_i2c_slave_peer", .file = "src/i2c_slave_peer.zig" },
+        .{ .target = pico2_w_ram, .name = "pico2_w_ram_net-access_point", .file = "src/net/access_point.zig" },
         // RaspberryPi Boards:
         .{ .target = raspberrypi.pico, .name = "pico_board_blinky", .file = "src/board_blinky.zig" },
         .{ .target = raspberrypi.pico, .name = "pico_random", .file = "src/rp2040_only/random.zig" },
@@ -172,6 +179,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "net-udp", .file = "src/net/udp.zig" },
         .{ .name = "net-tcp_client", .file = "src/net/tcp_client.zig" },
         .{ .name = "net-tcp_server", .file = "src/net/tcp_server.zig" },
+        .{ .name = "net-access_point", .file = "src/net/access_point.zig" },
         .{ .name = "board-id", .file = "src/board_id.zig" },
         .{ .name = "flash-program", .file = "src/flash_program.zig" },
     };
@@ -235,6 +243,14 @@ pub fn build(b: *std.Build) void {
             });
             const net_mod = net_dep.module("net");
             fw.exe.root_module.addImport("net", net_mod);
+        }
+
+        if (std.mem.find(u8, example.name, "_net-access_point") != null) {
+            fw.exe.root_module.addImport("dhcp_server", b.dependency("dhcp_server", .{}).module("dhcp_server"));
+            const options = b.addOptions();
+            options.addOption([]const u8, "security", @tagName(ap_security));
+            options.addOption(u32, "run_s", ap_run_s);
+            fw.exe.root_module.addOptions("ap_options", options);
         }
 
         // Import freertos module for some examples, kind of a hack
