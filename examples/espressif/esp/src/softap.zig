@@ -65,6 +65,8 @@ pub const microzig_options: microzig.Options = .{
 
 // The netif is published before Wi-Fi starts; it lives for the firmware lifetime.
 var ap_netif: lwip.c.netif = undefined;
+// The reporter, Wi-Fi, and lwIP can still use this heap after main returns an error.
+var heap: microzig.Allocator = undefined;
 var ap_started: std.atomic.Value(bool) = .init(false);
 var serving: std.atomic.Value(bool) = .init(false);
 var station_count: std.atomic.Value(u32) = .init(0);
@@ -75,8 +77,7 @@ var packet_buf: [1600]u8 = undefined;
 extern fn netconn_new_with_proto_and_callback(t: lwip.c.enum_netconn_type, proto: lwip.c.u8_t, callback: ?*const anyopaque) [*c]lwip.c.struct_netconn;
 
 pub fn main() !void {
-    // lwIP and radio tasks allocate from this explicit application heap.
-    var heap: microzig.Allocator = try .init_with_heap(32768);
+    heap = try .init_with_heap(32768);
     const gpa = heap.allocator();
     _ = try rtos.spawn(gpa, reporter, .{}, .{});
     @import("wifi_antenna.zig").apply();

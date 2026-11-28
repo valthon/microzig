@@ -65,6 +65,9 @@ Keep the C allocator route and its backing storage valid for all live lwIP alloc
 including across Wi-Fi deinit and reinit. Vendor RX allocates a pbuf before taking the
 TCP/IP core lock, so both allocator routes must be safe across their calling tasks.
 Keep the netif and its context alive while registered or reachable by callbacks.
+The TCP server keeps its registered netif and allocator for the boot. SoftAP keeps its
+allocator for the boot so the reporter, Wi-Fi and lwIP can retain it if the application
+returns an error.
 
 The TCP/IP task services lwIP timeouts using a wrapping millisecond clock. The
 sys_arch mailbox and semaphore waits take milliseconds. Zero waits indefinitely,
@@ -81,7 +84,9 @@ tasks, take `LOCK_TCPIP_CORE` as in `examples/espressif/esp/src/softap.zig:start
 Vendor RX runs inline on the vendor task. Locked input can call `linkoutput` there
 before RX returns, and TX can also run on the TCP/IP task or a caller holding the lock.
 Keep `linkoutput` from waiting for vendor work that could be blocked on that lock.
-Publish the registered netif before RX uses it. Keep the caller-owned `Wifi` stationary
+Publish the registered netif before RX uses it. The TCP server publishes the pointer
+with a release store after registration, and its vendor RX callback loads it with acquire.
+Keep the caller-owned `Wifi` stationary
 and quiesce calls into it, including TX through `linkoutput`, before deinit.
 Run lifecycle waits in the application task outside the lwIP lock.
 
@@ -177,10 +182,7 @@ within the remaining buffer.
 - `modules/network/src/root.zig:Endpoint.parse` and `Interface.Options.Fixed.init` pass slice pointers to C parsers that expect NUL termination. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Endpoint.format` always formats the address as IPv4. ([#64](https://github.com/valthon/microzig/issues/64))
 - `examples/raspberrypi/rp2xxx/src/net/irq.zig:main` can lose a wake posted between reading and clearing the flags. ([#80](https://github.com/valthon/microzig/issues/80))
-- `examples/espressif/esp/src/tcp_server.zig:run` can return from an ordinary server error even after successful Wi-Fi teardown, while lwIP still references the stack-local netif and allocator. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/tcp_server.zig:run_server` can deinitialize Wi-Fi after a server error with the netif still up and registered, allowing TX to overlap teardown. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/tcp_server.zig:maybe_netif` is shared with the vendor task without synchronized publication. ([#81](https://github.com/valthon/microzig/issues/81))
-- `examples/espressif/esp/src/softap.zig:main` can return while the reporter, Wi-Fi or lwIP still uses its stack-local allocator. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/lwip/exports.zig:sys_mbox_trypost` exports a from-ISR alias that uses the task queue API. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/lwip/exports.zig:lwip_assert_core_locked` checks for a lock holder without checking that it is the calling task. ([#81](https://github.com/valthon/microzig/issues/81))
 - `examples/espressif/esp/src/selftest_coex_wifi_ble.zig:cycle_wifi` clears the TX gate without synchronizing with a `linkoutput` already inside that gate before deinit. ([#81](https://github.com/valthon/microzig/issues/81))

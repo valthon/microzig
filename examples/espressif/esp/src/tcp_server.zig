@@ -62,7 +62,10 @@ const AUTH_METHOD = std.meta.stringToEnum(radio.wifi.AuthMethod, wifi_options.au
     @compileError("wifi_options.auth is not a hal.radio.wifi.AuthMethod name");
 const SERVER_PORT = 3333;
 
-var maybe_netif: ?*lwip.c.netif = null;
+var maybe_netif: std.atomic.Value(?*lwip.c.netif) = .init(null);
+// lwIP retains these for the boot, including after a server error.
+var heap_allocator: microzig.Allocator = undefined;
+var station_netif: lwip.c.netif = undefined;
 
 var wifi_ready_signal: rtos.Signal(void) = .{};
 var ap_started: std.atomic.Value(bool) = .init(false);
@@ -89,14 +92,11 @@ pub fn main() !void {
 /// Shared entry point so the lifecycle test uses the same build-time credentials
 /// and the same lwIP/DHCP/TCP echo implementation as the ordinary server.
 pub fn run(comptime lifecycle_selftest: bool) !void {
-    var heap_allocator = microzig.Allocator.init_with_heap(16384) catch |err| {
+    heap_allocator = microzig.Allocator.init_with_heap(16384) catch |err| {
         if (lifecycle_selftest) lifecycle_fail(err);
         return err;
     };
-    var netif: lwip.c.netif = undefined;
-    run_server(lifecycle_selftest, heap_allocator.allocator(), &netif) catch |err| {
-        // lwIP retains the allocator and registered netif. Park inside their
-        // owning frame so callbacks and allocations remain valid during FAIL.
+    run_server(lifecycle_selftest, heap_allocator.allocator(), &station_netif) catch |err| {
         if (lifecycle_selftest) lifecycle_fail(err);
         return err;
     };
@@ -115,8 +115,7 @@ fn run_server(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: 
         return err;
     };
     const result = serve(lifecycle_selftest, gpa, netif);
-    // The driver keeps allocating from `gpa` until a deinit succeeds, so after a failed one
-    // this parks, and the frame that owns the heap and the netif never returns.
+    // A failed teardown leaves Wi-Fi owned. Keep reporting the failure.
     wifi.deinit() catch |err| {
         if (result) |_| {} else |served_err| std.log.err("server failed ({t})", .{served_err});
         std.log.err("Wi-Fi deinit failed ({t}); keeping its memory", .{err});
@@ -142,7 +141,7 @@ fn serve(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip
         netif_init,
         lwip.c.tcpip_input,
     ));
-    maybe_netif = netif;
+    maybe_netif.store(netif, .release);
     try lwip.c_err(lwip.c.netifapi_netif_common(netif, null, lwip.c.dhcp_start));
 
     const station: radio.wifi.Config.Station = .{
@@ -191,7 +190,7 @@ fn serve(comptime lifecycle_selftest: bool, gpa: std.mem.Allocator, netif: *lwip
 
         try connect_sta(station);
     }
-    try lwip.c_err(lwip.c.netifapi_netif_common(maybe_netif.?, lwip.c.netif_set_link_up, null));
+    try lwip.c_err(lwip.c.netifapi_netif_common(netif, lwip.c.netif_set_link_up, null));
 
     if (lifecycle_selftest) {
         lifecycle_step = "dhcp";
@@ -423,19 +422,16 @@ fn netif_status_callback(netif_ptr: [*c]lwip.c.netif) callconv(.c) void {
 }
 
 fn on_packet_received(comptime _: radio.wifi.Interface, data: []const u8) void {
+    const netif = maybe_netif.load(.acquire) orelse return;
     const pbuf: *lwip.c.struct_pbuf = lwip.c.pbuf_alloc(lwip.c.PBUF_RAW, @intCast(data.len), lwip.c.PBUF_POOL) orelse {
         std.log.err("failed to allocate receive pbuf", .{});
         return;
     };
     lwip.c_err(lwip.c.pbuf_take(pbuf, data.ptr, @intCast(data.len))) catch unreachable;
-    if (maybe_netif) |netif| {
-        lwip.c_err(netif.input.?(pbuf, netif)) catch |err| {
-            _ = lwip.c.pbuf_free(pbuf);
-            std.log.warn("tcpip_input failed: {t}", .{err});
-        };
-    } else {
+    lwip.c_err(netif.input.?(pbuf, netif)) catch |err| {
         _ = lwip.c.pbuf_free(pbuf);
-    }
+        std.log.warn("tcpip_input failed: {t}", .{err});
+    };
 }
 
 fn netif_init(netif_ptr: [*c]lwip.c.struct_netif) callconv(.c) lwip.c.err_t {
