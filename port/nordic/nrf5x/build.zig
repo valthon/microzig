@@ -280,4 +280,44 @@ pub fn build(b: *std.Build) void {
     const unit_tests_run = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run platform agnostic unit tests");
     test_step.dependOn(&unit_tests_run.step);
+    add_radio_tests(b, test_step, optimize);
+}
+
+fn add_radio_tests(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode) void {
+    const nrfx = b.dependencyLazy("nrfx", .{}) catch return;
+    const regz = b.dependencyLazy("regz", .{ .optimize = .safe }) catch return;
+    const generate = b.addRunArtifact(regz.artifact("regz"));
+    generate.addArgs(&.{ "--format", "svd", "--output_path" });
+    const chips = generate.addOutputDirectoryArg2("chips", .{});
+    for ([_][]const u8{ "patches/nrf528xx.zon", "patches/nrf52840.zon" }) |patch| {
+        generate.addArg("--patch_path");
+        generate.addFileArg2(b.path(patch), .{});
+    }
+    generate.addFileArg2(nrfx.path("mdk/nrf52840.svd"), .{});
+
+    const registers = b.createModule(.{
+        .root_source_file = chips.path(b, "nrf52840.zig"),
+        .target = b.graph.host,
+    });
+    const radio_interface = b.createModule(.{
+        .root_source_file = b.path("../../../drivers/src/base/IEEE802154_Radio.zig"),
+        .target = b.graph.host,
+    });
+    const core = b.createModule(.{
+        .root_source_file = b.path("src/radio_test_microzig.zig"),
+        .target = b.graph.host,
+        .imports = &.{
+            .{ .name = "registers", .module = registers },
+            .{ .name = "radio_interface", .module = radio_interface },
+        },
+    });
+    registers.addImport("microzig", core);
+    core.addImport("microzig", core);
+    const tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/hal/radio/ieee802154.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "microzig", .module = core }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 }

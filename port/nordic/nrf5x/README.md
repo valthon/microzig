@@ -270,3 +270,149 @@ magnitudes, and PDM sample variation. The microphone check accepts quiet-room
 noise. The board needs only its USB connection.
 
 Evidence: ran on a XIAO nRF52840 Sense.
+
+## IEEE 802.15.4 on nRF52840
+
+Set `microzig_options.hal.ieee802154 = true` to install the RADIO and TIMER3
+handlers. Initialize the HAL timebase, initialize a stationary
+`hal.ieee802154.Radio` with `init(config)`, then call
+`ieee802154_radio().enable()`. Use static storage for the handle: init
+installs it as the owner before verifying the hardware, and if init returns
+`HardwareFault` it keeps that ownership, so the handle and its DMA storage
+must stay stationary until chip reset. Only one handle may own RADIO, TIMER3 and PPI
+channels 17–19. Serialize foreground calls. TEMP is reserved for
+compensation while the handle is active. Init seeds the CSMA-CA PRNG with
+eight bias-corrected RNG bytes. Each byte gets its own 3,968 µs deadline,
+16 times the sum of the typical 128 µs startup and 120 µs corrected-byte times
+in the [nRF52840 Product Specification v1.11 RNG electrical table](https://docs.nordicsemi.com/r/bundle/ps_nrf52840/page/rng.html).
+If any byte times out, init continues with a backoff seed that mixes FICR
+`DEVICEID` with RTC-backed time since boot. The HFXO request stays active for
+other users such as USB.
+
+`disable()` synchronously seals event publication and leaves accepted results
+available to poll. `deinit()` returns `Busy` while a result is unread. With an
+empty backlog it tears down an enabled radio, then rechecks for saved results
+before releasing the handle. Unverified hardware retirement returns
+`HardwareFault` and retains ownership. Keep quarantined handle and DMA storage
+stationary until chip reset.
+
+`receive(channel)` arms RX on channels 11–26. RADIO and TIMER3 interrupts
+handle frames, ACK turnaround, backoffs, retries and energy scans. With
+RX-on-when-idle enabled, the radio returns to RX after foreground operations.
+With it disabled, an explicit receive ends after one accepted frame and its
+ACK, if needed. TX and its ACK wait use the TX request channel, then idle RX
+resumes on the last receive channel. With RX-on-when-idle disabled, a matching
+ACK with Frame Pending on a possible Data Request opens a 100 ms response
+window on the TX channel. This uses the default
+[`OPENTHREAD_CONFIG_MAC_DATA_POLL_TIMEOUT`](https://github.com/openthread/openthread/blob/main/src/core/config/mac.h).
+The window starts at ACK reception and runs independently of polling the TX
+completion. At expiry a qualified frame and any owed ACK finish on that channel.
+A matching receive during the window defers a one-shot renewal until expiry.
+The outstanding receive request or idle policy then selects what happens next.
+A retune, Sleep or an admitted operation can retire the window early.
+
+RSSI is a bounded diagnostic on an already settled RX arm. The RXREADY
+capture gives the settle interval, and packet ADDRESS takes precedence over
+a conflicting diagnostic.
+
+`poll()` drains a 16-entry FIFO. The separate sticky fault is returned first.
+Returned frame slices are valid until the next poll. TX reserves one slot for
+each possible on-air attempt and one for `tx_done`. This is nine slots with
+seven retries, and two for TX without an ACK request. ED and CCA each reserve
+a terminal. TX, ED and CCA return `Busy` when admission capacity or an active
+owner blocks the operation. An RX owner found after operation preflight can
+complete on the old channel, including its owed ACK, before the admitted
+operation starts. An admitted operation blocks Receive until its terminal.
+Sleep can abort accepted work. Settings publish as one generation, and a
+latched frame retains its END settings through its owed ACK.
+
+With a full FIFO, the driver withholds packet START and waits for a poll to
+free capacity. A witnessed drop produces an ordered, coalesced overrun.
+`set_notify` installs a wake callback that can run under the driver’s interrupt
+mask in either foreground or IRQ context. The callback must return quickly
+and avoid calling back into the radio. Drain `poll()` until null before
+waiting for another wake.
+
+The driver supports energy scan, unslotted CSMA-CA, ACK timeout and frame
+retries, sleep-to-TX, RX-on-when-idle, source match and bad-FCS delivery. The
+default backoff exponents are 3 and 5, with four backoffs and three frame retries
+by default. Requests may specify up to five backoffs when CSMA is enabled
+and up to seven frame retries. Zero backoffs performs one CCA per attempt
+without random delay. A busy CCA in that mode reports channel access failure.
+Standalone CCA returns true for a clear channel. ED rounds up to a whole
+eight-symbol interval and reports the strongest RSSI in dBm. Use
+`hal.ieee802154.ed_level` for the IEEE 802.15.4-2006 §6.9.7 scale, from zero at
+and below −75 dBm to 255 at −29 dBm. Enhanced ACK and TX security capability
+bits are reserved. Scheduled TX/RX and slotted CSMA are outside this implementation.
+
+TX input is the MAC frame without PHR or FCS. EasyDMA uses a private copy and
+RADIO generates the FCS. Acknowledged TX returns the matching legacy ACK frame.
+Ordinary RX filters IEEE 802.15.4-2003/2006 frames by clear PAN and short or
+extended address, including broadcasts. Secured unicast frames can receive
+legacy ACKs in either direction. The stack supplies secured TX bytes and
+handles RX authentication and decryption. PAN ID 0xffff enables discovery of
+beacons from any PAN. A configured node accepts beacons from its own PAN.
+Coordinator mode also accepts destinationless frames from its own PAN.
+Promiscuous mode accepts frames irrespective of addresses and suppresses
+auto-ACKs. Bad-FCS delivery is optional and those frames are never ACKed. Each
+received frame has the two FCS octets from RXCRC, LQI from EasyDMA, and RSSI
+read at frame END before ACK or RX restarts.
+
+The source-match tables hold 16 short and 16 extended addresses. With matching
+enabled, the driver sets Frame Pending only in ACKs to possible Data Request
+commands from a listed source. With matching disabled, all such requests get
+Frame Pending. For unsecured commands the driver checks the command ID.
+A secured legacy MAC command is treated as a possible Data Request because
+the driver leaves the protected body opaque. The same classification selects
+the sleepy TX response window. ACKs to data frames leave Frame Pending clear.
+
+PPI captures TX ADDRESS and PHYEND, and RX ADDRESS, END and RXREADY on
+the 1 MHz TIMER3 (nRF52840 PS v1.11 §§6.16, 6.20 and 6.30). TIMER3 drives
+the public clock while enabled. The last valid reading is retained across
+Disable and becomes the baseline for the next Enable. TX ADDRESS marks the
+end of SFD. TX PHYEND supplies a fallback by subtracting PHR and PSDU
+airtime, and starts the 54-symbol ACK wait. RX timestamp conversion also
+subtracts the 23 µs RX END pipeline delay. A fault result has null timestamps.
+Blocking waits leave the sticky reason and saved results pollable on fault.
+
+RADIO transitions use bounded CPU checks. If TIMER3 appears stopped during
+dispatch, the driver confirms the stall with independent RTC0 progress
+(nRF52840 PS v1.11 §§6.20, 6.22 and 6.30). The fault path isolates the
+producers, leaves the radio Disabled, queues each admitted terminal once
+and preserves the first sticky reason and a saturating count.
+
+TXREADY service launches foreground packets under the same mask as explicit
+stops. A stop reports a proven TX start before aborting the operation. A sender
+ACK wait ends with `no_ack`. A queued RX frame with its immediate ACK
+abandoned has both ACK metadata bits clear.
+
+PPI schedules immediate ACK TXEN 129 µs after captured RX END. Together
+with the 23 µs RX END delay and 40 µs fast ramp-up, TXREADY→START targets the
+12-symbol (192 µs) ACK turnaround. Keep interrupt latency short enough for
+foreground TXREADY, ACK scheduling, and entering RX for a peer ACK after TX.
+A missed ACK arm reports the received frame with `ack_sent = false`.
+
+Register setup and timing follow the nRF52840 Product Specification v1.11
+[RADIO §6.20](https://docs.nordicsemi.com/r/bundle/ps_nrf52840/page/radio.html),
+PPI §6.16 and TIMER §6.30. The driver disables after RX (anomaly 110), checks
+CRCSTATUS after END (112), compensates RSSI, LQI, ED and CCA for temperature
+(153), crosses through DISABLED from TX to RX (204), and uses the corrected
+ED/LQI conversions (236). It uses DISABLED interrupts in place of SYNC (228), leaves whitening off (245),
+and writes DTX directly (248). See the
+[nRF52840 Engineering A errata](https://docs.nordicsemi.com/r/bundle/errata_nrf52840_enga)
+and [Revision 3 errata](https://docs.nordicsemi.com/r/bundle/errata_nrf52840_rev3).
+Nordic's BSD-3-Clause
+[nrf_802154_procedures_duration.h](https://github.com/zephyrproject-rtos/hal_nordic/blob/master/drivers/nrf_802154/driver/src/nrf_802154_procedures_duration.h)
+and
+[nrf_802154_rssi.c](https://github.com/zephyrproject-rtos/hal_nordic/blob/master/drivers/nrf_802154/driver/src/nrf_802154_rssi.c)
+document the RX END offset and RSSI compensation. Nordic reports TX start
+from ADDRESS in [nrf_802154_trx.c](https://github.com/zephyrproject-rtos/hal_nordic/blob/master/drivers/nrf_802154/driver/src/nrf_802154_trx.c).
+
+Evidence: ran on a XIAO nRF52840 Sense against an ESP32-H2 peer running
+ESP-IDF's `ieee802154_cli` commands on channel 25. The
+`xiao_nrf52840_sense_selftest_ieee802154` self-test passes every case: init,
+ED, CCA, RSSI, broadcast TX, RX timeout, RX while the foreground waits, data
+ACKs with pending clear for the H2's frames, a TX the H2 ACKs, and a
+three-second sniffer capture. The
+port's host tests cover source matching and the driver’s register-boundary
+dispatch, deadline and lifecycle regressions.
