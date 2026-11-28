@@ -32,8 +32,9 @@ package directly and supply their own netif and RTOS glue.
 ### Bare metal
 
 Keep the link context and the caller-owned `Interface` at stable addresses.
-`modules/network/src/root.zig:Interface.init` initializes global lwIP state, registers
-the embedded netif with `netif_input`, and makes it the default. It installs ARP and
+`modules/network/src/root.zig:Interface.init` initializes the shared lwIP stack once and registers
+the embedded netif with `netif_input`. A successful registration becomes the default.
+A failed DHCP start removes the new netif and preserves the existing default. It installs ARP and
 IPv6 output, sets the MAC and creates an IPv6 link-local address. Choose fixed IPv4 or
 let the interface supply its embedded DHCP state. The wrapper has no teardown API,
 so reserve these objects for the registered lifetime and treat initialization as one-time.
@@ -169,7 +170,6 @@ within the remaining buffer.
 - `modules/network/src/root.zig:Interface.poll` can return on a receive error before installing pbuf cleanup. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Interface.poll` trusts the frame length without checking it against the remaining pbuf. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Interface.c_netif_linkoutput` extends the original pbuf for headroom without restoring it. ([#80](https://github.com/valthon/microzig/issues/80))
-- `modules/network/src/root.zig:Interface.init` reinitializes global lwIP on each call and leaves the interface registered on a DHCP start error. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:Interface.ready` checks a word of the primary address union and misses the separate IPv6 slots. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Connection.c_on_recv` calls `on_recv` before `tcp_recved`, so a close there can discard queued output and send RST. ([#80](https://github.com/valthon/microzig/issues/80))
 - `modules/network/src/root.zig:tcp.Connection.close` sets `.closed` while the old PCB can still call the wrapper on data ACKs or reset during FIN processing, so `.closed` is unsafe as a reuse signal. ([#80](https://github.com/valthon/microzig/issues/80))

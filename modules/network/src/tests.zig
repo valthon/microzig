@@ -168,3 +168,44 @@ const headroom = lwip.PBUF_LINK_ENCAPSULATION_HLEN;
 
 const no_ipv4: net.Interface.Options = .{ .fixed = .{ .ip = .{}, .netmask = .{}, .gw = .{} } };
 const test_mac = [6]u8{ 0x02, 0, 0, 0, 0, 1 };
+
+test "registering another interface preserves live lwIP allocations" {
+    var test_link: TestLink = .{};
+    var first: net.Interface = .{ .link = test_link.link() };
+    try first.init(test_mac, no_ipv4);
+    defer lwip.netif_remove(&first.netif);
+    try testing.expectError(error.AlreadyInitialized, first.init(test_mac, no_ipv4));
+    const pcb = lwip.udp_new() orelse return error.OutOfMemory;
+    const pool = lwip.lwip_stats.memp[lwip.MEMP_UDP_PCB];
+    const used = pool.*.used;
+    defer lwip.udp_remove(pcb);
+
+    var second: net.Interface = .{ .link = test_link.link() };
+    try second.init(test_mac, no_ipv4);
+    defer lwip.netif_remove(&second.netif);
+    try testing.expectEqual(used, pool.*.used);
+}
+
+test "DHCP start failure preserves the default and unregisters the failed interface" {
+    var test_link: TestLink = .{};
+    var first: net.Interface = .{ .link = test_link.link() };
+    try first.init(test_mac, no_ipv4);
+    defer lwip.netif_remove(&first.netif);
+
+    var pcbs: [lwip.MEMP_NUM_UDP_PCB]*lwip.udp_pcb = undefined;
+    var count: usize = 0;
+    defer for (pcbs[0..count]) |pcb| lwip.udp_remove(pcb);
+    for (&pcbs) |*pcb| {
+        pcb.* = lwip.udp_new() orelse return error.OutOfMemory;
+        count += 1;
+    }
+
+    var failed: net.Interface = .{ .link = test_link.link() };
+    try testing.expectError(error.OutOfMemory, failed.init(test_mac, .{}));
+    try testing.expect(lwip.netif_default == &first.netif);
+    try testing.expect(lwip.netif_list == &first.netif);
+    try testing.expectEqual(null, lwip.netif_dhcp_data(&failed.netif));
+    try failed.init(test_mac, no_ipv4);
+    defer lwip.netif_remove(&failed.netif);
+    try testing.expect(lwip.netif_default == &failed.netif);
+}

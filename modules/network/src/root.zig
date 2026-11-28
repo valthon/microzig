@@ -49,8 +49,15 @@ pub const Interface = struct {
     };
 
     pub fn init(self: *Self, mac: [6]u8, opt: Options) !void {
-        lwip.lwip_init();
+        // memp_init installs the statistics pointers for the global pools.
+        // They remain installed even if the first netif fails to register.
+        if (lwip.lwip_stats.memp[lwip.MEMP_PBUF_POOL] == null) lwip.lwip_init();
         const netif: *lwip.netif = &self.netif;
+
+        var registered = lwip.netif_list;
+        while (registered != null) : (registered = registered[0].next) {
+            if (registered == netif) return error.AlreadyInitialized;
+        }
 
         if (opt.fixed) |fixed| {
             _ = lwip.netif_add(
@@ -71,17 +78,20 @@ pub const Interface = struct {
             ) orelse return error.OutOfMemory;
         }
 
+        errdefer lwip.netif_remove(netif);
+
         std.mem.copyForwards(u8, &netif.hwaddr, &mac);
         lwip.netif_create_ip6_linklocal_address(netif, 1);
         netif.ip6_autoconfig_enabled = 1;
-        lwip.netif_set_default(netif);
         lwip.netif_set_up(netif);
-        lwip.netif_set_status_callback(netif, c_on_netif_status);
-        lwip.netif_set_link_callback(netif, c_on_netif_status);
         if (opt.fixed == null) {
             lwip.dhcp_set_struct(netif, &self.dhcp);
+            errdefer netif.client_data[lwip.LWIP_NETIF_CLIENT_DATA_INDEX_DHCP] = null;
             try c_err(lwip.dhcp_start(netif));
         }
+        lwip.netif_set_default(netif);
+        lwip.netif_set_status_callback(netif, c_on_netif_status);
+        lwip.netif_set_link_callback(netif, c_on_netif_status);
     }
 
     // synchronously called from init (during netif_add)
