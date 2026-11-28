@@ -34,6 +34,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
     const b = dep.builder;
 
     const riscv32_common_dep = b.dependency("microzig/modules/riscv32-common", .{});
+    const rtt = b.dependency("microzig/modules/rtt", .{}).module("rtt");
     const pico_sdk = b.dependencyLazy("pico-sdk", .{}) catch return null;
     const bounded_array_dep = b.dependency("bounded-array", .{});
 
@@ -133,6 +134,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                     .name = "riscv32-common",
                     .module = riscv32_common_dep.module("riscv32-common"),
                 },
+                .{ .name = "rtt", .module = rtt },
             }) catch @panic("OOM"),
         },
         .chip = .{

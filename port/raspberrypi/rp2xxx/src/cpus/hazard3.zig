@@ -2,6 +2,8 @@ const std = @import("std");
 const microzig = @import("microzig");
 const riscv32_common = @import("riscv32-common");
 
+pub const rtt = @import("rtt");
+
 pub const CPU_Options = struct {
     ram_vector_table: bool = false,
 };

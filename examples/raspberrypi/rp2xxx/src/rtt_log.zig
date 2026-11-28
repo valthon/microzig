@@ -1,57 +1,15 @@
 const std = @import("std");
 const microzig = @import("microzig");
-const mdf = microzig.drivers;
-const rp2xxx = microzig.hal;
-const time = rp2xxx.time;
+const hal = microzig.hal;
+const time = hal.time;
 
-/// Dummy example of defining a custom locking/unlocking mechanisms for thread safety
-// const pretend_thread_safety = struct {
-//     var locked: bool = false;
+const rtt = microzig.cpu.rtt.RTT(.{});
 
-//     const Context = *bool;
-
-//     fn lock(context: Context) void {
-//         context.* = true;
-//     }
-
-//     fn unlock(context: Context) void {
-//         context.* = false;
-//     }
-
-//     var generic_lock: rtt.GenericLock(Context, lock, unlock) = .{
-//         .context = &locked,
-//     };
-// };
-
-const rtt = microzig.cpu.rtt;
-
-// Configure RTT with specific sizes/names for up and down channels (2 of each) as
-// well as a custom locking routine and specific linker placement.
-// const rtt_instance = rtt.RTT(.{
-//     .up_channels = &.{
-//         .{ .name = "Terminal", .mode = .NoBlockSkip, .buffer_size = 128 },
-//         .{ .name = "Up2", .mode = .NoBlockSkip, .buffer_size = 256 },
-//     },
-//     .down_channels = &.{
-//         .{ .name = "Terminal", .mode = .BlockIfFull, .buffer_size = 512 },
-//         .{ .name = "Down2", .mode = .BlockIfFull, .buffer_size = 1024 },
-//     },
-//     .exclusive_access = pretend_thread_safety.generic_lock.any(),
-//     .linker_section = ".rtt_cb",
-// });
-
-// Configure RTT with default settings but disable exclusive access protection
-// const rtt_instance = rtt.RTT(.{ .exclusive_access = null });
-
-// Configure RTT with all default settings:
-const rtt_instance = rtt.RTT(.{});
-
-// Set up RTT channel 0 as a logger
-var rtt_logger: ?rtt_instance.Writer = null;
-// var rtt_write_buffer: [64]u8 = undefined;
+// On boards with a CYW43 (Pico W, Pico 2 W) GPIO25 is the radio's SPI chip select and the
+// LED hangs off the CYW43, so this example blinks nothing there.
+const has_gpio_led = !@hasDecl(microzig.board, "has_cyw43");
 
 pub const panic = microzig.panic;
-
 pub const std_options = microzig.std_options(.{
     .log_level = .debug,
     .logFn = log,
@@ -61,7 +19,7 @@ comptime {
     _ = microzig.export_startup();
 }
 
-pub fn log(
+fn log(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.EnumLiteral),
     comptime format: []const u8,
@@ -72,76 +30,43 @@ pub fn log(
         .default => ": ",
         else => " (" ++ @tagName(scope) ++ "): ",
     };
-    if (rtt_logger) |*writer| {
-        const current_time = time.get_time_since_boot();
-        const seconds = current_time.to_us() / std.time.us_per_s;
-        const microseconds = current_time.to_us() % std.time.us_per_s;
-        writer.interface.print(prefix ++ format ++ "\r\n", .{ seconds, microseconds } ++ args) catch {};
-        // Don't forget to flush! This never returns an error with how the Writer interface is implemented
-        // so unreachable is appropriate here.
-        writer.interface.flush() catch unreachable;
-    }
+    const timestamp = time.get_time_since_boot().to_us();
+    const seconds = timestamp / std.time.us_per_s;
+    const microseconds = timestamp % std.time.us_per_s;
+    var buffer: [256]u8 = undefined;
+    const line = std.mem.print(&buffer, prefix ++ format ++ "\r\n", .{ seconds, microseconds } ++ args) catch
+        "RTT log line too long\r\n";
+    _ = rtt.write(0, line);
 }
 
-pub fn main() !void {
+pub fn main() void {
+    const led = hal.gpio.num(25);
+    var led_on: u1 = 1;
+    if (has_gpio_led) {
+        led.set_direction(.out);
+        led.set_function(.sio);
+        led.put(led_on);
+    }
 
-    // Don't forget to bring a blinky!
-    var led_gpio = rp2xxx.gpio.num(25);
-    led_gpio.set_direction(.out);
-    led_gpio.set_function(.sio);
-    led_gpio.put(1);
+    rtt.init();
+    _ = rtt.write(0, "Hello RTT!\n");
+    std.log.info("Hello from std.log!", .{});
 
-    // Nothing will work if you don't initialize the RTT control block first!
-    rtt_instance.init();
-
-    // Manually write some bytes to RTT up channel 0 so that it shows up in RTT Viewer
-    _ = rtt_instance.write(0, "Hello RTT!\n");
-
-    // Use std.log instead by instantiating a Writer our log function can use, here we aren't buffering
-    // so all writes will go immediately to RTT up channel
-    rtt_logger = rtt_instance.writer(0, &.{});
-    std.log.info("Hello from std.log!\n", .{});
-
-    // You could also buffer your writes, experiment with what happens if you forget to flush!
-    // rtt_logger = rtt_instance.writer(0, &write_buffer);
-    // for (0..10) |i| {
-    //     try rtt_logger.?.interface.print("{d}\n", .{i});
-    // }
-    // try rtt_logger.?.interface.flush();
-
-    // Instantiate a Reader for RTT down channel 0, giving it an internal buffer that is as big as the max
-    // line length we expect. This allows us to utilize the std.Io.Reader interface to read until a delimiter.
-    const max_line_len = 64;
-    var rtt_reader_buffer: [max_line_len]u8 = undefined;
-    var reader = rtt_instance.reader(0, &rtt_reader_buffer);
-
-    // For blinking our LED on a timeout without blocking
-    var blink_deadline = mdf.time.make_timeout_us(time.get_time_since_boot(), 500_000);
-    var led_val: u1 = 0;
-
-    // Now infinitely wait for a complete line, and print it
+    var blink_deadline = time.deadline_in_ms(500);
+    var ticks: u32 = 0;
+    var input: [16]u8 = undefined;
     while (true) {
-        const now = time.get_time_since_boot();
-        // Toggle LED every 500 msec
-        if (blink_deadline.is_reached_by(now)) {
-            led_gpio.put(led_val);
-            led_val = if (led_val == 0) 1 else 0;
-            blink_deadline = mdf.time.make_timeout_us(now, 500_000);
+        if (blink_deadline.is_reached_by(time.get_time_since_boot())) {
+            led_on ^= 1;
+            if (has_gpio_led) led.put(led_on);
+            blink_deadline = time.deadline_in_ms(500);
+            if (led_on == 1) {
+                std.log.info("RTT tick {d}", .{ticks});
+                ticks +%= 1;
+            }
         }
-        // Attempt to read an entire line from RTT
-        const line_maybe: ?[]const u8 = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => null, // EndOfStream can be safely ignored, this just means there wasn't anything in the RTT buffer
-            error.StreamTooLong => v: {
-                std.log.err("Line overflowed internal buffer, discarding buffer", .{});
-                // Need to purge whatever is in the buffer to read more data as takeDelimiterExclusive() on error
-                // leaves the stream state unmodified
-                reader.interface.tossBuffered();
-                break :v null;
-            },
-            else => unreachable,
-        };
-        if (line_maybe) |line| {
-            std.log.info("Got a line: \"{s}\"", .{line});
-        }
+        // Poll without waiting for a newline so the LED keeps blinking.
+        const n = rtt.read(0, &input);
+        if (n > 0) std.log.info("RTT echo {f}", .{std.zig.fmtString(input[0..n])});
     }
 }

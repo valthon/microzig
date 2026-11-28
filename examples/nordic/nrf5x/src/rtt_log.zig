@@ -9,9 +9,6 @@ const rtt = microzig.cpu.rtt;
 // Configure RTT with all default settings:
 const rtt_instance = rtt.RTT(.{});
 
-// Set up RTT channel 0 as a logger
-var rtt_logger: ?rtt_instance.Writer = null;
-
 pub const panic = microzig.panic;
 
 pub const std_options = microzig.std_options(.{
@@ -34,15 +31,13 @@ pub fn log(
         .default => ": ",
         else => " (" ++ @tagName(scope) ++ "): ",
     };
-    if (rtt_logger) |*writer| {
-        const current_time = time.get_time_since_boot();
-        const seconds = current_time.to_us() / std.time.us_per_s;
-        const microseconds = current_time.to_us() % std.time.us_per_s;
-        writer.interface.print(prefix ++ format ++ "\r\n", .{ seconds, microseconds } ++ args) catch {};
-        // Don't forget to flush! This never returns an error with how the Writer interface is implemented
-        // so unreachable is appropriate here.
-        writer.interface.flush() catch unreachable;
-    }
+    const timestamp = time.get_time_since_boot().to_us();
+    const seconds = timestamp / std.time.us_per_s;
+    const microseconds = timestamp % std.time.us_per_s;
+    var buffer: [256]u8 = undefined;
+    const line = std.mem.print(&buffer, prefix ++ format ++ "\r\n", .{ seconds, microseconds } ++ args) catch
+        "RTT log line too long\r\n";
+    _ = rtt_instance.write(0, line);
 }
 
 pub fn main() !void {
@@ -52,15 +47,7 @@ pub fn main() !void {
     rtt_instance.init();
     // Manually write some bytes to RTT up channel 0 so that it shows up in RTT Viewer
     _ = rtt_instance.write(0, "Hello RTT!\n");
-    // Use std.log instead by instantiating a Writer our log function can use, here we aren't buffering
-    // so all writes will go immediately to RTT up channel
-    rtt_logger = rtt_instance.writer(0, &.{});
-
-    // Instantiate a Reader for RTT down channel 0, giving it an internal buffer that is as big as the max
-    // line length we expect. This allows us to utilize the std.Io.Reader interface to read until a delimiter.
-    const max_line_len = 64;
-    var rtt_reader_buffer: [max_line_len]u8 = undefined;
-    var reader = rtt_instance.reader(0, &rtt_reader_buffer);
+    var input: [16]u8 = undefined;
 
     // For blinking our LED on a timeout without blocking
     var blink_deadline = mdf.time.make_timeout_us(time.get_time_since_boot(), 500_000);
@@ -79,20 +66,7 @@ pub fn main() !void {
             std.log.info("Hello!", .{});
             hello_deadline = mdf.time.make_timeout_us(now, 2_000_000);
         }
-        // Attempt to read an entire line from RTT
-        const line_maybe: ?[]const u8 = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => null, // EndOfStream can be safely ignored, this just means there wasn't anything in the RTT buffer
-            error.StreamTooLong => v: {
-                std.log.err("Line overflowed internal buffer, discarding buffer", .{});
-                // Need to purge whatever is in the buffer to read more data as takeDelimiterExclusive() on error
-                // leaves the stream state unmodified
-                reader.interface.tossBuffered();
-                break :v null;
-            },
-            else => unreachable,
-        };
-        if (line_maybe) |line| {
-            std.log.info("Got a line: \"{s}\"", .{line});
-        }
+        const n = rtt_instance.read(0, &input);
+        if (n > 0) std.log.info("RTT echo {f}", .{std.zig.fmtString(input[0..n])});
     }
 }

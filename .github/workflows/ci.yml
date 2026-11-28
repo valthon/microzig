@@ -14,6 +14,7 @@ jobs:
       regz: ${{ steps.paths.outputs.regz }}
       uf2: ${{ steps.paths.outputs.uf2 }}
       esp_image: ${{ steps.paths.outputs.esp_image }}
+      rtt: ${{ steps.paths.outputs.rtt }}
       printer: ${{ steps.paths.outputs.printer }}
       stm32: ${{ steps.paths.outputs.stm32 }}
       build: ${{ steps.paths.outputs.build }}
@@ -48,6 +49,7 @@ jobs:
           regz=$all
           uf2=$all
           esp_image=$all
+          rtt=$all
           printer=$all
           stm32=$all
           build=$all
@@ -59,6 +61,7 @@ jobs:
                   regz=true
                   uf2=true
                   esp_image=true
+                  rtt=true
                   printer=true
                   stm32=true
                   build=true
@@ -89,6 +92,7 @@ jobs:
             echo "regz=$regz"
             echo "uf2=$uf2"
             echo "esp_image=$esp_image"
+            echo "rtt=$rtt"
             echo "printer=$printer"
             echo "stm32=$stm32"
             echo "build=$build"
@@ -158,6 +162,20 @@ jobs:
       - name: Unit Test ESP Image
         run: zig build test
         working-directory: tools/esp-image
+
+  unit-test-rtt:
+    needs: changes
+    if: needs.changes.outputs.rtt == 'true'
+    name: Unit Test RTT
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+      - name: Unit Test RTT
+        run: zig build test
+        working-directory: modules/rtt
 
   test-printer:
     needs: changes

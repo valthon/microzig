@@ -46,6 +46,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // RISC-V twin of pico2_w_ram, for the RTT example on the Hazard3 cores.
+    const pico2_w_ram_riscv = raspberrypi.pico2_riscv_flashless.derive(.{
+        .board = .{
+            .name = "Raspberry Pi Pico 2 W (RISC-V ram image)",
+            .url = "https://datasheets.raspberrypi.com/pico/pico-2-w-datasheet.pdf",
+            .root_source_file = b.path("src/boards/pico2_w.zig"),
+        },
+    });
+
     const pizero_rp2350_ram = raspberrypi.pico2_arm_flashless.derive(.{
         .board = .{
             .name = "Waveshare RP2350-PiZero (ram image)",
@@ -57,6 +66,8 @@ pub fn build(b: *std.Build) void {
     const specific_examples: []const Example = &.{
         .{ .target = pico2_w_ram, .name = "pico2_w_ram_esp_peer", .file = "src/esp_peer.zig" },
         .{ .target = pico2_w_ram, .name = "pico2_w_ram_i2c_slave_peer", .file = "src/i2c_slave_peer.zig" },
+        .{ .target = pico2_w_ram, .name = "pico2_w_ram_rtt-log", .file = "src/rtt_log.zig" },
+        .{ .target = pico2_w_ram_riscv, .name = "pico2_w_ram_riscv_rtt-log", .file = "src/rtt_log.zig" },
         // RaspberryPi Boards:
         .{ .target = raspberrypi.pico, .name = "pico_board_blinky", .file = "src/board_blinky.zig" },
         .{ .target = raspberrypi.pico, .name = "pico_random", .file = "src/rp2040_only/random.zig" },
@@ -132,7 +143,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "pwm", .file = "src/pwm.zig" },
         .{ .name = "uart-echo", .file = "src/uart_echo.zig" },
         .{ .name = "uart-log", .file = "src/uart_log.zig" },
-        .{ .name = "rtt-log", .file = "src/rtt_log.zig", .works_with_riscv = false },
+        .{ .name = "rtt-log", .file = "src/rtt_log.zig" },
         .{ .name = "spi-master", .file = "src/spi_master.zig" },
         .{ .name = "spi-slave", .file = "src/spi_slave.zig" },
         .{ .name = "spi-loopback-dma", .file = "src/spi_loopback_dma.zig" },

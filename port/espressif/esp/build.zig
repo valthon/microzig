@@ -58,6 +58,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
 
     const riscv32_common_dep = b.dependency("microzig/modules/riscv32-common", .{});
     const riscv32_common_mod = riscv32_common_dep.module("riscv32-common");
+    const rtt = b.dependency("microzig/modules/rtt", .{}).module("rtt");
 
     const esp_image_dep = b.dependency("microzig/tools/esp-image", .{});
     const esp_image_mod = esp_image_dep.module("esp_image");
@@ -88,6 +89,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                     .name = "riscv32-common",
                     .module = riscv32_common_mod,
                 },
+                .{ .name = "rtt", .module = rtt },
                 .{ .name = "interrupt-encoding", .module = interrupt_encoding },
             }) catch @panic("OOM"),
         },
@@ -156,6 +158,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                     .name = "riscv32-common",
                     .module = riscv32_common_mod,
                 },
+                .{ .name = "rtt", .module = rtt },
                 .{ .name = "interrupt-encoding", .module = interrupt_encoding },
             }) catch @panic("OOM"),
         },
@@ -226,6 +229,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                             .name = "riscv32-common",
                             .module = riscv32_common_mod,
                         },
+                        .{ .name = "rtt", .module = rtt },
                         .{ .name = "interrupt-encoding", .module = interrupt_encoding },
                     }) catch @panic("OOM"),
                 },
@@ -289,6 +293,7 @@ pub fn init(dep: *std.Build.Dependency) ?Self {
                             .name = "riscv32-common",
                             .module = riscv32_common_mod,
                         },
+                        .{ .name = "rtt", .module = rtt },
                         .{ .name = "interrupt-encoding", .module = interrupt_encoding },
                     }) catch @panic("OOM"),
                 },
