@@ -96,6 +96,8 @@ A reset latched during the callback takes priority in the next snapshot.
 USBHS acknowledges reset and discards co-latched packet events before the controller callback.
 A reset latched during the callback takes priority in the next snapshot.
 
+USBFS and USBHS leave EP0 OUT able to ACK a retried control-read status packet and discard the duplicate using the receive-toggle match flag.
+
 ### Entry points × phases
 
 | Call | Before an operation | During or after an operation |
@@ -194,6 +196,7 @@ Run `zig build test` in each package. `core/build.zig:build` reaches USB via `co
 - **`port/wch/ch32v/`** checks USBFS reset priority in `port/wch/ch32v/src/hals/usbfs.zig`.
 - **`port/wch/ch32v/`** checks USBHS reset priority in `port/wch/ch32v/src/hals/usbhs.zig`.
 - **`port/wch/ch32v/`** checks the USBFS EP0 status OUT toggle in `port/wch/ch32v/src/hals/usbfs.zig`.
+- **`port/wch/ch32v/`** checks the EP0 receive toggle on retried status OUT in `port/wch/ch32v/src/hals/usbfs.zig` and `port/wch/ch32v/src/hals/usbhs.zig`.
 - Dedicated tests are absent for stationary handles, descriptor and handler rules, synchronous callbacks,
   packet and read capacities, clock and IRQ setup, Nordic attach/detach, physical toggles, RP2xxx and
   WCH USBD register paths, STM32F103 startup and PMA mapping, hardware reset timing, HID I/O,

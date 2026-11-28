@@ -441,16 +441,22 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             // must not consume data or advance the expected toggle, including EP0.
             if (stv.RB_UIS_TOG_OK == 0) return;
 
-            // EP0 data OUT waits for the controller to accept or rearm it.
             if (ep == 0) {
-                const st_out = self.st(.ep0, .out);
-                st_out.rx_last_len = len;
-                const next = toggle_next(current_rx_tog(0));
-                set_rx_ctrl(0, RES_NAK, next, false);
-                if (self.control.out_packet()) {
-                    self.call_on_buffer(.out, 0, controller);
-                    if (self.control.needs_stall()) self.stall_control();
+                const next = toggle_next(rx_ctrl.TOG);
+                if (!self.control.out_packet()) {
+                    // ACK a control-read status retry, and let TOG_OK filter
+                    // the duplicate (USB 2.0 §8.6.4, CH32FV2x_V3x RM
+                    // v2.5 §23.2.2.9, UEP_R_RES and UEP_R_TOG).
+                    const status_out = self.control.direction == .in and self.control.answered;
+                    set_rx_ctrl(0, if (status_out) RES_ACK else RES_NAK, next, false);
+                    return;
                 }
+
+                // Data OUT waits for the controller to accept or rearm it.
+                self.st(.ep0, .out).rx_last_len = len;
+                set_rx_ctrl(0, RES_NAK, next, false);
+                self.call_on_buffer(.out, 0, controller);
+                if (self.control.needs_stall()) self.stall_control();
                 return;
             }
 
@@ -864,4 +870,16 @@ test "USBFS control read keeps DATA1 status OUT armed through IN completion" {
         try std.testing.expectEqual(RES_ACK, rx.RES);
         try std.testing.expectEqual(TOG_DATA1, rx.TOG);
     }
+
+    Regs.R16_USB_RX_LEN = 0;
+    Regs.R8_USB_INT_ST.raw = 1; // The DATA1 OUT matched.
+    dev.handle_out(0, &ctl);
+    const rx = EP_Regs[0].UEP_RX_CTRL.read();
+    try std.testing.expectEqual(RES_ACK, rx.RES);
+    try std.testing.expectEqual(TOG_DATA0, rx.TOG);
+
+    Regs.R8_USB_INT_ST.raw = 0; // The host repeats DATA1 after losing the ACK.
+    dev.handle_out(0, &ctl);
+    try std.testing.expectEqual(rx, EP_Regs[0].UEP_RX_CTRL.read());
+    try std.testing.expectEqual(2, ctl.completions);
 }

@@ -513,16 +513,22 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
             // must not consume data or advance the expected toggle, including EP0.
             if (stv.RB_UIS_TOG_OK == 0) return;
 
-            // EP0 data OUT waits for the controller to accept or rearm it.
             if (ep == 0) {
-                const st_out = self.st(.ep0, .out);
-                st_out.rx_last_len = len;
-                const next = toggle_next(current_rx_tog(0));
-                set_rx_ctrl(0, RES_NAK, next, false);
-                if (self.control.out_packet()) {
-                    self.call_on_buffer(.out, 0, controller);
-                    if (self.control.needs_stall()) self.stall_control();
+                const next = toggle_next(rx_ctrl.TOG);
+                if (!self.control.out_packet()) {
+                    // ACK a control-read status retry, and let TOG_OK filter
+                    // the duplicate (USB 2.0 §8.6.4, CH32FV2x_V3x RM
+                    // v2.5 §22.2.2.10, UEP_R_RES and UEP_R_TOG).
+                    const status_out = self.control.direction == .in and self.control.answered;
+                    set_rx_ctrl(0, if (status_out) RES_ACK else RES_NAK, next, false);
+                    return;
                 }
+
+                // Data OUT waits for the controller to accept or rearm it.
+                self.st(.ep0, .out).rx_last_len = len;
+                set_rx_ctrl(0, RES_NAK, next, false);
+                self.call_on_buffer(.out, 0, controller);
+                if (self.control.needs_stall()) self.stall_control();
                 return;
             }
 
@@ -1161,4 +1167,38 @@ test "USBHS drops the old OUT completion when SETUP reopens and rearms the endpo
 
 test "USBHS drops the old IN completion when SETUP reopens and rearms the endpoint" {
     try expect_reopened_endpoint_drops_old_completion(.in);
+}
+
+test "USBHS acknowledges a retried control read status OUT" {
+    const Device = Polled(.{}, .{});
+    const Controller = struct {
+        completions: usize = 0,
+
+        pub fn on_buffer(self: *@This(), _: *usb.DeviceInterface, comptime ep: types.Endpoint) void {
+            std.debug.assert(ep.dir == .in and ep.num == .ep0);
+            self.completions += 1;
+        }
+    };
+    var dev: Device = undefined;
+    dev.endpoints = @splat(@splat(.{}));
+    dev.discard_ep0_setup = false;
+    dev.control = .{ .direction = .in };
+    var tx: [64]u8 align(4) = undefined;
+    dev.st(.ep0, .in).buf = &tx;
+    set_rx_ctrl(0, RES_NAK, TOG_DATA1, false);
+    _ = Device.ep_writev(&dev.interface, .ep0, &.{"response"});
+
+    var ctl: Controller = .{};
+    dev.handle_in(0, &ctl);
+    Regs.USB_RX_LEN.raw = 0;
+    Regs.USB_INT_ST.raw = 1;
+    dev.handle_out(0, &ctl);
+    const rx = EP_Regs[0].UEP_RX_CTRL.read();
+    try std.testing.expectEqual(RES_ACK, rx.RES);
+    try std.testing.expectEqual(TOG_DATA0, rx.TOG);
+
+    Regs.USB_INT_ST.raw = 0; // The host repeats DATA1 after losing the ACK.
+    dev.handle_out(0, &ctl);
+    try std.testing.expectEqual(rx, EP_Regs[0].UEP_RX_CTRL.read());
+    try std.testing.expectEqual(1, ctl.completions);
 }
