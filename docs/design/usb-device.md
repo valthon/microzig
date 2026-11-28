@@ -128,6 +128,7 @@ USBFS and USBHS leave EP0 OUT able to ACK a retried control-read status packet a
 | USB 2.0 §5.5.3 and §8.5.3 in `core/src/core/usb.zig:DeviceController` | End data on a short packet or at the requested length. |
 | USB 2.0 §9.2.7 and §8.5.3.4 in the header of `core/src/core/usb/ControlRequest.zig` | Stall an unsupported control request. |
 | USB 2.0 §9.4.2, §9.4.7 and §9.1.1.5 in `core/src/core/usb.zig:DeviceController` | GET_CONFIGURATION returns the selected descriptor's value or zero. The port reopens data endpoints at DATA0 on each selection. |
+| USB 2.0 §5.8.3 in `port/wch/ch32v/src/hals/usbhs.zig:Polled.device_capabilities` | Report 64 bytes for bulk endpoints in full-speed mode and 512 bytes when high speed is selected. |
 | USB 2.0 §5.8.3 in `core/src/core/usb/drivers/CDC.zig:Runtime` | CDC uses a ZLP when a full bulk packet completes and no further data has been queued. |
 
 ### Consumer trace
@@ -197,6 +198,7 @@ Run `zig build test` in each package. `core/build.zig:build` reaches USB via `co
 - **`port/wch/ch32v/`** checks USBHS reset priority in `port/wch/ch32v/src/hals/usbhs.zig`.
 - **`port/wch/ch32v/`** checks the USBFS EP0 status OUT toggle in `port/wch/ch32v/src/hals/usbfs.zig`.
 - **`port/wch/ch32v/`** checks the EP0 receive toggle on retried status OUT in `port/wch/ch32v/src/hals/usbfs.zig` and `port/wch/ch32v/src/hals/usbhs.zig`.
+- **`port/wch/ch32v/`** checks USBHS bulk packet size in `port/wch/ch32v/src/hals/usbhs.zig`.
 - Dedicated tests are absent for stationary handles, descriptor and handler rules, synchronous callbacks,
   packet and read capacities, clock and IRQ setup, Nordic attach/detach, physical toggles, RP2xxx and
   WCH USBD register paths, STM32F103 startup and PMA mapping, hardware reset timing, HID I/O,

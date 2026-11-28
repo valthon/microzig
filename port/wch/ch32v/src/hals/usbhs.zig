@@ -189,7 +189,8 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
         pub const device_capabilities: usb.DeviceCapabilities = .{
             .max_supported_bcd_usb = .v2_00,
             .max_packet_size0 = 64,
-            .max_packet_size = 512,
+            // USB 2.0 §5.8.3. The PHY speed selection uses the same config.
+            .max_packet_size = if (cfg.prefer_high_speed) 512 else 64,
         };
 
         comptime {
@@ -961,6 +962,11 @@ test "USBHS bus reset discards pending SETUP" {
     dev.poll(false, &ctl);
     try std.testing.expectEqual(resets + 2, ctl.resets);
     try std.testing.expectEqual(setups, ctl.setups);
+}
+
+test "USBHS bulk packet size follows the selected speed" {
+    try std.testing.expectEqual(64, Polled(.{}, .{ .prefer_high_speed = false }).device_capabilities.max_packet_size);
+    try std.testing.expectEqual(512, Polled(.{}, .{ .prefer_high_speed = true }).device_capabilities.max_packet_size);
 }
 
 fn expect_setup_during_callback(comptime reset: bool, comptime reply: enum { none, pending_setup, racing_setup }) !void {
