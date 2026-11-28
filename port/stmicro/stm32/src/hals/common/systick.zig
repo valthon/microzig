@@ -137,3 +137,40 @@ test "SysTick samples remain monotonic when a wrap precedes the handler" {
     try std.testing.expect(!record_wrap(&timer, &count));
     try std.testing.expectEqual(@as(u64, 11), sample_ticks(&timer, &count));
 }
+
+/// A polled peripheral uses elapsed microseconds when its clock advances.
+/// The finite fallback bounds waits even before clock initialization or if it stalls.
+pub const PollDeadline = struct {
+    // A software watchdog budget, independent of the peripheral's bus rate.
+    const max_stalled_polls = 1_000_000;
+
+    started: u64,
+    latest: u64,
+    duration_us: u64,
+    stalled_polls_left: u32 = max_stalled_polls,
+
+    pub fn init(now_us: u64, duration_us: u64) PollDeadline {
+        return .{ .started = now_us, .latest = now_us, .duration_us = duration_us };
+    }
+
+    pub fn expired(self: *PollDeadline, now_us: u64) bool {
+        if (now_us > self.latest) {
+            self.latest = now_us;
+            self.stalled_polls_left = max_stalled_polls;
+        } else {
+            self.stalled_polls_left -|= 1;
+        }
+        return self.latest - self.started >= self.duration_us or self.stalled_polls_left == 0;
+    }
+};
+
+test "poll deadline bounds running and stalled clocks" {
+    var running = PollDeadline.init(100, 10);
+    try std.testing.expect(!running.expired(109));
+    try std.testing.expect(running.expired(110));
+
+    var stalled = PollDeadline.init(0, 100);
+    stalled.stalled_polls_left = 2;
+    try std.testing.expect(!stalled.expired(0));
+    try std.testing.expect(stalled.expired(0));
+}

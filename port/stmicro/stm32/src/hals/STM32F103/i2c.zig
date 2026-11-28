@@ -9,7 +9,10 @@ const F_S = microzig.chip.types.peripherals.i2c_v1.F_S;
 const mdf = microzig.drivers;
 const drivers = mdf.base;
 const Duration = mdf.time.Duration;
-const Deadline = mdf.time.Deadline;
+const PollDeadline = @import("../common/systick.zig").PollDeadline;
+
+const default_timeout_us = 100_000;
+const recovery_timeout_us = 5_000;
 
 pub const Mode = enum {
     standard,
@@ -232,33 +235,47 @@ pub const I2C = struct {
         regs.CR1.modify(.{ .SWRST = 0 });
     }
 
-    fn check_error(i2c: *const I2C, deadline: Deadline) Error!void {
-        const regs = i2c.regs;
-        const status = regs.SR1.read();
+    fn status_error(status: @FieldType(I2C_Peripheral, "SR1").underlying_type) ?Error {
+        if (status.AF == 1) return error.NoAcknowledge;
+        if (status.ARLO == 1) return error.ArbitrationLoss;
+        if (status.BERR == 1) return error.BusError;
+        if (status.TIMEOUT == 1) return error.BusTimeout;
+        return null;
+    }
 
-        var io_err: ?Error = null;
-
-        if (status.AF == 1) {
-            io_err = Error.NoAcknowledge;
-        } else if (status.ARLO == 1) {
-            io_err = Error.ArbitrationLoss;
-        } else if (status.BERR == 1) {
-            io_err = Error.BusError;
-        } else if (status.TIMEOUT == 1) {
-            io_err = Error.BusTimeout;
-        } else if (deadline.is_reached_by(time.get_time_since_boot())) {
-            io_err = Error.Timeout;
+    fn wait(regs: anytype, comptime flag: []const u8, deadline: *PollDeadline) Error!void {
+        while (true) {
+            const status = regs.SR1.read();
+            if (status_error(status)) |err| return err;
+            if (@field(status, flag) == 1) return;
+            if (deadline.expired(time.get_time_since_boot().to_us())) return error.Timeout;
         }
+    }
 
-        //generate a stop condition if there is an error
-        //if stop condition is not generated in time, i2c bus need to be reset
-        if (io_err) |err| {
-            switch (err) {
-                error.Timeout => {},
-                else => try i2c.STOP(deadline),
+    fn retire_failed_transfer(i2c: *const I2C, err: Error) Error {
+        defer i2c.clear_errors();
+        if (err == error.ArbitrationLoss) return err;
+
+        const control = i2c.regs.CR1.read();
+        if (control.START == 1) return error.UnrecoverableError;
+        // Reading SR2 also releases a latched ADDR before an abort.
+        if (control.STOP == 1 or i2c.regs.SR2.read().MSL == 1) {
+            i2c.clear_errors();
+            var recovery = PollDeadline.init(time.get_time_since_boot().to_us(), recovery_timeout_us);
+            if (control.STOP == 1) {
+                i2c.wait_for_stop(&recovery) catch return error.UnrecoverableError;
+            } else {
+                i2c.STOP(&recovery) catch return error.UnrecoverableError;
             }
-            return err;
         }
+        return err;
+    }
+
+    fn prepare(i2c: *const I2C) Error!void {
+        const control = i2c.regs.CR1.read();
+        // RM0008 §26.6.1 forbids modifying CR1 while START or STOP is set.
+        if (control.START == 1 or control.STOP == 1 or i2c.regs.SR2.read().MSL == 1)
+            return error.UnrecoverableError;
     }
 
     pub fn clear_errors(i2c: *const I2C) void {
@@ -267,10 +284,11 @@ pub const I2C = struct {
             .AF = 0,
             .ARLO = 0,
             .BERR = 0,
+            .TIMEOUT = 0,
         });
     }
 
-    fn START(i2c: *const I2C, deadline: Deadline) Error!void {
+    fn START(i2c: *const I2C, deadline: *PollDeadline) Error!void {
         const regs = i2c.regs;
 
         regs.CR1.modify(.{
@@ -280,12 +298,10 @@ pub const I2C = struct {
 
         //if start condition is not generated in time, i2c bus need to be reset
         //NOTE: this is a workaround for the errata 2.9.4
-        while (regs.SR1.read().START != 1) {
-            i2c.check_error(deadline) catch return Error.UnrecoverableError;
-        }
+        wait(regs, "START", deadline) catch return error.UnrecoverableError;
     }
 
-    fn STOP(i2c: *const I2C, deadline: Deadline) Error!void {
+    fn STOP(i2c: *const I2C, deadline: *PollDeadline) Error!void {
         const regs = i2c.regs;
 
         //if stop is already set, just wait for it to be cleared
@@ -296,36 +312,38 @@ pub const I2C = struct {
             });
         }
 
+        try i2c.wait_for_stop(deadline);
+    }
+
+    fn wait_for_stop(i2c: *const I2C, deadline: *PollDeadline) Error!void {
+        const regs = i2c.regs;
         //if stop condition is not generated in time, i2c bus need to be reset
         //if the bus still busy after stop condition, it means that the bus is in an error state, errata: 2.9.7
-        while ((regs.CR1.read().STOP != 0) or i2c.is_busy()) {
-            if (deadline.is_reached_by(time.get_time_since_boot())) {
-                return Error.UnrecoverableError;
-            }
+        while (true) {
+            // STOPF is a slave flag on F1 (RM0008 §26.6.6). A master
+            // waits for CR1.STOP and BUSY to clear.
+            if (status_error(regs.SR1.read())) |err| return err;
+            if (regs.CR1.read().STOP == 0 and !i2c.is_busy()) return;
+            if (deadline.expired(time.get_time_since_boot().to_us())) return error.UnrecoverableError;
         }
     }
 
-    fn clear_flags(i2c: *const I2C) void {
-        const regs = i2c.regs;
+    fn clear_addr(regs: anytype) void {
         //clear ADDR register
-        std.mem.doNotOptimizeAway(regs.SR1.raw);
-        std.mem.doNotOptimizeAway(regs.SR2.raw);
+        _ = regs.SR1.read();
+        _ = regs.SR2.read();
     }
 
-    fn send_7bits_addr(i2c: *const I2C, addr: u10, IO: u1, deadline: Deadline) Error!void {
+    fn send_7bits_addr(i2c: *const I2C, addr: u10, IO: u1, deadline: *PollDeadline) Error!void {
         const regs = i2c.regs;
         const addr7 = @as(u8, @intCast(addr));
         const byte: u8 = (addr7 << 1) + IO;
         regs.DR.modify(.{ .DR = byte });
 
-        while (regs.SR1.read().ADDR != 1) {
-            try i2c.check_error(deadline);
-        }
-
-        i2c.clear_flags();
+        try wait(regs, "ADDR", deadline);
     }
 
-    fn send_10bits_addr(i2c: *const I2C, addr: u10, IO: u1, deadline: Deadline) Error!void {
+    fn send_10bits_addr(i2c: *const I2C, addr: u10, IO: u1, deadline: *PollDeadline) Error!void {
         const regs = i2c.regs;
 
         //10 bits address is sent in 2 bytes
@@ -337,79 +355,124 @@ pub const I2C = struct {
         const header: u8 = ((0xF0 | (high << 1)) & 0b11110110); //first header is always in Write mode
 
         regs.DR.modify(.{ .DR = header });
-        while (regs.SR1.read().ADD10 != 1) {
-            try i2c.check_error(deadline);
-        }
+        try wait(regs, "ADD10", deadline);
 
         regs.DR.modify(.{ .DR = low });
-        while (regs.SR1.read().ADDR != 1) {
-            try i2c.check_error(deadline);
-        }
-        //clear ADDR register
-        i2c.clear_flags();
+        try wait(regs, "ADDR", deadline);
         if (IO == 1) {
+            clear_addr(regs);
             const read_header: u8 = header | 1;
             try i2c.START(deadline);
             regs.DR.modify(.{ .DR = read_header });
-            while (regs.SR1.read().ADDR != 1) {
-                try i2c.check_error(deadline);
-            }
-
-            i2c.clear_flags();
+            try wait(regs, "ADDR", deadline);
         }
     }
 
-    fn set_addr(i2c: *const I2C, address: Address, rw: u1, deadline: Deadline) Error!void {
+    fn set_addr(i2c: *const I2C, address: Address, rw: u1, deadline: *PollDeadline) Error!void {
         switch (address.mode) {
             .@"7bits" => try i2c.send_7bits_addr(address.addr, rw, deadline),
             .@"10bits" => try i2c.send_10bits_addr(address.addr, rw, deadline),
         }
     }
 
-    pub fn readv_blocking(i2c: *const I2C, addr: Address, chunks: []const []u8, timeout: ?Duration) Error!void {
-        const regs = i2c.regs;
-        const deadline = Deadline.init_relative(time.get_time_since_boot(), timeout);
-        try i2c.START(deadline);
-        try i2c.set_addr(addr, 1, deadline);
+    fn read_rxne(regs: anytype, deadline: *PollDeadline) Error!u8 {
+        try wait(regs, "RXNE", deadline);
+        return regs.DR.read().DR;
+    }
 
-        regs.CR1.modify(.{
-            .ACK = 1,
-        });
-        for (chunks) |data| {
-            for (0..data.len) |index| {
-                if (index == data.len - 1) {
-                    //disable ACk on last byte
-                    regs.CR1.modify(.{
-                        .ACK = 0,
-                    });
-                }
-                while (regs.SR1.read().RXNE != 1) {
-                    try i2c.check_error(deadline);
-                }
+    fn read_last_two(regs: anytype, deadline: *PollDeadline) Error![2]u8 {
+        try wait(regs, "BTF", deadline);
+        // ES096, "Wrong data read into data register", workaround 2.
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+        regs.CR1.modify(.{ .STOP = 1 });
+        return .{ regs.DR.read().DR, regs.DR.read().DR };
+    }
 
-                data[index] = regs.DR.read().DR;
-            }
+    fn read_last_three(regs: anytype, deadline: *PollDeadline) Error![3]u8 {
+        try wait(regs, "BTF", deadline);
+        const third_last, const second_last = blk: {
+            // ES096, "Wrong data read into data register", workaround 2.
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            regs.CR1.modify(.{ .ACK = 0 });
+            const byte = regs.DR.read().DR;
+            regs.CR1.modify(.{ .STOP = 1 });
+            break :blk .{ byte, regs.DR.read().DR };
+        };
+        return .{ third_last, second_last, try read_rxne(regs, deadline) };
+    }
 
-            while (regs.SR1.read().BTF != 1) {
-                try i2c.check_error(deadline);
+    // RM0008 rev 21 §26.3.3, master receiver method 2 (EV7, EV7_2, EV7_3).
+    // The tail is selected once for the whole transaction, across slice boundaries.
+    fn receive_data(regs: anytype, vector: microzig.utilities.SliceVector([]u8), count: usize, deadline: *PollDeadline) Error!void {
+        // RM0008 rev 21 §26.3.3, master receiver method 2 (EV6_1 and EV6_3).
+        // set_addr leaves the final ADDR latched, stretching SCL until cleared.
+        {
+            const cs = microzig.interrupt.enter_critical_section();
+            defer cs.leave();
+            if (count == 1) regs.CR1.modify(.{ .ACK = 0 });
+            clear_addr(regs);
+            switch (count) {
+                1 => regs.CR1.modify(.{ .STOP = 1 }),
+                2 => regs.CR1.modify(.{ .ACK = 0 }),
+                else => {},
             }
         }
 
-        try i2c.STOP(deadline);
+        var dest = vector.iterator();
+        for (0..count -| 3) |_| {
+            dest.next_element_ptr().?.value_ptr.* = try read_rxne(regs, deadline);
+        }
+        const tail: [3]u8, const tail_len: usize = switch (count) {
+            1 => .{ .{ try read_rxne(regs, deadline), 0, 0 }, 1 },
+            2 => blk: {
+                const bytes = try read_last_two(regs, deadline);
+                break :blk .{ .{ bytes[0], bytes[1], 0 }, 2 };
+            },
+            else => .{ try read_last_three(regs, deadline), 3 },
+        };
+        for (tail[0..tail_len]) |byte| dest.next_element_ptr().?.value_ptr.* = byte;
+    }
+
+    pub fn readv_blocking(i2c: *const I2C, addr: Address, chunks: []const []u8, timeout: ?Duration) Error!void {
+        try i2c.prepare();
+        i2c.readv(addr, chunks, timeout) catch |err| return i2c.retire_failed_transfer(err);
+    }
+
+    fn readv(i2c: *const I2C, addr: Address, chunks: []const []u8, timeout: ?Duration) Error!void {
+        const vector = microzig.utilities.SliceVector([]u8).init(chunks);
+        const count = vector.size();
+        if (count == 0) return;
+
+        const regs = i2c.regs;
+        var deadline = PollDeadline.init(time.get_time_since_boot().to_us(), if (timeout) |t| t.to_us() else default_timeout_us);
+        regs.CR1.modify_one("POS", if (count == 2) .Next else .Current);
+        try i2c.START(&deadline);
+        try i2c.set_addr(addr, 1, &deadline);
+
+        try receive_data(regs, vector, count, &deadline);
+        try i2c.wait_for_stop(&deadline);
+        regs.CR1.modify_one("POS", .Current);
     }
 
     pub fn writev_blocking(i2c: *const I2C, addr: Address, chunks: []const []const u8, timeout: ?Duration) Error!void {
-        const regs = i2c.regs;
-        const deadline = Deadline.init_relative(time.get_time_since_boot(), timeout);
+        try i2c.prepare();
+        i2c.writev(addr, chunks, timeout) catch |err| return i2c.retire_failed_transfer(err);
+    }
 
-        try i2c.START(deadline);
-        try i2c.set_addr(addr, 0, deadline);
+    fn writev(i2c: *const I2C, addr: Address, chunks: []const []const u8, timeout: ?Duration) Error!void {
+        const regs = i2c.regs;
+        var deadline = PollDeadline.init(time.get_time_since_boot().to_us(), if (timeout) |t| t.to_us() else default_timeout_us);
+
+        regs.CR1.modify_one("POS", .Current);
+        try i2c.START(&deadline);
+        try i2c.set_addr(addr, 0, &deadline);
+        clear_addr(regs);
 
         for (chunks) |data| {
             for (data) |byte| {
-                while (regs.SR1.read().TXE != 1) {
-                    try i2c.check_error(deadline);
-                }
+                try wait(regs, "TXE", &deadline);
 
                 regs.DR.modify(.{
                     .DR = byte,
@@ -417,11 +480,9 @@ pub const I2C = struct {
             }
         }
 
-        while (regs.SR1.read().BTF != 1) {
-            try i2c.check_error(deadline);
-        }
+        try wait(regs, "BTF", &deadline);
 
-        try i2c.STOP(deadline);
+        try i2c.STOP(&deadline);
     }
 
     pub fn write_blocking(i2c: *const I2C, address: Address, data: []const u8, timeout: ?Duration) Error!void {
@@ -444,3 +505,94 @@ pub const I2C = struct {
         return .{ .regs = enums.get_regs(I2C_Peripheral, instance) };
     }
 };
+
+test "F1 receiver writes ACK and STOP at the transaction tail across chunks" {
+    const Event = enum { clear_addr, nack, stop, data };
+    const Bus = struct {
+        const Self = @This();
+        events: [9]Event = undefined,
+        event_count: usize = 0,
+        next: u8 = 1,
+
+        fn record(self: *Self, event: Event) void {
+            self.events[self.event_count] = event;
+            self.event_count += 1;
+        }
+
+        const Control = struct {
+            bus: *Self,
+
+            fn modify(self: @This(), fields: anytype) void {
+                if (@hasField(@TypeOf(fields), "ACK") and fields.ACK == 0) self.bus.record(.nack);
+                if (@hasField(@TypeOf(fields), "STOP") and fields.STOP == 1) self.bus.record(.stop);
+            }
+        };
+        const Status = struct {
+            fn read(_: @This()) @FieldType(I2C_Peripheral, "SR1").underlying_type {
+                return std.mem.zeroInit(@FieldType(I2C_Peripheral, "SR1").underlying_type, .{ .RXNE = 1, .BTF = 1 });
+            }
+        };
+        const Status2 = struct {
+            bus: *Self,
+
+            fn read(self: @This()) void {
+                self.bus.record(.clear_addr);
+            }
+        };
+        const Data = struct {
+            bus: *Self,
+
+            fn read(self: @This()) struct { DR: u8 } {
+                self.bus.record(.data);
+                defer self.bus.next += 1;
+                return .{ .DR = self.bus.next };
+            }
+        };
+    };
+
+    const sequences: []const []const Event = &.{
+        &.{ .nack, .clear_addr, .stop, .data },
+        &.{ .clear_addr, .nack, .stop, .data, .data },
+        &.{ .clear_addr, .nack, .data, .stop, .data, .data },
+        &.{ .clear_addr, .data, .nack, .data, .stop, .data, .data },
+        &.{ .clear_addr, .data, .data, .nack, .data, .stop, .data, .data },
+    };
+    for (sequences, 1..) |expected, len| {
+        var first: [1]u8 = undefined;
+        var rest: [4]u8 = undefined;
+        const chunks: []const []u8 = &.{ &.{}, &first, &.{}, rest[0 .. len - 1], &.{} };
+        const vector = microzig.utilities.SliceVector([]u8).init(chunks);
+        var bus: Bus = .{};
+        const regs = .{
+            .CR1 = Bus.Control{ .bus = &bus },
+            .SR1 = Bus.Status{},
+            .SR2 = Bus.Status2{ .bus = &bus },
+            .DR = Bus.Data{ .bus = &bus },
+        };
+        var deadline = PollDeadline.init(0, default_timeout_us);
+        try I2C.receive_data(regs, vector, vector.size(), &deadline);
+        try std.testing.expectEqualSlices(Event, expected, bus.events[0..bus.event_count]);
+        try std.testing.expectEqual(@as(u8, 1), first[0]);
+        try std.testing.expectEqualSlices(u8, (&[_]u8{ 2, 3, 4, 5 })[0 .. len - 1], rest[0 .. len - 1]);
+    }
+}
+
+test "F1 master waits time out with a stalled clock and prioritize hardware TIMEOUT" {
+    var regs = std.mem.zeroes(I2C_Peripheral);
+    const bus: I2C = .{ .regs = &regs };
+    inline for (.{ "START", "ADDR", "ADD10", "RXNE", "TXE", "BTF" }) |flag| {
+        regs.SR1.raw = 0;
+        var deadline = PollDeadline.init(0, default_timeout_us);
+        deadline.stalled_polls_left = 1;
+        try std.testing.expectError(error.Timeout, I2C.wait(bus.regs, flag, &deadline));
+        regs.SR1.modify(.{ .TIMEOUT = 1 });
+        regs.SR1.modify_one(flag, 1);
+        try std.testing.expectError(error.BusTimeout, I2C.wait(bus.regs, flag, &deadline));
+    }
+    regs.SR1.raw = 0;
+    regs.CR1.modify(.{ .STOP = 1 });
+    var deadline = PollDeadline.init(0, default_timeout_us);
+    deadline.stalled_polls_left = 1;
+    try std.testing.expectError(error.UnrecoverableError, bus.wait_for_stop(&deadline));
+    try std.testing.expectError(error.UnrecoverableError, bus.prepare());
+}
