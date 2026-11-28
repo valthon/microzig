@@ -1,6 +1,6 @@
 # nRF52840 Bluetooth LE over the SoftDevice Controller
 
-Covers: port/nordic/nrf5x/build.zig, port/nordic/nrf5x/build.zig.zon, port/nordic/nrf5x/src/hal.zig, port/nordic/nrf5x/src/hal/time.zig, port/nordic/nrf5x/src/hal/clocks.zig, port/nordic/nrf5x/src/hal/radio/ble/, port/nordic/nrf5x/src/hal/radio/ieee802154.zig, drivers/src/base/HCI_Transport.zig, modules/ble/, port/espressif/esp/src/hal/radio/bluetooth.zig, port/espressif/esp/src/hal/radio/ble/
+Covers: port/nordic/nrf5x/build.zig, port/nordic/nrf5x/build.zig.zon, port/nordic/nrf5x/src/hal.zig, port/nordic/nrf5x/src/hal/time.zig, port/nordic/nrf5x/src/hal/clocks.zig, port/nordic/nrf5x/src/hal/timer.zig, port/nordic/nrf5x/src/hal/rtc.zig, port/nordic/nrf5x/src/hal/ppi.zig, port/nordic/nrf5x/src/hal/temp.zig, port/nordic/nrf5x/src/hal/nvmc.zig, port/nordic/nrf5x/src/hal/usbd.zig, port/nordic/nrf5x/src/hal/radio/ble/, drivers/src/base/HCI_Transport.zig, modules/ble/, port/espressif/esp/src/hal/radio/bluetooth.zig, port/espressif/esp/src/hal/radio/ble/
 
 ## Purpose
 
@@ -8,294 +8,356 @@ Bluetooth LE on the nRF52840 ([#101](https://github.com/valthon/microzig/issues/
 SoftDevice Controller (SDC) runs the link layer and Nordic's Multiprotocol Service Layer (MPSL)
 schedules the radio; both are prebuilt libraries from `sdk-nrfxlib`. Everything above HCI is ours:
 the Zig host that the ESP port already runs over Espressif's controller moves out of the ESP port
-and becomes the host for both chips. The nRF glue is an HCI transport, the MPSL plumbing
-(interrupts, clocks, low-priority work) and a static memory pool.
+and becomes the host for both chips. The nRF glue is an HCI transport with a command dispatcher,
+the MPSL plumbing (vectors, priorities, clocks, low-priority service) and a static memory pool.
 
-It does not implement a link layer, run the SDC on any chip other than the nRF52840, write flash
-while the controller is enabled, or (in the first implementation) run BLE and the 802.15.4 driver
-in the same image; the coexistence design for that is below, under its own heading.
+It does not implement a link layer, run the SDC on any chip other than the nRF52840, write internal
+flash while MPSL runs, use extended advertising, or (in the first implementation) run BLE and the
+802.15.4 driver in one image; the coexistence design is under its own heading below.
 
 The SDC and MPSL are `LicenseRef-Nordic-5-Clause`: Nordic ICs only, no reverse engineering. The
-glue is written from the public headers and the integration notes in `sdk-nrfxlib`
+glue is written from the public headers and integration notes of `sdk-nrfxlib` v3.4.2
 (`mpsl/doc/mpsl.rst`, `mpsl/doc/timeslot.rst`, `softdevice_controller/doc/softdevice_controller.rst`),
-never from the binaries, and the libraries are fetched as a lazy build dependency, never
-committed. Nordic's own glue in `sdk-nrf` carries the same licence, so it is read for behavior
-and cited, never copied.
+never from the binaries. The libraries and headers are a lazy build dependency, never committed.
+Nordic's glue in `sdk-nrf` carries the same licence, so it is read for behavior and cited, never
+copied.
 
 ## Code map
 
-Planned layout. Names are binding for the implementation unless a review changes this doc.
+Planned layout; names bind the implementation unless a review changes this doc.
 
 | Path | Role |
 | --- | --- |
-| `drivers/src/base/HCI_Transport.zig` | Port-agnostic HCI transport interface: send command, send ACL, receive packet with timeout, clock. Replaces `wire.Transport` in the ESP host. |
-| `modules/ble/` | The host, moved from `port/espressif/esp/src/hal/radio/ble/` (`host.zig`, `protocol.zig`, `gatt.zig`, `smp.zig`, `smp_bond.zig`, `smp_crypto.zig` and their tests). Imports only `std` and `drivers.base`. |
-| `port/espressif/esp/src/hal/radio/bluetooth.zig` | Keeps `Controller`; `Controller.transport()` returns an `HCI_Transport`. `smp_hardware.zig` stays in the ESP port and implements the host's crypto provider. |
-| `port/nordic/nrf5x/src/hal/radio/ble/mpsl.zig` | `mpsl_init` at HAL init, the five MPSL vectors, the low-priority service ISR, HFCLK requests for other HAL users, temperature. |
-| `port/nordic/nrf5x/src/hal/radio/ble/controller.zig` | `Controller`: `sdc_init`/`sdc_cfg_set`/`sdc_enable`, the command mailbox, the receive ring, `transport()`. |
-| `port/nordic/nrf5x/src/hal/radio/ble/hci_command.zig` | Pure: decode an HCI command packet, call the matching `sdc_hci_cmd_*` through a function table, encode Command Complete or Command Status. Host-tested with a fake table. |
-| `port/nordic/nrf5x/src/hal/radio/ble/memory.zig` | Pure: comptime upper bound of the SDC pool from the role configuration. |
+| `drivers/src/base/HCI_Transport.zig` | Port-agnostic HCI transport interface (pointer + vtable): send command, send ACL, receive one packet with a timeout, clock. Replaces `wire.Transport` in the ESP host. |
+| `drivers/src/base/` (same file) | `SMP_Crypto` provider interface (random, P-256 key pair, DH), lifted from `smp.Crypto` so ports implement it without depending on the host. |
+| `modules/ble/` | The host, moved from `port/espressif/esp/src/hal/radio/ble/` (`host.zig`, `protocol.zig`, `gatt.zig`, `smp.zig`, `smp_bond.zig`, `smp_crypto.zig`, tests). Imports only `std` and `drivers`. |
+| `port/espressif/esp/src/hal/radio/bluetooth.zig` | Keeps `Controller`; `Controller.transport()` returns an `HCI_Transport`. `smp_hardware.zig` implements `SMP_Crypto` on the C6 ECC block. |
+| `port/nordic/nrf5x/src/hal/radio/ble/mpsl.zig` | `mpsl_init` at HAL init, the MPSL vectors, the SWI5 signal handler, `service`, HFCLK requests for other HAL users, temperature. |
+| `port/nordic/nrf5x/src/hal/radio/ble/controller.zig` | `Controller`: enable sequence, `transport()`, the one-slot command reply. |
+| `port/nordic/nrf5x/src/hal/radio/ble/hci_command.zig` | Pure: validate an HCI command packet, call the matching `sdc_hci_cmd_*` through a function table, encode Command Complete or Command Status. |
+| `port/nordic/nrf5x/src/hal/radio/ble/memory.zig` | Pure: comptime upper bound of the SDC pool for the role configuration. |
+| `port/nordic/nrf5x/src/hal/radio/ble/crypto.zig` | `SMP_Crypto` for the nRF: RNG for randomness, `std.crypto` P-256 in software. |
 | `port/nordic/nrf5x/build.zig:with_ble` | Build-time opt-in: derives a target whose HAL imports the translated SDC/MPSL headers and links the libraries. |
 
 ## Invariants
 
-**Opt-in at build time and at comptime, both required.** A BLE image uses a target from
-`with_ble(target, .{ .roles = ... })`, which resolves the lazy `nrfxlib` dependency, translates the
-headers with a stub `nrfx.h` from our tree, and links `libmpsl.a` and one
-`libsoftdevice_controller_{peripheral,central,multirole}.a` chosen from the roles (soft-float ABI
-variant to match the port's `eabi` target). The app also sets `microzig_options.hal.ble = true`,
-which adds the MPSL vectors to `hal.default_interrupts`. Either one without the other is a compile
-error naming the missing half. Targets not derived through `with_ble` are the same objects as today,
-so non-radio images stay byte-identical; the PR checks it with the existing image comparison.
+### Opt-in
 
-**MPSL owns its peripherals from HAL init.** In a BLE image `hal.init` calls `mpsl_init` before
-anything else touches CLOCK, so MPSL starts and calibrates the LF clock (NCS does the same at
-`SYS_INIT`, `subsys/mpsl/init/mpsl_init.c`). The peripherals MPSL and the SDC own on the nRF52
-(`mpsl.rst`, `softdevice_controller.rst`) and what the HAL does about each:
+- **Two switches, both required.** A BLE image uses a target from `with_ble(target)`, which
+  resolves the lazy `sdk-nrfxlib` dependency, translates the SDC/MPSL headers (include paths from
+  the port's existing `nrfx` dependency for `nrfx.h` and `hal/nrf_clock.h`, plus a config shim of
+  our own with only the macros `nrfx.h` requires), adds the result as a HAL import, and links
+  `libmpsl.a` and `libsoftdevice_controller_multirole.a` (the self-test needs all four roles; the
+  peripheral-only and central-only variants are a later size optimization). The ABI variant matches
+  the port's `eabi` target and is chosen by the build, which fails if the file is missing. The app
+  also sets `microzig_options.hal.ble = true`, a new `HAL_Options` field. `hal.zig` checks both
+  directions at compile time: the option without the import names `with_ble`; a BLE-import target
+  without the option names `hal.ble`.
+- **Off means unchanged.** With `hal.ble` false, `default_interrupts`, `hal.init`, `hal.time` and
+  every refused API compile exactly as today, and targets not derived through `with_ble` carry no
+  new import. The PR adds `scripts/image_compare.sh`, which builds every non-radio nRF and ESP
+  example at the base and head commits and compares SHA-256 of each image; the PR reports its
+  result.
+
+### Execution context
+
+- **Every MPSL and SDC call runs in the foreground.** `mpsl.rst` (Scheduling) asks that
+  `mpsl_low_priority_process` run in thread context, not in the software interrupt handler, and
+  that MPSL APIs never run concurrently; `sdc_hci.h` asks that HCI APIs run at the priority of
+  `mpsl_low_priority_process`. Both prior arts do this: NCS's SWI handler only submits work to the
+  "MPSL Work" thread (`subsys/mpsl/init/mpsl_init.c:mpsl_low_prio_irq_handler`), and embassy's
+  handler only wakes the task whose `run()` calls the process (`nrf-mpsl/src/mpsl.rs`). Here the
+  SWI5 handler stores `low_priority_pending = true` (atomic, release) and returns. `mpsl.service()`
+  runs in the foreground: if the flag is set it clears it, calls `mpsl_low_priority_process`, and
+  runs the RC calibration call when due. The SDC's host callback, `rand_poll` and the HFCLK
+  callbacks run inside that call, so they run in the foreground too.
+- **Who calls `service`.** The nRF transport calls it before every `sdc_hci_get` and on every pass
+  of its receive wait, so a host blocked in `poll`, `connect` or a GATT procedure keeps MPSL
+  serviced. An app doing other work calls `hal.ble.service()` at least every 2 ms, the "couple of
+  ms" in `mpsl.rst`. Interrupt handlers never call MPSL, SDC or `service`; with one foreground
+  context that is the whole synchronization rule.
+- **Long foreground work is the app's budget.** A software P-256 multiply during pairing, or any
+  long app computation, delays `service`. embassy has the same property (a task that does not yield
+  delays `run()`). The self-test measures the longest gap between SWI5 and `service` during
+  pairing and reports it; a gap that breaks the link is a finding against this design, not against
+  the app.
+
+### Interrupts
+
+- **Priorities.** The nRF52840 has 3 priority bits (`nvicPrioBits` in the nRF52840 SVD, carried by
+  regz into `interrupt_priority_bits`); the implementation asserts the value at compile time.
+  RADIO, RTC0 and TIMER0 run at 0 (`MPSL_HIGH_IRQ_PRIORITY`, `mpsl.h`). Nothing else may share 0:
+  "Interrupting or delaying these handlers leads to undefined behavior" (`mpsl.rst`). In a BLE image
+  `hal.init` sets every other NVIC line to 2 before enabling any, as Zephyr offsets every
+  application IRQ below its reserved levels (`include/zephyr/arch/arm/cortex_m/exception.h`,
+  `_IRQ_PRIO_OFFSET`). POWER_CLOCK and SWI5 go to 6: `mpsl.rst` requires them below 0 and they do
+  no real-time work. An app that later sets an IRQ to 0 breaks the contract; the doc comment on
+  `hal.ble` says so.
+- **Order in `hal.init`.** VTOR (below), all priorities, SWI5 and POWER_CLOCK enabled, then
+  `mpsl_init(&lfclk_config, SWI5_EGU5, assert_handler)`, then `mpsl_clock_hfclk_latency_set`, then
+  `hal.time` on RTC1. nrf-mpsl sets the low-priority IRQ before `mpsl_init` and the high ones after;
+  MPSL enables the reserved lines itself (`mpsl.rst`, Interrupt configuration).
+- **Vectors.** `default_interrupts` gains, only when `hal.ble` is set: RADIO, RTC0, TIMER0 to
+  `MPSL_IRQ_*_Handler`, POWER_CLOCK to `MPSL_IRQ_CLOCK_Handler` (MPSL ignores events it does not
+  own, `mpsl.rst`), SWI5_EGU5 to the signal handler. `hal.time`'s RTC0 entry moves to RTC1.
+- **VTOR.** On boards linked behind a bootloader (XIAO nRF52840 Sense at 0x27000) interrupts reach
+  the app through the MBR and the disabled SoftDevice's forwarding. A BLE image writes VTOR to its
+  own table first in `hal.init`, as Zephyr does for every image
+  (`arch/arm/core/cortex_m/prep_c.c:relocate_vector_table`).
+- **Critical sections.** MicroZig's critical section sets PRIMASK and so also masks MPSL. Zephyr's
+  default (`ZERO_LATENCY_IRQS` off) masks MPSL in `irq_lock` too, so NCS relies on short sections;
+  nrf-mpsl instead leaves RADIO, RTC0 and TIMER0 unmasked (`critical_section_impl.rs`) and warns
+  that `cpsid` "can disrupt timing". Neither Nordic document publishes a bound. This design keeps
+  PRIMASK, refuses the one known long section (`hal.nvmc`, which spans a page erase), and the
+  self-test reports the longest masked interval measured with the DWT cycle counter. Switching to
+  a BASEPRI section that spares priority 0 is the fallback if a measurement fails.
+
+### Resource ownership
+
+MPSL and the SDC own these on the nRF52 (`mpsl.rst`; `softdevice_controller.rst`; `sdc_soc.h`
+`SDC_PPI_CHANNELS_USED_MASK`). In a BLE image the HAL behaves as follows. "Compile error" means a
+branch on `options.hal.ble` inside the function body, so it fires only if the app references the
+function; "refused" means a check on a runtime argument that panics with the owner's name, since
+`Timer`, `Rtc` and `ppi.Channel` are runtime values. This is the Zig form of nrf-mpsl's
+`Peripherals` ownership struct.
 
 | Resource | Owner | BLE-image HAL behavior |
 | --- | --- | --- |
-| RTC0 | MPSL (IRQ) | `hal.time` moves to RTC1 and stops configuring LFCLK; the RTC0 vector goes to MPSL. |
-| TIMER0 | MPSL (IRQ) | `hal.timer` refuses `.timer0` at compile time. |
-| RADIO | MPSL (IRQ via MPSL) | Only MPSL or a timeslot owner touches it. `hal.ieee802154` is a compile error until coexistence lands. |
-| CLOCK, POWER_CLOCK IRQ | MPSL | `clocks.hfxo.start` and `clocks.lfclk.*` are compile errors; USB and others use `ble.hfclk_request`/`release` (`mpsl_clock_hfclk_request`). |
-| TEMP | MPSL | `hal.temp` is a compile error; `ble.temperature()` calls `mpsl_temperature_get`. |
-| ECB | MPSL (IRQ) | The host's SMP uses software AES (`std.crypto`), so nothing else needs ECB. |
-| CCM, AAR | SDC | Not exposed by the HAL today; stays that way. |
-| NVMC | SDC | `hal.nvmc` erase/write are compile errors in a BLE image (flash writes stall the CPU; nrf-mpsl schedules them in timeslots, `nrf-mpsl/src/flash.rs`). A timeslot flash backend is an open question. |
-| PPI 17–31 | SDC (19, 30, 31 also MPSL) | `ppi.Channel` values 17–31 are refused at compile time in a BLE image. |
+| RTC0 | MPSL | `hal.time` moves to RTC1 and stops configuring LFCLK. |
+| RTC1 | `hal.time` | `hal.rtc` refuses `.rtc1`. |
+| TIMER0 | MPSL | `hal.timer` refuses `.timer0`. |
+| RADIO | MPSL, or a timeslot owner | `hal.ieee802154` with `hal.ble` is a compile error until coexistence lands. |
+| CLOCK, POWER_CLOCK IRQ | MPSL | `clocks.hfxo.*` and `clocks.lfclk.*` are compile errors. `usbd` requests the crystal with `mpsl_clock_hfclk_src_request` (the non-deprecated form, `mpsl_clock.h`) and waits for its callback via `service`. |
+| TEMP | MPSL | `hal.temp` is a compile error; `hal.ble.temperature()` calls `mpsl_temperature_get` (about 50 µs, `mpsl_temp.h`). |
+| ECB | MPSL | The host uses software AES (`std.crypto`). |
+| CCM, AAR | SDC | Not exposed by the HAL; stays that way. |
+| NVMC | SDC | `hal.nvmc` write and erase are compile errors (nrf-mpsl routes flash through timeslots, `flash.rs`). |
+| PPI 17–31 | SDC; 19, 30, 31 also MPSL | `ppi.Channel` operations refuse 17–31. |
+| SWI5/EGU5 | MPSL low-priority signal | Not exposed by the HAL; the vector is taken. |
+| RNG | shared, foreground only | `rand_poll` and the SMP provider fill from RNG with bias correction, in the foreground. Interrupt handlers must not use `hal.rng`. |
 
-Compile-time refusal is the Zig form of nrf-mpsl's `Peripherals` ownership struct
-(`nrf-mpsl/src/mpsl.rs`): a branch on `options.hal.ble` inside the function body errors only if
-the app references it.
+### Controller and HCI
 
-**One execution priority for every MPSL and SDC call.** `sdc_hci.h` requires the HCI APIs to run at
-the priority of `mpsl_low_priority_process`; `mpsl.rst` requires MPSL APIs not to run concurrently.
-All of them run in one place: the low-priority service ISR (SWI5_EGU5, the NCS default
-`MPSL_LOW_PRIO_IRQN` on nRF52, priority 4 as in NCS `MPSL_LOW_PRIO` and nrf-mpsl). Foreground code
-never calls MPSL or the SDC. It writes a request into the controller handle and pends SWI5; the ISR
-executes requests, then runs `mpsl_low_priority_process`, then drains `sdc_hci_get` into the
-receive ring. MPSL's note that the process call belongs in thread context is satisfied by its stated
-alternative ("ensure that no MPSL functions are called at the same time"): nothing else calls them.
-This keeps MPSL serviced while the foreground runs a P-256 multiply or a QSPI erase, which a
-foreground-polled design (nrf-mpsl's executor task) cannot promise on bare metal.
-
-**Backpressure, never drop.** When the receive ring has no free slot the ISR stops calling
-`sdc_hci_get` and leaves packets in the controller; the host's next receive frees a slot and pends
-SWI5. NCS does the same on `-ENOBUFS` (`hci_driver.c:hci_driver_receive_process`). The host's HCI
-command credit (one) and ACL credits (from LE Read Buffer Size) bound what the foreground can
-submit, so the request mailbox never overflows; a request beyond them returns `Busy`.
-
-**The SDC never sees a raw command packet.** This SDC version exports one function per command
-(`sdc_hci_cmd_*`) and no packet entry point. `hci_command.zig` decodes the packet, calls the
-function, and builds Command Complete (Core v5.4 Vol 4 Part E §7.7.14) with `Num_HCI_Command_Packets
-= 1`, or Command Status (§7.7.15) for the commands whose completion is a later event (Disconnect,
-LE Create Connection, LE Enable Encryption among those the host sends). An opcode not in the table
-returns Command Status with Unknown HCI Command (0x01). NCS's `hci_internal.c` has the same shape;
-ours covers only the commands the host sends and is generated from one comptime table, so a new
-host command fails a host test until it is added.
-
-**Memory is static and checked twice.** `memory.zig` computes the pool bound at comptime from the
-`SDC_MEM_*` formulas for the configured roles (the header calls them upper limits). At
-`Controller.init` the ISR's `sdc_cfg_set` returns the exact requirement; more than the pool is
-`error.PoolTooSmall` before `sdc_enable`. NCS sizes `sdc_mempool` the same way and checks at
-runtime (`hci_driver.c:configure_memory_usage`). The pool is 8-byte aligned (`sdc_enable`).
-
-**Faults end in a reset.** The MPSL assert and SDC fault handlers record file and line in the
-handle and call `@panic`; both libraries disable interrupts first and reset the chip if the handler
-returns (`mpsl.h`, `sdc.h`). nrf-mpsl panics the same way.
-
-**Identity.** The nRF52840 has no public address; FICR `DEVICEADDR` with `DEVICEADDRTYPE = Random`
-is a static random address (nRF52840 PS v1.11, FICR). The host gains an identity setting: public
-(the controller's BD_ADDR, the ESP default and unchanged) or random static, where the host sends LE
-Set Random Address and uses own-address-type random in advertising, scanning and connection
-parameters, and in the SMP `a1`/`a2` inputs (Core Vol 3 Part H §2.2). The nRF port supplies the
-FICR address with the two top bits forced to `11` (Core Vol 6 Part B §1.3.2.1).
-
-**Vector table.** On boards linked behind a bootloader (XIAO nRF52840 Sense at 0x27000), interrupts
-arrive through the MBR and the disabled SoftDevice's forwarding. A BLE image writes VTOR to its own
-table at HAL init so MPSL's priority-0 handlers do not pay the forwarding, as Zephyr does for every
-image (`arch/arm/core/cortex_m/prep_c.c:relocate_vector_table`).
-
-**Critical sections stay PRIMASK.** MicroZig's `enter_critical_section` masks everything, MPSL's
-priority-0 handlers included. Zephyr's default (`ZERO_LATENCY_IRQS` off) does the same: MPSL's
-priority 0 is offset to hardware priority 1 and `irq_lock` sets BASEPRI to that level
-(`include/zephyr/arch/arm/cortex_m/exception.h`), so NCS ships with MPSL maskable by short critical
-sections. nrf-mpsl offers the alternative, an NVIC-based section that leaves RADIO, RTC0 and TIMER0
-running (`critical_section_impl.rs`). Neither Nordic document publishes a bound, so the self-test
-measures the longest masked interval in a BLE image with the DWT cycle counter and the PR reports it.
+- **Enable order** (`sdc.h` notes on each call; `softdevice_controller.rst` sequence chart; NCS
+  `hci_driver.c:hci_driver_open`): `sdc_init(fault_handler)`; `sdc_support_adv`,
+  `sdc_support_peripheral`, `sdc_support_scan`, `sdc_support_central` (legacy only: the host sends
+  only legacy advertising and scan commands, and every `sdc_support_*` must precede `sdc_cfg_set`);
+  `sdc_cfg_set` for the counts and buffer sizes; `sdc_cfg_set(SDC_CFG_TYPE_NONE)` for the exact
+  pool size; `sdc_rand_source_register`; `sdc_enable(host_callback, pool)`.
+- **Memory is static and checked twice.** `memory.zig` computes the pool bound at comptime from
+  the `SDC_MEM_*` formulas for one central, one peripheral, one advertising set and the scan
+  buffers (the header calls them upper limits). The last `sdc_cfg_set` return above the pool is
+  `error.PoolTooSmall` before `sdc_enable`. NCS sizes `sdc_mempool` the same way and checks at run
+  time (`hci_driver.c:configure_memory_usage`). The pool is 8-byte aligned (`sdc_enable`).
+- **The SDC never sees a raw command packet.** This SDC exports one function per command and no
+  packet entry point. `hci_command.zig` checks the header length against the packet (Core v5.4 Vol 4
+  Part E §5.4.1) and the parameter length against the opcode's fixed size; a mismatch never reaches
+  the SDC and returns status 0x12, Invalid HCI Command Parameters (Vol 1 Part F). It then calls the
+  function and builds Command Complete (Vol 4 Part E §7.7.14) with `Num_HCI_Command_Packets = 1`, or
+  Command Status (§7.7.15) for commands completed by a later event: of those the host sends,
+  Disconnect, LE Create Connection and LE Enable Encryption, the same set as NCS
+  `hci_internal.c:command_generates_command_complete_event`. Unknown opcodes, including Read Buffer
+  Size (0x1005, not exported), return Command Status 0x01. One comptime table lists the host's
+  opcodes, so a new host command fails a host test until it is added.
+- **Reply slot.** `send_command` dispatches synchronously and stores the encoded reply in the
+  handle's one reply slot; `receive` returns the slot before calling `sdc_hci_get`, as NCS does
+  (`hci_internal.c:hci_internal_msg_get`). The host's single command credit means the slot is free
+  whenever the host may send; a send while it is full returns `Busy`.
+- **No intermediate buffer.** `receive` pulls one packet from `sdc_hci_get` per call, so packets the
+  host has not asked for stay in the controller and nothing is dropped in the glue. (NCS has a
+  buffer pool in between and drops advertising reports when it is empty,
+  `hci_driver.c:event_packet_process`; with no pool there is no such choice to make.) ACL out goes
+  through `sdc_hci_data_put` under the host's existing credit accounting (LE Read Buffer Size).
+- **Faults reset.** The MPSL assert and SDC fault handlers return at once; both libraries disable
+  interrupts before calling them and reset the chip when they return (`mpsl.h`, `sdc.h`). They do
+  not call `@panic`, whose default ends in `hang()` (`core/src/microzig.zig`) rather than a reset.
+  Keeping the fault site across the reset needs a no-init RAM region, an open question.
+- **Identity.** The nRF52840 has no public address: `Read BD_ADDR` returns zeros, and FICR
+  `DEVICEADDR` with `DEVICEADDRTYPE = Random` is meant as a static random address (nRF52840 PS
+  v1.11, FICR). The host gains an identity setting. Public (the ESP default) is unchanged. Random
+  static makes `initialize` send LE Set Random Address (0x2005) after Reset, use own-address type 1
+  in Set Advertising Parameters, Set Scan Parameters and Create Connection, and use type 1 with
+  that address as the local `a1`/`a2` input of SMP (Core Vol 3 Part H §2.2). The nRF port supplies
+  the FICR address with the two top bits forced to `11` (Core Vol 6 Part B §1.3.2.1).
 
 ## Design tables
 
 ### 1. Phases (controller handle)
 
-| Phase | Hardware / libraries | Entered by | Left by | Owner |
+| Phase | Libraries | Entered by | Left by | Owner |
 | --- | --- | --- | --- | --- |
 | `mpsl_only` | MPSL running, SDC not initialized | `hal.init` (BLE image) | `Controller.init` | foreground |
-| `enabling` | ISR runs `sdc_init`, `sdc_rand_source_register`, `sdc_cfg_set`, `sdc_support_*`, `sdc_enable` | `Controller.init` posts the enable request | ISR posts `enabled` or `failed(code)` | ISR |
-| `enabled` | SDC scheduling; HCI traffic flows | enable success | fault (never returns) | ISR moves packets; foreground submits |
-| `failed` | SDC not enabled; MPSL still running | enable error | `Controller.init` again (retry) | foreground |
-| `faulted` | interrupts off, chip about to reset | MPSL assert or SDC fault, any context | reset | library |
+| `enabled` | SDC scheduling; HCI flows | `Controller.init` success | fault only | foreground |
+| `failed` | SDC init or config refused; MPSL running | `Controller.init` error | reset only | foreground |
+| `faulted` | interrupts off, chip resetting | MPSL assert or SDC fault, any context | reset | library |
 
-There is no disable phase: the host has no shutdown API (the ESP `Controller` holds BLE for the
-boot for the same reason), and `sdc_disable` returns only when the build adds one.
+`Controller.init` runs the whole enable sequence synchronously in the foreground, so there is no
+`enabling` phase visible to another caller. `failed` is terminal: after a `cfg_set`, the
+`sdc_support_*` calls return `-NRF_EPERM` (`sdc.h`), and a comptime-sized pool cannot grow. There is
+no disable phase: the host has no shutdown API, as on ESP (BLE held for the boot).
 
 ### 2. Ownership
 
 | Field | Written by | Read by | Guard |
 | --- | --- | --- | --- |
-| `request` (one command, or enable) | foreground when `request_state == .empty`; ISR sets `.done` | ISR, foreground | `request_state` atomic (release on publish, acquire on read) |
-| `acl_tx` ring (≤ ACL credits) | foreground producer | ISR consumer | single-producer/single-consumer indices, atomics |
-| `rx` ring (events, ACL in) | ISR producer | foreground consumer | SPSC indices, atomics |
-| `rx_blocked` | ISR when the ring is full | ISR; foreground clears and pends SWI5 after consuming | atomic |
-| `fault_site` | fault handlers | after reset, from no-init RAM | none (interrupts already off) |
-| `hci_ready` | SDC callback (in the ISR) | ISR loop | ISR only |
+| `low_priority_pending` | SWI5 handler (set), `service` (clear) | `service` | atomic; clear before calling the process, so a pend during the call is kept |
+| `calibration_due_us` | `service` | `service` | foreground only |
+| `phase` | foreground | foreground | foreground only |
+| `reply` (one encoded event) | `send_command` | `receive` | foreground only |
+| `hfclk_requests` count | foreground (`hfclk_request`/`release`) | foreground | foreground only; first request calls `_src_request`, last release `_src_release` |
+| `hfclk_running` | HFCLK callback (inside `service`) | `usbd` wait | foreground only |
 
-The command reply travels in the `rx` ring like any event, so the host's existing ordering rule
-(Command Complete matched by opcode) applies unchanged.
+The only field the foreground shares with an interrupt is `low_priority_pending`.
 
 ### 3. Events × phases
 
-| Event | `mpsl_only` | `enabling` | `enabled` | Cleared |
-| --- | --- | --- | --- | --- |
-| SWI5 pended by MPSL (low-priority work) | run `mpsl_low_priority_process` | same, then continue enable | same, then drain | NVIC on entry |
-| SWI5 pended by foreground (request, ring space) | nothing queued: run process only | execute enable | execute request, drain | NVIC on entry |
-| SDC host callback (`hci_ready`) | impossible | possible after `sdc_enable` | drain until `-NRF_EAGAIN` or ring full | ISR, before draining |
-| Pend latched while the ISR is draining | runs again on exit (NVIC pending bit) | same | same | NVIC |
-| MPSL assert / SDC fault | reset | reset | reset | n/a |
-
-The ISR loops "execute request; process; drain" until it does no work in a pass, so a pend that
-arrives mid-pass costs one extra pass instead of a lost wakeup.
+| Event | `mpsl_only` | `enabled` | `failed` | `faulted` | Cleared |
+| --- | --- | --- | --- | --- | --- |
+| SWI5 (MPSL signals low-priority work) | set flag | set flag | set flag | impossible (interrupts off) | NVIC on entry; flag by `service` |
+| SWI5 while `service` is inside the process | flag set again; next `service` runs the process again | same | same | n/a | same |
+| SDC host callback | impossible | inside `service`: no action (the transport polls `sdc_hci_get`) | impossible | n/a | n/a |
+| HFCLK started callback | inside `service`: set `hfclk_running` | same | same | n/a | on last release |
+| RADIO, RTC0, TIMER0, POWER_CLOCK | MPSL handlers | MPSL handlers | MPSL handlers | n/a | MPSL |
+| MPSL assert / SDC fault | reset | reset | reset | n/a | n/a |
 
 ### 4. Entry points × phases
 
-| Call | `mpsl_only` | `enabling` | `enabled` | `failed` |
+| Call | `mpsl_only` | `enabled` | `failed` | `faulted` |
 | --- | --- | --- | --- | --- |
-| `Controller.init` | run | `Busy` | `AlreadyStarted` | run (retry) |
-| `transport.send_command` | `NotEnabled` | `NotEnabled` | run; `Busy` if a command is in flight | `NotEnabled` |
-| `transport.send_acl` | `NotEnabled` | `NotEnabled` | run; `NoBuffer` if the ring is full | `NotEnabled` |
-| `transport.receive` | `NotEnabled` | `NotEnabled` | run (waits on the ring with `hal.time`) | `NotEnabled` |
-| `hfclk_request` / `hfclk_release` | run (via mailbox) | run | run | run |
-| `temperature` | run (via mailbox) | run | run | run |
+| `Controller.init` | run | `AlreadyStarted` | `Failed` | unreachable |
+| `transport.send_command` | `NotEnabled` | run; `Busy` if `reply` is full | `NotEnabled` | unreachable |
+| `transport.send_acl` | `NotEnabled` | run; `NoBuffer` if the SDC refuses | `NotEnabled` | unreachable |
+| `transport.receive` | `NotEnabled` | run (services MPSL while waiting) | `NotEnabled` | unreachable |
+| `hal.ble.service` | run | run | run | unreachable |
+| `hfclk_request` / `hfclk_release` | run | run | run | unreachable |
+| `temperature` | run | run | run | unreachable |
+| any of the above from an interrupt handler | contract violation, unchecked | same | same | same |
 
 ### 5. Timing budget
 
 | Quantity | Value | Source | Used in |
 | --- | --- | --- | --- |
-| `mpsl_low_priority_process` latency after the IRQ | "as soon as possible (at least within a couple of ms)" in `mpsl.rst`; "at least a few 100 ms" in `mpsl.h` | both, nrfxlib v3.4.2 | the stricter one sizes the SWI5 priority: above every app IRQ that can run long |
-| Priority of RADIO, RTC0, TIMER0 | 0 | `mpsl.rst`, `MPSL_HIGH_IRQ_PRIORITY` | `hal.init` |
-| Priority of POWER_CLOCK and SWI5 | lower than 0; 4 | `mpsl.rst`; NCS and nrf-mpsl use 4 | `hal.init` |
+| `service` latency after SWI5 | within "a couple of ms" | `mpsl.rst`, Interrupt configuration | the 2 ms rule above; measured by the self-test |
+| Priority of RADIO, RTC0, TIMER0 | 0, unshared | `mpsl.h`, `mpsl.rst` | `hal.init` |
+| Priority of POWER_CLOCK, SWI5 | below 0; 6 chosen | `mpsl.rst` | `hal.init` |
+| Priority of all other lines | 2 | design choice, Zephyr offset as prior art | `hal.init` |
 | LFCLK accuracy | 500 ppm or better, or `sdc_init` fails | `sdc.h:sdc_init` | board config |
-| RC calibration call period | 4000 ms | Zephyr `CLOCK_CONTROL_NRF_CALIBRATION_PERIOD` default, used by NCS `MPSL_CALIBRATION_PERIOD` | ISR timer, RC boards only |
-| `rand_poll` | blocks until all bytes are written | `sdc_soc.h` | RNG with bias correction, polled in the ISR |
-| Longest PRIMASK section in a BLE image | unmeasured | open question | self-test report |
+| LFCLK started before `mpsl_init` returns | `skip_wait_lfclk_started = false` (default) | `mpsl_clock.h` | `hal.time` on RTC1 needs it running |
+| RC calibration interval | `rc_ctiv = 16` (`MPSL_RECOMMENDED_RC_CTIV`); `mpsl_calibration_timer_handle` every 4000 ms from `service` | `mpsl_clock.h`, `mpsl.h`; 4000 ms is Zephyr's `CLOCK_CONTROL_NRF_CALIBRATION_PERIOD` default | RC boards only |
+| HFXO ramp-up passed to MPSL | 1400 µs | NCS `MPSL_HFCLK_LATENCY` default (`subsys/mpsl/init/Kconfig`) | `mpsl_clock_hfclk_latency_set`; a board with a measured value overrides it |
+| `rand_poll` per byte | typical 248 µs (t_RNG,START 128 µs + t_RNG,BC 120 µs); no maximum published | nRF52840 PS v1.11 §6.21, as cited in `hal/radio/ieee802154.zig` | blocks inside `service` |
+| `mpsl_temperature_get` | about 50 µs | `mpsl_temp.h` | `temperature` |
+| Longest PRIMASK section | unmeasured | open question | self-test report |
+| Longest gap SWI5 → `service` during pairing | unmeasured | open question | self-test report |
 
-The XIAO nRF52840 Sense is configured for the 32.768 kHz crystal: Zephyr's `xiao_ble` board
-leaves the nRF default `CLOCK_CONTROL_NRF_K32SRC_XTAL`. The first bench run confirms `LFCLKSTAT`
-reports the crystal before this is relied on.
+The XIAO nRF52840 Sense is configured for its 32.768 kHz crystal: Zephyr's `xiao_ble` board keeps
+the nRF default `CLOCK_CONTROL_NRF_K32SRC_XTAL`. The first bench run checks that `LFCLKSTAT`
+reports the crystal before anything relies on it. The synthesized LF source is not offered.
 
 ### 6. Spec rules
 
 | Clause | Rule | Host test |
 | --- | --- | --- |
-| Core Vol 4 Part E §5.4.1 | A command packet is opcode (2), length (1), parameters; length must match | `hci_command: rejects a length that disagrees with the packet` |
-| Vol 4 Part E §7.7.14 | Command Complete carries credits, opcode, then return parameters starting with status | `hci_command: command complete layout per opcode` |
+| Core v5.4 Vol 4 Part E §5.4.1 | Command packet: opcode (2), length (1), parameters; length must match the packet | `hci_command: header length disagrees with the packet` |
+| Vol 4 Part E §7.8 and §7.4 (per-command sections) | Each command's parameters have a fixed size; a mismatch returns 0x12 without calling the SDC | `hci_command: wrong parameter length for every table opcode` |
+| Vol 4 Part E §7.7.14 | Command Complete carries credits, opcode, then status and return parameters | `hci_command: command complete layout per opcode` |
 | Vol 4 Part E §7.7.15 | Commands completed by a later event get Command Status, never Command Complete | `hci_command: disconnect, create connection and enable encryption get command status` |
-| Vol 4 Part E §7.7.15 | An unknown opcode gets Command Status 0x01 | `hci_command: unknown opcode` |
-| Vol 4 Part E §4.1 | The host sends no ACL data beyond the controller's buffer count | existing host credit tests, moved with the host |
-| Vol 6 Part B §1.3.2.1 | Static random address: top two bits 11, rest not all 0 or all 1 | `identity: FICR address becomes a valid static address` |
+| Vol 4 Part E §7.7.15 | Unknown opcode: Command Status 0x01 | `hci_command: unknown opcode` |
+| Vol 4 Part E §4.1 | No ACL data beyond the controller's buffer count | existing host credit tests, moved with the host |
+| Vol 6 Part B §1.3.2.1 | Static random address: top two bits 11; the rest not all 0 or all 1 | `identity: FICR address becomes a valid static address` |
+| Vol 3 Part H §2.2 | SMP address inputs carry the address type actually used on air | `identity: random-static identity changes own-address fields and SMP inputs` |
 
 ### 7. Interface consumer trace (`HCI_Transport`)
 
-Consumers: the host in `modules/ble/` (both ports), and an HCI bridge that exposes the controller
-over UART or USB to a PC host (a later issue; it needs no interface change).
+Consumers: the host in `modules/ble/` on both ports, and later an HCI bridge exposing the
+controller over UART or USB to a PC host (no interface change needed).
 
-- **Correlation:** one command in flight; the reply is matched by opcode in the event stream, as
-  the host does today.
-- **Buffer lifetime:** `send_*` copies before returning; `receive` returns a packet by value.
-- **Event completeness:** every controller event and ACL packet is delivered, in controller order;
-  backpressure replaces loss on both ports (ESP's queue latches `ReceiveOverflow`; that remains a
-  difference, recorded as an open question).
-- **Notification:** none; `receive(timeout)` blocks on the port's clock.
-- **Unavailable:** before enable, `NotEnabled`; the clock still advances, so a blocking caller
-  times out rather than spinning.
-- **Same meaning across ports:** packets exclude the H4 type byte on both ports, as
-  `wire.Packet.kind` already encodes the type.
+- **Correlation:** one command in flight; the reply is matched by opcode, as the host does today.
+- **Buffer lifetime:** `send_*` copies before returning; `receive` returns the packet by value.
+- **Event completeness:** every controller event and ACL packet is delivered, in controller order.
+  The nRF glue holds nothing; ESP's queue latches `ReceiveOverflow` when full, a difference recorded
+  under Open questions.
+- **Notification:** none; `receive(timeout)` blocks on the port's clock (on the nRF, while
+  servicing MPSL).
+- **Unavailable:** before enable, `NotEnabled`; the clock still advances, so a blocking caller times
+  out rather than spinning.
+- **Same meaning across ports:** packets exclude the H4 type byte; `Packet.kind` carries the type.
 
 ## Coexistence with the 802.15.4 driver
 
-Not in the first implementation; a BLE image that also sets `hal.ieee802154` is a compile error,
-as BLE + 802.15.4 is on the ESP32-C6 without its coex scheduler. The design that removes the error:
+Not in the first implementation: `hal.ble` with `hal.ieee802154` is a compile error, as BLE +
+802.15.4 is on the ESP32-C6 without its coex scheduler ([interrupts.md](interrupts.md)). The design
+that removes the error, to be reviewed on its own before code:
 
 - MPSL arbitrates the radio. The 802.15.4 driver opens a timeslot session
   (`mpsl_timeslot_session_open`) and touches RADIO only between `MPSL_TIMESLOT_SIGNAL_START` and the
   end of the granted slot; RADIO interrupts reach it as `MPSL_TIMESLOT_SIGNAL_RADIO` through MPSL's
   vector (`timeslot.rst`). It extends slots for continuous receive and re-requests *earliest
   possible* after a block or cancel, the pattern `timeslot.rst` gives for an always-on listener.
-- The driver's hardware conflicts with the reserved list must move: PPI 17–19 (all SDC-owned)
-  move below 17; direct HFCLK start becomes the slot's crystal guarantee
-  (`MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED`); direct TEMP sampling becomes
-  `mpsl_temperature_get`; RTC0 reads move to the `hal.time` RTC. TIMER3 stays the driver's, but
-  its handler runs below priority 0 and its slot-bound work moves to MPSL's TIMER0, which a slot
-  owner gets for the slot's length (`timeslot.rst`, "Ending a timeslot in time").
-- A frame in progress at the slot's end is the new phase the driver tables need: the slot end is a
-  deadline after which the driver must have stopped RADIO, so RX that cannot finish reports
-  `aborted` and TX is not started unless its airtime and ACK wait fit. This changes the driver's
-  phase, event and timing tables, so it gets its own design review before code.
+- Its conflicts with the reserved list move: PPI 17–19 (SDC-owned) move below 17; the direct HFCLK
+  start becomes the slot's crystal guarantee (`MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED`); TEMP
+  sampling becomes `mpsl_temperature_get`; RTC0 reads move to the `hal.time` RTC. TIMER3 stays the
+  driver's at a priority below 0; slot-bound deadlines use MPSL's TIMER0, which the slot owner gets
+  for the slot (`timeslot.rst`, "Ending a timeslot in time").
+- The slot end is a new deadline phase in the driver's tables: RX that cannot finish reports
+  `aborted`, and TX starts only if its airtime and ACK wait fit the slot. That changes the driver's
+  phase, event and timing tables in [ieee802154.md](ieee802154.md).
 
 Nordic's own multiprotocol 802.15.4 service layer is a closed library under the same licence, so it
 is not prior art we can read; the public timeslot API is.
 
 ## Prior art
 
-- ESP BLE host, `port/espressif/esp/src/hal/radio/ble/`: the host this design moves and reuses
-  unchanged except for the transport type and the identity setting. ESP's controller takes raw HCI
-  packets, so it needs no command dispatcher; the nRF needs one.
+- ESP BLE host, `port/espressif/esp/src/hal/radio/ble/`: the host this design moves, changed only
+  in its transport type, crypto provider type and identity setting. ESP's controller takes raw HCI
+  packets, so it needs no command dispatcher.
 - ESP `Controller`, `port/espressif/esp/src/hal/radio/bluetooth.zig`: vendor callbacks copy packets
-  into a queue the host blocks on. Reused as the shape; it differs by running every vendor call in
-  one ISR and by backpressure instead of a latched overflow.
-- nRF 802.15.4 driver, `port/nordic/nrf5x/src/hal/radio/ieee802154.zig`: the comptime HAL option
-  that installs vectors (`hal.zig:default_interrupts`) and the singleton owner rule; reused as is.
-- NCS v3.4.2 `subsys/mpsl/init/mpsl_init.c` and `subsys/bluetooth/controller/hci_driver.c`,
-  `hci_internal.c`: init order, IRQ priorities, low-priority work, memory sizing and check,
-  backpressure, and the command-to-function dispatch with Command Status for deferred commands.
-  Read for behavior only (licence).
-- embassy `nrf-sdc`/`nrf-mpsl` (Apache-2.0/MIT, `github.com/alexmoon/nrf-sdc`): the closest
-  analogue, a non-Nordic host over SDC on bare metal; IRQ binding, priority 4 for low priority,
-  compile-time peripheral ownership, timeslot flash, and the MPSL-preserving critical section we
-  chose not to adopt.
+  into an RTOS queue the host blocks on. The nRF differs because the SDC is pulled (`sdc_hci_get`)
+  from the foreground, so it needs no queue.
+- nRF 802.15.4 driver, `port/nordic/nrf5x/src/hal/radio/ieee802154.zig` and `hal.zig`: the comptime
+  HAL option that adds vectors to `default_interrupts`; reused.
+- nrf5x USB, `port/nordic/nrf5x/src/hal/usbd.zig`: "IRQ only as a wakeup; all work in foreground
+  `poll`" ([interrupts.md](interrupts.md)), the same split as SWI5 and `service`.
+- NCS v3.4.2 `subsys/mpsl/init/mpsl_init.c`, `subsys/bluetooth/controller/hci_driver.c`,
+  `hci_internal.c`: init order, IRQ use, low-priority work in a thread, memory sizing and check,
+  enable order, the reply slot, and the command-to-function dispatch. Read for behavior only.
+- embassy `nrf-sdc`/`nrf-mpsl` (Apache-2.0/MIT, `github.com/alexmoon/nrf-sdc`): a non-Nordic host
+  over the SDC without an RTOS kernel; signal-then-run low-priority work, compile-time peripheral
+  ownership, timeslot flash, and the MPSL-preserving critical section kept as our fallback.
 - NimBLE: no public integration with the SDC was found; NimBLE ships its own controller for nRF5
-  parts. Its host-over-HCI transport split is the same split as `HCI_Transport`.
+  parts. Its host/transport split is the split `HCI_Transport` makes.
 
 ## Shared patterns
 
-- [Interrupt handling and ISR routing](interrupts.md): HAL-owned vectors through
-  `default_interrupts`, singleton routing for the controller handle, "fixed ring in the handle,
-  foreground polls".
-- [ESP radio stack and coexistence](esp-radio.md): BLE held for the boot; selection checked at
+- [Interrupt handling and ISR routing](interrupts.md): HAL-owned vectors via `default_interrupts`,
+  singleton routing for the controller handle, IRQ-as-wakeup with foreground work.
+- [ESP radio stack and coexistence](esp-radio.md): BLE held for the boot; radio selection checked at
   compile time.
-- [Base driver interfaces](base-interfaces.md): `HCI_Transport` follows the pointer + vtable form.
+- [Base driver interfaces](base-interfaces.md): `HCI_Transport` and `SMP_Crypto` follow the pointer +
+  vtable form.
 
 ## Evidence
 
 Planned; each item names the test the implementation adds.
 
-- Command dispatch, layouts and the Command Status set: `hci_command` host tests with a fake
+- Dispatch, lengths, layouts and the Command Status set: `hci_command` host tests with a fake
   `sdc_hci_cmd_*` table.
-- Pool bound covers the configured roles: `memory` host test against the header formulas.
-- Ring backpressure and mailbox admission: `controller` host tests with a fake SDC that produces
-  packets faster than the host reads.
-- Identity: host tests that random-static identity changes own-address-type fields and SMP inputs.
-- Moved host: its existing tests run from `modules/ble/`, and the ESP BLE self-tests still build.
-- Non-radio images byte-identical: the PR's image comparison.
-- On hardware (XIAO nRF52840 Sense): advertise and accept a connection from a PC; scan and connect
-  to an ESP32 peer running the existing ESP self-test; LE Secure Connections pairing; LFCLK source
-  and longest masked interval reported.
+- Pool bound: `memory` host test against the header formulas for the configured roles.
+- `service` flag handling, reply slot admission and enable order: `controller` host tests with a
+  fake MPSL/SDC that records call order and pends SWI5 during the process call.
+- Identity: host tests for random-static own-address fields and SMP inputs.
+- Moved host: its existing tests run from `modules/ble/`; the ESP BLE examples still build.
+- Off means unchanged: `scripts/image_compare.sh` in the PR.
+- On hardware (XIAO nRF52840 Sense): advertise and accept a connection from a PC; scan for and
+  connect to an ESP32 peer running the existing ESP BLE self-test; LE Secure Connections pairing;
+  LFCLK source, longest masked interval and longest SWI5-to-`service` gap reported.
 
 ## Open questions
 
-- Flash writes while BLE is enabled need a timeslot backend (nrf-mpsl's `flash.rs` is the model);
-  the KV store ([#45](https://github.com/valthon/microzig/issues/45)) depends on it.
-- The bound on PRIMASK sections that MPSL tolerates is unpublished; measure first.
-- ESP's receive path latches `ReceiveOverflow` while the nRF path applies backpressure.
-- 802.15.4 coexistence, as designed above, needs its own reviewed table changes.
+- Flash writes while MPSL runs need a timeslot backend (nrf-mpsl `flash.rs` is the model); the KV
+  store ([#45](https://github.com/valthon/microzig/issues/45)) depends on it.
+- The bound on PRIMASK sections and on `service` latency that MPSL tolerates is unpublished;
+  measure first, BASEPRI section as fallback.
+- Keeping the fault site across the reset needs a no-init RAM region the linker does not have yet.
+- ESP's receive path latches `ReceiveOverflow`; the nRF path cannot overflow.
+- 802.15.4 coexistence, as above, needs its own reviewed table changes.
