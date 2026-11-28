@@ -290,7 +290,7 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                 set_tx_ctrl(e, RES_NAK, TOG_DATA0, false);
             }
 
-            // EP0 special.
+            set_tx_ctrl(0, RES_NAK, TOG_DATA0, false);
             self.arm_ep0_out_always();
         }
 
@@ -357,18 +357,24 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
                 }
 
                 if (flags.RB_UIF_BUS_RST__RB_UIF_DETECT != 0) {
-                    log.info("bus reset\n\n\n", .{});
-                    // clear
+                    // Reset and SETUP_ACT can latch independently of the
+                    // TRANSFER busy interlock (CH32FV2x_V3x RM v2.5,
+                    // §22.2.1.1, §22.2.1.8–9). Retire them before reopening EP0.
                     PollRegs.USB_INT_FG.write(.{
                         .RB_UIF_BUS_RST__RB_UIF_DETECT = 1,
-                        .RB_UIF_SETUP_ACT = 0,
+                        .RB_UIF_SETUP_ACT = flags.RB_UIF_SETUP_ACT,
                     });
-
-                    // address back to 0
-                    set_address(&self.interface, 0);
-
                     self.on_bus_reset_local();
+                    set_address(&self.interface, 0);
+                    if (flags.RB_UIF_TRANSFER != 0) {
+                        PollRegs.USB_INT_FG.write(.{
+                            .RB_UIF_TRANSFER = 1,
+                            .RB_UIF_SETUP_ACT = 0,
+                        });
+                    }
+                    log.debug("bus reset", .{});
                     controller.on_bus_reset(&self.interface);
+                    continue;
                 }
 
                 if (flags.RB_UIF_SETUP_ACT != 0) {
@@ -846,6 +852,78 @@ pub fn Polled(comptime _: Setup, comptime cfg: Config) type {
 pub fn usbhs_interrupt_handler() callconv(microzig.cpu.riscv_calling_convention) void {
     Regs.USB_INT_FG.write(Regs.USB_INT_FG.read());
     @panic("Don't Enable USBHS Interrupt, Not yet supported!");
+}
+
+test "USBHS bus reset discards pending SETUP" {
+    const Device = Polled(.{}, .{});
+    const Controller = struct {
+        resets: usize = 0,
+        setups: usize = 0,
+        setup_during_reset: bool = false,
+        second_reset: bool = false,
+
+        pub fn on_bus_reset(self: *@This(), _: *usb.DeviceInterface) void {
+            self.resets += 1;
+            if (self.setup_during_reset) {
+                self.setup_during_reset = false;
+                test_poll_regs.USB_INT_FG.pending.RB_UIF_SETUP_ACT = 1;
+            }
+            if (self.second_reset) {
+                self.second_reset = false;
+                test_poll_regs.USB_INT_FG.pending.RB_UIF_BUS_RST__RB_UIF_DETECT = 1;
+            }
+        }
+
+        pub fn on_setup_req(self: *@This(), _: *usb.DeviceInterface, _: *const types.SetupPacket) void {
+            self.setups += 1;
+        }
+
+        pub fn on_buffer(_: *@This(), _: *usb.DeviceInterface, comptime _: types.Endpoint) void {
+            unreachable;
+        }
+    };
+    var dev: Device = undefined;
+    dev.endpoints = @splat(@splat(.{}));
+    var setup: [8]u8 align(4) = .{ 0, 9, 1, 0, 0, 0, 0, 0 }; // SET_CONFIGURATION(1)
+    dev.st(.ep0, .out).buf = &setup;
+    var ctl: Controller = .{};
+    test_poll_regs.USB_INT_ST.write(.{ .MASK_UIS_TOKEN = TOKEN_SETUP });
+
+    for ([_]TestFlags{
+        .{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1, .RB_UIF_SETUP_ACT = 0, .RB_UIF_TRANSFER = 1 },
+        .{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1, .RB_UIF_SETUP_ACT = 1 },
+        .{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1, .RB_UIF_SETUP_ACT = 1, .RB_UIF_TRANSFER = 1 },
+    }, 1..) |pending, resets| {
+        set_tx_ctrl(0, RES_ACK, TOG_DATA1, false);
+        test_poll_regs.USB_INT_FG.pending = pending;
+        dev.poll(false, &ctl);
+        try std.testing.expectEqual(resets, ctl.resets);
+        try std.testing.expectEqual(RES_NAK, EP_Regs[0].UEP_TX_CTRL.read().RES);
+        try std.testing.expectEqual(0, ctl.setups);
+        try std.testing.expectEqual(TestFlags{ .RB_UIF_SETUP_ACT = 0 }, test_poll_regs.USB_INT_FG.pending);
+    }
+
+    test_poll_regs.USB_INT_FG.pending = .{ .RB_UIF_SETUP_ACT = 1 };
+    dev.poll(false, &ctl);
+    test_poll_regs.USB_INT_FG.pending = .{ .RB_UIF_SETUP_ACT = 0, .RB_UIF_TRANSFER = 1 };
+    dev.poll(false, &ctl);
+    try std.testing.expectEqual(2, ctl.setups);
+    // A flag outside the reset snapshot remains pending.
+    ctl.setup_during_reset = true;
+    test_poll_regs.USB_INT_FG.pending = .{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1, .RB_UIF_SETUP_ACT = 0 };
+    dev.poll(false, &ctl);
+    try std.testing.expectEqual(3, ctl.setups);
+
+    // A SETUP that arrived before a second reset must be discarded.
+    const resets = ctl.resets;
+    const setups = ctl.setups;
+    ctl.setup_during_reset = true;
+    ctl.second_reset = true;
+    test_poll_regs.USB_INT_FG.pending = .{ .RB_UIF_BUS_RST__RB_UIF_DETECT = 1, .RB_UIF_SETUP_ACT = 0 };
+    dev.poll(false, &ctl);
+    dev.poll(false, &ctl);
+    try std.testing.expectEqual(resets + 2, ctl.resets);
+    try std.testing.expectEqual(setups, ctl.setups);
 }
 
 fn expect_transfer_co_latched_with_setup(discard: bool) !void {
