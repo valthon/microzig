@@ -31,13 +31,12 @@ inline fn read_stk_cnt() u64 {
     }
 }
 
-/// Global tick counter in microseconds.
-/// Incremented by the TIM2 interrupt handler.
-var ticks_us: u64 = 0;
-
-/// Interval between TIM2 interrupts in microseconds.
-/// Configured during init().
-var tick_interval_us: u64 = 1000; // Default 1ms
+// TIM2 is dedicated to the boot clock. The ISR owns the high word.
+var overflows: u64 = 0;
+var timer_hz: u32 = 0;
+var tick_numerator: u32 = 0;
+var epoch_us: u64 = 0;
+const us_per_second = 1_000_000;
 
 /// Initialize SysTick as a free-running counter for delays.
 ///
@@ -62,46 +61,45 @@ fn init_delay_counter() void {
     PFIC.STK_CNTH.raw = 0;
 }
 
-/// Initialize TIM2 to fire interrupts every 1ms for timekeeping.
-///
-/// This configures TIM2 to generate periodic interrupts that maintain the ticks_us counter.
-/// NOTE: This must be called AFTER configuring the system clock to the final frequency.
-fn init_tick_timer() void {
-    const freq: u32 = microzig.hal.clocks.get_sysclk();
-
-    // Enable TIM2 clock (bit 0 of APB1PCENR)
-    RCC.APB1PCENR.raw |= 1 << 0;
-
-    // Set prescaler and auto-reload for 1ms ticks
-    // For 48MHz: PSC = 47 (divide by 48), ARR = 999 (count to 1000)
-    // = 48MHz / 48 / 1000 = 1kHz = 1ms
-    const prescaler: u16 = @intCast((freq / 1_000_000) - 1); // Divide to 1MHz
-    TIM2.PSC.modify(.{ .PSC = prescaler });
-    TIM2.ATRLR.modify(.{ .ARR = 999 }); // Count 1000 cycles = 1ms at 1MHz
-
-    // Enable update interrupt
-    TIM2.DMAINTENR.modify(.{ .UIE = 1 });
-
-    // Enable the counter
-    TIM2.CTLR1.modify(.{ .CEN = 1 });
-
-    // Enable TIM2 interrupt in NVIC
-    cpu.interrupt.enable(.TIM2);
-}
-
-/// Initialize the time system with TIM2 and SysTick.
-///
-/// - TIM2: Configured to fire interrupts every 1ms, maintaining a microsecond counter
-/// - SysTick: Configured as a free-running 64-bit counter for precise delays (no interrupts)
-/// NOTE: This must be called AFTER configuring the system clock to the final frequency.
+/// Start the TIM2 boot clock and the free-running SysTick delay counter.
+/// Boot time stays monotonic across reinitialization. TIM2 ticks between a
+/// system clock switch and this call are scaled at the old rate, which can
+/// skew elapsed time and deadlines spanning the switch.
 pub fn init() void {
-    tick_interval_us = 1000; // 1ms intervals
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
 
-    // Initialize SysTick as free-running delay counter (no interrupts)
-    init_delay_counter();
+    const clocks = microzig.hal.clocks.get_freqs();
+    // CH32F/V20x_V30x_V31x RM §3.3.1: TIM2 gets PCLK1, doubled
+    // when the PB1 divider is greater than one.
+    const frequency = if (clocks.pclk1 == clocks.hclk) clocks.pclk1 else 2 * clocks.pclk1;
+    asm volatile ("" ::: .{ .memory = true });
+    if (timer_hz == frequency) return;
 
-    // Initialize TIM2 for periodic 1ms interrupts
-    init_tick_timer();
+    if (timer_hz == 0) {
+        init_delay_counter();
+        RCC.APB1PCENR.raw |= 1 << 0;
+    }
+    TIM2.CTLR1.modify(.{ .CEN = 0 });
+    TIM2.DMAINTENR.modify(.{ .UIE = 0 });
+    // With CNT stopped and its ISR masked, include any pending wrap
+    // before UG resets CNT and sets its own update flag (RM §15.4.1, §15.4.6).
+    if (timer_hz != 0)
+        epoch_us += ticks_to_us(sample_counter(TIM2, overflows), tick_numerator, timer_hz);
+    overflows = 0;
+
+    const divisor = @max(1, frequency / us_per_second);
+    timer_hz = frequency;
+    tick_numerator = divisor * us_per_second;
+    TIM2.PSC.write(.{ .PSC = @intCast(divisor - 1) });
+    // RM §15.4.10 and §15.4.13: use the full 16-bit up-counter period.
+    TIM2.ATRLR.write_raw(0xffff);
+    TIM2.SWEVGR.write(.{ .UG = 1 });
+    TIM2.INTFR.write_raw(0);
+    TIM2.DMAINTENR.modify(.{ .UIE = 1 });
+    TIM2.CTLR1.modify(.{ .CEN = 1 });
+    cpu.interrupt.enable(.TIM2);
+    asm volatile ("" ::: .{ .memory = true });
 }
 
 /// TIM2 interrupt handler.
@@ -113,23 +111,56 @@ pub fn init() void {
 /// };
 /// ```
 pub fn tim2_handler() callconv(cpu.riscv_calling_convention) void {
-    // Increment the tick counter
-    ticks_us +%= tick_interval_us;
+    const cs = microzig.interrupt.enter_critical_section();
+    defer cs.leave();
 
-    // Clear the update interrupt flag
-    TIM2.INTFR.modify(.{ .UIF = 0 });
+    if (TIM2.INTFR.read().UIF == 0) return;
+    // RM §15.4.5: UIF is cleared by writing zero. TIM2 is reserved for timekeeping.
+    TIM2.INTFR.write_raw(0);
+    overflows +%= 1;
+    asm volatile ("" ::: .{ .memory = true });
 }
 
-/// Get the current time since boot.
+fn sample_counter(timer: anytype, high: u64) u64 {
+    const pending_before = timer.INTFR.read().UIF != 0;
+    var low = timer.CNT.read().CNT;
+    const pending = pending_before or timer.INTFR.read().UIF != 0;
+    // If the overflow followed the first flag read, sample CNT again so
+    // the low word belongs to the same period as the pending update.
+    if (pending and !pending_before) low = timer.CNT.read().CNT;
+    return ((high +% @intFromBool(pending)) << 16) | low;
+}
+
+fn ticks_to_us(ticks: u64, numerator: u32, frequency: u32) u64 {
+    if (numerator == frequency) return ticks;
+    // Scale the quotient and remainder separately to avoid overflowing the product.
+    return ticks / frequency * numerator + (ticks % frequency) * numerator / frequency;
+}
+
+/// Get the current time since boot. TIM2 must service every rollover
+/// (about 65.5 ms apart at 1 MHz). One pending rollover is included
+/// before its handler runs. Timeout guarantees require TIM2 IRQ service.
+/// Do not mask TIM2 or global interrupts across a timed wait.
 pub fn get_time_since_boot() time.Absolute {
-    // Read the tick counter
-    // NOTE: On RISC-V, we rely on the fact that reading a u64 is atomic on 32-bit systems when
-    // properly aligned. The worst case is reading a slightly stale value.
-    return time.Absolute.from_us(ticks_us);
+    const snapshot = blk: {
+        const cs = microzig.interrupt.enter_critical_section();
+        defer cs.leave();
+
+        asm volatile ("" ::: .{ .memory = true });
+        if (timer_hz == 0) return .from_us(0);
+        const counter = .{
+            .ticks = sample_counter(TIM2, overflows),
+            .epoch = epoch_us,
+            .numerator = tick_numerator,
+            .frequency = timer_hz,
+        };
+        asm volatile ("" ::: .{ .memory = true });
+        break :blk counter;
+    };
+    return .from_us(snapshot.epoch + ticks_to_us(snapshot.ticks, snapshot.numerator, snapshot.frequency));
 }
 
-/// Sleep for the specified number of milliseconds.
-/// Uses the interrupt-driven tick counter for accurate timing regardless of interrupt latency.
+/// Sleep for the specified number of milliseconds using the TIM2 boot clock.
 pub fn sleep_ms(time_ms: u32) void {
     const deadline = get_time_since_boot().add_duration(time.Duration.from_ms(time_ms));
     while (deadline.is_reached_by(get_time_since_boot()) == false) {
@@ -177,10 +208,153 @@ pub fn delay_us(us: u32) void {
     }
 }
 
+/// Deadlines require TIM2 IRQ service as described by get_time_since_boot.
 pub fn deadline_in_ms(time_ms: u32) microzig.drivers.time.Deadline {
     return .init_relative(get_time_since_boot(), .from_ms(time_ms));
 }
 
+/// Deadlines require TIM2 IRQ service as described by get_time_since_boot.
 pub fn deadline_in_us(time_us: u64) microzig.drivers.time.Deadline {
     return .init_relative(get_time_since_boot(), .from_us(time_us));
+}
+
+/// Accept readiness only when its observation is followed by a clock sample
+/// strictly before the deadline. The status flags carry no event timestamp.
+/// A zero poll limit returns Timeout without polling.
+pub fn wait_until_ready(
+    context: anytype,
+    comptime poll: anytype,
+    deadline: anytype,
+    comptime now: anytype,
+    comptime poll_limit: ?u32,
+) !void {
+    if (comptime poll_limit == 0) return error.Timeout;
+
+    var remaining: u32 = poll_limit orelse 0;
+    while (true) {
+        const ready = try poll(context);
+        try deadline.check(now());
+        if (ready) return;
+        if (comptime poll_limit != null) {
+            remaining -= 1;
+            if (remaining == 0) return error.Timeout;
+        }
+    }
+}
+
+test "zero poll limit times out without polling" {
+    const Fake = struct {
+        fn poll(_: void) error{UnexpectedPoll}!bool {
+            return error.UnexpectedPoll;
+        }
+
+        fn now() time.Absolute {
+            return .from_us(0);
+        }
+    };
+    const deadline = time.Deadline.init_relative(.from_us(0), .from_us(1));
+    try @import("std").testing.expectError(error.Timeout, wait_until_ready({}, Fake.poll, deadline, Fake.now, 0));
+}
+
+test "TIM2 reinitialization preserves elapsed time and services a pending wrap" {
+    const testing = @import("std").testing;
+
+    try testing.expectEqual(0, get_time_since_boot().to_us());
+    init();
+    try testing.expectEqual(7, TIM2.PSC.read().PSC);
+    try testing.expectEqual(1, TIM2.CTLR1.read().CEN);
+    try testing.expectEqual(1, TIM2.DMAINTENR.read().UIE);
+    try testing.expect(microzig.interrupt.enabled);
+
+    TIM2.INTFR.raw = 1;
+    tim2_handler();
+    TIM2.CNT.raw = 3;
+    PFIC.STK_CNTL.raw = 123;
+
+    init();
+    try testing.expectEqual(65_539, get_time_since_boot().to_us());
+    try testing.expectEqual(3, TIM2.CNT.read().CNT);
+    try testing.expectEqual(123, PFIC.STK_CNTL.raw);
+
+    TIM2.INTFR.raw = 1;
+    TIM2.CNT.raw = 7;
+    microzig.hal.clocks.frequency = 48_000_000;
+    init();
+    try testing.expectEqual(47, TIM2.PSC.read().PSC);
+    try testing.expectEqual(131_079, get_time_since_boot().to_us());
+    // A pending IRQ delivered after the handoff must see the cleared flag.
+    tim2_handler();
+    TIM2.CNT.raw = 10;
+    try testing.expectEqual(131_089, get_time_since_boot().to_us());
+    try testing.expect(microzig.interrupt.enabled);
+}
+
+test "TIM2 snapshots count through delayed interrupt and pending rollover" {
+    const Fake = struct {
+        const Status = struct {
+            before: u1,
+            after: u1,
+            reads: u2 = 0,
+
+            fn read(status: *@This()) struct { UIF: u1 } {
+                const pending = if (status.reads == 0) status.before else status.after;
+                status.reads += 1;
+                return .{ .UIF = pending };
+            }
+        };
+        const Count = struct {
+            before: u16,
+            after: u16,
+            reads: u2 = 0,
+
+            fn read(count: *@This()) struct { CNT: u16 } {
+                const value = if (count.reads == 0) count.before else count.after;
+                count.reads += 1;
+                return .{ .CNT = value };
+            }
+        };
+
+        const Deadline = struct {
+            expires_at: u64,
+
+            fn check(deadline: @This(), current: u64) error{Timeout}!void {
+                if (current >= deadline.expires_at) return error.Timeout;
+            }
+        };
+        var active_timer: *@This() = undefined;
+
+        INTFR: Status,
+        CNT: Count,
+
+        fn now() u64 {
+            return sample_counter(active_timer, 0);
+        }
+
+        fn ready(_: void) error{}!bool {
+            return true;
+        }
+    };
+
+    const testing = @import("std").testing;
+    var timer: Fake = .{
+        .INTFR = .{ .before = 0, .after = 0 },
+        .CNT = .{ .before = 10_123, .after = 0 },
+    };
+    // Over ten of the old 1 ms ticks elapsed without any ISR.
+    try testing.expectEqual(10_123, sample_counter(&timer, 0));
+    timer.INTFR.reads = 0;
+    timer.CNT.reads = 0;
+    Fake.active_timer = &timer;
+    const deadline: Fake.Deadline = .{ .expires_at = 10_000 };
+    try testing.expectError(error.Timeout, wait_until_ready({}, Fake.ready, deadline, Fake.now, null));
+
+    timer = .{ .INTFR = .{ .before = 0, .after = 1 }, .CNT = .{ .before = 0xffff, .after = 2 } };
+    try testing.expectEqual(65_538, sample_counter(&timer, 0));
+
+    timer = .{ .INTFR = .{ .before = 1, .after = 1 }, .CNT = .{ .before = 3, .after = 0 } };
+    try testing.expectEqual(65_539, sample_counter(&timer, 0));
+
+    timer = .{ .INTFR = .{ .before = 0, .after = 0 }, .CNT = .{ .before = 4, .after = 0 } };
+    try testing.expectEqual(65_540, sample_counter(&timer, 1));
+    try testing.expectEqual(2000, ticks_to_us(2100, 21_000_000, 22_050_000));
 }

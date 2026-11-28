@@ -4,6 +4,9 @@
 //! Based on the WCH CH32V20x I2C peripheral implementation.
 //! Reference: CH32V20x Reference Manual Section on I2C
 //!
+//! STOP/MSL status can change between sampling and issuing a command.
+//! A deadline sample likewise precedes the separate access that issues
+//! START, sends an address or data, enables DMA, or releases ADDR.
 const microzig = @import("microzig");
 const mdf = microzig.drivers;
 const drivers = mdf.base;
@@ -20,6 +23,10 @@ pub const Address = drivers.I2C_Device.Address;
 pub const AddressError = drivers.I2C_Device.Address.Error;
 pub const Error = drivers.I2C_Device.Error || error{
     ArbitrationLost,
+    TransferTooLong,
+    DmaTransferFailed,
+    /// STOP recovery failed. Reapply the I2C configuration after the bus is idle.
+    RecoveryRequired,
     BusError,
     Overrun,
 };
@@ -100,6 +107,8 @@ pub const instance = struct {
 pub const I2C = enum(u1) {
     _,
 
+    const poll_limit = 100_000;
+
     pub inline fn get_regs(i2c: I2C) *volatile I2cRegs {
         return switch (@backingInt(i2c)) {
             0 => I2C1,
@@ -108,11 +117,11 @@ pub const I2C = enum(u1) {
     }
 
     inline fn disable(i2c: I2C) void {
-        i2c.get_regs().CTLR1.modify(.{ .PE = 0 });
+        write_control(&i2c.get_regs().CTLR1, .{ .PE = 0 });
     }
 
     inline fn enable(i2c: I2C) void {
-        i2c.get_regs().CTLR1.modify(.{ .PE = 1 });
+        write_control(&i2c.get_regs().CTLR1, .{ .PE = 1 });
     }
 
     /// Initializes the I2C HW block per the Config provided
@@ -200,7 +209,7 @@ pub const I2C = enum(u1) {
 
         // Configure control register 1 - clear mode bits and set I2C mode + ACK
         // This matches: tmpreg &= CTLR1_CLEAR_Mask; tmpreg |= (I2C_Mode_I2C | I2C_Ack_Enable);
-        regs.CTLR1.modify(.{
+        write_control(&regs.CTLR1, .{
             .SMBUS = 0, // I2C mode (not SMBus)
             .SMBTYPE = 0, // Not used in I2C mode
             .ACK = 1, // Enable ACK
@@ -208,9 +217,7 @@ pub const I2C = enum(u1) {
         });
 
         // Enable DMA mode in I2C peripheral if configured
-        if (comptime config.dma != null) {
-            regs.CTLR2.modify(.{ .DMAEN = 1 });
-        }
+        regs.CTLR2.modify(.{ .DMAEN = @intFromBool(config.dma != null), .LAST = 0 });
     }
 
     /// Disables I2C, returns peripheral registers to reset state.
@@ -218,29 +225,81 @@ pub const I2C = enum(u1) {
         i2c.disable();
     }
 
-    /// Generate START condition
-    inline fn generate_start(i2c: I2C) void {
-        i2c.get_regs().CTLR1.modify(.{ .START = 1 });
+    // A failed STOP recovery leaves PE clear. Reapply configuration before retrying.
+    fn begin_transfer(i2c: I2C, ack: bool, deadline: mdf.time.Deadline) Error!void {
+        const regs = i2c.get_regs();
+        try require_enabled(regs.CTLR1.read().PE);
+        try i2c.wait_for_bus_idle(deadline);
+        write_control(&regs.CTLR1, .{ .ACK = @intFromBool(ack) });
+        write_control(&regs.CTLR1, .{ .START = 1 });
     }
 
     /// Generate STOP condition
     inline fn generate_stop(i2c: I2C) void {
-        i2c.get_regs().CTLR1.modify(.{ .STOP = 1 });
+        write_control(&i2c.get_regs().CTLR1, .{ .STOP = 1, .ACK = 0 });
     }
 
-    /// Generate STOP and wait for bus to be released (used in error cleanup)
-    /// TRM 19.12.7 (I2Cx_STAR2): BUSY is cleared when a STOP bit is detected.
-    /// Waiting for BUSY == 0 ensures the bus is idle after issuing STOP.
-    fn cleanup_stop(i2c: I2C) void {
-        i2c.generate_stop();
-
-        // Wait for BUSY to clear
-        i2c.wait_flag_star2("BUSY", 0, .no_deadline) catch {};
+    fn abort_transfer(i2c: I2C) void {
+        // Allow a short, independent STOP recovery after a transfer timeout.
+        // The poll cap also applies if the TIM2 tick is interrupted or stopped.
+        const recovery_deadline = hal.time.deadline_in_ms(2);
+        recover_after_abort(i2c, recovery_deadline, hal.time.get_time_since_boot);
     }
 
-    /// Enable/disable ACK
-    inline fn set_ack(i2c: I2C, en: bool) void {
-        i2c.get_regs().CTLR1.modify(.{ .ACK = @intFromBool(en) });
+    fn prepare_abort(i2c: I2C) void {
+        const control = &i2c.get_regs().CTLR1;
+        // A pending STOP already disabled ACK. Let hardware finish it
+        // without writing either command bit during that interval.
+        if (control.read().STOP == 0) write_control(control, .{ .ACK = 0 });
+    }
+
+    fn poll_abort(i2c: I2C) bool {
+        const regs = i2c.get_regs();
+        const status = regs.STAR1.read();
+        const bus = regs.STAR2.read();
+        // RM §19.12.6: STAR1 then STAR2 releases ADDR stretching. Reading
+        // DATAR releases RXNE/BTF stretching while STOP is pending.
+        if (status.RxNE == 1) _ = regs.DATAR.read();
+        const control = regs.CTLR1.read();
+        if (bus.MSL == 1 and status.ARLO == 0 and control.STOP == 0) i2c.generate_stop();
+        if (bus.MSL == 0 and status.ARLO != 0 and control.STOP != 0)
+            write_control(&regs.CTLR1, .{ .STOP = 0 });
+        return !local_stop_pending(bus.MSL, control.STOP, status.ARLO);
+    }
+
+    fn can_reset_after_abort(i2c: I2C) bool {
+        const regs = i2c.get_regs();
+        // A completed or lost transaction can still have one byte waiting in
+        // DATAR and one in the shifter. Discard both without changing PE.
+        for (0..2) |_| {
+            if (regs.STAR1.read().RxNE == 0) break;
+            _ = regs.DATAR.read();
+        }
+        const status = regs.STAR1.read();
+        const lost_arbitration = status.ARLO != 0;
+        // DMA may have returned a timeout before observing a bus error.
+        // Clear those flags while preserving the original transfer error.
+        clear_errors(&regs.STAR1, status, true);
+        return may_reset_after_abort(lost_arbitration, regs.STAR2.read().BUSY != 0);
+    }
+
+    fn bus_idle(i2c: I2C) error{}!bool {
+        const regs = i2c.get_regs();
+        return regs.STAR2.read().BUSY == 0 and regs.CTLR1.read().STOP == 0;
+    }
+
+    fn wait_for_bus_idle(i2c: I2C, deadline: mdf.time.Deadline) Error!void {
+        try hal.time.wait_until_ready(i2c, bus_idle, deadline, hal.time.get_time_since_boot, poll_limit);
+    }
+
+    fn wait_for_stop(i2c: I2C, deadline: mdf.time.Deadline) Error!void {
+        const Poll = struct {
+            fn ready(bus: I2C) TerminalError!bool {
+                try bus.poll_errors();
+                return bus.bus_idle();
+            }
+        };
+        try hal.time.wait_until_ready(i2c, Poll.ready, deadline, hal.time.get_time_since_boot, poll_limit);
     }
 
     /// Send 7-bit address with direction bit
@@ -249,61 +308,36 @@ pub const I2C = enum(u1) {
         i2c.get_regs().DATAR.write_raw(addr_byte);
     }
 
-    /// Common wait for STAR1/STAR2 flag with timeout
-    /// Note: Error flags reside in STAR1; we poll check_errors() only on STAR1 path.
-    inline fn wait_flag_reg(i2c: I2C, comptime use_star2: bool, comptime flag_name: []const u8, expected: u1, deadline: mdf.time.Deadline) Error!void {
-        const regs = i2c.get_regs();
-        var iterations: u32 = 0;
-        while ((if (use_star2) @field(regs.STAR2.read(), flag_name) else @field(regs.STAR1.read(), flag_name)) != expected) {
-            if (!use_star2) {
-                // Only STAR1 has error flags we should poll while waiting
-                try i2c.check_errors();
+    fn wait_flag_star1(i2c: I2C, comptime flag_name: []const u8, deadline: mdf.time.Deadline) Error!void {
+        const Poll = struct {
+            fn ready(bus: I2C) Error!bool {
+                const status = bus.get_regs().STAR1.read();
+                try bus.check_errors(status);
+                return @field(status, flag_name) == 1;
             }
-            iterations += 1;
-            if (iterations > 100_000) return Error.Timeout;
-            if (deadline.is_reached_by(hal.time.get_time_since_boot())) return Error.Timeout;
-        }
+        };
+        try hal.time.wait_until_ready(i2c, Poll.ready, deadline, hal.time.get_time_since_boot, poll_limit);
     }
 
-    /// Wait for a specific flag in STAR1 with timeout
-    inline fn wait_flag_star1(i2c: I2C, comptime flag_name: []const u8, expected: u1, deadline: mdf.time.Deadline) Error!void {
-        return i2c.wait_flag_reg(false, flag_name, expected, deadline);
+    fn check_errors(i2c: I2C, status: @TypeOf(i2c.get_regs().STAR1.read())) TerminalError!void {
+        terminal_error(status) catch |err| {
+            // Hold ARLO for abort, even if another flag was present in this sample.
+            clear_errors(&i2c.get_regs().STAR1, status, false);
+            return err;
+        };
     }
 
-    /// Wait for a specific flag in STAR2 with timeout
-    inline fn wait_flag_star2(i2c: I2C, comptime flag_name: []const u8, expected: u1, deadline: mdf.time.Deadline) Error!void {
-        return i2c.wait_flag_reg(true, flag_name, expected, deadline);
+    fn poll_errors(i2c: I2C) TerminalError!void {
+        try i2c.check_errors(i2c.get_regs().STAR1.read());
     }
 
-    /// Check and clear error flags
-    /// TRM 19.12.6 (I2Cx_STAR1): AF, ARLO, BERR, OVR are cleared by software
-    /// by writing 0 (or by hardware when PE becomes 0). Clear only bits observed
-    /// set to avoid clearing a flag that latched after the status read.
-    fn check_errors(i2c: I2C) Error!void {
-        const regs = i2c.get_regs();
-        const star1 = regs.STAR1.read();
-
-        // Choose one error to report
-        var err: ?Error = null;
-        if (star1.AF == 1) {
-            err = Error.NoAcknowledge;
-        } else if (star1.ARLO == 1) {
-            err = Error.ArbitrationLost;
-        } else if (star1.BERR == 1) {
-            err = Error.BusError;
-        } else if (star1.OVR == 1) {
-            err = Error.Overrun;
-        }
-
-        // Clear only the flags that were observed set to avoid
-        // accidentally clearing an error that latched after our read.
-        if (err) |e| {
-            if (star1.AF == 1) regs.STAR1.modify(.{ .AF = 0 });
-            if (star1.ARLO == 1) regs.STAR1.modify(.{ .ARLO = 0 });
-            if (star1.BERR == 1) regs.STAR1.modify(.{ .BERR = 0 });
-            if (star1.OVR == 1) regs.STAR1.modify(.{ .OVR = 0 });
-            return e;
-        }
+    fn wait_for_dma(i2c: I2C, comptime channel: dma.Channel, deadline: mdf.time.Deadline) Error!void {
+        const Poll = struct {
+            fn ready(bus: I2C) Error!bool {
+                return dma.poll_peripheral_transfer(bus, poll_errors, .{channel});
+            }
+        };
+        try hal.time.wait_until_ready(i2c, Poll.ready, deadline, hal.time.get_time_since_boot, null);
     }
 
     /// Attempts to write bytes to target device and blocks until complete, error, or timeout
@@ -320,20 +354,17 @@ pub const I2C = enum(u1) {
 
         const deadline = mdf.time.Deadline.init_relative(hal.time.get_time_since_boot(), timeout);
 
-        // Generate START condition (hardware will wait if bus is busy)
-        i2c.generate_start();
-
-        // Ensure STOP is generated and bus is released on any error
-        errdefer i2c.cleanup_stop();
+        try i2c.begin_transfer(false, deadline);
+        errdefer i2c.abort_transfer();
 
         // Wait for SB (Start Bit) flag
-        try i2c.wait_flag_star1("SB", 1, deadline);
+        try i2c.wait_flag_star1("SB", deadline);
 
         // Send address with write bit
         i2c.send_address(addr, .write);
 
         // Wait for ADDR flag (errors like NACK are checked while waiting)
-        try i2c.wait_flag_star1("ADDR", 1, deadline);
+        try i2c.wait_flag_star1("ADDR", deadline);
 
         // Clear ADDR by reading SR2
         _ = regs.STAR2.read();
@@ -342,20 +373,20 @@ pub const I2C = enum(u1) {
         var iter = write_vec.iterator();
         while (iter.next_element()) |element| {
             // Wait for TXE (Transmit buffer Empty)
-            try i2c.wait_flag_star1("TxE", 1, deadline);
+            try i2c.wait_flag_star1("TxE", deadline);
 
             // Write data to DATAR
             regs.DATAR.write_raw(element.value);
         }
 
         // Wait for BTF (Byte Transfer Finished) - ensures last byte is transmitted
-        try i2c.wait_flag_star1("BTF", 1, deadline);
+        try i2c.wait_flag_star1("BTF", deadline);
 
         // Generate STOP condition
         i2c.generate_stop();
 
-        // Wait for BUSY flag to clear
-        try i2c.wait_flag_star2("BUSY", 0, deadline);
+        // Wait for STOP and BUSY to clear.
+        try i2c.wait_for_stop(deadline);
     }
 
     /// Attempts to read bytes from target device and blocks until complete, error, or timeout
@@ -373,31 +404,20 @@ pub const I2C = enum(u1) {
         const deadline = mdf.time.Deadline.init_relative(hal.time.get_time_since_boot(), timeout);
         const total_bytes = read_vec.size();
 
-        // Enable ACK for multi-byte reads
-        if (total_bytes > 1) {
-            i2c.set_ack(true);
-        }
-
-        // Generate START condition
-        i2c.generate_start();
-
-        // Ensure STOP is generated and bus is released on any error
-        errdefer i2c.cleanup_stop();
+        try i2c.begin_transfer(total_bytes > 1, deadline);
+        errdefer i2c.abort_transfer();
 
         // Wait for SB (Start Bit) flag
-        try i2c.wait_flag_star1("SB", 1, deadline);
+        try i2c.wait_flag_star1("SB", deadline);
 
         // Send address with read bit
         i2c.send_address(addr, .read);
 
         // Wait for ADDR flag (errors like NACK are checked while waiting)
-        try i2c.wait_flag_star1("ADDR", 1, deadline);
+        try i2c.wait_flag_star1("ADDR", deadline);
 
         // Handle single byte read specially
         if (total_bytes == 1) {
-            // Disable ACK before clearing ADDR
-            i2c.set_ack(false);
-
             // Clear ADDR by reading SR2
             _ = regs.STAR2.read();
 
@@ -405,7 +425,7 @@ pub const I2C = enum(u1) {
             i2c.generate_stop();
 
             // Wait for RxNE
-            try i2c.wait_flag_star1("RxNE", 1, deadline);
+            try i2c.wait_flag_star1("RxNE", deadline);
 
             // Read data
             var iter = read_vec.iterator();
@@ -425,20 +445,19 @@ pub const I2C = enum(u1) {
 
                 // For the last byte, disable ACK and generate STOP before reading
                 if (bytes_remaining == 0) {
-                    i2c.set_ack(false);
                     i2c.generate_stop();
                 }
 
                 // Wait for RxNE
-                try i2c.wait_flag_star1("RxNE", 1, deadline);
+                try i2c.wait_flag_star1("RxNE", deadline);
 
                 // Read data
                 element.value_ptr.* = regs.DATAR.read().DATAR;
             }
         }
 
-        // Wait for BUSY flag to clear
-        try i2c.wait_flag_star2("BUSY", 0, deadline);
+        // Wait for STOP and BUSY to clear.
+        try i2c.wait_for_stop(deadline);
     }
 
     /// Write then read with repeated start (or STOP/START if repeated start disabled)
@@ -479,25 +498,26 @@ pub const I2C = enum(u1) {
         const deadline = mdf.time.Deadline.init_relative(hal.time.get_time_since_boot(), timeout);
 
         if (data.len == 0) return Error.NoData;
+        _ = try dma.checked_transfer_count(data.len);
 
-        // Generate START condition
-        i2c.generate_start();
-        errdefer i2c.cleanup_stop();
+        try i2c.begin_transfer(false, deadline);
+        errdefer i2c.abort_transfer();
 
         // Wait for SB (Start Bit) flag
-        try i2c.wait_flag_star1("SB", 1, deadline);
+        try i2c.wait_flag_star1("SB", deadline);
 
         // Send address with write bit
         i2c.send_address(addr, .write);
 
         // Wait for ADDR flag
-        try i2c.wait_flag_star1("ADDR", 1, deadline);
+        try i2c.wait_flag_star1("ADDR", deadline);
 
         // Setup DMA transfer from memory to I2C DATAR
         const peripheral_target = dma.PeripheralTarget{
             .addr = @intFromPtr(&regs.DATAR),
         };
 
+        try deadline.check(hal.time.get_time_since_boot());
         dma_cfg.tx_channel.setup_transfer(
             peripheral_target, // destination (I2C DATAR)
             data, // source (memory buffer)
@@ -507,20 +527,23 @@ pub const I2C = enum(u1) {
             },
         );
 
+        defer dma_cfg.tx_channel.stop();
+
         // Clear ADDR by reading SR2 (starts I2C and DMA transfer)
+        try deadline.check(hal.time.get_time_since_boot());
         _ = regs.STAR2.read();
 
-        // Wait for DMA transfer completion
-        dma_cfg.tx_channel.wait_for_finish_blocking();
+        // CH32F/V20x_V30x_V31x RM §19.9: TX DMA completion can precede BTF.
+        try i2c.wait_for_dma(dma_cfg.tx_channel, deadline);
 
         // Wait for BTF (Byte Transfer Finished) - ensures last byte transmitted
-        try i2c.wait_flag_star1("BTF", 1, deadline);
+        try i2c.wait_flag_star1("BTF", deadline);
 
         // Generate STOP condition
         i2c.generate_stop();
 
-        // Wait for BUSY flag to clear
-        try i2c.wait_flag_star2("BUSY", 0, deadline);
+        // Wait for STOP and BUSY to clear.
+        try i2c.wait_for_stop(deadline);
     }
 
     pub fn read_dma(
@@ -538,33 +561,31 @@ pub const I2C = enum(u1) {
         const deadline = mdf.time.Deadline.init_relative(hal.time.get_time_since_boot(), timeout);
 
         if (dst.len == 0) return Error.NoData;
+        _ = try dma.checked_transfer_count(dst.len);
 
-        // Enable ACK
-        i2c.set_ack(true);
-
-        // Generate START condition
-        i2c.generate_start();
-        errdefer i2c.cleanup_stop();
+        try i2c.begin_transfer(true, deadline);
+        errdefer i2c.abort_transfer();
 
         // Wait for SB flag
-        try i2c.wait_flag_star1("SB", 1, deadline);
+        try i2c.wait_flag_star1("SB", deadline);
 
         // Send address with read bit
         i2c.send_address(addr, .read);
 
         // Wait for ADDR flag
-        try i2c.wait_flag_star1("ADDR", 1, deadline);
+        try i2c.wait_flag_star1("ADDR", deadline);
 
         // CRITICAL: LAST tells I2C peripheral to NACK the final byte when DMA counter reaches 1
         // (DMAEN is already set globally in apply() method)
-        // This doesn't affect writes, so we can keep it set.
         regs.CTLR2.modify(.{ .LAST = 1 });
+        defer regs.CTLR2.modify(.{ .LAST = 0 });
 
         // Setup DMA transfer from I2C DATAR to memory
         const peripheral_target = dma.PeripheralTarget{
             .addr = @intFromPtr(&regs.DATAR),
         };
 
+        try deadline.check(hal.time.get_time_since_boot());
         dma_cfg.rx_channel.setup_transfer(
             dst, // write: destination (memory buffer)
             peripheral_target, // read: source (I2C DATAR)
@@ -574,18 +595,20 @@ pub const I2C = enum(u1) {
             },
         );
 
+        defer dma_cfg.rx_channel.stop();
+
         // Clear ADDR by reading SR2 (starts I2C and DMA transfer)
+        try deadline.check(hal.time.get_time_since_boot());
         _ = regs.STAR2.read();
 
-        // Wait for DMA transfer completion
-        dma_cfg.rx_channel.wait_for_finish_blocking();
+        // CH32F/V20x_V30x_V31x RM §19.9: RX DMA completion precedes STOP.
+        try i2c.wait_for_dma(dma_cfg.rx_channel, deadline);
 
         // Disable ACK and generate STOP
-        i2c.set_ack(false);
         i2c.generate_stop();
 
-        // Wait for BUSY flag to clear
-        try i2c.wait_flag_star2("BUSY", 0, deadline);
+        // Wait for STOP and BUSY to clear.
+        try i2c.wait_for_stop(deadline);
     }
 
     /// Automatic write - uses DMA if configured and transfer is large enough
@@ -708,3 +731,240 @@ pub const I2C = enum(u1) {
         try i2c.readv_auto(config, addr, read_chunks, timeout);
     }
 };
+
+// CH32F/V20x_V30x_V31x RM §19.12.1: START and STOP are self-clearing
+// commands. Only write a one when the caller explicitly issues a command.
+fn write_control(register: anytype, fields: anytype) void {
+    var control = register.read();
+    control.START = 0;
+    control.STOP = 0;
+    inline for (@typeInfo(@TypeOf(fields)).@"struct".field_names) |field| {
+        @field(control, field) = @field(fields, field);
+    }
+    register.write(control);
+}
+
+const TerminalError = error{ ArbitrationLost, BusError, NoAcknowledge, Overrun };
+
+fn terminal_error(status: anytype) TerminalError!void {
+    if (status.ARLO != 0) return error.ArbitrationLost;
+    if (status.BERR != 0) return error.BusError;
+    if (status.AF != 0) return error.NoAcknowledge;
+    if (status.OVR != 0) return error.Overrun;
+}
+
+// RM §19.12.6: ones preserve RW0 flags, including those raised after
+// the snapshot. Never write the snapshot itself back to the register.
+fn clear_errors(register: anytype, status: anytype, clear_arbitration: bool) void {
+    const Status = @TypeOf(status);
+    const clear_arlo = clear_arbitration and status.ARLO != 0;
+    if (status.AF == 0 and status.BERR == 0 and status.OVR == 0 and !clear_arlo) return;
+    var value: Status = .{
+        .ADDR = 1,
+        .PECERR = 1,
+        .AF = @intFromBool(status.AF == 0),
+        .BERR = @intFromBool(status.BERR == 0),
+        .OVR = @intFromBool(status.OVR == 0),
+        .ARLO = @intFromBool(!clear_arlo),
+    };
+    if (@hasField(Status, "TIMEOUT")) value.TIMEOUT = 1;
+    if (@hasField(Status, "SMBALERT")) value.SMBALERT = 1;
+    register.write(value);
+}
+
+fn require_enabled(pe: u1) error{RecoveryRequired}!void {
+    if (pe == 0) return error.RecoveryRequired;
+}
+
+// RM §19.12.7: arbitration loss clears MSL. BUSY covers all controllers
+// and belongs in the wait before START, never in the local STOP recovery.
+fn local_stop_pending(master: u1, stop: u1, arbitration_lost: u1) bool {
+    return master != 0 or (stop != 0 and arbitration_lost == 0);
+}
+
+fn may_reset_after_abort(lost_arbitration: bool, bus_busy: bool) bool {
+    return !lost_arbitration and !bus_busy;
+}
+
+fn recover_after_abort(bus: anytype, recovery_deadline: anytype, comptime now: anytype) void {
+    bus.prepare_abort();
+    const Clock = @import("time.zig");
+    const Poll = struct {
+        fn ready(context: @TypeOf(bus)) error{}!bool {
+            return context.poll_abort();
+        }
+    };
+    if (!bus.poll_abort()) {
+        Clock.wait_until_ready(bus, Poll.ready, recovery_deadline, now, I2C.poll_limit) catch {
+            // The deadline may have expired even though STOP has completed.
+            if (!bus.poll_abort()) {
+                bus.disable();
+                return;
+            }
+        };
+    }
+    // RM §19.12.6: clearing PE clears pending RXNE, BTF and ADDR.
+    // Leave PE alone when another controller owns the bus.
+    if (bus.can_reset_after_abort()) {
+        bus.disable();
+        bus.enable();
+    }
+}
+
+test "I2C abort waits for STOP, flushes receive state and requires reapply if stuck" {
+    const Fake = struct {
+        const Deadline = struct {
+            limit: u8,
+
+            pub fn check(deadline: @This(), current: u8) error{Timeout}!void {
+                if (current >= deadline.limit) return error.Timeout;
+            }
+        };
+        var tick: u8 = 0;
+
+        enabled: u1 = 1,
+        pending_rx: bool = true,
+        stop_requested: bool = false,
+        stop_at: u8,
+        master: u1 = 1,
+        externally_busy: bool = false,
+        lost_arbitration: bool = false,
+        disable_calls: u8 = 0,
+
+        fn prepare_abort(bus: *@This()) void {
+            if (bus.master == 1) bus.stop_requested = true;
+        }
+
+        fn poll_abort(bus: *@This()) bool {
+            if (bus.stop_requested and tick >= bus.stop_at) {
+                bus.master = 0;
+                bus.stop_requested = false;
+            }
+            const lost = @intFromBool(bus.lost_arbitration);
+            const pending = local_stop_pending(bus.master, @intFromBool(bus.stop_requested), lost);
+            if (!pending) bus.stop_requested = false;
+            return !pending;
+        }
+
+        fn can_reset_after_abort(bus: *@This()) bool {
+            bus.pending_rx = false;
+            return may_reset_after_abort(bus.lost_arbitration, bus.externally_busy);
+        }
+
+        fn disable(bus: *@This()) void {
+            bus.enabled = 0;
+            bus.disable_calls += 1;
+            bus.pending_rx = false;
+        }
+
+        fn enable(bus: *@This()) void {
+            bus.enabled = 1;
+        }
+
+        fn now() u8 {
+            tick += 1;
+            return tick;
+        }
+    };
+
+    const testing = @import("std").testing;
+    const expired_transfer: Fake.Deadline = .{ .limit = 1 };
+    const recovery_deadline: Fake.Deadline = .{ .limit = 6 };
+    Fake.tick = 2;
+    try testing.expectError(error.Timeout, expired_transfer.check(Fake.tick));
+    var bus: Fake = .{ .stop_at = 4 };
+    recover_after_abort(&bus, recovery_deadline, Fake.now);
+    try testing.expect(Fake.tick >= bus.stop_at and Fake.tick < recovery_deadline.limit);
+    try testing.expect(!bus.pending_rx);
+    try require_enabled(bus.enabled);
+
+    Fake.tick = 2;
+    bus = .{ .stop_at = 7 };
+    recover_after_abort(&bus, recovery_deadline, Fake.now);
+    try testing.expectEqual(6, Fake.tick);
+    try testing.expect(!bus.pending_rx);
+    try testing.expectError(error.RecoveryRequired, require_enabled(bus.enabled));
+
+    // Another master owns the bus after arbitration loss. A busy bus with
+    // neither MSL nor STOP set must not consume the recovery budget.
+    Fake.tick = 6;
+    bus = .{ .stop_at = 7, .master = 0, .externally_busy = true, .lost_arbitration = true };
+    recover_after_abort(&bus, recovery_deadline, Fake.now);
+    try testing.expectEqual(6, Fake.tick);
+    try testing.expectEqual(0, bus.disable_calls);
+    try testing.expect(!bus.pending_rx);
+    try require_enabled(bus.enabled);
+
+    bus.stop_requested = true;
+    recover_after_abort(&bus, recovery_deadline, Fake.now);
+    try testing.expect(!bus.stop_requested);
+    try testing.expectEqual(0, bus.disable_calls);
+
+    bus.externally_busy = false;
+    recover_after_abort(&bus, recovery_deadline, Fake.now);
+    try testing.expectEqual(0, bus.disable_calls);
+}
+
+test "I2C writes only explicit START or STOP commands" {
+    const Control = struct { START: u1 = 0, STOP: u1 = 0, ACK: u1 = 0, PE: u1 = 1 };
+    const Register = struct {
+        value: Control,
+
+        fn read(reg: *@This()) Control {
+            return reg.value;
+        }
+
+        fn write(reg: *@This(), value: Control) void {
+            reg.value = value;
+        }
+    };
+    const testing = @import("std").testing;
+    var control: Register = .{ .value = .{ .START = 1, .STOP = 1 } };
+    write_control(&control, .{ .ACK = @as(u1, 1) });
+    try testing.expectEqual(Control{ .ACK = 1 }, control.value);
+    write_control(&control, .{ .START = 1 });
+    try testing.expectEqual(Control{ .START = 1, .ACK = 1 }, control.value);
+    write_control(&control, .{ .STOP = 1, .ACK = 0 });
+    try testing.expectEqual(Control{ .STOP = 1 }, control.value);
+}
+
+test "I2C status clears observed flags without losing late arbitration loss" {
+    const Status = struct {
+        ADDR: u1 = 0,
+        PECERR: u1 = 0,
+        AF: u1 = 0,
+        BERR: u1 = 0,
+        OVR: u1 = 0,
+        ARLO: u1 = 0,
+        TIMEOUT: u1 = 0,
+        SMBALERT: u1 = 0,
+    };
+    const Register = struct {
+        latched: Status,
+        writes: u8 = 0,
+
+        fn write(reg: *@This(), value: Status) void {
+            inline for (@typeInfo(Status).@"struct".field_names) |field| {
+                @field(reg.latched, field) &= @field(value, field);
+            }
+            reg.writes += 1;
+        }
+    };
+    const testing = @import("std").testing;
+    const observed: Status = .{ .AF = 1, .BERR = 1 };
+    var status: Register = .{ .latched = .{
+        .AF = 1,
+        .BERR = 1,
+        .ARLO = 1,
+        .ADDR = 1,
+        .PECERR = 1,
+        .TIMEOUT = 1,
+        .SMBALERT = 1,
+    } };
+    clear_errors(&status, observed, false);
+    try testing.expectEqual(1, status.writes);
+    try testing.expectEqual(Status{ .ARLO = 1, .ADDR = 1, .PECERR = 1, .TIMEOUT = 1, .SMBALERT = 1 }, status.latched);
+    try testing.expectError(error.ArbitrationLost, terminal_error(status.latched));
+    clear_errors(&status, status.latched, true);
+    try testing.expectEqual(0, status.latched.ARLO);
+}

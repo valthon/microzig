@@ -61,12 +61,12 @@ Each dispatched interface has a local `TestDevice`. Port names refer to the `dri
 | Interface | Adapter | Operations provided |
 | --- | --- | --- |
 | BlockMemory | Local test double only | It exercises sector writes and byte-offset reads. |
-| ClockDevice | ESP, RP2xxx, CH32V and nRF5x | They report boot time. Let `port/wch/ch32v/src/hals/time.zig:tim2_handler` run during CH32V adapter sleeps and deadline polling. Keep `port/nordic/nrf5x/src/hal/time.zig:rtc_interrupt` servicing RTC0 compare and overflow events to extend the nRF5x counter. |
+| ClockDevice | ESP, RP2xxx, CH32V and nRF5x | They report boot time. CH32V time stays monotonic across reinitialization. TIM2 ticks between a system clock switch and `time.init()` are scaled at the old rate, which can skew elapsed time and deadlines spanning the switch. Let `port/wch/ch32v/src/hals/time.zig:tim2_handler` run during CH32V adapter sleeps and deadline polling. Keep `port/nordic/nrf5x/src/hal/time.zig:rtc_interrupt` servicing RTC0 compare and overflow events to extend the nRF5x counter. |
 | ClockDevice | ATmega328P | Install `port/microchip/atmega/src/hals/atmega328p/time.zig:timer0_overflow` on `TIMER0_OVF`, call `hal.time.init()`, and leave interrupts enabled during sleeps. |
 | ClockDevice | `port/stmicro/stm32/src/hals/common/systick_timer.zig:clock_device` | It rejects creation before SysTick initialization. Let `port/stmicro/stm32/src/hals/common/systick.zig:SysTick_handler` run during sleeps so the wrap count advances. |
 | DatagramDevice | `I2C_DatagramDevice` on ESP, RP2xxx, nRF5x and STM32F103 | They bind an address, with combined transfer slots on RP2xxx and nRF5x. |
 | DatagramDevice | `SPI_Device` on ESP, RP2xxx and nRF5x, `SPI_DatagramDevice` on ATmega328P and CH32V | They provide selection and transfer, with combined transfer slots on ESP, ATmega328P and CH32V. |
-| Digital_IO | `GPIO_Device` on ESP, RP2xxx, CH32V and ATmega328P, plus `port/stmicro/stm32/src/hals/common/pins_v2.zig:Digital_IO_Pin` | These adapt concrete GPIO pins. |
+| Digital_IO | `GPIO_Device` on ESP, RP2xxx, CH32V and ATmega328P, plus `port/stmicro/stm32/src/hals/common/pins_v2.zig:Digital_IO_Pin` | These adapt concrete GPIO pins. CH32V remembers bias requests made in output or analog mode and applies them when the adapter selects input. |
 | Digital_IO | `drivers/src/io_expander/pcf8574.zig:PCF8574.digital_IO` | Pins support read and write but return `Unsupported` for direction and bias. |
 | I2C_Device | ESP and nRF5x `I2C_Device` | The combined slot uses a repeated START under one deadline. ESP starts with a write address even for an empty write, and nRF5x rejects either empty phase. |
 | I2C_Device | RP2xxx `I2C_Device` | The combined slot shares a deadline and requires `port/raspberrypi/rp2xxx/src/hal/i2c.zig:Config`'s `repeated_start` for a restart, which enables `IC_RESTART_EN` by default. |
@@ -143,7 +143,7 @@ count fits `CNTR.NDT` in the port's register definitions.
   ran on ESP32-C3, Super Mini ESP32-C6 and XIAO ESP32-C6. Build with `-Dexample=selftest_uart`.
   [Driver evidence](../../port/espressif/esp/README.md#drivers)
 - No host test verifies hardware framing or timing, adapter and DMA lifetimes, erase
-  side effects, the clock polling fallback, port GPIO bias or std.Io edge cases.
+  side effects, the clock polling fallback, electrical GPIO bias or std.Io edge cases.
 
 ## Open questions
 

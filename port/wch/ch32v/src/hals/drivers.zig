@@ -47,21 +47,21 @@ pub fn I2C_Device(comptime config: i2c.Config) type {
 
         pub fn write(dev: Self, address: I2CAddress, buf: []const u8) I2CError!void {
             return dev.bus.write_auto(config, address, buf, dev.timeout) catch |err| switch (err) {
-                error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                 else => |e| e,
             };
         }
 
         pub fn writev(dev: Self, address: I2CAddress, chunks: []const []const u8) I2CError!void {
             return dev.bus.writev_auto(config, address, chunks, dev.timeout) catch |err| switch (err) {
-                error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                 else => |e| e,
             };
         }
 
         pub fn read(dev: Self, address: I2CAddress, buf: []u8) I2CError!usize {
             dev.bus.read_auto(config, address, buf, dev.timeout) catch |err| return switch (err) {
-                error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                 else => |e| e,
             };
             return buf.len;
@@ -69,7 +69,7 @@ pub fn I2C_Device(comptime config: i2c.Config) type {
 
         pub fn readv(dev: Self, address: I2CAddress, chunks: []const []u8) I2CError!usize {
             dev.bus.readv_auto(config, address, chunks, dev.timeout) catch |err| return switch (err) {
-                error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                 else => |e| e,
             };
             return microzig.utilities.SliceVector([]u8).init(chunks).size();
@@ -80,7 +80,7 @@ pub fn I2C_Device(comptime config: i2c.Config) type {
             const read_chunks: []const []u8 = &.{dst};
             dev.bus.writev_then_readv_auto(config, address, write_chunks, read_chunks, dev.timeout) catch |err|
                 return switch (err) {
-                    error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                    error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                     else => |e| e,
                 };
         }
@@ -93,7 +93,7 @@ pub fn I2C_Device(comptime config: i2c.Config) type {
         ) I2CError!void {
             return dev.bus.writev_then_readv_auto(config, address, write_chunks, read_chunks, dev.timeout) catch |err|
                 switch (err) {
-                    error.ArbitrationLost, error.BusError, error.Overrun => I2CError.UnknownAbort,
+                    error.ArbitrationLost, error.BusError, error.Overrun, error.TransferTooLong, error.DmaTransferFailed, error.RecoveryRequired => I2CError.UnknownAbort,
                     else => |e| e,
                 };
         }
@@ -139,6 +139,7 @@ pub const GPIO_Device = struct {
     pub const Direction = Digital_IO.Direction;
 
     pin: gpio.Pin,
+    bias: ?gpio.Pull = null,
 
     pub fn init(pin: gpio.Pin) GPIO_Device {
         return .{ .pin = pin };
@@ -152,17 +153,24 @@ pub const GPIO_Device = struct {
     }
 
     pub fn set_direction(dio: GPIO_Device, dir: Direction) SetDirError!void {
-        dio.pin.set_mode(switch (dir) {
-            .output => .{ .output = .general_purpose_push_pull },
-            .input => .{ .input = .pull },
-        });
+        switch (dir) {
+            .output => dio.pin.set_mode(.{ .output = .general_purpose_push_pull }),
+            .input => if (dio.bias) |pull|
+                dio.pin.set_input_pull(pull)
+            else
+                dio.pin.set_input_mode(.pull),
+        }
     }
 
-    pub fn set_bias(dio: GPIO_Device, maybe_bias: ?State) SetBiasError!void {
-        dio.pin.set_pull(if (maybe_bias) |bias| switch (bias) {
+    pub fn set_bias(dio: *GPIO_Device, maybe_bias: ?State) SetBiasError!void {
+        const pull: gpio.Pull = if (maybe_bias) |bias| switch (bias) {
             .low => .down,
             .high => .up,
-        } else .disabled);
+        } else .disabled;
+        dio.bias = pull;
+        // Digital inputs can apply this immediately. Other modes keep their
+        // configuration until set_direction selects input.
+        dio.pin.set_pull(pull);
     }
 
     pub fn write(dio: GPIO_Device, state: State) WriteError!void {
@@ -202,6 +210,63 @@ pub const GPIO_Device = struct {
         return try gd.read();
     }
 };
+
+test "GPIO adapter applies a button's bias requested before input direction" {
+    const testing = @import("std").testing;
+    const Button = mdf.input.DebouncedButton(.{ .active_state = .low });
+    const pin: gpio.Pin = .init(0, 0);
+    const port = pin.get_port();
+    var device: GPIO_Device = .init(pin);
+    const io = device.digital_io();
+
+    try io.set_direction(.output);
+    _ = try Button.init(io);
+    try testing.expectEqual(0b1000, port.CFGLR.raw);
+    try testing.expectEqual(1, port.BSHR.raw);
+    port.OUTDR.raw = 1; // Latch state after the BSHR write.
+
+    try io.set_direction(.output);
+    const output_config = port.CFGLR.raw;
+    try io.set_bias(.low);
+    try testing.expectEqual(output_config, port.CFGLR.raw);
+    try testing.expectEqual(0, port.BCR.raw);
+    try io.set_direction(.input);
+    try testing.expectEqual(0b1000, port.CFGLR.raw);
+    try testing.expectEqual(1, port.BCR.raw);
+    port.OUTDR.raw = 0; // Latch state after the BCR write.
+
+    pin.set_input_mode(.analog);
+    port.BSHR.raw = 0;
+    try io.set_bias(.high);
+    try testing.expectEqual(0, port.CFGLR.raw);
+    try testing.expectEqual(0, port.BSHR.raw);
+    try io.set_direction(.input);
+    try testing.expectEqual(0b1000, port.CFGLR.raw);
+    try testing.expectEqual(1, port.BSHR.raw);
+
+    try io.set_direction(.output);
+    try io.set_bias(null);
+    try testing.expectEqual(output_config, port.CFGLR.raw);
+    try io.set_direction(.input);
+    try testing.expectEqual(0b0100, port.CFGLR.raw);
+}
+
+test "GPIO adapter leaves an existing button pull undisturbed" {
+    const testing = @import("std").testing;
+    const Button = mdf.input.DebouncedButton(.{ .active_state = .low });
+    const pin: gpio.Pin = .init(1, 0);
+    const port = pin.get_port();
+    pin.set_input_mode(.pull);
+    port.OUTDR.raw = 1;
+    const writes_before = port.CFGLR.writes;
+    var device: GPIO_Device = .init(pin);
+
+    _ = try Button.init(device.digital_io());
+
+    try testing.expectEqual(writes_before, port.CFGLR.writes);
+    try testing.expectEqual(0, port.BSHR.raw);
+    try testing.expectEqual(0, port.BCR.raw);
+}
 
 /// A SPI Datagram Device implementation
 /// Generic over SPI configuration to enable compile-time DMA optimization
