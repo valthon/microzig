@@ -9,6 +9,17 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const maybe_example = b.option([]const u8, "example", "only build matching examples");
 
+    const radio_interface = b.createModule(.{
+        .root_source_file = b.path("../../../drivers/src/base/IEEE802154_Radio.zig"),
+        .target = b.graph.host,
+    });
+    const selftest = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/selftest/ieee802154.zig"),
+        .target = b.graph.host,
+        .imports = &.{.{ .name = "radio_interface", .module = radio_interface }},
+    }) });
+    b.step("test", "Run host tests for the IEEE 802.15.4 self-test").dependOn(&b.addRunArtifact(selftest).step);
+
     const mz_dep = b.dependency("microzig", .{});
     const mb = MicroBuild.init(b, mz_dep) orelse return;
 
@@ -59,6 +70,7 @@ pub fn build(b: *std.Build) void {
         .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_storage", .file = "src/selftest/storage.zig" },
         .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_analog", .file = "src/selftest/analog.zig" },
         .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_sense", .file = "src/selftest/sense.zig" },
+        .{ .target = xiao_nrf52840_sense, .name = "xiao_nrf52840_sense_selftest_ieee802154", .file = "src/selftest/ieee802154.zig" },
     };
 
     for (available_examples) |example| {
